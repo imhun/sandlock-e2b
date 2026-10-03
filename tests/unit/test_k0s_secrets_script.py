@@ -59,9 +59,11 @@ MANAGED_KEYS = (
     "E2B_C3_AGENT_TOKEN",
 )
 
-#: 行为用例的假 `kubectl`：只认识 `secrets.sh` 真的会发的两种调用（`get`/`create
-#: --dry-run=client`/`apply -f -`），状态放在一个 JSON 文件里。测试断言因此可以是
-#: **精确**的（整份 stdout 逐字比较、逐键比较），而不是"看起来像"。
+#: 行为用例的假 `kubectl`：只认识 `secrets.sh` 与集群身份闸门真的会发的调用
+#: （闸门的 `config current-context` / `version -o json` / `get nodes -o json`，
+#: 加上脚本自己的 `get`/`create --dry-run=client`/`apply -f -`），状态放在一个 JSON
+#: 文件里。测试断言因此可以是**精确**的（整份 stdout 逐字比较、逐键比较），而不是
+#: "看起来像"；不认识的动词照旧失败，漏了什么会立刻红。
 _STUB_BODY = r'''
 """Fake kubectl for the secrets.sh contract tests."""
 import base64
@@ -99,6 +101,32 @@ while i < len(argv):
 
 data = current()
 verb = args[0]
+
+# --- 集群身份闸门（deploy/scripts/lib/cluster-guard.sh）---------------------
+# 闸门在任何 kubectl 之前问这三个只读问题；答不出/答错就是"连错集群"。
+if verb == "config" and args[1:] == ["current-context"]:
+    print("k0s-sandlock")
+    raise SystemExit(0)
+
+if verb == "version":
+    if args[1:] != ["-o", "json"]:
+        fail("stub kubectl: version only supports -o json")
+    print(json.dumps({
+        "clientVersion": {"gitVersion": "v1.37.1"},
+        "serverVersion": {"gitVersion": "v1.36.4+k0s"},
+    }))
+    raise SystemExit(0)
+
+if verb == "get" and args[1:2] == ["nodes"]:
+    if args[2:] != ["-o", "json"]:
+        fail("stub kubectl: get nodes only supports -o json")
+    print(json.dumps({"items": [
+        {"metadata": {"name": "izuf697v12g31dyz4uvsjlz"},
+         "status": {"nodeInfo": {"architecture": "arm64", "kubeletVersion": "v1.36.4+k0s"}}},
+        {"metadata": {"name": "izuf6d1usviqv6x9qk1hpcz"},
+         "status": {"nodeInfo": {"architecture": "arm64", "kubeletVersion": "v1.36.4+k0s"}}},
+    ]}))
+    raise SystemExit(0)
 
 if verb == "get":
     if ns != "sandlock":
@@ -190,6 +218,9 @@ def stub_cluster():
         kubectl = stub_dir / "kubectl"
         kubectl.write_text(f"#!{sys.executable}\n{_STUB_BODY}", encoding="utf-8")
         kubectl.chmod(0o755)
+        #: 闸门要求 KUBECONFIG 指向一份**真实存在**的文件（它先验存在、再问集群身份）；
+        #: 内容无所谓 —— 这一档里唯一的 kubectl 是这个桩。
+        (root / "kubeconfig").write_text("apiVersion: v1\nkind: Config\n", encoding="utf-8")
         yield stub_dir, root / "state.json"
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -209,7 +240,7 @@ def _run(stub_cluster, *args: str) -> subprocess.CompletedProcess:
     env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
     env["STUB_KUBECTL_STATE"] = str(state_path)
     # 假 kubectl 一旦没被用上，真的那个会立刻失败 —— 这个用例永远不会碰到集群。
-    env["KUBECONFIG"] = str(stub_dir / "no-such-kubeconfig")
+    env["KUBECONFIG"] = str(stub_dir.parent / "kubeconfig")
     return subprocess.run(
         [str(SCRIPT), *args],
         cwd=REPO,
@@ -228,6 +259,15 @@ def _fingerprint_table(values: dict[str, str]) -> str:
         digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
         lines.append(f"{key} sha256:{digest} len:{len(value)}")
     return "\n".join(lines) + "\n"
+
+
+#: 集群身份闸门（`deploy/scripts/lib/cluster-guard.sh`）成功时打在 **stderr** 的
+#: 那一行确认。它在任何 kubectl 之前跑，所以下面每个"逐字相等"的 stderr 断言都以它
+#: 开头 —— 闸门的输出也是脚本输出的一部分，一个字都不许变。
+TARGET_CLUSTER_LINE = (
+    "✓ target cluster: context=k0s-sandlock server=v1.36.4+k0s nodes=2"
+    " (izuf697v12g31dyz4uvsjlz izuf6d1usviqv6x9qk1hpcz)"
+)
 
 
 def _script_text() -> str:
@@ -507,6 +547,7 @@ def test_rotate_internal_key_keeps_the_old_key_in_the_window_list(stub_cluster):
     # 整个 runbook（含逐步命令）逐行固定：窗口的两把 key 只以指纹出现。
     assert result.stdout == _fingerprint_table(stored)
     assert result.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         "已轮换 internal key：新主 key 写入 E2B_INTERNAL_API_KEY；旧 key 留在 "
         "E2B_INTERNAL_API_KEYS（窗口内新旧都认，这一步不重启任何 pod）",
         f"  新主 key {_fp(new_primary)}",
@@ -538,6 +579,7 @@ def test_rotate_internal_key_refuses_without_a_current_key_or_a_secret(stub_clus
 
     assert no_primary.returncode != 0
     assert no_primary.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         "secrets.sh: 无法确定当前 internal key（Secret 缺 E2B_INTERNAL_API_KEY）"
     ]
     assert _state(state_path) == {"E2B_API_KEYS": "api-old"}
@@ -548,6 +590,7 @@ def test_rotate_internal_key_refuses_without_a_current_key_or_a_secret(stub_clus
     assert missing.returncode != 0
     assert missing.stdout == ""
     assert missing.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         "secrets.sh: --rotate-internal-key / --rotate-api-keys / --finalize-* 都需要先有 "
         "sandlock/e2b-secrets：先跑一次不带这些参数的本脚本把它建出来"
     ]
@@ -580,6 +623,7 @@ def test_finalize_internal_key_rotation_removes_the_named_key(stub_cluster):
     assert "internal-old" not in by_fingerprint.stdout + by_fingerprint.stderr
     assert by_fingerprint.stdout == _fingerprint_table(stored)
     assert by_fingerprint.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         f"已从 E2B_INTERNAL_API_KEYS 移除 {_fp('internal-old')}：该 key 立即失效",
         "保留 E2B_API_KEYS（已有值；要换值请显式 --rotate E2B_API_KEYS）",
         "保留 E2B_INTERNAL_API_KEY（已有值；要换值请显式 --rotate E2B_INTERNAL_API_KEY）",
@@ -592,6 +636,7 @@ def test_finalize_internal_key_rotation_removes_the_named_key(stub_cluster):
     by_value = _run(stub_cluster, "--finalize-internal-key-rotation", "internal-new")
     assert by_value.returncode != 0
     assert by_value.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         f"secrets.sh: 不能移除当前主 key（{_fp('internal-new')}）："
         "先 --rotate-internal-key 生成新主 key"
     ]
@@ -610,6 +655,7 @@ def test_finalize_internal_key_rotation_refuses_an_unknown_key_or_an_empty_list(
 
     assert unknown.returncode != 0
     assert unknown.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         f"secrets.sh: E2B_INTERNAL_API_KEYS 里没有 {_fp('not-in-list')}："
         "地址既不是列表里的 key，也不是它打印过的 sha256 前 16 位"
     ]
@@ -629,6 +675,7 @@ def test_finalize_internal_key_rotation_refuses_an_unknown_key_or_an_empty_list(
 
     assert empty.returncode != 0
     assert empty.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         "secrets.sh: E2B_INTERNAL_API_KEYS 为空：旧 key 已不在生效列表"
     ]
 
@@ -649,6 +696,7 @@ def test_rotate_api_keys_appends_a_new_key_and_keeps_the_old_one(stub_cluster):
     assert new_key not in result.stdout + result.stderr
     assert result.stdout == _fingerprint_table(stored)
     assert result.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         "已轮换 API key：新 key 追加进 E2B_API_KEYS（旧 key 仍有效，"
         "这一步不重启任何 pod）",
         "  窗口列表成员（finalize 用这里的指纹）：",
@@ -692,6 +740,7 @@ def test_finalize_api_key_rotation_removes_the_named_key_but_never_the_last_one(
     assert "api-old" not in result.stdout + result.stderr
     assert result.stdout == _fingerprint_table(stored)
     assert result.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         f"已从 E2B_API_KEYS 移除 {_fp('api-old')}：该 key 立即失效",
         "保留 E2B_API_KEYS（已有值；要换值请显式 --rotate E2B_API_KEYS）",
         "保留 E2B_INTERNAL_API_KEY（已有值；要换值请显式 --rotate E2B_INTERNAL_API_KEY）",
@@ -705,6 +754,7 @@ def test_finalize_api_key_rotation_removes_the_named_key_but_never_the_last_one(
 
     assert last.returncode != 0
     assert last.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         "secrets.sh: 不能移除最后一个 API key：所有客户端会被锁在门外"
     ]
     assert _state(state_path)["E2B_API_KEYS"] == "api-new"

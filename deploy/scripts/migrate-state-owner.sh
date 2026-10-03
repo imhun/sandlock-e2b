@@ -382,8 +382,17 @@ PY_ENGINE
 
 # --- 只读的集群自检（与 migrate-state-base.sh 同一姿态：先认集群，再敲命令） ----
 
+#: 期望值只有一处真相源：`lib/cluster-guard.sh` 的三个常量（默认 2 × arm64 × `+k0s`，
+#: 可用 `E2B_TARGET_*` 覆盖）。这里**不调** `require_target_cluster` —— 本脚本保有自己的
+#: 姿态：`--root`/`--print-plan` 完全不连集群、逐条累加 `bad` 再 `refuse 2`，而且它比
+#: 闸门多一条"KUBECONFIG 必须是本项目那一份"（`check_kubeconfig`）。
+. "$SCRIPT_DIR/lib/cluster-guard.sh"
+
 IDENTITY_CHECK='
 import json, sys
+want_nodes = int(sys.argv[1])
+want_arch = sys.argv[2]
+want_kubelet = sys.argv[3]
 items = json.load(sys.stdin)["items"]
 nodes = [
     (
@@ -394,13 +403,13 @@ nodes = [
     for node in items
 ]
 bad = []
-if len(nodes) != 2:
-    bad.append("节点数 %d != 2" % len(nodes))
+if len(nodes) != want_nodes:
+    bad.append("节点数 %d != %d" % (len(nodes), want_nodes))
 for name, arch, version in nodes:
-    if arch != "arm64":
-        bad.append("%s 架构 %s != arm64" % (name, arch))
-    if "+k0s" not in version:
-        bad.append("%s 版本 %s 不含 +k0s" % (name, version))
+    if arch != want_arch:
+        bad.append("%s 架构 %s != %s" % (name, arch, want_arch))
+    if want_kubelet not in version:
+        bad.append("%s 版本 %s 不含 %s" % (name, version, want_kubelet))
 for name, arch, version in nodes:
     print("   节点 %s %s %s" % (name, arch, version), file=sys.stderr)
 if bad:
@@ -427,7 +436,10 @@ check_cluster_identity() {
     local nodes
     nodes="$(kubectl get nodes -o json)" ||
         refuse 2 "kubectl get nodes 失败 —— 通道在吗？deploy/scripts/open-cluster-tunnel.sh"
-    if ! printf '%s' "$nodes" | python3 -c "$IDENTITY_CHECK"; then
+    if ! printf '%s' "$nodes" | python3 -c "$IDENTITY_CHECK" \
+        "$CLUSTER_GUARD_EXPECTED_NODES" \
+        "$CLUSTER_GUARD_EXPECTED_ARCH" \
+        "$CLUSTER_GUARD_EXPECTED_KUBELET_SUBSTR"; then
         refuse 2 "集群身份自检没过（上面那几行）——本机默认 context 指的是另一套 ACK 集群，见 docs/deploy-clusters.md §2"
     fi
 }

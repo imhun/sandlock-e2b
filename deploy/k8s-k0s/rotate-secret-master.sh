@@ -46,10 +46,20 @@
 #   KUBECONFIG=... deploy/k8s-k0s/rotate-secret-master.sh status
 #   KUBECONFIG=... deploy/k8s-k0s/rotate-secret-master.sh finalize sha256:<旧主 key 的指纹>
 #
+# **集群身份闸门**：三个子命令（含只读的 `status`）在碰任何 kubectl 之前都先跑
+# `deploy/scripts/lib/cluster-guard.sh` 的 `require_target_cluster` —— KUBECONFIG 必须
+# 显式设置且文件存在、server 含 `+k0s`、节点 2 × arm64 × `+k0s`，不符即 exit 2 并点名
+# 实际值。闸门判的是"连对集群没有"，不是"会不会写"：不带 KUBECONFIG 时 kubectl 会安静
+# 地用 ~/.kube/config 的 current-context，那是另一套阿里云 ACK 集群
+# （docs/deploy-clusters.md §1/§7.34.1；与 secrets.sh / apply.sh 同一道闸）。
+#
 # 环境变量：NAMESPACE（默认 sandlock）、SECRET_NAME（默认 e2b-secrets）、
 # DEPLOYMENT（默认 control-plane）、CONTAINER（默认 control-plane）、
 # ROLLOUT_TIMEOUT（默认 300s）。
 set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 
 NAMESPACE="${NAMESPACE:-sandlock}"
 SECRET_NAME="${SECRET_NAME:-e2b-secrets}"
@@ -266,6 +276,11 @@ require_tools() {
     command -v kubectl >/dev/null 2>&1 || die "缺少 kubectl"
     command -v python3 >/dev/null 2>&1 ||
         die "缺少 python3（读 Deployment / Pod 的 -o json 用）"
+    #: 认集群：三个子命令（rotate / status / finalize）都先过这里，任何 kubectl 都在它
+    #: 之后 —— `status` 是只读的也照样过闸（全副本滚动那几批判据读的是某个集群，不是
+    #: 随便哪个集群）。不通过时闸门自己 `exit 2` 并点名实际值。
+    . "$REPO_ROOT/deploy/scripts/lib/cluster-guard.sh"
+    require_target_cluster
 }
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,13 @@
 #   KUBECONFIG=... deploy/k8s-k0s/secrets.sh --fingerprint            # 只打印，不改动
 #   KUBECONFIG=... deploy/k8s-k0s/secrets.sh --rotate E2B_REDIS_PASSWORD
 #
+# **集群身份闸门**：碰任何 kubectl 之前先跑 `deploy/scripts/lib/cluster-guard.sh` 的
+# `require_target_cluster`（KUBECONFIG 必须显式设置且文件存在、server 含 `+k0s`、
+# 节点 2 × arm64 × `+k0s`，不符即 exit 2 并点名实际值）。**所有模式都要过**，包括
+# 只读的 `--fingerprint` —— 闸门判的是"连对集群没有"，不是"会不会写"：不带
+# KUBECONFIG 时 kubectl 会安静地用 ~/.kube/config 的 current-context，那是另一套
+# 阿里云 ACK 集群（docs/deploy-clusters.md §1/§7.34.1）。
+#
 # 双窗轮换（O3 Task 3）。语义照 deploy/scripts/upgrade.sh:122-168：旧 key 留在
 # 列表里继续可用，新 key 进单值槽（internal）或追加进列表（api），等消费者都滚到
 # 新 key 之后再由 finalize 摘掉旧 key —— 中间不断服（唯一的中断点是 worker 滚动，
@@ -51,6 +58,9 @@
 # `--rotate <KEY>` 仍是**单槽换值**（旧值立刻失效，要窗口没有）：对
 # E2B_API_KEYS / E2B_INTERNAL_API_KEY 它会打一条指路告警。
 set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 
 NAMESPACE="${NAMESPACE:-sandlock}"
 SECRET_NAME="${SECRET_NAME:-e2b-secrets}"
@@ -360,6 +370,11 @@ if is_rotate "$API_KEYS_LIST" && [ "$rotate_api" = 1 ]; then
 fi
 
 command -v kubectl >/dev/null 2>&1 || die "缺少 kubectl"
+
+#: 认集群（写操作与 `--fingerprint` 一起过）：`exit 2` 由闸门自己发出，并点名实际
+#: 看到的 context / server 版本 / 每台节点的架构与版本。
+. "$REPO_ROOT/deploy/scripts/lib/cluster-guard.sh"
+require_target_cluster
 
 have_secret=0
 if secret_exists; then

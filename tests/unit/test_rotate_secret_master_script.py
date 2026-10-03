@@ -136,6 +136,33 @@ with (root / "calls.log").open("a", encoding="utf-8") as fh:
 
 verb = args[0]
 
+# --- 集群身份闸门（deploy/scripts/lib/cluster-guard.sh）---------------------
+# 闸门在任何 kubectl 之前问这三个只读问题（都是 cluster-scoped，不带 `-n`）；答不出/
+# 答错就是"连错集群"。它们在下面那条"每个调用都要带 -n sandlock"的断言之前。
+if verb == "config" and args[1:] == ["current-context"]:
+    print("k0s-sandlock")
+    raise SystemExit(0)
+
+if verb == "version":
+    if args[1:] != ["-o", "json"]:
+        fail("version only supports -o json")
+    print(json.dumps({
+        "clientVersion": {"gitVersion": "v1.37.1"},
+        "serverVersion": {"gitVersion": "v1.36.4+k0s"},
+    }))
+    raise SystemExit(0)
+
+if verb == "get" and args[1:2] == ["nodes"]:
+    if args[2:] != ["-o", "json"]:
+        fail("get nodes only supports -o json")
+    print(json.dumps({"items": [
+        {"metadata": {"name": "izuf697v12g31dyz4uvsjlz"},
+         "status": {"nodeInfo": {"architecture": "arm64", "kubeletVersion": "v1.36.4+k0s"}}},
+        {"metadata": {"name": "izuf6d1usviqv6x9qk1hpcz"},
+         "status": {"nodeInfo": {"architecture": "arm64", "kubeletVersion": "v1.36.4+k0s"}}},
+    ]}))
+    raise SystemExit(0)
+
 # `get`/`create`/`rollout`/`exec` 都要带 -n sandlock；`apply -f -` 的 namespace 来自
 # 清单对象本身（与 secrets.sh 一样不打 -n），所以那个分支单独判。
 if verb != "apply" and ns != "sandlock":
@@ -340,6 +367,8 @@ class Cluster:
         self.workspace = root / "workspace"
         self.redis_state = root / "redis.json"
         self.calls = root / "calls.log"
+        #: 闸门要求 KUBECONFIG 指向一份**真实存在**的文件（先验存在、再问集群身份）。
+        self.kubeconfig = root / "kubeconfig"
         self.python_path = ""
 
     @property
@@ -420,6 +449,7 @@ def cluster():
         kubectl = fake.bin_dir / "kubectl"
         kubectl.write_text(f"#!{sys.executable}\n{_STUB_BODY}", encoding="utf-8")
         kubectl.chmod(0o755)
+        fake.kubeconfig.write_text("apiVersion: v1\nkind: Config\n", encoding="utf-8")
         # 脚本用本地 python3 解析 `-o json`；把它钉在本测试解释器上（PATH 里第一个
         # 就是这个 stub bin，所以真的 kubectl 从来不会被碰到）。
         python3 = fake.bin_dir / "python3"
@@ -445,7 +475,7 @@ def _run(cluster_obj: Cluster, *args: str) -> subprocess.CompletedProcess:
     env["STUB_PYTHONPATH"] = cluster_obj.python_path
     env["STUB_REDIS_STATE"] = str(cluster_obj.redis_state)
     # 假 kubectl 一旦没被用上，真的那个会立刻失败 —— 这个用例永远不会碰到集群。
-    env["KUBECONFIG"] = str(cluster_obj.bin_dir / "no-such-kubeconfig")
+    env["KUBECONFIG"] = str(cluster_obj.kubeconfig)
     return subprocess.run(
         [str(SCRIPT), *args],
         cwd=REPO,
@@ -464,6 +494,15 @@ def _fingerprint_table(values: dict[str, str]) -> str:
         digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
         lines.append(f"{key} sha256:{digest} len:{len(value)}")
     return "\n".join(lines) + "\n"
+
+
+#: 集群身份闸门（`deploy/scripts/lib/cluster-guard.sh`）成功时打在 **stderr** 的
+#: 那一行确认。它在任何 kubectl 之前跑，所以下面每个断言 `stderr` 序号的用例都往后
+#: 挪一行 —— 闸门的输出也是脚本输出的一部分，一个字都不许变。
+TARGET_CLUSTER_LINE = (
+    "✓ target cluster: context=k0s-sandlock server=v1.36.4+k0s nodes=2"
+    " (izuf697v12g31dyz4uvsjlz izuf6d1usviqv6x9qk1hpcz)"
+)
 
 
 def _script_text() -> str:
@@ -595,6 +634,7 @@ def test_rotate_retires_the_current_primary_into_the_window_and_rolls_the_cp(clu
         assert secret_value not in result.stdout + result.stderr
     assert result.stdout == _fingerprint_table(stored)
     assert result.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         f"rotate：{MASTER} 换主 key：旧 {_fp(OLD_MASTER)} → 新 {_fp(new_primary)}"
         "（只打指纹，值不出脚本）",
         f"窗口：{MASTER_LIST} 现在持有下面这些旧 key（finalize 的地址就是它们的指纹）",
@@ -626,7 +666,8 @@ def test_rotate_keeps_an_existing_window_list_and_appends_the_retired_primary(cl
     # 逐字等于 upgrade.sh 的 join：原列表在前，被退役的主 key 追加在后。
     assert stored[MASTER_LIST] == f"{older},{OLD_MASTER}"
     assert older not in result.stdout + result.stderr
-    assert result.stderr.splitlines()[:4] == [
+    assert result.stderr.splitlines()[:5] == [
+        TARGET_CLUSTER_LINE,
         f"rotate：{MASTER} 换主 key：旧 {_fp(OLD_MASTER)} → 新 {_fp(stored[MASTER])}"
         "（只打指纹，值不出脚本）",
         f"窗口：{MASTER_LIST} 现在持有下面这些旧 key（finalize 的地址就是它们的指纹）",
@@ -644,6 +685,7 @@ def test_rotate_refuses_without_a_current_master_key_or_a_secret(cluster):
     assert no_primary.returncode != 0
     assert no_primary.stdout == ""
     assert no_primary.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         "rotate-secret-master.sh: 无法确定当前 secret master key"
         "（sandlock/e2b-secrets 缺 E2B_SECRET_MASTER_KEY）：没有它 rotate 会把旧记录的"
         "窗口切断 —— 先跑 deploy/k8s-k0s/secrets.sh 补上它（O3 Task 1）"
@@ -656,6 +698,7 @@ def test_rotate_refuses_without_a_current_master_key_or_a_secret(cluster):
     assert missing.returncode != 0
     assert missing.stdout == ""
     assert missing.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         "rotate-secret-master.sh: sandlock/e2b-secrets 不存在："
         "先跑 deploy/k8s-k0s/secrets.sh 把它建出来"
     ]
@@ -669,6 +712,7 @@ def test_finalize_refuses_the_current_primary_an_empty_list_and_an_unknown_key(c
     assert current.returncode != 0
     assert current.stdout == ""
     assert current.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         "rotate-secret-master.sh: 不能移除当前主 key（cannot remove the current master key）："
         f"{_fp(NEW_MASTER)} 就是 {MASTER} —— 先跑 rotate 生成新主 key"
         "（与 deploy/scripts/upgrade.sh 的同一句守卫）"
@@ -679,6 +723,7 @@ def test_finalize_refuses_the_current_primary_an_empty_list_and_an_unknown_key(c
 
     assert unknown.returncode != 0
     assert unknown.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         f"rotate-secret-master.sh: {MASTER_LIST} 里没有 {_fp('not-in-the-list')}："
         "地址既不是列表里的 key，也不是它打印过的 sha256 前 16 位"
     ]
@@ -688,6 +733,7 @@ def test_finalize_refuses_the_current_primary_an_empty_list_and_an_unknown_key(c
 
     assert empty.returncode != 0
     assert empty.stderr.splitlines() == [
+        TARGET_CLUSTER_LINE,
         f"rotate-secret-master.sh: {MASTER_LIST} 为空：旧 key 已不在生效列表"
     ]
 
@@ -711,22 +757,23 @@ def test_finalize_refuses_while_a_replica_still_runs_the_old_key(cluster):
 
     assert result.returncode != 0
     lines = result.stderr.splitlines()
-    assert lines[0] == (
+    assert lines[0] == TARGET_CLUSTER_LINE
+    assert lines[1] == (
         "判据 1/3（没有旧副本在跑）：deploy/control-plane "
         "metadata.generation=8 status.observedGeneration=7 spec.replicas=2 "
         "status.replicas=2 status.updatedReplicas=1 status.availableReplicas=1 "
         "status.unavailableReplicas=1 ⇒ 未通过"
     )
-    assert lines[1] == (
+    assert lines[2] == (
         f"判据 2/3（每个 running 副本拿的都是当前主 key）：Secret 主 key {_fp(NEW_MASTER)}；"
         f"running 副本 2 个（spec.replicas=2）：control-plane-0 {_fp(NEW_MASTER)} ✓、"
         f"control-plane-1 {_fp(OLD_MASTER)} ✗（≠ 主 key）⇒ 未通过"
     )
-    assert lines[2] == (
+    assert lines[3] == (
         "判据 3/3（at-rest 没有还要旧 key 才能解开的记录）⇒ 未执行"
         "（判据 2 未过：副本还没拿到当前主 key，此刻在 pod 里扫没有意义，不算通过）"
     )
-    assert lines[3] == (
+    assert lines[4] == (
         "rotate-secret-master.sh: finalize 被拒：上面有判据未通过 —— 旧 key 一旦摘掉，"
         "仍由它加密的记录就永久解不开。让所有副本都滚到主 key（判据 1/2）、确认 at-rest "
         "全是主 key 能单独解开的密文（判据 3）再重试；Secret 一个字没动。"
@@ -749,22 +796,23 @@ def test_finalize_refuses_when_a_disk_record_still_needs_the_old_key(cluster):
         str(cluster.secrets_dir / secret_id / "secret.json")
         for secret_id in ids.values()
     )
-    assert lines[0].endswith("status.unavailableReplicas=0 ⇒ 通过")
-    assert lines[1] == (
+    assert lines[0] == TARGET_CLUSTER_LINE
+    assert lines[1].endswith("status.unavailableReplicas=0 ⇒ 通过")
+    assert lines[2] == (
         f"判据 2/3（每个 running 副本拿的都是当前主 key）：Secret 主 key {_fp(NEW_MASTER)}；"
         f"running 副本 2 个（spec.replicas=2）：control-plane-0 {_fp(NEW_MASTER)} ✓、"
         f"control-plane-1 {_fp(NEW_MASTER)} ✓⇒ 通过"
     )
-    assert lines[2:4] == [
+    assert lines[3:5] == [
         f"    ✗ {path}：需要旧 key 才能解开（主 key 单独解不开）" for path in paths
     ]
-    assert lines[4] == (
+    assert lines[5] == (
         "    扫到 2 条 at-rest 记录（磁盘 2 + redis 0）：2 条有问题（见上）"
     )
-    assert lines[5] == (
+    assert lines[6] == (
         "判据 3/3（at-rest 没有还要旧 key 才能解开的记录）⇒ 未通过"
     )
-    assert lines[6] == (
+    assert lines[7] == (
         "rotate-secret-master.sh: finalize 被拒：上面有判据未通过 —— 旧 key 一旦摘掉，"
         "仍由它加密的记录就永久解不开。让所有副本都滚到主 key（判据 1/2）、确认 at-rest "
         "全是主 key 能单独解开的密文（判据 3）再重试；Secret 一个字没动。"
@@ -810,12 +858,13 @@ def test_finalize_refuses_when_a_replica_has_no_master_key_in_its_env(cluster):
 
     assert result.returncode != 0
     lines = result.stderr.splitlines()
-    assert lines[1] == (
+    assert lines[0] == TARGET_CLUSTER_LINE
+    assert lines[2] == (
         f"判据 2/3（每个 running 副本拿的都是当前主 key）：Secret 主 key {_fp(NEW_MASTER)}；"
         f"running 副本 2 个（spec.replicas=2）：control-plane-0 {_fp(NEW_MASTER)} ✓、"
         "control-plane-1 读不到（exec 失败或 env 未设置）✗⇒ 未通过"
     )
-    assert lines[2] == (
+    assert lines[3] == (
         "判据 3/3（at-rest 没有还要旧 key 才能解开的记录）⇒ 未执行"
         "（判据 2 未过：副本还没拿到当前主 key，此刻在 pod 里扫没有意义，不算通过）"
     )
@@ -837,7 +886,8 @@ def test_status_is_read_only_and_prints_the_same_judgement(cluster):
         if call.split()[0] in ("rollout", "apply", "create")
     ] == []
     assert result.stdout == _fingerprint_table(before)
-    assert result.stderr.splitlines()[0].startswith("判据 1/3（没有旧副本在跑）：")
+    assert result.stderr.splitlines()[0] == TARGET_CLUSTER_LINE
+    assert result.stderr.splitlines()[1].startswith("判据 1/3（没有旧副本在跑）：")
     assert result.stderr.splitlines()[-1] == (
         "判据全过：可以 finalize（摘旧 key 是不可逆点，执行前再确认一次）"
     )
@@ -859,7 +909,8 @@ def test_finalize_removes_the_old_key_once_every_replica_and_record_has_rolled(c
         assert stored[key] == _plain_secret(NEW_MASTER)[key]
     assert OLD_MASTER not in result.stdout + result.stderr
     assert result.stdout == _fingerprint_table(stored)
-    assert result.stderr.splitlines()[:3] == [
+    assert result.stderr.splitlines()[:4] == [
+        TARGET_CLUSTER_LINE,
         "判据 1/3（没有旧副本在跑）：deploy/control-plane "
         "metadata.generation=7 status.observedGeneration=7 spec.replicas=2 "
         "status.replicas=2 status.updatedReplicas=2 status.availableReplicas=2 "
@@ -918,9 +969,10 @@ def test_the_three_beats_end_to_end(cluster):
     mid = _run(cluster, "status")
 
     assert mid.returncode != 0
-    assert mid.stderr.splitlines()[0].endswith("status.unavailableReplicas=1 ⇒ 未通过")
-    assert mid.stderr.splitlines()[1].endswith("✗（≠ 主 key）⇒ 未通过")
-    assert mid.stderr.splitlines()[2] == (
+    assert mid.stderr.splitlines()[0] == TARGET_CLUSTER_LINE
+    assert mid.stderr.splitlines()[1].endswith("status.unavailableReplicas=1 ⇒ 未通过")
+    assert mid.stderr.splitlines()[2].endswith("✗（≠ 主 key）⇒ 未通过")
+    assert mid.stderr.splitlines()[3] == (
         "判据 3/3（at-rest 没有还要旧 key 才能解开的记录）⇒ 未执行"
         "（判据 2 未过：副本还没拿到当前主 key，此刻在 pod 里扫没有意义，不算通过）"
     )
