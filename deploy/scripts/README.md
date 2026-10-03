@@ -19,7 +19,9 @@
 ## 集群身份闸门（写侧脚本通用）
 
 写侧的 k8s 脚本在碰集群之前必须过 [`lib/cluster-guard.sh`](lib/cluster-guard.sh) 的
-`require_target_cluster`（`deploy/k8s-k0s/apply.sh` 连 **DRY_RUN 都算**）：`KUBECONFIG` 必须
+`require_target_cluster`（`deploy/k8s-k0s/apply.sh` 连 **DRY_RUN 都算**；`deploy/k8s-k0s/secrets.sh`
+与 `deploy/k8s-k0s/rotate-secret-master.sh` 也过闸 —— 含只读的 `--fingerprint` 与 `status`，
+闸门判的是"连对集群没有"，不是"会不会写"）：`KUBECONFIG` 必须
 **显式设置**（且文件存在）、server `gitVersion` 必须含 `+k0s`、节点必须是 `E2B_TARGET_NODES`
 （默认 2）× `arm64` × `kubeletVersion` 含 `+k0s`；不符即 `exit 2` 并点名 context / server
 版本 / 每台节点的架构与版本。原因：本机 `kubectl` 的默认 context 指向**另一套阿里云 ACK
