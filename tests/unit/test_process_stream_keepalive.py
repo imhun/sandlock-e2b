@@ -151,3 +151,46 @@ async def test_the_data_and_end_events_are_unchanged_by_the_ping() -> None:
     assert await asyncio.wait_for(stream.__anext__(), timeout=2.0) == end_event(0)
     with pytest.raises(StopAsyncIteration):
         await stream.__anext__()
+
+
+async def test_a_stalled_response_is_cut_at_the_stream_budget() -> None:
+    """SEC-K0S-003: what the relay *sends* is bounded too, not just the queue.
+
+    Draining the subscriber queue eagerly is not enough. Whatever the relay
+    hands to the ASGI layer sits in that connection's write buffer until the
+    client (or the proxy in front of it) reads it, and uvicorn's transport does
+    not block the sender while it grows. Measured live 2026-10-03 on
+    ``0.1.0-969``: a 256 MiB command whose client was frozen grew
+    ``e2b-worker-0`` from 95 MiB to 374 MiB RSS while the subscriber queue
+    never filled -- the queue is not where those bytes live.
+
+    So the relay counts what it has sent and cuts at the same budget, with the
+    same inline marker the other two paths use; after the cut it keeps draining
+    the queue (so the producer is never blocked) and still delivers the end.
+    """
+    import base64
+
+    from envd_service.process.manager import TRUNCATED_MARK, SubscriberQueue
+
+    budget = 1024
+    proc = _FakeProc()
+    queue = SubscriberQueue(max_bytes=budget)
+    # ``force=True`` stands in for "the queue legitimately holds more than the
+    # response budget" (the queue's bound and the relay's bound are separate
+    # counters; replay data is admitted with force for the same reason).
+    for _ in range(8):  # 2048 bytes of output, twice the budget
+        queue.put_nowait(("data", "stdout", b"x" * 256), force=True)
+    queue.put_nowait(("end", 0, "exited"))
+
+    events = [event async for event in _consume_stream(proc, queue, 5.0)]
+    sent = b"".join(
+        base64.b64decode(part)
+        for event in events
+        if "data" in event["event"]
+        for part in event["event"]["data"].values()
+    )
+
+    assert events[-1] == end_event(0)
+    assert len(sent) <= budget + len(TRUNCATED_MARK)
+    assert sent.count(TRUNCATED_MARK) == 1
+    assert sent == b"x" * (budget - len(TRUNCATED_MARK)) + TRUNCATED_MARK

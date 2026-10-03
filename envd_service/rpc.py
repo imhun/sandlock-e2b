@@ -21,7 +21,11 @@ from envd_service.process.events import (
     keepalive_event,
     start_event,
 )
-from envd_service.process.manager import ManagedProcess, parse_signal
+from envd_service.process.manager import (
+    TRUNCATED_MARK,
+    ManagedProcess,
+    parse_signal,
+)
 from envd_service.runtime.context import runtime_context
 from gateway_common.errors import (
     ConnectError,
@@ -116,7 +120,21 @@ async def _consume_stream(
     and a command that prints nothing for a minute -- a 4000-file write on
     NFS -- is exactly that shape. The wait is per read, so a command that is
     producing output never pings.
+
+    SEC-K0S-003: the relay also bounds what it **sends**. Bounding the
+    subscriber queue is not enough -- whatever the relay hands to the ASGI
+    layer sits in that connection's write buffer until the client (or the
+    proxy in front of it) reads it, and uvicorn's transport does not block the
+    sender while it grows. Measured live 2026-10-03: a 256 MiB command with a
+    frozen client grew the worker from 95 MiB to 374 MiB RSS while the queue
+    never filled. So the relay keeps the head of the stream up to the queue's
+    own budget, puts the same inline marker where it cut, and after that keeps
+    *draining* the queue without sending, so the producer is never blocked and
+    the client still gets its end event.
     """
+    budget = getattr(queue, "max_bytes", None)
+    sent = 0
+    cut = False
     try:
         while True:
             try:
@@ -130,7 +148,31 @@ async def _consume_stream(
                 continue
             kind = item[0]
             if kind == "data":
-                yield data_event(item[1], item[2])
+                chunk = item[2]
+                if cut:
+                    continue
+                if chunk == TRUNCATED_MARK:
+                    # A marker already injected upstream (the queue dropped
+                    # output because *it* filled). Do not add a second one.
+                    cut = True
+                    yield data_event(item[1], chunk)
+                    continue
+                if budget is None:
+                    sent += len(chunk)
+                    yield data_event(item[1], chunk)
+                    continue
+                room = budget - sent - len(TRUNCATED_MARK)
+                if room <= 0:
+                    cut = True
+                    yield data_event(item[1], TRUNCATED_MARK)
+                    continue
+                if len(chunk) > room:
+                    cut = True
+                    yield data_event(item[1], chunk[:room])
+                    yield data_event(item[1], TRUNCATED_MARK)
+                    continue
+                sent += len(chunk)
+                yield data_event(item[1], chunk)
             elif kind == "end":
                 yield end_event(item[1], item[2])
                 return
