@@ -206,10 +206,10 @@ async def handle_stream(
         # E9.1: an open stream is activity for as long as it is open -- see
         # ``ACTIVITY_KEEPALIVE_S``. The task is cancelled in ``finally``, so
         # both a clean end and a client disconnect stop the marks.
-        registry = request.app.state.runtime_registry
         sandbox_id = getattr(sandbox, "sandbox_id", None)
         keepalive = None
         if sandbox_id:
+            registry = request.app.state.runtime_registry
             keepalive = asyncio.create_task(
                 _keep_active_while_streaming(registry, sandbox_id)
             )
