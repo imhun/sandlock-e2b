@@ -109,6 +109,7 @@ from c3_agent.lookup import (
     missing_slot_pid_message,
 )
 from c3_agent.materialize import (
+    DESTINATION_IS_A_SYMLINK,
     MaterializeRefusal,
     materialize_tree,
     PARTIAL_COPY,
@@ -752,12 +753,21 @@ def create_app(
 def _materialize_status(reason: str) -> int:
     """The status for one ``MaterializeRefusal`` reason.
 
-    A half-applied copy is a *failed privileged step* (502: the caller must not
-    read it as success), while a path outside the roots or a destination that
-    is a symlink is a plan this agent will not act on at all (400). A payload
-    over the byte cap (Task 3) is neither: the plan is fine and nothing was
-    applied, and the size is the whole refusal -- 413, the same status the
-    worker's snapshot capture and import answer.
+    The split is *where the refusal comes from*, not how bad it sounds: 400 is
+    "the derived plan itself is one this agent will not act on"
+    (``path-outside-roots``, ``already-exists-as-a-file``, ``bad-plan``), while
+    502 is "the plan was fine and the step still could not be carried out".
+
+    ``destination-is-a-symlink`` (N75) is the second kind: the plan names a
+    clean member, and it is the *live tree* that holds a link. Reading it as a
+    bad plan (400) put it out of family with the refusals N67/N69 had just
+    aligned (a half-applied copy, a payload over the member cap, a payload over
+    the time budget), so all four answer 502 -- "the step ran and failed" is
+    never a 400, and the caller must not read it as success.
+
+    A payload over the byte cap (Task 3) is neither: the plan is fine and
+    nothing was applied, and the size is the whole refusal -- 413, the same
+    status the worker's snapshot capture and import answer.
 
     A payload over the *member* cap (Task 4/N63) or over the unpack's own time
     budget (Task 15/N67) is a broken/hostile payload, not a bad plan: both come
@@ -766,7 +776,7 @@ def _materialize_status(reason: str) -> int:
     uses, and never a 400 that would read as "the control plane derived
     something this agent will not act on".
     """
-    if reason == PARTIAL_COPY:
+    if reason in (PARTIAL_COPY, DESTINATION_IS_A_SYMLINK):
         return 502
     if reason == TREE_TOO_LARGE:
         return 413

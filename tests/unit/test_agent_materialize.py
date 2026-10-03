@@ -579,7 +579,9 @@ async def test_a_symlinked_destination_segment_is_refused_named(
         _instruction(tree=_plan_tree(agent, copy_from=str(agent.snapshot_fs()))),
     )
 
-    assert resp.status_code == 400
+    # N75: a link the *live tree* holds is "the step ran and failed" (502),
+    # not a plan this agent refuses (400) -- the same family as partial-copy.
+    assert resp.status_code == 502
     assert "destination-is-a-symlink" in resp.json()["error"]
     # Nothing was written through the link, and nothing was chowned either:
     # a refused materialization must not leave a half-claimed tree.
@@ -824,7 +826,8 @@ async def test_a_destination_symlink_segment_is_refused_named(workspace: Path) -
         agent, _instruction(tree=_plan_tree(agent, copy_from=str(payload)))
     )
 
-    assert resp.status_code == 400
+    # N75: same family as partial-copy -- 502.
+    assert resp.status_code == 502
     assert "destination-is-a-symlink" in resp.json()["error"]
     assert sorted(os.listdir(outside)) == []
     assert agent.runner.calls == []
@@ -1219,7 +1222,8 @@ async def test_a_cached_parent_still_refuses_a_symlinked_segment(
 
     resp = await _post(agent, _instruction(tree=_plan_tree(agent)))
 
-    assert resp.status_code == 400
+    # N75: same family as partial-copy -- 502.
+    assert resp.status_code == 502
     assert "destination-is-a-symlink" in resp.json()["error"]
     assert sorted(os.listdir(outside)) == []
     assert agent.runner.calls == []

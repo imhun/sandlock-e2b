@@ -490,12 +490,18 @@ def test_a_small_archive_is_unaffected_by_the_default_budget(
 
 
 def test_the_member_cap_and_the_time_budget_answer_502() -> None:
-    """Task 11's leftover: "the payload is wrong" is 502, not the default 400."""
+    """The family rule (Task 11, N75): "the step could not be carried out" is 502.
+
+    400 is left to the refusals that describe the *derived plan* itself
+    (``bad-plan``). A link the live tree holds (N75) is not one of those -- the
+    plan named a clean member -- so it answers 502 with the other
+    step-failed reasons.
+    """
     assert _materialize_status(materialize.TOO_MANY_MEMBERS) == 502
     assert _materialize_status(materialize.TIME_BUDGET_EXCEEDED) == 502
     assert _materialize_status(materialize.PARTIAL_COPY) == 502
+    assert _materialize_status(materialize.DESTINATION_IS_A_SYMLINK) == 502
     assert _materialize_status(materialize.TREE_TOO_LARGE) == 413
-    assert _materialize_status(materialize.DESTINATION_IS_A_SYMLINK) == 400
     assert _materialize_status(materialize.BAD_PLAN) == 400
 
 
