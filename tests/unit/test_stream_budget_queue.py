@@ -10,12 +10,14 @@ dropped, and the accounting that makes a truncated stream visible.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
 from envd_service.process.stream_budget import (
     TRUNCATED_MARK,
     ByteBudgetQueue,
+    ThreadHandoff,
 )
 
 
@@ -99,3 +101,45 @@ def test_an_unlimited_queue_only_bounds_items():
 def item_bytes_of(item: tuple) -> bytes:
     """The payload of one ``(kind, chunk)`` item, for byte-exact assertions."""
     return item[1] if isinstance(item[1], bytes) else b""
+
+
+def test_the_thread_gate_blocks_until_the_loop_releases():
+    """Real backpressure for a reader thread: it waits instead of queueing up."""
+    gate = ThreadHandoff(max_bytes=1024)
+    gate.acquire(1024)
+    acquired: list[str] = []
+
+    waiter = threading.Thread(target=lambda: (gate.acquire(1024), acquired.append("x")))
+    waiter.start()
+    waiter.join(timeout=0.3)
+    assert acquired == []
+    assert gate.outstanding_bytes == 1024
+
+    gate.release(1024)
+
+    waiter.join(timeout=2.0)
+    assert acquired == ["x"]
+    assert gate.outstanding_bytes == 1024
+
+
+def test_closing_the_thread_gate_unblocks_a_waiter():
+    gate = ThreadHandoff(max_bytes=1024)
+    gate.acquire(1024)
+    acquired: list[str] = []
+    waiter = threading.Thread(target=lambda: (gate.acquire(1024), acquired.append("x")))
+    waiter.start()
+    waiter.join(timeout=0.3)
+    assert acquired == []
+
+    gate.close()
+
+    waiter.join(timeout=2.0)
+    assert acquired == ["x"]
+
+
+def test_an_unlimited_thread_gate_never_blocks():
+    gate = ThreadHandoff(max_bytes=None)
+    for _ in range(100):
+        gate.acquire(1024 * 1024)
+
+    assert gate.outstanding_bytes == 0  # no accounting when unlimited

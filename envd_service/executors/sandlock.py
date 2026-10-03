@@ -36,6 +36,7 @@ from envd_service.executors.base import ExecConfig, Executor, RunningProcess
 from envd_service.process.stream_budget import (
     STREAM_LIMIT_DEFAULT,
     ByteBudgetQueue,
+    ThreadHandoff,
     TRUNCATED_MARK,
 )
 from envd_service.process.stream_budget import item_bytes
@@ -582,6 +583,7 @@ class SandlockRunningProcess(RunningProcess):
         on_exit=None,
         on_setup_failure=None,
         signal_pause_supported: bool | None = None,
+        handoff: ThreadHandoff | None = None,
     ) -> None:
         self._proc = proc
         self._queue = queue
@@ -596,6 +598,9 @@ class SandlockRunningProcess(RunningProcess):
         self._closed = False
         self._stdin_closed = False
         self._eof_count = 0
+        # SEC-K0S-003: the reader thread's byte gate; closing it unblocks a
+        # pump that is waiting for a consumer that will never come back.
+        self._handoff = handoff
         if signal_pause_supported is not None:
             # Instance-level override of the class flag: a route-B child can
             # be signalled by number, an in-process one cannot.
@@ -718,6 +723,10 @@ class SandlockRunningProcess(RunningProcess):
     supports_signal_pause = False
 
     def kill(self, sig: int) -> None:
+        if self._handoff is not None:
+            # A pump thread blocked on the byte gate must not outlive the
+            # command it was reading (SEC-K0S-003).
+            self._handoff.close()
         # In-process: the fork registry delivers SIGKILL to the child's whole
         # command subtree regardless of the requested signal, so
         # ``supports_signal_pause`` stays False and ProcessManager's
@@ -2998,6 +3007,12 @@ class SandlockExecutor(Executor):
         # backpressure, so this hop drops (with the marker and a WARNING).
         queue = ByteBudgetQueue(max_bytes=self._stream_limit_bytes)
         limit_bytes = self._stream_limit_bytes
+        # SEC-K0S-003, the hop that actually OOMKilled the worker: the pump
+        # below runs in a reader *thread*, and ``call_soon_threadsafe`` is a
+        # queue no bound above can see. The gate makes the thread wait for
+        # room, which stops it draining the command's pipe (real backpressure,
+        # nothing lost).
+        handoff = ThreadHandoff(max_bytes=self._stream_limit_bytes)
         stdin_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         loop = asyncio.get_running_loop()
         running = SandlockRunningProcess(
@@ -3005,6 +3020,7 @@ class SandlockExecutor(Executor):
             queue=queue,
             loop=loop,
             stdin_queue=stdin_queue,
+            handoff=handoff,
             pty_mode=config.pty,
             on_exit=self._child_exited,
             on_setup_failure=lambda code: self._log_exec_failure_context(
@@ -3025,21 +3041,24 @@ class SandlockExecutor(Executor):
         def _enqueue(item: tuple) -> None:
             """Runs on the event loop (``call_soon_threadsafe``)."""
             try:
-                queue.put_nowait(item)
-            except asyncio.QueueFull:
-                if item[0] == "__eof__":
-                    queue.put_control(item)
-                    return
-                if not queue.note_dropped(item_bytes(item)):
-                    return
-                logger.warning(
-                    "sandbox_id=%s: the output queue is full (budget %s bytes); "
-                    "dropping command output from here on and marking the "
-                    "stream truncated",
-                    self._sandbox_id or "-",
-                    limit_bytes,
-                )
-                queue.put_control((item[0], TRUNCATED_MARK))
+                try:
+                    queue.put_nowait(item)
+                except asyncio.QueueFull:
+                    if item[0] == "__eof__":
+                        queue.put_control(item)
+                        return
+                    if not queue.note_dropped(item_bytes(item)):
+                        return
+                    logger.warning(
+                        "sandbox_id=%s: the output queue is full (budget %s "
+                        "bytes); dropping command output from here on and "
+                        "marking the stream truncated",
+                        self._sandbox_id or "-",
+                        limit_bytes,
+                    )
+                    queue.put_control((item[0], TRUNCATED_MARK))
+            finally:
+                handoff.release(item_bytes(item))
 
         def _pump(stream, kind: str) -> None:
             if stream is None:
@@ -3050,6 +3069,7 @@ class SandlockExecutor(Executor):
                     chunk = stream.read(65536)
                     if not chunk:
                         break
+                    handoff.acquire(len(chunk))
                     loop.call_soon_threadsafe(_enqueue, (kind, chunk))
             except Exception:  # pragma: no cover - defensive
                 pass

@@ -20,6 +20,7 @@ env var of ``0`` means "off").
 from __future__ import annotations
 
 import asyncio
+import threading
 
 #: How much output one hop may hold for one consumer before dropping.
 STREAM_LIMIT_DEFAULT = 32 * 1024 * 1024
@@ -111,3 +112,61 @@ class ByteBudgetQueue(asyncio.Queue):
         item = await super().get()
         self._bytes -= item_bytes(item)
         return item
+
+
+class ThreadHandoff:
+    """A byte-bounded hand-off from a reader *thread* to the event loop.
+
+    ``loop.call_soon_threadsafe(queue.put_nowait, chunk)`` is itself a queue,
+    and it is invisible to every bound above: the callbacks (each carrying its
+    chunk) pile up in the event loop's ready queue while the loop is busy.
+    Measured 2026-10-03 on ``0.1.0-972``: with both queue bounds in place, a
+    frozen client plus ``yes`` still OOMKilled ``e2b-worker-0``
+    (13:33:34Z, exit 137) and the queue bound never fired once -- the bytes
+    were in the ready queue.
+
+    So the thread waits here for room instead. That is *real* backpressure and
+    it loses nothing: the thread stops reading the command's pipe, the pipe
+    fills, and the command's own writes block, exactly as they would on a slow
+    terminal. A consumer that stops reading entirely therefore slows the
+    sandbox down rather than growing the worker.
+    """
+
+    def __init__(self, *, max_bytes: int | None) -> None:
+        self._max_bytes = max_bytes
+        self._outstanding = 0
+        self._closed = False
+        self._condition = threading.Condition()
+
+    @property
+    def outstanding_bytes(self) -> int:
+        with self._condition:
+            return self._outstanding
+
+    def acquire(self, size: int) -> None:
+        """Block until ``size`` more bytes may be handed to the loop."""
+        if self._max_bytes is None:
+            return
+        with self._condition:
+            while (
+                not self._closed
+                and self._outstanding + size > self._max_bytes
+            ):
+                # A timeout keeps a lost ``release`` (a crashed consumer)
+                # from wedging the pump forever; the loop re-checks the state.
+                self._condition.wait(timeout=0.5)
+            self._outstanding += size
+
+    def release(self, size: int) -> None:
+        """Called by the loop side once the chunk has been handled."""
+        if self._max_bytes is None:
+            return
+        with self._condition:
+            self._outstanding = max(0, self._outstanding - size)
+            self._condition.notify_all()
+
+    def close(self) -> None:
+        """Unblock every waiter (the process ended or is being torn down)."""
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
