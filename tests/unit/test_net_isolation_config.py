@@ -112,6 +112,9 @@ def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
         # N16 too: the factory reads the switch and the directory together.
         pure_rootfs="off",
         pure_rootfs_dir=Path("tmp/cache/pure"),
+        # SEC-K0S-003 carries the same way: the factory reads the per-command
+        # output queue's byte budget from settings too.
+        command_stream_limit_mb=32,
     )
     executor = create_executor(
         settings,
@@ -167,6 +170,7 @@ def test_policy_ceiling_requests_bind_injection(monkeypatch) -> None:
             real_root=False,
             pure_rootfs="off",
             pure_rootfs_dir=Path("tmp/cache/pure"),
+            command_stream_limit_mb=32,
         )
         executor = create_executor(
             settings,

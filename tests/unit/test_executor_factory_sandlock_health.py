@@ -48,6 +48,9 @@ def _settings(executor: str) -> SimpleNamespace:
         # one these cases take.
         pure_rootfs="off",
         pure_rootfs_dir=Path("tmp/cache/pure"),
+        # SEC-K0S-003: the factory forwards this one too (the per-command
+        # output queue's byte budget), so the fake has to carry it.
+        command_stream_limit_mb=32,
     )
 
 

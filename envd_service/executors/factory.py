@@ -255,6 +255,13 @@ def create_executor(
                 fs_mounts=fs_mounts,
                 sandbox_id=sandbox_id,
                 route_b=RouteBConfig.from_settings(settings),
+                # SEC-K0S-003: the byte budget of the per-command output queue
+                # (0 in config = unlimited, repo convention).
+                stream_limit_bytes=(
+                    None
+                    if settings.command_stream_limit_mb <= 0
+                    else settings.command_stream_limit_mb * 1024 * 1024
+                ),
             )
 
     logger.info("using local executor for sandbox %s", workspace_dir)

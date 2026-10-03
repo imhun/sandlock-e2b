@@ -33,6 +33,12 @@ from gateway_common.errors import ConnectError, unimplemented
 from gateway_common.network import NetworkUpdateConflictError
 from gateway_common.paths import route_b_instance_name
 from envd_service.executors.base import ExecConfig, Executor, RunningProcess
+from envd_service.process.stream_budget import (
+    STREAM_LIMIT_DEFAULT,
+    ByteBudgetQueue,
+    TRUNCATED_MARK,
+)
+from envd_service.process.stream_budget import item_bytes
 from envd_service.uid_pool import (
     CAP_SETGID,
     CAP_SETUID,
@@ -741,8 +747,11 @@ class SandlockRunningProcess(RunningProcess):
         target = 1 if self._pty_mode else 2
         if self._eof_count >= target:
             try:
-                self._queue.put_nowait(None)
-            except asyncio.QueueFull:
+                # SEC-K0S-003: the end-of-stream sentinel is a control item --
+                # it must arrive even when the queue is at its budget, or the
+                # consumer waits forever on a command that already ended.
+                self._queue.put_control(None)
+            except asyncio.QueueFull:  # pragma: no cover - item bound only
                 pass
 
     async def exit_code(self) -> int:
@@ -813,6 +822,7 @@ class SandlockExecutor(Executor):
         network_deny_cidrs: tuple[str, ...] = (),
         notify_rate_limit: int = 0,
         iam_tokens: dict[str, dict[str, str]] | None = None,
+        stream_limit_bytes: int | None = STREAM_LIMIT_DEFAULT,
         iam_signing_key: str | None = None,
         secrets_dir: str | Path | None = None,
         extra_fs_writable: list[str] | None = None,
@@ -834,6 +844,13 @@ class SandlockExecutor(Executor):
         self._disk_stats_path = disk_stats_path
         self._max_file_size_mb = max_file_size_mb
         self._max_processes = max_processes
+        # SEC-K0S-003: the byte budget of the per-command output queue below
+        # (``None`` or non-positive = unlimited, repo convention).
+        self._stream_limit_bytes = (
+            None
+            if stream_limit_bytes is None or int(stream_limit_bytes) <= 0
+            else int(stream_limit_bytes)
+        )
         self._max_open_files = max_open_files
         self._allow_internet_access = allow_internet_access
         self._enable_network = enable_network
@@ -2972,7 +2989,15 @@ class SandlockExecutor(Executor):
         # resolved argv) before the running process is returned so a later
         # ``update_network`` can log which children keep their old policy.
         self._child_registry[proc.child_id] = (proc.pid, resolved)
-        queue: asyncio.Queue = asyncio.Queue()
+        # SEC-K0S-003: the reader thread below pushes through
+        # ``call_soon_threadsafe``, so this queue is where output piles up when
+        # the consumer is slow -- it used to be unbounded and was the buffer
+        # the live acceptance measured (59 MiB -> 330 MiB anon on a 256 MiB
+        # command with a frozen client, while the subscriber queue and the
+        # relay's own counters stayed untouched). A thread cannot apply
+        # backpressure, so this hop drops (with the marker and a WARNING).
+        queue = ByteBudgetQueue(max_bytes=self._stream_limit_bytes)
+        limit_bytes = self._stream_limit_bytes
         stdin_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         loop = asyncio.get_running_loop()
         running = SandlockRunningProcess(
@@ -2997,6 +3022,25 @@ class SandlockExecutor(Executor):
             # apply the create-time rows/cols once before any output flows.
             running.resize(config.rows, config.cols)
 
+        def _enqueue(item: tuple) -> None:
+            """Runs on the event loop (``call_soon_threadsafe``)."""
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                if item[0] == "__eof__":
+                    queue.put_control(item)
+                    return
+                if not queue.note_dropped(item_bytes(item)):
+                    return
+                logger.warning(
+                    "sandbox_id=%s: the output queue is full (budget %s bytes); "
+                    "dropping command output from here on and marking the "
+                    "stream truncated",
+                    self._sandbox_id or "-",
+                    limit_bytes,
+                )
+                queue.put_control((item[0], TRUNCATED_MARK))
+
         def _pump(stream, kind: str) -> None:
             if stream is None:
                 loop.call_soon_threadsafe(running._mark_eof)
@@ -3006,11 +3050,11 @@ class SandlockExecutor(Executor):
                     chunk = stream.read(65536)
                     if not chunk:
                         break
-                    loop.call_soon_threadsafe(queue.put_nowait, (kind, chunk))
+                    loop.call_soon_threadsafe(_enqueue, (kind, chunk))
             except Exception:  # pragma: no cover - defensive
                 pass
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, ("__eof__", kind))
+                loop.call_soon_threadsafe(_enqueue, ("__eof__", kind))
                 loop.call_soon_threadsafe(running._mark_eof)
 
         if config.pty:

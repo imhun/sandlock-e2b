@@ -135,8 +135,10 @@ async def _consume_stream(
     budget = getattr(queue, "max_bytes", None)
     sent = 0
     cut = False
-    logger.info(
-        "process %s: relaying a stream with budget=%s bytes", proc.pid, budget
+    logger.debug(
+        "process %s: relaying a stream with budget=%s bytes",
+        getattr(proc, "pid", "-"),
+        budget,
     )
     try:
         while True:
@@ -170,7 +172,7 @@ async def _consume_stream(
                     logger.warning(
                         "process %s: cutting this stream at %d bytes (budget %s): "
                         "the client is not reading; the marker says where",
-                        proc.pid,
+                        getattr(proc, "pid", "-"),
                         sent,
                         budget,
                     )
@@ -181,7 +183,7 @@ async def _consume_stream(
                     logger.warning(
                         "process %s: cutting this stream at %d bytes (budget %s): "
                         "the client is not reading; the marker says where",
-                        proc.pid,
+                        getattr(proc, "pid", "-"),
                         sent,
                         budget,
                     )

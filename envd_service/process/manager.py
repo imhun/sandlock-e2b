@@ -16,6 +16,13 @@ from envd_service.executors.base import (
     FailedRunningProcess,
     RunningProcess,
 )
+from envd_service.process.stream_budget import (
+    STREAM_LIMIT_DEFAULT,
+    STREAM_QUEUE_MAX_ITEMS,
+    TRUNCATED_MARK,
+    ByteBudgetQueue,
+)
+from envd_service.process.stream_budget import item_bytes as _item_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -35,20 +42,7 @@ TRUNCATED_MARK = b"\n... output truncated ...\n"
 # reading) therefore grew the **worker's** heap with whatever the command
 # printed: measured on the live cluster, one ``yes`` OOMKilled
 # ``e2b-worker-0`` (exit 137). ``None`` = unlimited.
-STREAM_LIMIT_DEFAULT = 32 * 1024 * 1024
-
-#: Hard item bound per subscriber, so a stream of *tiny* writes is bounded in
-#: object count as well as in bytes (each queued item costs ~100 B of Python
-#: object overhead, which a byte budget alone cannot see).
-STREAM_QUEUE_MAX_ITEMS = 1024
-
-
-def _item_bytes(item: tuple) -> int:
-    """Payload bytes of one broadcast item (``("data", kind, chunk)`` / end)."""
-    return sum(len(part) for part in item if isinstance(part, (bytes, bytearray)))
-
-
-class SubscriberQueue(asyncio.Queue):
+class SubscriberQueue(ByteBudgetQueue):
     """One subscriber's queue, bounded by bytes *and* items (SEC-K0S-003).
 
     ``put_nowait`` raises ``asyncio.QueueFull`` for a data item that would
@@ -63,58 +57,11 @@ class SubscriberQueue(asyncio.Queue):
     the stream at the cut point.
     """
 
-    def __init__(
-        self, *, max_bytes: int | None, max_items: int = STREAM_QUEUE_MAX_ITEMS
-    ) -> None:
-        super().__init__(maxsize=max_items)
-        self.max_bytes = max_bytes
-        self.dropped_bytes = 0
-        self._bytes = 0
-        self._marked = False
-
-    @property
-    def queued_bytes(self) -> int:
-        return self._bytes
-
     def put_nowait(self, item: tuple, *, force: bool = False) -> None:
-        size = _item_bytes(item)
-        is_data = bool(item) and item[0] == "data"
-        if is_data and not force:
-            # ``+ len(TRUNCATED_MARK)`` is the headroom the marker itself will
-            # need: reserved on the way in so the cut point always fits, and
-            # the subscriber's payload never exceeds the budget it was given.
-            reserve = len(TRUNCATED_MARK)
-            if (
-                self.max_bytes is not None
-                and self._bytes + size + reserve > self.max_bytes
-            ):
-                raise asyncio.QueueFull
-            # Keep one slot free for a control item (marker / end).
-            if self.qsize() >= self.maxsize - 1:
-                raise asyncio.QueueFull
-        else:
-            while self.qsize() >= self.maxsize:
-                oldest = self.get_nowait()
-                self.dropped_bytes += _item_bytes(oldest)
+        if force or not item or item[0] != "data":
+            self.put_control(item)
+            return
         super().put_nowait(item)
-        self._bytes += size
-
-    def note_dropped(self, size: int) -> bool:
-        """Count a dropped data item; ``True`` the first time (send the marker)."""
-        self.dropped_bytes += size
-        first = not self._marked
-        self._marked = True
-        return first
-
-    def get_nowait(self):  # noqa: D102 - asyncio.Queue API
-        item = super().get_nowait()
-        self._bytes -= _item_bytes(item)
-        return item
-
-    async def get(self):  # noqa: D102 - asyncio.Queue API
-        item = await super().get()
-        self._bytes -= _item_bytes(item)
-        return item
 
 
 SIGNAL_MAP: dict[str, int] = {

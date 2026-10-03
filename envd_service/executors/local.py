@@ -14,6 +14,7 @@ import termios
 from collections.abc import AsyncIterator
 
 from envd_service.executors.base import ExecConfig, Executor, RunningProcess
+from envd_service.process.stream_budget import STREAM_QUEUE_MAX_ITEMS
 
 
 class LocalRunningProcess(RunningProcess):
@@ -155,7 +156,14 @@ class LocalExecutor(Executor):
             if config.stdin_enabled:
                 stdin_writer = proc.stdin
 
-        queue: asyncio.Queue = asyncio.Queue()
+        # SEC-K0S-003: bounded, and here the bound applies *real* backpressure
+        # -- ``_read`` below awaits ``queue.put``, so a full queue stops
+        # draining the pipe, the pipe fills, and the command's writes block.
+        # No output is lost, and the ceiling is ``maxsize`` x the 64 KiB read
+        # (2 streams at most). A thread-fed queue cannot do this (the sandlock
+        # executor drops with the marker instead), but this reader is a
+        # coroutine, so it can.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=STREAM_QUEUE_MAX_ITEMS)
         loop = asyncio.get_running_loop()
         readers: list[asyncio.Task] = []
 
