@@ -12,12 +12,14 @@ from datetime import timedelta
 
 import pytest
 import redis
+import logging
 
 fakeredis = pytest.importorskip("fakeredis")
 
 from control_plane.config import Settings
 from control_plane.registry.manager import (
     QUOTA_RELEASE_CLAIM_TTL_S,
+    QUOTA_RELEASE_TOMBSTONE_TTL_S,
     ResourceUnavailableError,
     SandboxRegistry,
     SandboxStateConflictError,
@@ -730,3 +732,78 @@ def test_a_store_that_cannot_record_the_return_keeps_the_row_booked(make_record)
     registry._quota_store._client = client
     assert record.quota_released is False
     assert registry.global_reserved()["disk"] == 64
+
+
+# -- N78: the release guard has to outlive the record ----------------------
+
+
+def test_a_deleted_episode_keeps_a_long_tombstone(workspace):
+    """The record is removed *before* the release, so the marker is all there is.
+
+    ``QUOTA_RELEASE_CLAIM_TTL_S`` (600 s) is sized for the race it was written
+    for -- a replica holding a pre-release read. For an episode whose record is
+    *gone*, a second release arriving after that TTL had nothing in its way and
+    decremented the row again (measured: ``e2b:quota:global`` at
+    -1024/-100/-1024/-256 with an empty fleet). The key names one episode, so a
+    longer-lived marker costs key space only.
+    """
+    client = fakeredis.FakeRedis()
+    registry = SandboxRegistry(_settings(), redis_client=client)
+    record = _create(registry, sandbox_id="sbx_gone")
+    marker = registry._quota_release_key(record)
+
+    registry.delete("sbx_gone")
+
+    assert client.exists(marker) == 1
+    ttl = client.ttl(marker)
+    assert ttl > QUOTA_RELEASE_CLAIM_TTL_S
+    assert ttl <= QUOTA_RELEASE_TOMBSTONE_TTL_S
+
+
+def test_a_release_that_would_go_negative_is_clamped_and_named(workspace, caplog):
+    """A negative row is free capacity: never write it, name it instead."""
+    client = fakeredis.FakeRedis()
+    registry = SandboxRegistry(_settings(), redis_client=client)
+    record = _create(registry, sandbox_id="sbx_neg")
+    # The shape a double release leaves behind: a record that still holds a
+    # reservation while the row has already been given back.
+    client.hset(
+        "e2b:quota:global",
+        mapping={"memory": "0", "cpu": "0", "disk": "0", "processes": "0"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="control_plane.registry.redis_backend"):
+        registry.delete("sbx_neg")
+
+    assert [entry.getMessage() for entry in caplog.records] == [
+        f"quota release for {registry._quota_release_key(record)} would take "
+        "global below zero (cpu: 0 - 100 = -100, memory: 0 - 512 = -512); "
+        "clamping to zero -- something released this reservation already"
+    ]
+    assert registry.global_reserved()["memory"] == 0
+
+
+def test_reconcile_global_ledger_rebuilds_the_row_from_the_records(workspace):
+    client = fakeredis.FakeRedis()
+    registry = SandboxRegistry(_settings(), redis_client=client)
+    _create(registry, sandbox_id="sbx_live")
+    # The measured shape: one sandbox's dims of phantom credit.
+    client.hset(
+        "e2b:quota:global",
+        mapping={"memory": "-512", "cpu": "-100", "disk": "0", "processes": "0"},
+    )
+
+    deltas = registry.reconcile_global_ledger()
+
+    assert deltas["global"] == {
+        "memory": 1024,
+        "cpu": 200,
+        "disk": 0,
+        "processes": 0,
+    }
+    assert registry.global_reserved() == {
+        "memory": 512,
+        "cpu": 100,
+        "disk": 0,
+        "processes": 0,
+    }

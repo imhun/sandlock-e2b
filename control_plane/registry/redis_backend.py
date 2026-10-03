@@ -92,6 +92,7 @@ class RedisQuotaStore:
         marker_key: str,
         *,
         marker_ttl_s: int,
+        tombstone_ttl_s: int | None = None,
         record_key: str | None = None,
     ) -> bool:
         """Give every row in ``rows`` back exactly once per reservation episode.
@@ -132,6 +133,16 @@ class RedisQuotaStore:
         the under-count direction again, while the caller's pause/delete can
         simply fail and be retried, leaving the reservation booked
         (over-counted -- capacity that is only recovered by retrying).
+
+        ``tombstone_ttl_s`` is what the marker gets when there is **no durable
+        record left to consult or mark** -- the delete path removes the record
+        before it releases (N53's ordering), which leaves the 600 s marker as
+        the *only* guard. A second release of the same episode arriving after
+        that TTL then has nothing in its way, and the row is decremented twice
+        (N78: measured ``e2b:quota:global`` at -1024/-100/-1024/-256 with an
+        empty fleet). A marker that outlives any possible sandbox lifetime
+        closes that window; it costs only key space, because the key names one
+        episode (``sandbox_id`` + ``client_id``, minted per create).
         """
         ledger_keys = [self._key(name) for name, _ in rows]
         watched = [*ledger_keys, marker_key]
@@ -151,13 +162,54 @@ class RedisQuotaStore:
                         if marked:
                             pipe.unwatch()
                             return False
+                    # N78: read the rows inside the WATCH and clamp at zero. A
+                    # row that would cross zero means something released this
+                    # episode already; a negative row is *free capacity*, the
+                    # direction that over-sells the fleet, so it is clamped and
+                    # named rather than written.
+                    clamped: dict[str, dict[str, int]] = {}
+                    for name, dims in rows:
+                        current = self.get(name)
+                        below = {
+                            dim: int(current.get(dim, 0)) - value
+                            for dim, value in dims.items()
+                            if int(current.get(dim, 0)) - value < 0
+                        }
+                        if below:
+                            logger.warning(
+                                "quota release for %s would take %s below zero "
+                                "(%s); clamping to zero -- something released "
+                                "this reservation already",
+                                marker_key,
+                                name,
+                                ", ".join(
+                                    f"{dim}: {current.get(dim, 0)} -"
+                                    f" {dims[dim]} = {below[dim]}"
+                                    for dim in sorted(below)
+                                ),
+                            )
+                            clamped[name] = {
+                                dim: max(0, int(current.get(dim, 0)) - value)
+                                for dim, value in dims.items()
+                            }
                     pipe.multi()
-                    pipe.set(marker_key, "1", ex=max(1, int(marker_ttl_s)))
+                    ttl = (
+                        tombstone_ttl_s
+                        if record_value is None and tombstone_ttl_s is not None
+                        else marker_ttl_s
+                    )
+                    pipe.set(marker_key, "1", ex=max(1, int(ttl)))
                     if record_value is not None:
                         pipe.set(record_key, record_value)
+                    clamped_keys = {self._key(name) for name in clamped}
                     for (_, dims), key in zip(rows, ledger_keys):
+                        if key in clamped_keys:
+                            # Written whole (clamped) below, not decremented.
+                            continue
                         for dim, value in dims.items():
                             pipe.hincrby(key, dim, -value)
+                    for name, dims in clamped.items():
+                        pipe.hset(self._key(name), mapping=dims)
                     pipe.execute()
                     return True
                 except (redis.WatchError, redis.exceptions.WatchError):  # type: ignore[union-attr]

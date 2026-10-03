@@ -136,6 +136,16 @@ EVICTION_REASON = "evicted-idle"
 #: before, and it must not be forever, for the leak above.
 QUOTA_RELEASE_CLAIM_TTL_S = 600
 
+#: N78: the marker's TTL when the record is already gone (the delete path
+#: removes it before releasing). The 600 s above is sized for the race it was
+#: written for -- a replica holding a pre-release read -- but a *deleted*
+#: episode has no record left to consult, so the marker is its only guard, and
+#: a second release arriving after 600 s decremented the row again (measured:
+#: ``e2b:quota:global`` at -1024/-100/-1024/-256 with an empty fleet). A day
+#: outlives any sandbox (the default command ceiling is an hour) and the key
+#: names one episode, so the cost is key space only.
+QUOTA_RELEASE_TOMBSTONE_TTL_S = 24 * 60 * 60
+
 
 def _safe_priority(value: object) -> int:
     """Coerce a supplied/stored ``priority`` into the accepted range.
@@ -1006,6 +1016,9 @@ class SandboxRegistry:
                 rows,
                 self._quota_release_key(record),
                 marker_ttl_s=QUOTA_RELEASE_CLAIM_TTL_S,
+                # N78: the record may already be gone (the delete path removes
+                # it first), and then this marker is the only guard left.
+                tombstone_ttl_s=QUOTA_RELEASE_TOMBSTONE_TTL_S,
                 record_key=self._record_store.record_key(record.sandbox_id),
             ):
                 return False
@@ -1104,6 +1117,83 @@ class SandboxRegistry:
                     used[dim] += value
         record.quota_released = False
         return True
+
+    def reconcile_global_ledger(
+        self, *, dry_run: bool = False
+    ) -> dict[str, dict[str, int]]:
+        """Set the fleet/tenant ledger rows to the sum of the live records (N78).
+
+        The operator repair for a drifted row: the global row had **no**
+        reconciliation path (N59's fix covered the per-node rows only), and a
+        row that goes negative is *free capacity* -- the direction that
+        over-sells the fleet. This is deliberately **not** run automatically at
+        startup: another replica may be mid-create (reserved, record not yet
+        written), and rebuilding from the records would leave that in-flight
+        reservation out of the sum, i.e. the same over-sell direction. Run it
+        when the fleet is quiet and the drift is suspected.
+
+        Returns the deltas, ``{row: {dimension: signed delta}}`` (all-zero means
+        the row was already right). ``dry_run=True`` computes and returns them
+        **without writing** -- what the operator script prints before asking for
+        ``--apply``. The write is the store's own WATCH/MULTI ``reconcile``, so
+        a concurrent ``reserve`` cannot be interleaved.
+        """
+        rows: dict[str, dict[str, int]] = {
+            "global": {dim: 0 for dim in self._global_dims_empty()}
+        }
+        for record in self.list():
+            if record.quota_released:
+                # Parked: the reservation really is back (E9.2).
+                continue
+            for dim, value in self._global_dims(record).items():
+                rows["global"][dim] += value
+            if record.tenant_id:
+                tenant_row = rows.setdefault(
+                    f"tenant:{record.tenant_id}",
+                    {dim: 0 for dim in self._TENANT_DIMS},
+                )
+                for dim, value in self._tenant_dims(record).items():
+                    tenant_row[dim] += value
+
+        deltas: dict[str, dict[str, int]] = {}
+        if self._quota_store is not None:
+            for name, dims in rows.items():
+                current = self._quota_store.get(name)
+                deltas[name] = {
+                    dim: value - int(current.get(dim, 0))
+                    for dim, value in dims.items()
+                }
+                if not dry_run:
+                    self._quota_store.reconcile(name, dims)
+        else:
+            global_dims = rows["global"]
+            with self._lock:
+                deltas["global"] = {
+                    "memory": global_dims["memory"] - self._reserved_memory,
+                    "cpu": global_dims["cpu"] - self._reserved_cpu,
+                    "disk": global_dims["disk"] - self._reserved_disk,
+                    "processes": global_dims["processes"] - self._reserved_processes,
+                }
+                if not dry_run:
+                    self._reserved_memory = global_dims["memory"]
+                    self._reserved_cpu = global_dims["cpu"]
+                    self._reserved_disk = global_dims["disk"]
+                    self._reserved_processes = global_dims["processes"]
+
+        for name, delta in deltas.items():
+            if any(delta.values()) and not dry_run:
+                logger.warning(
+                    "quota ledger reconcile: %s moved by %s (from the live "
+                    "records); a nonzero delta means it had drifted",
+                    name,
+                    delta,
+                )
+        return deltas
+
+    @staticmethod
+    def _global_dims_empty() -> tuple[str, ...]:
+        """The global row's dimensions, without a record to read them from."""
+        return ("memory", "cpu", "disk", "processes")
 
     def pause(
         self, record: SandboxRecord, reason: str | None = None
