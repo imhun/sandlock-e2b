@@ -19,9 +19,15 @@ Three claims are pinned here.
   dropped silently. It stays a fallback (not a ``503``): a nominal pin must not
   refuse a legal create.
 
-The manifest pin is the deploy half: the control plane and the worker must
-spell the shared volume root the same way, or the store's root and the judge's
-input disagree.
+The manifest pin is the deploy half, and it pins the *invariant*, not a shared
+spelling: the control plane's volume store must land on ``<platform_root>/
+"_volumes"`` -- the directory this pod holds writable -- so it must not name
+``E2B_SHARED_VOLUME_ROOT`` at all. On the control plane that name is the store
+root *itself* (``app.py``: ``volume_root = settings.shared_volume_root or
+platform_root / "_volumes"``), while on the worker it is the *export root* the
+agent scopes hostPaths to. One name, two meanings: naming it on the control
+plane points the store at the read-only mount and every ``POST /volumes`` is
+``EROFS`` (0.1.0-943).
 """
 
 from __future__ import annotations
@@ -306,9 +312,8 @@ def test_a_pin_to_a_full_node_names_the_dimension_and_falls_back(caplog) -> None
 # ------------------------------------------------------------- manifest pin
 
 
-def _shared_volume_root_entries(
-    path: Path, kind: str, name: str, container: str
-) -> list[dict]:
+def _container(path: Path, kind: str, name: str, container: str) -> dict:
+    """The named container of one workload document, parsed rather than grepped."""
     docs = [doc for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")) if doc]
     matches = [
         doc
@@ -323,26 +328,107 @@ def _shared_volume_root_entries(
         if c["name"] == container
     ]
     assert len(containers) == 1, f"{path}: expected one {container}: {containers}"
-    env = containers[0].get("env") or []
-    return [e for e in env if e.get("name") == "E2B_SHARED_VOLUME_ROOT"]
+    return containers[0]
 
 
-def test_the_control_plane_and_the_worker_name_the_same_shared_volume_root() -> None:
-    """One value, both manifests: the store's root and the judge's input.
+def _env_entries(container: dict, name: str) -> list[dict]:
+    return [e for e in container.get("env") or [] if e.get("name") == name]
 
-    The worker derives every volume host path from this and the agent refuses a
-    hostPath outside it; the control plane derives the volume store from it and
-    the create/migration judge reads it. A control plane whose copy is missing
-    reads its volumes as node-local (N65), so the two lines must agree.
+
+def _env_value(container: dict, name: str) -> str | None:
+    entries = _env_entries(container, name)
+    assert len(entries) <= 1, f"duplicate env {name}: {entries}"
+    return entries[0].get("value") if entries else None
+
+
+def _reroot(root: str, tmp_path: Path) -> Path:
+    """The manifest's absolute root, re-rooted under ``tmp_path``.
+
+    The value -- and therefore the *relation* between two of them -- is kept;
+    only the leading ``/`` moves, so the derivation can run on a host where
+    ``/var/lib/e2b-sandboxes`` does not exist and is not writable.
     """
-    worker = _shared_volume_root_entries(
-        K8S_WORKER, "StatefulSet", "e2b-worker", "worker"
-    )
-    plane = _shared_volume_root_entries(
+    return tmp_path / Path(root).relative_to("/")
+
+
+def test_the_control_plane_volume_store_lands_on_its_writable_volumes_subpath(
+    tmp_path,
+) -> None:
+    """(a) Derived, not textual: the env the manifest names must derive a store
+    root equal to ``<platform_root>/"_volumes"`` -- the directory this pod holds
+    writable.
+
+    0.1.0-943 added ``E2B_SHARED_VOLUME_ROOT=/var/lib/e2b-sandboxes`` to this
+    pod. On the control plane that name is the volume *store root itself*
+    (``app.py``: ``volume_root = settings.shared_volume_root or platform_root /
+    "_volumes"``), and ``/var/lib/e2b-sandboxes`` is exactly the mount this pod
+    holds **read-only** (``_volumes`` is the writable subPath) -- so the first
+    ``POST /volumes`` was ``EROFS``. The manifest is this test's *input*: its
+    env is fed to ``create_app`` and the derived path is judged. A manifest that
+    names the export root as the volume root makes the store land on the
+    read-only mount and this assertion fails.
+    """
+    plane = _container(
         K8S_CONTROL_PLANE, "Deployment", "control-plane", "control-plane"
     )
-    assert len(worker) == 1, worker
-    assert len(plane) == 1, plane
-    value = worker[0]["value"]
-    assert value, "the worker's shared volume root must be a named path"
-    assert plane[0]["value"] == value
+    export = _env_value(plane, "E2B_SHARED_WORKSPACE_ROOT")
+    assert export, "the control plane must name its shared export root"
+    volume_root = _env_value(plane, "E2B_SHARED_VOLUME_ROOT")
+    settings = ControlSettings(
+        api_keys=(API_KEY,),
+        workspace_base=_reroot(_env_value(plane, "E2B_WORKSPACE_BASE"), tmp_path),
+        shared_workspace_root=str(_reroot(export, tmp_path)),
+        shared_volume_root=str(_reroot(volume_root, tmp_path)) if volume_root else None,
+        trees_shared=False,
+        eviction_enabled=False,
+        create_queue_timeout_s=0,
+    )
+    app = create_control_app(
+        settings=settings, workspace_base=settings.workspace_base
+    )
+    # The derived store root is the manifest's own export root plus `_volumes`,
+    # and no named store root hijacked it (`create_app` only reaches for
+    # `shared_volume_root` when the deployment set one).
+    assert app.state.platform_root == Path(settings.shared_workspace_root).resolve()
+    assert app.state.volumes._base == app.state.platform_root / "_volumes"
+    assert app.state.settings.shared_volume_root is None
+
+
+def test_the_control_plane_mounts_its_volumes_store_read_write() -> None:
+    """(b) The directory (a) derives must be writable in this pod's own mounts.
+
+    The read-only parent plus writable subPaths is the OBS-9 shape. Without the
+    ``_volumes`` subPath the derivation in (a) still "passes" while the store
+    lands on the read-only export root again -- ``EROFS`` on the first create.
+    """
+    plane = _container(
+        K8S_CONTROL_PLANE, "Deployment", "control-plane", "control-plane"
+    )
+    export = _env_value(plane, "E2B_SHARED_WORKSPACE_ROOT")
+    assert export, "the control plane must name its shared export root"
+    store = f"{export}/_volumes"
+    mounts = [
+        m for m in plane.get("volumeMounts") or [] if m.get("mountPath") == store
+    ]
+    assert len(mounts) == 1, f"expected one mount at {store}: {mounts}"
+    assert mounts[0]["subPath"] == "_volumes", mounts[0]
+    assert mounts[0].get("readOnly") is not True, mounts[0]
+
+
+def test_the_worker_names_the_shared_volume_export_root() -> None:
+    """(b) The worker's copy keeps its meaning: the export root the agent scopes.
+
+    ``E2B_SHARED_VOLUME_ROOT`` on the worker is the *export root* the control
+    plane's volume paths must also live under (``build_volume_mounts``, and the
+    agent refusing a hostPath outside its roots). So it stays named here and it
+    must equal the control plane's own export root -- the two manifests agree on
+    the *directory*, which is the fact; "both pods set the same variable" was
+    the 0.1.0-943 mistake.
+    """
+    worker = _container(K8S_WORKER, "StatefulSet", "e2b-worker", "worker")
+    plane = _container(
+        K8S_CONTROL_PLANE, "Deployment", "control-plane", "control-plane"
+    )
+    worker_root = _env_value(worker, "E2B_SHARED_VOLUME_ROOT")
+    assert worker_root, "the worker must name the shared volume export root"
+    assert worker_root == _env_value(plane, "E2B_SHARED_WORKSPACE_ROOT")
