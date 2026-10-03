@@ -44,11 +44,12 @@ def _fake_clock():
 
 
 def test_wait_for_state_returns_every_sample_it_saw():
+    # ``fetch()`` returns the state string -- the shape ``main`` passes.
     states = iter(["running", "paused"])
     clock, sleep = _fake_clock()
 
     reached, samples = PROBE_MODULE.wait_for_state(
-        lambda: {"state": next(states)},
+        lambda: next(states),
         "paused",
         wait_s=10,
         poll_s=1,
@@ -64,7 +65,7 @@ def test_wait_for_state_gives_up_at_the_deadline():
     clock, sleep = _fake_clock()
 
     reached, samples = PROBE_MODULE.wait_for_state(
-        lambda: {"state": "running"},
+        lambda: "running",
         "paused",
         wait_s=3,
         poll_s=1,
@@ -122,6 +123,29 @@ def test_the_state_is_read_from_the_list_view_not_the_item_payload():
 
     assert PROBE_MODULE._fetch_state(client, "http://cp", "key", "sbx_a") == "paused"
     assert client.urls == ["http://cp/sandboxes"]
+
+
+def test_the_poll_loop_and_the_fetch_helper_agree_on_a_string():
+    """The wiring ``main`` uses: ``_fetch_state`` -> ``wait_for_state``.
+
+    These two agreeing is the whole point: their first live run disagreed
+    (``wait_for_state`` wrapped the string in ``state_of``), and a sandbox that
+    had paused on schedule was reported as ``unknown`` for seven minutes.
+    """
+    clock, sleep = _fake_clock()
+    client = _FakeClient([{"sandboxID": "sbx_a", "state": "paused"}])
+
+    reached, samples = PROBE_MODULE.wait_for_state(
+        lambda: PROBE_MODULE._fetch_state(client, "http://cp", "key", "sbx_a"),
+        "paused",
+        wait_s=10,
+        poll_s=1,
+        clock=clock,
+        sleep=sleep,
+    )
+
+    assert reached is True
+    assert samples == [(0.0, "paused")]
 
 
 def test_the_probe_refuses_by_name_without_an_api_key(monkeypatch, capsys):

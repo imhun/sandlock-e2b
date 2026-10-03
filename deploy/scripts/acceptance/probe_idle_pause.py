@@ -100,6 +100,11 @@ def wait_for_state(
 ) -> tuple[bool, list[tuple[float, str]]]:
     """Poll ``fetch`` until it reports ``target`` or ``wait_s`` elapses.
 
+    ``fetch()`` returns the sandbox's **state string** (:func:`_fetch_state`
+    and its 5xx-tolerant wrapper do), not a payload: the first live run of this
+    probe wrapped a string in :func:`state_of`, read ``"unknown"`` 29 times and
+    reported "never paused" for a sandbox that had paused on schedule.
+
     Returns ``(reached, samples)`` where each sample is ``(elapsed_s, state)``.
     Returning the samples instead of raising is what makes a timeout usable:
     the caller prints the states it actually saw.
@@ -108,7 +113,7 @@ def wait_for_state(
     samples: list[tuple[float, str]] = []
     while True:
         elapsed = clock() - started
-        state = state_of(fetch())
+        state = str(fetch())
         samples.append((elapsed, state))
         if state == target:
             return True, samples
