@@ -140,7 +140,7 @@ class TTLSweeper:
 
     async def _loop(self, registry) -> None:
         while True:
-            started = self._clock()
+            started = self._clock_safely()
             won = False
             reaped = 0
             try:
@@ -197,11 +197,46 @@ class TTLSweeper:
                 raise
             except Exception:  # pragma: no cover - defensive
                 logger.exception("TTL sweep failed")
-            finished = self._clock()
-            self._note_round(
-                won=won, seconds=finished - started, reaped=reaped, now=finished
-            )
+            if started is not None:
+                finished = self._clock_safely()
+                if finished is not None:
+                    self._note_round_safely(
+                        won=won,
+                        seconds=finished - started,
+                        reaped=reaped,
+                        now=finished,
+                    )
             await asyncio.sleep(self._interval)
+
+    def _clock_safely(self) -> float | None:
+        """``self._clock()`` guarded: the *metric* must not kill the sweep.
+
+        The clock used to be read outside the round's ``try``. A clock that
+        raises -- an injected one, or (once a log sink is a metric sink) a
+        pathological one -- escaped ``_loop``, so the task died and *nothing*
+        was reaped from then on, silently. A failed read is one named WARNING
+        and one skipped note; the reaping continues.
+        """
+        try:
+            return self._clock()
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "TTL sweep: the round's metric failed (_clock raised); the "
+                "sweep continues"
+            )
+            return None
+
+    def _note_round_safely(
+        self, *, won: bool, seconds: float, reaped: int, now: float
+    ) -> None:
+        """``_note_round`` guarded: a broken log sink is not a broken sweep."""
+        try:
+            self._note_round(won=won, seconds=seconds, reaped=reaped, now=now)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "TTL sweep: the round's metric failed (_note_round raised); "
+                "the sweep continues"
+            )
 
     async def stop(self) -> None:
         if self._task is not None:

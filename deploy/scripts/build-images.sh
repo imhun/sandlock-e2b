@@ -17,8 +17,15 @@
 #   REGISTRY=myrepo/e2b VERSION=1.0 PLATFORMS=linux/amd64 ./deploy/scripts/build-images.sh
 #   REGISTRY=registry.cn-shanghai.aliyuncs.com/byteplan VERSION=1.0 PUSH=1 ./deploy/scripts/build-images.sh
 #
-# Multi-platform output must go to a registry (buildx --push); single
-# platform defaults to --load. Defaults push nothing.
+# Output matrix (N72: single platform + PUSH=1 used to be silently ignored,
+# so the three images were built locally and never reached the registry):
+#   PLATFORMS=linux/arm64                      -> --load   (local images)
+#   PLATFORMS=linux/arm64 PUSH=1               -> --push   (to $REGISTRY)
+#   PLATFORMS=linux/amd64,linux/arm64 PUSH=1   -> --push   (registry-only)
+#   PLATFORMS=linux/amd64,linux/arm64          -> refused, non-zero exit
+# Multi-platform output has nowhere to go but a registry, so PUSH=1 is
+# mandatory there; single platform pushes on demand and loads otherwise.
+# Defaults push nothing.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -36,7 +43,11 @@ case "$PLATFORMS" in
     OUT_FLAG="--push"
     ;;
 *)
-    OUT_FLAG="--load"
+    if [ "$PUSH" = "1" ]; then
+        OUT_FLAG="--push"
+    else
+        OUT_FLAG="--load"
+    fi
     ;;
 esac
 

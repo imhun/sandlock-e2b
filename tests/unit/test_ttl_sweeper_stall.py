@@ -38,7 +38,16 @@ from control_plane.registry.ttl import TTLSweeper
 
 SANDBOX_OK = "sb-ok"
 SANDBOX_AFTER_FAILURE = "sb-after-failure"
+SANDBOX_AFTER_METRIC_FAILURE = "sb-after-metric-failure"
 SUMMARY_PREFIX = "TTL sweep: this replica ran "
+#: The named WARNING the round's *metric* path must raise -- one per call site.
+#: A metric that throws is a bad log line, never the end of the sweep.
+CLOCK_METRIC_FAILURE = (
+    "TTL sweep: the round's metric failed (_clock raised); the sweep continues"
+)
+NOTE_METRIC_FAILURE = (
+    "TTL sweep: the round's metric failed (_note_round raised); the sweep continues"
+)
 PROBE_PATH = (
     Path(__file__).resolve().parents[2]
     / "deploy"
@@ -316,6 +325,117 @@ async def test_the_sweep_still_reaps_after_a_candidate_scan_failure(caplog):
     assert _messages(caplog, level=logging.ERROR) == ["TTL sweep failed"]
     assert registry.deleted == [SANDBOX_AFTER_FAILURE]
     assert registry.cleaned == [SANDBOX_AFTER_FAILURE]
+
+
+class _FlakyClock:
+    """A clock that raises on its ``fail_on``-th read and works otherwise."""
+
+    def __init__(self, *, fail_on: int, step: float = 0.1) -> None:
+        self._fail_on = fail_on
+        self._step = step
+        self._reads = 0
+
+    def __call__(self) -> float:
+        self._reads += 1
+        if self._reads == self._fail_on:
+            raise RuntimeError("clock is broken")
+        return self._reads * self._step
+
+
+class _LateRecordRegistry:
+    """A registry whose one overdue record shows up on its second scan.
+
+    The metric (a clock read, or the round's note) fails *before* the record
+    exists, so the round that has to prove the loop is still alive is also the
+    round that reaps it: ``delete`` + ``cleanup`` are asserted, not just "the
+    task did not die".
+    """
+
+    def __init__(self, record: SandboxRecord, *, hidden_scans: int = 1) -> None:
+        self._record = record
+        self._hidden_scans = hidden_scans
+        self.deleted: list[str] = []
+        self.cleaned: list[str] = []
+        self.round_done = asyncio.Event()
+        self._loop = asyncio.get_running_loop()
+
+    def expired_candidates(self):
+        if self._hidden_scans > 0:
+            self._hidden_scans -= 1
+            return []
+        return [self._record]
+
+    def delete(self, sandbox_id: str) -> None:
+        self.deleted.append(sandbox_id)
+
+    def cleanup_workspace(self, record: SandboxRecord) -> None:
+        self.cleaned.append(record.sandbox_id)
+        self._loop.call_soon_threadsafe(self.round_done.set)
+
+
+@pytest.mark.asyncio
+async def test_a_throwing_clock_does_not_stop_the_sweeper(caplog):
+    """度量失败只是一条 WARNING，不许把 sweeper 循环打死。
+
+    今天 ``self._clock()`` 在轮次的 ``try`` **之外**：注入的时钟（或病态日志
+    汇）在**第一次读**就抛，异常直接穿出 ``_loop``，任务就此死掉 —— 从那一刻
+    起一条记录都不再回收，而且没人知道。这里让时钟恰好在第一次读时抛，要求
+    sweeper 点名度量失败（逐字），并在下一轮照常回收那条过期记录。
+    """
+    record = _record(SANDBOX_AFTER_METRIC_FAILURE)
+    registry = _LateRecordRegistry(record)
+    caplog.set_level(logging.WARNING, logger="control_plane.registry.ttl")
+    sweeper = TTLSweeper(
+        interval_seconds=0.01,
+        claim=lambda: True,
+        clock=_FlakyClock(fail_on=1),
+        overrun_after_s=1000.0,
+    )
+    sweeper.start(registry)
+    try:
+        await asyncio.wait_for(registry.round_done.wait(), timeout=5)
+    finally:
+        await sweeper.stop()
+    assert _messages(caplog, level=logging.WARNING) == [CLOCK_METRIC_FAILURE]
+    assert registry.deleted == [SANDBOX_AFTER_METRIC_FAILURE]
+    assert registry.cleaned == [SANDBOX_AFTER_METRIC_FAILURE]
+
+
+@pytest.mark.asyncio
+async def test_a_throwing_round_note_does_not_stop_the_sweeper(monkeypatch, caplog):
+    """同一个守护的第二个调用点：``_note_round`` 也在 ``try`` 之外。
+
+    日志汇病态（``_note_round`` 抛）与时钟抛是同一种形状：只要它落在循环体
+    的保护区外，sweeper 就会静默停摆。第一轮的 note 抛、第二轮恢复，所以那条
+    记录仍然是**下一轮**照常回收的。
+    """
+    record = _record(SANDBOX_AFTER_METRIC_FAILURE)
+    registry = _LateRecordRegistry(record)
+    caplog.set_level(logging.WARNING, logger="control_plane.registry.ttl")
+    sweeper = TTLSweeper(
+        interval_seconds=0.01,
+        claim=lambda: True,
+        clock=_StepClock(0.001),
+        overrun_after_s=1000.0,
+    )
+    original = sweeper._note_round
+    calls = {"n": 0}
+
+    def broken_note(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("the log sink is broken")
+        original(**kwargs)
+
+    monkeypatch.setattr(sweeper, "_note_round", broken_note)
+    sweeper.start(registry)
+    try:
+        await asyncio.wait_for(registry.round_done.wait(), timeout=5)
+    finally:
+        await sweeper.stop()
+    assert _messages(caplog, level=logging.WARNING) == [NOTE_METRIC_FAILURE]
+    assert registry.deleted == [SANDBOX_AFTER_METRIC_FAILURE]
+    assert registry.cleaned == [SANDBOX_AFTER_METRIC_FAILURE]
 
 
 def test_the_sweep_claim_still_expires_with_the_cadence():
