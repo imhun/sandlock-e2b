@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -17,7 +18,7 @@ from envd_service.connect.codec import (
     encode_end_stream,
     encode_message,
 )
-from envd_service.runtime.registry import state_clause
+from envd_service.runtime.registry import RuntimeRegistry, state_clause
 from gateway_common.errors import (
     CONNECT_HTTP_STATUS,
     ConnectError,
@@ -35,6 +36,19 @@ StreamHandler = Callable[
     [Request, dict[str, Any], Any],
     Awaitable[AsyncIterator[dict[str, Any]]],
 ]
+
+#: E9.1: while a stream RPC is open, re-stamp its sandbox's activity on this
+#: cadence. It matches ``RuntimeRegistry.ACTIVITY_COALESCE_S`` on purpose --
+#: the registry coalesces marks inside that window, so one open stream costs at
+#: most one activity write per window regardless of how long the command runs.
+#:
+#: Why it has to exist at all: ``_find_sandbox`` marks the sandbox active once,
+#: when the request arrives. A stream that then stays silent -- ``sleep 300``,
+#: a slow ``make``, an exec waiting on a remote API -- produces no further
+#: chunks and (for ``sleep``) no measurable CPU, so ``last_active_at`` would
+#: age out while the client is still holding the stream, and the idle->pause
+#: sweep would freeze the command underneath it.
+ACTIVITY_KEEPALIVE_S: float = RuntimeRegistry.ACTIVITY_COALESCE_S
 
 
 def _find_sandbox(request: Request) -> Any:
@@ -56,6 +70,28 @@ def _find_sandbox(request: Request) -> Any:
     # control plane on its next heartbeat (idle detection / eviction).
     request.app.state.runtime_registry.mark_active(sandbox_id)
     return runtime
+
+
+async def _keep_active_while_streaming(registry, sandbox_id: str) -> None:
+    """Keep ``sandbox_id`` active for as long as a stream RPC is open (E9.1).
+
+    Started by :func:`handle_stream` and cancelled when the stream closes
+    (including a client disconnect, which closes the response generator).
+    Cancellation is the normal exit. A failing activity report is the
+    registry's problem, not the caller's: it is logged and the stream keeps
+    running -- breaking an exec because a heartbeat could not be stamped would
+    be a far worse trade.
+    """
+    while True:
+        try:
+            registry.mark_active(sandbox_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "stream activity keepalive failed for sandbox %s",
+                sandbox_id,
+                exc_info=True,
+            )
+        await asyncio.sleep(ACTIVITY_KEEPALIVE_S)
 
 
 def connect_error_response(error: ConnectError) -> JSONResponse:
@@ -167,6 +203,16 @@ async def handle_stream(
         )
 
     async def body() -> AsyncIterator[bytes]:
+        # E9.1: an open stream is activity for as long as it is open -- see
+        # ``ACTIVITY_KEEPALIVE_S``. The task is cancelled in ``finally``, so
+        # both a clean end and a client disconnect stop the marks.
+        registry = request.app.state.runtime_registry
+        sandbox_id = getattr(sandbox, "sandbox_id", None)
+        keepalive = None
+        if sandbox_id:
+            keepalive = asyncio.create_task(
+                _keep_active_while_streaming(registry, sandbox_id)
+            )
         try:
             async for event in events:
                 yield encode_message(event)
@@ -176,6 +222,9 @@ async def handle_stream(
         except Exception as e:  # pragma: no cover - defensive
             logger.exception("stream RPC %s failed mid-stream", path)
             yield encode_end_stream(internal(str(e)))
+        finally:
+            if keepalive is not None:
+                keepalive.cancel()
 
     return StreamingResponse(body(), media_type=CONTENT_TYPE_STREAM)
 
