@@ -62,3 +62,29 @@ spec:
             # 真实信号看 `/internal/fleet/metrics` 的 `workspaceDisk`。
             - name: E2B_MAX_TOTAL_DISK_MB
               value: "10240"
+            # ---- 沙箱生命周期策略（2026-10-03 裁定，三个值一起看）----
+            #
+            # ① 闲置即暂挂：沙箱不是长期对象，闲置 5 分钟的沙箱被 SIGSTOP 冻结并
+            #    **归还准入配额**（现场保留，`Sandbox.connect` 自动解冻并按需重新占额）。
+            #    5 分钟是对着两个测量口径定的，不是拍脑袋：worker 每 5 s 一次心跳上报
+            #    每个沙箱的活跃时间戳，而活跃时间戳写共享 store 是 30 s 一次
+            #    （`E2B_ACTIVITY_PERSIST_INTERVAL_S`）—— 阈值必须远大于后者，否则
+            #    "读到的闲置"会因持久化延迟而假阳性。**有活跃 exec 流的沙箱不算闲置**
+            #    （worker 侧持续盖章），CPU ≥ `E2B_CPU_ACTIVITY_PERCENT`（默认 5）也算。
+            #    代码默认 **0 = 关**（inert，不建任务、不取 claim）；这里显式打开。
+            - name: E2B_IDLE_PAUSE_AFTER_S
+              value: "300"
+            # ② 暂挂不能无限期：`E2B_PAUSED_TTL_S` 到点由既有的 paused 扫描拆掉
+            #    （先拆树、再删记录，与 DELETE 同一条链）。必须设——暂挂归还了 disk
+            #    台账，但树还在盘上（每节点 75 G、8 沙箱/节点），不拆就是"槽位不占、
+            #    磁盘占满"。代码默认 0 = 关。
+            - name: E2B_PAUSED_TTL_S
+              value: "1800"
+            # ③ 孤儿记录（worker 失联被判死）的兜底回收：默认**永不回收**是有意的
+            #    （worker 可能还活着，拆树会把活进程的 inode 变成孤儿），但没有上限就
+            #    变成"过期还占着槽位"，N61 观测到的正是这个形状。300 s 对着两个数定：
+            #    `E2B_NODE_HEARTBEAT_TIMEOUT=30`（上面一行）与 N32 实测的控制面停顿
+            #    76 s —— 10 倍于最坏停顿才判死。无 `orphaned_at` 戳的旧记录按 `end_at`
+            #    计龄（`manager.py::_ttl_reapable`）。代码默认 0 = 关。
+            - name: E2B_ORPHAN_RECORD_TTL
+              value: "300"
