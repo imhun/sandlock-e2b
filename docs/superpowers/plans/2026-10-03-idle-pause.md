@@ -10,6 +10,22 @@
 
 **Spec:** 无独立设计文档；本计划的规格就是下面 Global Constraints 里逐字记录的 2026-10-03 用户裁定。
 
+## 当前进度（2026-10-03：**Task 1–5 代码与钉子全部完成，未上线**）
+
+| Task | 状态 | 提交 |
+|---|---|---|
+| 计划 | ✅ | `6d2786d`（本文档） |
+| 1 开着的流持续算活动 | ✅ | `3e24702`（`envd_service/connect/router.py` + `tests/unit/test_stream_activity_keepalive.py`，2 条） |
+| 2 pause 链抽成 request-free | ✅ | `1684523`（`control_plane/api/sandboxes.py` + `tests/unit/test_platform_pause_action.py`，3 条） |
+| 3 `IdlePauseSweeper` | ✅ | `67ebd1c`（`control_plane/registry/idle_pause.py` + `config.py` + `app.py` + `tests/unit/test_idle_pause_sweeper.py`，12 条） |
+| 4 部署取值 + 文档 | ✅ | `8b4ebd0`（`deploy/k8s-k0s/control-plane-nfs.patch.yaml` + `docs/env-vars.md`；`kubectl kustomize` 渲染出三个 env，值 `300`/`1800`/`300`） |
+| 5 无戳孤儿回落 | ✅ | `06ded8b`（`manager.py::_ttl_reapable` + `tests/unit/test_sandbox_registry.py` 3 条，贴在既有 N22 钉子旁） |
+| 验收探针 | ✅ | `d73398a`（`deploy/scripts/acceptance/probe_idle_pause.py` + `tests/unit/test_probe_idle_pause_script.py`，4 条） |
+| 回归 | ✅ | `tests/unit` **2419 passed / 12 skipped / 3 failed**（3 条是既有的 macOS-only：`test_real_root_gate` 与 2 条 `test_xfs_quotactl_backend`，需要 Linux `libc.so.6`） |
+| 上线 + 现场验收 | ⬜ **待控制者** | 见下面"上线后验收"：`apply.sh` + 探针 + `sleep` 反向对照 + 读数回填 |
+
+两处与原计划不同的做法（都记在上面各自 Task 里）：Task 2 用 `_state_of(ctx)` 一个访问器替掉 16 处调用点改动；Task 5 的钉子放进了 `tests/unit/test_sandbox_registry.py`，没有另起文件。
+
 ## Global Constraints
 
 - 闲置阈值 `E2B_IDLE_PAUSE_AFTER_S=300`（5 分钟，避免反复暂挂）；扫描间隔 `15 s`；claim key `e2b:idle-pause:sweep`，TTL = 间隔（沿用 `F11` 的 `SET NX EX` 协议，无释放路径）。
