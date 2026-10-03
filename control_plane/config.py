@@ -237,6 +237,15 @@ class Settings:
     activity_persist_interval_s: int = field(
         default_factory=lambda: _env_int("E2B_ACTIVITY_PERSIST_INTERVAL_S", 30)
     )
+    #: E9.1 x E9.2: pause a ``running`` sandbox whose *measured* inactivity
+    #: passed this many seconds (``E2B_IDLE_PAUSE_AFTER_S``). ``0`` -- the
+    #: default -- turns the sweep off inertly (no task, no claim). A paused
+    #: sandbox keeps its frozen session and gives its admission reservation
+    #: back; ``Sandbox.connect`` resumes it by buying the capacity back, and
+    #: answers 503 while the node it is pinned to has no room.
+    idle_pause_after_s: float = field(
+        default_factory=lambda: _env_float("E2B_IDLE_PAUSE_AFTER_S", 0.0)
+    )
     # E9.3: resource-driven eviction (resource-contention.md §5). Default ON
     # is a user decision (2026-09-01) that overrides the earlier design doc's
     # "default off" draft: when the fleet is full, idle low-priority sandboxes

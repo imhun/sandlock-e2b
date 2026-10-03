@@ -17,7 +17,10 @@ from fastapi import FastAPI
 from control_plane.api.errors import OfficialError, official_error_handler
 from control_plane.api.internal import router as internal_router
 from control_plane.api.nodes import router as nodes_router
-from control_plane.api.sandboxes import router as sandboxes_router
+from control_plane.api.sandboxes import (
+    pause_record_for_platform,
+    router as sandboxes_router,
+)
 from control_plane.api.secrets import router as secrets_router
 from control_plane.api.snapshots import (
     reconcile_pending_snapshots_or_report,
@@ -41,6 +44,10 @@ from control_plane.registry.ledger_alert import (
     ledger_alert_ratio,
 )
 from control_plane.registry.nodes import NodeRegistry
+from control_plane.registry.idle_pause import (
+    IdlePauseSweeper,
+    idle_pause_after_seconds,
+)
 from control_plane.registry.paused_ttl import (
     PausedTTLSweeper,
     paused_ttl_seconds,
@@ -56,6 +63,12 @@ from control_plane.registry.redis_backend import try_claim
 #: The TTL sweeper's cadence, and therefore the width of its single-flight
 #: claim (F11 step 4): one replica per interval, no lock to release.
 _TTL_SWEEP_INTERVAL_S = 1.0
+
+#: E9.1 x E9.2 idle->pause cadence. Deliberately slower than the TTL sweep:
+#: the threshold it measures against is minutes wide, so a 15 s round is
+#: plenty, and each round is a shared-store scan. The claim below is the
+#: interval, exactly like the other periodic jobs (F11 step 4).
+_IDLE_PAUSE_INTERVAL_S = 15.0
 
 #: E7's platform-account scan. Deliberately slower than the TTL sweep: the
 #: numbers only move when a worker heartbeats (every 5 s) or a capture lands,
@@ -454,6 +467,26 @@ def create_app(
         app.state.paused_sweeper = paused_sweeper
         paused_sweeper.start(registry)
 
+        # E9.1 x E9.2: a sandbox nobody is using gives its capacity back. Same
+        # shape as the paused sweep above -- one replica per round, selected
+        # from shared records -- and the action is the pause endpoint's own
+        # chain, so "paused" cannot come to mean two different things
+        # depending on who pressed the button.
+        idle_sweeper = IdlePauseSweeper(
+            after_s=idle_pause_after_seconds(settings),
+            on_idle=lambda record, idle_s: pause_record_for_platform(
+                app.state, record, reason=f"idle {idle_s:.0f}s"
+            ),
+            interval_seconds=_IDLE_PAUSE_INTERVAL_S,
+            claim=lambda: try_claim(
+                redis_client,
+                "e2b:idle-pause:sweep",
+                ttl_s=int(_IDLE_PAUSE_INTERVAL_S),
+            ),
+        )
+        app.state.idle_sweeper = idle_sweeper
+        idle_sweeper.start(registry)
+
         # E7: the platform account is a soft ledger (see §6(k)②), so the one
         # thing it needs is a reader. One replica per interval, one line per
         # crossing -- the shared node view is what makes both possible.
@@ -536,6 +569,7 @@ def create_app(
                     pass
         await sweeper.stop()
         await paused_sweeper.stop()
+        await idle_sweeper.stop()
         await ledger_alerter.stop()
         remote_http = getattr(app.state, "remote_http", None)
         if remote_http is not None:
