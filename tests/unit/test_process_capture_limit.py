@@ -269,3 +269,119 @@ async def test_capture_limit_none_is_unlimited():
     assert proc.capture_limit is None
     assert proc.captured_truncated == set()
     assert len(proc.captured["stdout"]) == 40 * 65536
+
+
+# -- SEC-K0S-003: the *live* path gets a budget too ------------------------
+#
+# ``capture_limit`` bounds what a replay can hand back; it says nothing about
+# the queue a live subscriber reads from. That queue used to be an unbounded
+# ``asyncio.Queue`` fed with ``put_nowait``, so a consumer that fell behind --
+# or a client that stopped reading -- grew the *worker's* heap with whatever
+# the command printed. Measured 2026-09-30: one ``yes`` OOMKilled
+# ``e2b-worker-0`` (exit 137). These pin the budget, the inline marker, and the
+# one event that must never be dropped.
+
+
+def _drain(queue) -> list:
+    items = []
+    while not queue.empty():
+        items.append(queue.get_nowait())
+    return items
+
+
+async def _wait_ended(proc, timeout: float = 5.0) -> None:
+    """Wait for the *producer* to finish without draining the subscriber."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not proc.ended:
+        assert loop.time() < deadline, "the command never reached its end"
+        await asyncio.sleep(0.01)
+
+
+async def test_a_slow_subscriber_is_bounded_and_told_where_it_was_cut():
+    executor = _ChunkExecutor()
+    limit = 1024 * 1024
+    manager = ProcessManager(
+        executor, sandbox_id="sbx_slow", stream_limit_bytes=limit
+    )
+    proc = await manager.start(**_start_kwargs())
+    queue = proc.subscribe(replay=False)
+
+    chunk = b"y" * 65536
+    produced = 64  # 4 MiB, four times the budget
+    for _ in range(produced):
+        executor.emit(proc.pid, chunk)
+    executor.end(proc.pid)
+    await _wait_ended(proc)
+
+    items = _drain(queue)
+    payload = b"".join(item[2] for item in items if item[0] == "data")
+    delivered = len(payload) - len(TRUNCATED_MARK)
+
+    assert items[-1] == ("end", 0, "exited")
+    assert len(payload) <= limit
+    assert payload.count(TRUNCATED_MARK) == 1
+    assert queue.max_bytes == limit
+    assert queue.dropped_bytes == produced * len(chunk) - delivered
+
+
+async def test_a_subscriber_that_keeps_up_sees_every_byte():
+    """A consumer that drains as the command produces loses nothing.
+
+    The producer yields between chunks, as a real one does (each chunk comes
+    off a pipe read, which suspends): a burst pushed within a single event-loop
+    turn would outrun *any* consumer, which is the slow-consumer case the
+    budget exists for -- not this one.
+    """
+    executor = _ChunkExecutor()
+    manager = ProcessManager(
+        executor, sandbox_id="sbx_fast", stream_limit_bytes=1024 * 1024
+    )
+    proc = await manager.start(**_start_kwargs())
+    queue = proc.subscribe(replay=False)
+
+    chunk = b"y" * 65536
+    seen = bytearray()
+    end: tuple | None = None
+
+    async def consume() -> None:
+        nonlocal end
+        while True:
+            item = await queue.get()
+            if item[0] == "data":
+                seen.extend(item[2])
+            else:
+                end = item
+                return
+
+    task = asyncio.create_task(consume())
+    for _ in range(64):
+        executor.emit(proc.pid, chunk)
+        await asyncio.sleep(0)  # the producer yields; the consumer drains
+    executor.end(proc.pid)
+    await asyncio.wait_for(task, 5)
+
+    assert bytes(seen) == chunk * 64
+    assert queue.dropped_bytes == 0
+    assert end == ("end", 0, "exited")
+
+
+async def test_the_end_event_survives_the_budget():
+    """A client that never learns the command ended would hang on the stream."""
+    executor = _ChunkExecutor()
+    manager = ProcessManager(
+        executor, sandbox_id="sbx_tiny", stream_limit_bytes=1024
+    )
+    proc = await manager.start(**_start_kwargs())
+    queue = proc.subscribe(replay=False)
+
+    for _ in range(8):
+        executor.emit(proc.pid, b"z" * 65536)
+    executor.end(proc.pid)
+    await _wait_ended(proc)
+
+    items = _drain(queue)
+    assert items[-1] == ("end", 0, "exited")
+    payload = b"".join(item[2] for item in items if item[0] == "data")
+    assert payload == TRUNCATED_MARK
+    assert queue.dropped_bytes == 8 * 65536

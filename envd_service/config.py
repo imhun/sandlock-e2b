@@ -386,6 +386,17 @@ class Settings:
     command_capture_limit_mb: int = field(
         default_factory=lambda: _env_int("E2B_COMMAND_CAPTURE_LIMIT_MB", 10)
     )
+    # SEC-K0S-003: per-subscriber budget for a **live** command stream (MiB).
+    # ``command_capture_limit_mb`` above only bounds the replay buffer the
+    # worker keeps; the queue a streaming client reads from used to be
+    # unbounded, so a consumer that fell behind grew the worker's heap with the
+    # command's output (measured 2026-09-30: one ``yes`` OOMKilled
+    # ``e2b-worker-0``, exit 137). When the budget is spent the subscriber gets
+    # a ``... output truncated ...`` marker inline and the dropped bytes are
+    # counted/logged. 0 disables the budget (unlimited, repo convention).
+    command_stream_limit_mb: int = field(
+        default_factory=lambda: _env_int("E2B_COMMAND_STREAM_LIMIT_MB", 32)
+    )
     # E4.2: max bytes accepted by the worker ``/files`` write endpoint.
     # 0 disables the limit (repo convention).
     max_file_write_mb: int = field(

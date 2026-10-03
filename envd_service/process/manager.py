@@ -27,6 +27,96 @@ logger = logging.getLogger(__name__)
 CAPTURE_LIMIT_DEFAULT = 10 * 1024 * 1024
 TRUNCATED_MARK = b"\n... output truncated ...\n"
 
+# SEC-K0S-003 (found 2026-09-30, fixed 2026-10-03): the budget of a *live*
+# subscriber's queue, in bytes. ``capture_limit`` above only bounds what a
+# replay can hand back -- it says nothing about the queue a streaming client
+# reads from, which used to be an unbounded ``asyncio.Queue`` fed with
+# ``put_nowait``. A consumer that fell behind (or a client that stopped
+# reading) therefore grew the **worker's** heap with whatever the command
+# printed: measured on the live cluster, one ``yes`` OOMKilled
+# ``e2b-worker-0`` (exit 137). ``None`` = unlimited.
+STREAM_LIMIT_DEFAULT = 32 * 1024 * 1024
+
+#: Hard item bound per subscriber, so a stream of *tiny* writes is bounded in
+#: object count as well as in bytes (each queued item costs ~100 B of Python
+#: object overhead, which a byte budget alone cannot see).
+STREAM_QUEUE_MAX_ITEMS = 1024
+
+
+def _item_bytes(item: tuple) -> int:
+    """Payload bytes of one broadcast item (``("data", kind, chunk)`` / end)."""
+    return sum(len(part) for part in item if isinstance(part, (bytes, bytearray)))
+
+
+class SubscriberQueue(asyncio.Queue):
+    """One subscriber's queue, bounded by bytes *and* items (SEC-K0S-003).
+
+    ``put_nowait`` raises ``asyncio.QueueFull`` for a data item that would
+    exceed the budget -- which is what turns :meth:`ManagedProcess._broadcast`'s
+    drop branch from dead code into real backpressure. Control items (the end
+    event, the truncation marker) are always admitted: a client that never
+    learns the command ended would hang on the stream, and if the *item* bound
+    is what stands in the way, the oldest data item makes room for them.
+
+    ``dropped_bytes`` is the subscriber's own accounting, so a truncated stream
+    is never silent: the producer logs the first drop and the marker lands in
+    the stream at the cut point.
+    """
+
+    def __init__(
+        self, *, max_bytes: int | None, max_items: int = STREAM_QUEUE_MAX_ITEMS
+    ) -> None:
+        super().__init__(maxsize=max_items)
+        self.max_bytes = max_bytes
+        self.dropped_bytes = 0
+        self._bytes = 0
+        self._marked = False
+
+    @property
+    def queued_bytes(self) -> int:
+        return self._bytes
+
+    def put_nowait(self, item: tuple, *, force: bool = False) -> None:
+        size = _item_bytes(item)
+        is_data = bool(item) and item[0] == "data"
+        if is_data and not force:
+            # ``+ len(TRUNCATED_MARK)`` is the headroom the marker itself will
+            # need: reserved on the way in so the cut point always fits, and
+            # the subscriber's payload never exceeds the budget it was given.
+            reserve = len(TRUNCATED_MARK)
+            if (
+                self.max_bytes is not None
+                and self._bytes + size + reserve > self.max_bytes
+            ):
+                raise asyncio.QueueFull
+            # Keep one slot free for a control item (marker / end).
+            if self.qsize() >= self.maxsize - 1:
+                raise asyncio.QueueFull
+        else:
+            while self.qsize() >= self.maxsize:
+                oldest = self.get_nowait()
+                self.dropped_bytes += _item_bytes(oldest)
+        super().put_nowait(item)
+        self._bytes += size
+
+    def note_dropped(self, size: int) -> bool:
+        """Count a dropped data item; ``True`` the first time (send the marker)."""
+        self.dropped_bytes += size
+        first = not self._marked
+        self._marked = True
+        return first
+
+    def get_nowait(self):  # noqa: D102 - asyncio.Queue API
+        item = super().get_nowait()
+        self._bytes -= _item_bytes(item)
+        return item
+
+    async def get(self):  # noqa: D102 - asyncio.Queue API
+        item = await super().get()
+        self._bytes -= _item_bytes(item)
+        return item
+
+
 SIGNAL_MAP: dict[str, int] = {
     "SIGNAL_SIGTERM": signal.SIGTERM,
     "SIGNAL_SIGKILL": signal.SIGKILL,
@@ -59,6 +149,11 @@ class ManagedProcess:
     )
     # ``None`` = unlimited; otherwise the cap per stream in bytes.
     capture_limit: int | None = CAPTURE_LIMIT_DEFAULT
+    # SEC-K0S-003: the budget of this subscriber-facing stream, in bytes.
+    # ``None`` = unlimited. Separate from ``capture_limit`` on purpose: one
+    # bounds the replay buffer the worker keeps, the other bounds what it will
+    # hold for a *live* consumer that is not keeping up.
+    stream_limit: int | None = STREAM_LIMIT_DEFAULT
     # Streams that crossed the capture cap (their replay ends with the marker).
     captured_truncated: set[str] = field(default_factory=set)
     #: Worker bookkeeping (the workspace writer's helpers), not a user command.
@@ -70,13 +165,16 @@ class ManagedProcess:
     killed: bool = False
     _running: RunningProcess | None = field(default=None, repr=False)
 
-    def subscribe(self, *, replay: bool) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
+    def subscribe(self, *, replay: bool) -> SubscriberQueue:
+        queue = SubscriberQueue(max_bytes=self.stream_limit)
         if replay:
             for kind, buf in self.captured.items():
                 data = bytes(buf)
                 if data:
-                    queue.put_nowait(("data", kind, data))
+                    # The replay is already bounded by ``capture_limit``, so it
+                    # goes in as a control item: a tight stream budget must not
+                    # refuse the history the caller explicitly asked for.
+                    queue.put_nowait(("data", kind, data), force=True)
         self.subscribers.append(queue)
         return queue
 
@@ -84,7 +182,17 @@ class ManagedProcess:
         try:
             self.subscribers.remove(queue)
         except ValueError:
-            pass
+            return
+        dropped = getattr(queue, "dropped_bytes", 0)
+        if dropped:
+            logger.warning(
+                "process %s: a subscriber left with %d bytes dropped from its "
+                "live stream (budget %s bytes); the marker in the stream says "
+                "where the cut is",
+                self.pid,
+                dropped,
+                getattr(queue, "max_bytes", None),
+            )
 
 
 def append_captured(proc: ManagedProcess, kind: str, chunk: bytes) -> bool:
@@ -243,6 +351,7 @@ class ProcessManager:
         max_queued_commands: int | None = None,
         queue_timeout_s: float | None = 30,
         capture_limit_bytes: int | None = CAPTURE_LIMIT_DEFAULT,
+        stream_limit_bytes: int | None = STREAM_LIMIT_DEFAULT,
     ) -> None:
         self._executor = executor
         self._max_command_timeout = max_command_timeout
@@ -266,6 +375,14 @@ class ProcessManager:
         # point (repo convention: 0 disables a dimension).
         self._capture_limit_bytes = (
             None if capture_limit_bytes is None else max(0, int(capture_limit_bytes))
+        )
+        # SEC-K0S-003: ``None`` or a non-positive value = unlimited (the repo
+        # convention: 0 disables a dimension). This is the live-stream budget,
+        # separate from the replay cap above.
+        self._stream_limit_bytes = (
+            None
+            if stream_limit_bytes is None or int(stream_limit_bytes) <= 0
+            else int(stream_limit_bytes)
         )
         # Per-sandbox gates; one entry per sandbox served by this manager.
         self._locks: dict[str, _CommandGate] = {}
@@ -364,6 +481,7 @@ class ProcessManager:
                 internal=internal,
                 _running=running,
                 capture_limit=self._capture_limit_bytes,
+                stream_limit=self._stream_limit_bytes,
             )
             # An internal process still enters the table (shutdown's
             # ``kill_all`` and the pause/resume walk must see it), but with a
@@ -449,8 +567,30 @@ class ProcessManager:
         for queue in list(proc.subscribers):
             try:
                 queue.put_nowait(item)
-            except asyncio.QueueFull:  # pragma: no cover - unbounded queues
-                pass
+            except asyncio.QueueFull:
+                # SEC-K0S-003: this branch used to be dead code (the queue was
+                # unbounded), which is how one command's output could grow the
+                # worker until the OOM killer took it. Now it is the budget:
+                # count the drop, and tell the subscriber *once* where its
+                # stream was cut -- inline, with the same marker the replay
+                # path uses, so a truncated stream is never silent.
+                if item and item[0] != "data":
+                    queue.put_nowait(item, force=True)
+                    continue
+                if not isinstance(queue, SubscriberQueue) or not queue.note_dropped(
+                    _item_bytes(item)
+                ):
+                    continue
+                logger.warning(
+                    "process %s: a subscriber fell behind; dropping its output "
+                    "from here on (budget %s bytes) and marking the stream "
+                    "truncated",
+                    proc.pid,
+                    queue.max_bytes,
+                )
+                queue.put_nowait(
+                    ("data", item[1], TRUNCATED_MARK), force=True
+                )
 
     def get(self, pid: int) -> ManagedProcess:
         proc = self._processes.get(pid)

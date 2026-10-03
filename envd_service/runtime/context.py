@@ -385,6 +385,11 @@ class SandboxRuntimeContext:
                 if settings.command_capture_limit_mb <= 0
                 else settings.command_capture_limit_mb * 1024 * 1024
             ),
+            stream_limit_bytes=(
+                None
+                if settings.command_stream_limit_mb <= 0
+                else settings.command_stream_limit_mb * 1024 * 1024
+            ),
         )
         self.files = FilesystemOps(record.workspace_dir)
         # N28: the sandbox is the single writer of its own tree, so every
