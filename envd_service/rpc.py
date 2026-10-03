@@ -135,6 +135,9 @@ async def _consume_stream(
     budget = getattr(queue, "max_bytes", None)
     sent = 0
     cut = False
+    logger.info(
+        "process %s: relaying a stream with budget=%s bytes", proc.pid, budget
+    )
     try:
         while True:
             try:
@@ -164,10 +167,24 @@ async def _consume_stream(
                 room = budget - sent - len(TRUNCATED_MARK)
                 if room <= 0:
                     cut = True
+                    logger.warning(
+                        "process %s: cutting this stream at %d bytes (budget %s): "
+                        "the client is not reading; the marker says where",
+                        proc.pid,
+                        sent,
+                        budget,
+                    )
                     yield data_event(item[1], TRUNCATED_MARK)
                     continue
                 if len(chunk) > room:
                     cut = True
+                    logger.warning(
+                        "process %s: cutting this stream at %d bytes (budget %s): "
+                        "the client is not reading; the marker says where",
+                        proc.pid,
+                        sent,
+                        budget,
+                    )
                     yield data_event(item[1], chunk[:room])
                     yield data_event(item[1], TRUNCATED_MARK)
                     continue
