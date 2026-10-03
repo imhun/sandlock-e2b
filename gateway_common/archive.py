@@ -375,6 +375,20 @@ def extract_sandbox_archive(
 # It is the one implementation both worker call sites use; the staging logic
 # deliberately stays out of ``extract_sandbox_archive`` because the control
 # plane's path already stages for itself.
+#
+# The publish itself has two shapes, and only one of them is atomic (N76). The
+# absent-destination rename is one step. The merge into an *existing* tree is
+# per-entry ``os.replace``, because the tree keeps everything the payload does
+# not name and ``rename(2)`` onto a non-empty directory is ``ENOTEMPTY``:
+# "build ``<dest>.next`` and swap" would need ``RENAME_EXCHANGE`` (Linux-only;
+# support over the deployment's NFS is unverified) or an "old tree aside, new
+# tree in" window that is not atomic either. So a merge killed halfway can
+# still leave a half-published tree. What this module owes the operator in that
+# case is *where it stopped*: the refusal names the entries already published,
+# and a retry converges -- every entry is an idempotent ``os.replace``,
+# so re-running the same materialization finishes the merge instead of
+# doubling it. The caller's own rollback decides what happens to the tree; a
+# refused create's tree is reclaimed by the node reconcile / orphan-tree GC.
 
 
 def extract_into_place(
@@ -456,8 +470,31 @@ def _publish_staged_tree(staging: Path, target: Path) -> None:
     # Everything the merge would touch is checked *before* anything moves, so
     # a refusal here leaves ``target`` exactly as it was.
     _guard_staged_tree(staging, target)
-    _merge_staged_tree(staging, target)
+    _merge_staged_tree(staging, target, [])
     _discard_staging(staging)
+
+
+def _merge_stopped_after(detail: str, target: Path, merged: list[str]) -> str:
+    """Append "how far the merge got" to a refusal's detail (N76).
+
+    The merge into an existing tree is per-entry ``os.replace`` and therefore
+    not atomic (see the section comment above): a failure halfway leaves a tree
+    that is part old, part new. The operator's next question is *which* part,
+    so the refusal answers it -- and says the way out, because every entry is
+    an idempotent rename and re-running the same materialization finishes the
+    merge rather than doubling it.
+    """
+    if not merged:
+        return (
+            f"{detail} (merge into {target}: nothing published; "
+            "re-running is free)"
+        )
+    shown = ", ".join(merged[:8])
+    more = "" if len(merged) <= 8 else f", … (+{len(merged) - 8} more)"
+    return (
+        f"{detail} (merge into {target}: published so far = "
+        f"[{shown}{more}]; re-running finishes the merge)"
+    )
 
 
 def _guard_staged_tree(staging: Path, target: Path) -> None:
@@ -480,19 +517,26 @@ def _guard_staged_tree(staging: Path, target: Path) -> None:
                 _guard_directory(target, relative)
 
 
-def _merge_staged_tree(staging: Path, target: Path) -> None:
+def _merge_staged_tree(
+    staging: Path, target: Path, merged: list[str], prefix: str = ""
+) -> None:
     """Move every entry under ``staging`` into ``target``, merging directories.
 
     ``target`` is an existing tree: entries the archive names replace what is
     there (``os.replace``, one rename each), directories merge recursively, and
     entries the archive does not name are left alone -- the semantics the
     unpack always had, now with nothing half-written on the way.
+
+    ``merged`` accumulates what this call and its ancestors have already
+    published (paths relative to the tree root under ``prefix``), so a failure
+    can name where the merge stopped (N76).
     """
     with os.scandir(staging) as entries:
         names = sorted(entry.name for entry in entries)
     for name in names:
         source = staging / name
         destination = target / name
+        relative = f"{prefix}{name}"
         try:
             if source.is_dir() and not source.is_symlink():
                 if destination.is_symlink():
@@ -500,28 +544,45 @@ def _merge_staged_tree(staging: Path, target: Path) -> None:
                     # as a second layer rather than trusted alone.
                     raise ArchiveRefusal(
                         DESTINATION_IS_A_SYMLINK,
-                        f"the destination holds a symbolic link at {name!r}: "
-                        "refusing to write through it",
+                        _merge_stopped_after(
+                            f"the destination holds a symbolic link at "
+                            f"{name!r}: refusing to write through it",
+                            target,
+                            merged,
+                        ),
                     )
                 if destination.exists() and not destination.is_dir():
                     raise ArchiveRefusal(
                         PARTIAL_UNPACK,
-                        f"{destination} is not a directory to merge into",
+                        _merge_stopped_after(
+                            f"{destination} is not a directory to merge into",
+                            target,
+                            merged,
+                        ),
                     )
                 if destination.exists():
-                    _merge_staged_tree(source, destination)
+                    _merge_staged_tree(source, destination, merged, f"{relative}/")
                     continue
                 os.replace(source, destination)
+                merged.append(relative)
                 continue
             if destination.is_dir() and not destination.is_symlink():
                 raise ArchiveRefusal(
                     PARTIAL_UNPACK,
-                    f"{destination} is a directory in the way of {name!r}",
+                    _merge_stopped_after(
+                        f"{destination} is a directory in the way of {name!r}",
+                        target,
+                        merged,
+                    ),
                 )
             os.replace(source, destination)
+            merged.append(relative)
         except OSError as exc:
             raise ArchiveRefusal(
-                PARTIAL_UNPACK, f"publishing {source} at {destination}: {exc}"
+                PARTIAL_UNPACK,
+                _merge_stopped_after(
+                    f"publishing {source} at {destination}: {exc}", target, merged
+                ),
             ) from exc
 
 

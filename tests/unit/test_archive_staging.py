@@ -286,6 +286,88 @@ def test_the_destination_guard_still_runs_against_the_live_tree(
     assert (workspace / f"{SANDBOX}.importing").exists() is False
 
 
+def test_a_merge_that_fails_partway_names_where_it_stopped(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N76: the merge into a live tree is not atomic, so a failure says where.
+
+    The per-entry ``os.replace`` cannot be made one step without
+    ``RENAME_EXCHANGE`` (Linux-only, unverified over the deployment's NFS), so
+    the accepted trade is a *named* stop: the refusal carries what was already
+    published into the live tree. That is the operator's next question when a
+    half-merged tree shows up.
+    """
+    archive_path = _tar(
+        workspace / "fs.tar", {"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"}
+    )
+    target = workspace / SANDBOX
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("from before\n", encoding="utf-8")
+
+    real_replace = os.replace
+    replaced: list[str] = []
+
+    def _flaky(source, destination):
+        replaced.append(Path(destination).name)
+        if len(replaced) == 2:
+            raise OSError(5, "Input/output error")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", _flaky)
+    with pytest.raises(archive.ArchiveRefusal) as caught:
+        archive.extract_into_place(archive_path, target)
+
+    assert caught.value.reason == archive.PARTIAL_UNPACK
+    assert caught.value.detail.startswith("publishing ")
+    assert (
+        f"(merge into {target}: published so far = [a.txt]; "
+        "re-running finishes the merge)"
+    ) in caught.value.detail
+    # The accepted half-state: one member landed, everything else is the old
+    # tree, and the staging tree is gone (there is nothing left to clean up).
+    assert (target / "a.txt").read_text(encoding="utf-8") == "a\n"
+    assert (target / "b.txt").exists() is False
+    assert (target / "keep.txt").read_text(encoding="utf-8") == "from before\n"
+    assert (workspace / f"{SANDBOX}.importing").exists() is False
+
+
+def test_the_same_materialization_converges_after_a_failed_merge(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N76: re-running finishes the merge instead of doubling it.
+
+    Every entry is an idempotent ``os.replace``, so the one recovery action the
+    operators do not have to invent is "do the same thing again".
+    """
+    archive_path = _tar(
+        workspace / "fs.tar", {"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"}
+    )
+    target = workspace / SANDBOX
+    target.mkdir(parents=True)
+    (target / "b.txt").write_text("stale\n", encoding="utf-8")
+
+    real_replace = os.replace
+    replaced: list[str] = []
+
+    def _flaky(source, destination):
+        replaced.append(Path(destination).name)
+        if len(replaced) == 2:
+            raise OSError(5, "Input/output error")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", _flaky)
+    with pytest.raises(archive.ArchiveRefusal):
+        archive.extract_into_place(archive_path, target)
+    monkeypatch.undo()
+
+    archive.extract_into_place(archive_path, target)
+
+    assert [
+        (target / name).read_text(encoding="utf-8")
+        for name in ("a.txt", "b.txt", "c.txt")
+    ] == ["a\n", "b\n", "c\n"]
+
+
 def test_the_two_call_sites_share_the_one_staged_implementation() -> None:
     """The helper is the shared function object, not a per-image copy."""
     assert envd_agent.extract_into_place is archive.extract_into_place
