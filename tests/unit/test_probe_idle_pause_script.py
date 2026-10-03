@@ -87,6 +87,43 @@ def test_the_defaults_outlive_the_shipped_threshold():
     assert (args.wait_s, args.poll_s, args.timeout) == (420.0, 5.0, 900)
 
 
+class _FakeClient:
+    """Records the URLs it was asked for and answers one list payload."""
+
+    def __init__(self, payload) -> None:
+        self.payload = payload
+        self.urls: list[str] = []
+
+    def get(self, url: str, **_kwargs):
+        self.urls.append(url)
+
+        class _Response:
+            def __init__(self, payload) -> None:
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self):
+                return self._payload
+
+        return _Response(self.payload)
+
+
+def test_the_state_is_read_from_the_list_view_not_the_item_payload():
+    """``GET /sandboxes/{id}`` carries no ``state`` -- the first live run read
+    ``"unknown"`` for six minutes because of exactly that."""
+    client = _FakeClient(
+        [
+            {"sandboxID": "sbx_other", "state": "running"},
+            {"sandboxID": "sbx_a", "state": "paused"},
+        ]
+    )
+
+    assert PROBE_MODULE._fetch_state(client, "http://cp", "key", "sbx_a") == "paused"
+    assert client.urls == ["http://cp/sandboxes"]
+
+
 def test_the_probe_refuses_by_name_without_an_api_key(monkeypatch, capsys):
     monkeypatch.delenv("E2B_API_KEY", raising=False)
 

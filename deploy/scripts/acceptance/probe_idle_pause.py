@@ -17,9 +17,21 @@ SDK::
     sbx = Sandbox.create(timeout=900)
     sbx.commands.run("sleep 400", timeout=400)   # held open, no output, no CPU
 
-and the answer is that ``GET /sandboxes/{id}`` stays ``running`` past the
+and the answer is that the list view keeps reporting ``running`` past the
 threshold. The worker-side keep-alive that makes that true is pinned by
 ``tests/unit/test_stream_activity_keepalive.py``.
+
+**Read the list, not the item.** ``GET /sandboxes/{id}`` answers the official
+``Sandbox`` payload, which carries no ``state`` at all; only the list view does
+(``as_listed``: ``state``, ``endAt``, ``lastActiveAt``). The first live run of
+this script (2026-10-03) polled the item endpoint and read ``"unknown"``
+forever -- the same mistake as reading ``state`` off a ``connect`` response.
+Both now go through :func:`_fetch_state`.
+
+A 5xx from the front proxy is recorded as a sample (``error-502``) and the
+poll continues: this probe runs for minutes and must not treat one proxy
+hiccup as "the sweep is broken". A run that ends without ever seeing
+``paused`` prints every state it saw, errors included.
 
 ``--wait-s`` must exceed the deployment's ``E2B_IDLE_PAUSE_AFTER_S`` by at
 least one sweep interval (15 s) plus the activity-persist lag (30 s); the
@@ -110,9 +122,24 @@ def _headers(api_key: str) -> dict[str, str]:
 
 
 def _fetch_state(client: httpx.Client, base_url: str, api_key: str, sandbox_id: str) -> str:
-    response = client.get(f"{base_url}/sandboxes/{sandbox_id}", headers=_headers(api_key))
+    """The sandbox's ``state``, read from the list view (see the module docstring)."""
+    response = client.get(f"{base_url}/sandboxes", headers=_headers(api_key))
     response.raise_for_status()
-    return state_of(response.json())
+    for entry in response.json():
+        if entry.get("sandboxID") == sandbox_id:
+            return state_of(entry)
+    return "gone"
+
+
+def _poll_state(client: httpx.Client, base_url: str, api_key: str, sandbox_id: str) -> str:
+    """``_fetch_state`` with a 5xx turned into a sample instead of an exception."""
+    try:
+        return _fetch_state(client, base_url, api_key, sandbox_id)
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status >= 500:
+            return f"error-{status}"
+        raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -143,7 +170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             def fetch() -> str:
                 assert sandbox_id is not None
-                return _fetch_state(client, args.base_url, api_key, sandbox_id)
+                return _poll_state(client, args.base_url, api_key, sandbox_id)
 
             paused, samples = wait_for_state(
                 fetch, "paused", wait_s=args.wait_s, poll_s=args.poll_s
@@ -166,8 +193,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 json={},
             )
             resumed.raise_for_status()
-            state = state_of(resumed.json())
-            print(f"probe_idle_pause: connect -> state={state}")
+            # The connect payload is the official ``Sandbox`` shape (no
+            # ``state``); read the state back from the list view.
+            state = fetch()
+            print(
+                f"probe_idle_pause: connect -> HTTP {resumed.status_code}, "
+                f"state={state}"
+            )
             if state != "running":
                 print(
                     "probe_idle_pause: FAIL -- connect did not bring the sandbox "
