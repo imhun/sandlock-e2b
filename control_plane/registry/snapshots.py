@@ -517,9 +517,21 @@ class SnapshotRegistry:
         return record
 
     def in_progress(self) -> list[SnapshotRecord]:
-        """Every record whose copy has not finished (startup reconciliation)."""
-        for path in sorted(self._snapshots_root.glob("*/snapshot.json")):
+        """Every record whose copy has not finished (startup reconciliation).
+
+        Walks :meth:`_record_files` rather than one layout's glob: ``list()``
+        and ``get()`` both read the current ``_snapshots/`` layout *and* the
+        pre-OBS-9 root-level one, and a ``creating`` record the reader can
+        serve must not be invisible to the pass that settles it. Ids are
+        deduped the same way ``list()`` does it, so a record present in both
+        layouts is reconciled once.
+        """
+        seen: set[str] = set()
+        for path in self._record_files():
             snapshot_id = path.parent.name
+            if snapshot_id in seen:
+                continue
+            seen.add(snapshot_id)
             try:
                 record = self.get(snapshot_id)
             except UnknownSnapshotError:
@@ -641,6 +653,8 @@ class SnapshotRegistry:
         records.sort(key=lambda r: r.created_at, reverse=True)
         if tenant_id is not None:
             records = [r for r in records if r.tenant_id == tenant_id]
+        if sandbox_id_filter is not None:
+            records = [r for r in records if r.sandbox_id == sandbox_id_filter]
         if name:
             records = [r for r in records if name in r.names]
         if limit is not None:

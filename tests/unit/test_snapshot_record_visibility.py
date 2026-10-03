@@ -32,6 +32,8 @@ def _write_record(
     created_at: str,
     names: list[str] | None = None,
     tenant_id: str | None = None,
+    sandbox_id: str | None = None,
+    status: str = "completed",
     legacy: bool = False,
 ) -> Path:
     """The on-disk shape ``SnapshotRegistry._write_record`` produces.
@@ -52,7 +54,8 @@ def _write_record(
             "names": list(names or []),
             "created_at": created_at,
             "tenant_id": tenant_id,
-            "status": "completed",
+            "sandbox_id": sandbox_id,
+            "status": status,
         },
     )
     return path
@@ -226,3 +229,105 @@ def test_listing_keeps_the_existing_filters(tmp_path):
         "snap_0000000000000c02",
     ]
     assert _ids(registry.list(limit=1, offset=1)) == ["snap_0000000000000c02"]
+
+
+def test_listing_filters_by_source_sandbox_id(tmp_path):
+    """N64: ``sandboxID`` is an outward filter and has to actually filter.
+
+    ``GET /snapshots`` passes its ``sandboxID`` query parameter through as
+    ``sandbox_id_filter``, and the registry accepted the argument without
+    ever reading it -- so a caller asking for one sandbox's snapshots was
+    silently answered with every snapshot on the volume.
+    """
+    base = tmp_path / "control"
+    registry = SnapshotRegistry(base)
+    _write_record(
+        base,
+        "snap_0000000000000f01",
+        created_at="2026-10-02T00:00:01Z",
+        sandbox_id="sbx_0000000000000001",
+    )
+    _write_record(
+        base,
+        "snap_0000000000000f02",
+        created_at="2026-10-02T00:00:02Z",
+        sandbox_id="sbx_0000000000000002",
+    )
+    _write_record(
+        base,
+        "snap_0000000000000f03",
+        created_at="2026-10-02T00:00:03Z",
+    )
+
+    assert _ids(
+        registry.list(sandbox_id_filter="sbx_0000000000000001")
+    ) == ["snap_0000000000000f01"]
+    assert _ids(
+        registry.list(sandbox_id_filter="sbx_0000000000000002")
+    ) == ["snap_0000000000000f02"]
+    # A record that never recorded a source sandbox matches no filter value,
+    # and passing ``None`` keeps every record (no filtering).
+    assert _ids(registry.list(sandbox_id_filter=None)) == [
+        "snap_0000000000000f03",
+        "snap_0000000000000f02",
+        "snap_0000000000000f01",
+    ]
+
+
+def test_the_sandbox_filter_is_applied_before_name_and_paging(tmp_path):
+    """The filter order is tenant -> sandbox -> name -> limit/offset (N64)."""
+    base = tmp_path / "control"
+    registry = SnapshotRegistry(base)
+    for index, (sandbox_id, name) in enumerate(
+        [
+            ("sbx_0000000000000010", "alpha"),
+            ("sbx_0000000000000010", "beta"),
+            ("sbx_0000000000000010", "alpha"),
+            ("sbx_0000000000000011", "alpha"),
+        ],
+        start=1,
+    ):
+        _write_record(
+            base,
+            f"snap_000000000000020{index}",
+            created_at=f"2026-10-02T00:00:0{index}Z",
+            names=[name],
+            sandbox_id=sandbox_id,
+        )
+
+    # Newest first: 0204, 0203, 0202, 0201. The sandbox filter drops 0204,
+    # the name filter drops 0202, and paging then slices the remaining two.
+    assert _ids(
+        registry.list(
+            sandbox_id_filter="sbx_0000000000000010",
+            name="alpha",
+            limit=1,
+            offset=1,
+        )
+    ) == ["snap_0000000000000201"]
+
+
+def test_in_progress_sees_a_legacy_layout_creating_record(tmp_path):
+    """``in_progress()`` walks every layout ``_record_files()`` knows.
+
+    It used to glob ``<base>/_snapshots/*/snapshot.json`` alone, so a
+    ``creating`` record in the pre-OBS-9 root-level layout was invisible to
+    startup reconciliation -- the interrupted copy was never settled.
+    """
+    base = tmp_path / "control"
+    registry = SnapshotRegistry(base)
+    _write_record(
+        base,
+        "snap_0000000000000f04",
+        created_at="2026-10-02T00:00:01Z",
+        status="creating",
+        legacy=True,
+    )
+    _write_record(
+        base,
+        "snap_0000000000000f05",
+        created_at="2026-10-02T00:00:02Z",
+        legacy=True,
+    )
+
+    assert _ids(registry.in_progress()) == ["snap_0000000000000f04"]

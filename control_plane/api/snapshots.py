@@ -608,9 +608,21 @@ async def _run_reserved_capture(
         logging.getLogger(__name__).warning(
             "async snapshot %s failed: %s", snapshot_id, exc
         )
-        await asyncio.to_thread(
-            snapshots.mark_failed, snapshot_id, str(exc)
-        )
+        try:
+            await asyncio.to_thread(
+                snapshots.mark_failed, snapshot_id, str(exc)
+            )
+        except UnknownSnapshotError:
+            # A peer deleted the record (its ``rmtree`` is the truth) while
+            # this capture was running. There is nothing left to write the
+            # failure to, and letting it raise would only kill this task --
+            # whose sole callback discards the id -- so the exception would
+            # vanish. Name the id and the reason instead.
+            logger.warning(
+                "snapshot %s: the record was deleted by another replica "
+                "before the failure could be recorded",
+                snapshot_id,
+            )
     finally:
         _IN_FLIGHT_COPIES.discard(snapshot_id)
         refresher.cancel()
@@ -801,16 +813,20 @@ async def list_snapshots(
     limit: int = Query(default=100, ge=1, le=100),
 ) -> list[dict[str, Any]]:
     offset = int(nextToken) if nextToken and nextToken.isdigit() else 0
-    records = _snapshots(request).list(
+    # One listing, taken once, off the event loop: the registry walks the
+    # shared volume (a stat per record, a ``json.loads`` per uncached one), so
+    # asking it twice per request doubled that I/O for a count -- and both
+    # calls used to run on the loop, stalling every other request behind
+    # them. The page is sliced here instead; ``total`` is the same number the
+    # second call used to compute.
+    all_records = await asyncio.to_thread(
+        _snapshots(request).list,
         sandbox_id_filter=sandbox_id,
         name=name,
-        limit=limit,
-        offset=offset,
         tenant_id=tenant_scope(request),
     )
-    total = len(
-        _snapshots(request).list(name=name, tenant_id=tenant_scope(request))
-    )
+    total = len(all_records)
+    records = all_records[offset : offset + limit]
     if offset + len(records) < total:
         response.headers["X-Next-Token"] = str(offset + len(records))
     return [r.as_snapshot_info() for r in records]
