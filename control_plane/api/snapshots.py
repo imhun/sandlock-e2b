@@ -17,7 +17,11 @@ from fastapi.responses import JSONResponse
 from control_plane.api.errors import OfficialError
 from control_plane.auth import _require_owned, require_api_key, tenant_of, tenant_scope
 from control_plane.ratelimit import enforce_resource_limit
-from control_plane.api.sandboxes import _provision_local, _provision_remote
+from control_plane.api.sandboxes import (
+    _non_shared_volume_node_id,
+    _provision_local,
+    _provision_remote,
+)
 from control_plane.registry.manager import (
     ResourceUnavailableError,
     SandboxStateConflictError,
@@ -914,6 +918,9 @@ async def _create_sandbox_from_snapshot(
     """Create one sandbox from a snapshot's filesystem + metadata."""
     registry = _registry(request)
     settings = request.app.state.settings
+    volume_mounts = [
+        {"name": m["name"], "path": m["path"]} for m in snapshot.volume_mounts
+    ]
     try:
         record = registry.create(
             template_id=snapshot.template_id,
@@ -923,10 +930,7 @@ async def _create_sandbox_from_snapshot(
             secure=True,
             allow_internet_access=snapshot.allow_internet_access,
             base_image=snapshot.base_image,
-            volume_mounts=[
-                {"name": m["name"], "path": m["path"]}
-                for m in snapshot.volume_mounts
-            ],
+            volume_mounts=volume_mounts,
             tenant_id=tenant_id,
             is_admin=is_admin,
         )
@@ -934,9 +938,15 @@ async def _create_sandbox_from_snapshot(
         raise OfficialError(503, str(e))
 
     workspace_dir = request.app.state.workspace_base / record.sandbox_id
+    # The snapshot itself produces **no** pin (N65): its payload is a tar on
+    # the shared volume, so the node that happened to capture it buys no
+    # locality -- and pinning to it made this path answer 503 while another
+    # node sat empty (N60's shape on a second endpoint). A pin comes from one
+    # place only: a volume whose bytes are not shared, judged by the same
+    # helper the create path uses.
     node = request.app.state.nodes.select_and_reserve(
         base_image=snapshot.base_image,
-        volume_node_id=snapshot.node_id,
+        volume_node_id=_non_shared_volume_node_id(request, volume_mounts),
         memory_mb=record.memory_mb,
         cpu_percent=record.cpu_count * 100,
         disk_mb=record.disk_size_mb,

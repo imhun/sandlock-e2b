@@ -32,6 +32,7 @@ from pathlib import Path
 import httpx
 import yaml
 
+from control_plane.api import snapshots as snapshots_api
 from control_plane.app import create_app as create_control_app
 from control_plane.config import Settings as ControlSettings
 from control_plane.registry.nodes import NodeRegistry
@@ -89,6 +90,25 @@ def _spy_placement(app) -> dict:
         return original(**kwargs)
 
     app.state.select_node = spy
+    return seen
+
+
+def _spy_fork_placement(app) -> dict:
+    """Same, for the fork path.
+
+    ``_create_sandbox_from_snapshot`` reaches for
+    ``app.state.nodes.select_and_reserve`` itself instead of the
+    ``app.state.select_node`` alias the create admission goes through, so the
+    spy has to sit on the registry method the fork actually calls.
+    """
+    seen: dict = {}
+    original = app.state.nodes.select_and_reserve
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return original(**kwargs)
+
+    app.state.nodes.select_and_reserve = spy
     return seen
 
 
@@ -152,6 +172,68 @@ async def test_a_snapshot_create_carries_no_pin_from_the_snapshot(tmp_path) -> N
             json={"templateID": snapshot.snapshot_id},
         )
     assert sandbox.status_code == 201, sandbox.text
+    # The snapshot still names the node that captured it; placement simply no
+    # longer hears about it.
+    assert seen["volume_node_id"] is None
+
+
+async def test_a_fork_carries_no_pin_from_the_snapshot(tmp_path, monkeypatch) -> None:
+    """``POST /sandboxes/{id}/fork`` builds from a snapshot through its own
+    path, so the same no-pin rule has to hold there.
+
+    Two snapshot-shaped creates with two answers would be the semantic split
+    the batch ruling closed: ``templateID=<snapID>`` unpinned, ``fork`` pinned
+    -- and a pinned fork answers ``503`` while another node sits empty (the
+    N60 shape on a second endpoint).
+    """
+    app = _control_app(tmp_path)
+    seen = _spy_fork_placement(app)
+    # The fleet knows the node that captured the snapshot, so the pin really
+    # binds a node today instead of being dropped as a ghost. It gets the
+    # in-process address because this lane is about the kwargs placement
+    # receives, not about a worker round trip: a bogus remote address would
+    # only add an HTTP timeout to the red run.
+    _register(
+        app.state.nodes,
+        "worker-that-captured-it",
+        address="local://",
+        labels={"node-type": "local"},
+    )
+    source = tmp_path / "captured-for-fork"
+    (source / "workspace").mkdir(parents=True)
+    (source / "workspace" / "data.txt").write_text("payload", encoding="utf-8")
+    snapshot = app.state.snapshots.create_from_sandbox(
+        workspace_dir=source,
+        template_id="base",
+        env_vars={},
+        metadata={},
+        volume_mounts=[],
+        base_image=None,
+        allow_internet_access=False,
+        node_id="worker-that-captured-it",
+        name="snap",
+    )
+    assert snapshot.node_id == "worker-that-captured-it"
+    # A fork captures first, and that capture is a worker round trip; this test
+    # is about the placement the fork then makes, so the capture is stubbed to
+    # the snapshot already on disk.
+    monkeypatch.setattr(
+        snapshots_api,
+        "_capture_snapshot",
+        lambda request, sandbox_id, name=None: snapshot,
+    )
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/sandboxes/sbx_captured/fork",
+            headers={"X-API-Key": API_KEY},
+            json={"timeout": 300},
+        )
+    assert response.status_code == 201, response.text
+    results = response.json()
+    assert len(results) == 1
+    assert "error" not in results[0]
+    assert results[0]["sandbox"]["templateID"] == "base"
     # The snapshot still names the node that captured it; placement simply no
     # longer hears about it.
     assert seen["volume_node_id"] is None
