@@ -55,12 +55,16 @@ quoted at the constant.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import stat
 import tarfile
+import time
 from pathlib import PurePosixPath
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 #: A member's *name* walks out of the destination (``..`` or an absolute path).
 MEMBER_ESCAPES = "archive-member-escapes"
@@ -73,6 +77,12 @@ PARTIAL_UNPACK = "partial-unpack"
 #: The archive carries more members than the unpack may index (a pathological
 #: input, not a corrupt one: the member *index* is what grows with the count).
 TOO_MANY_MEMBERS = "archive-too-many-members"
+#: The unpack crossed its wall-clock budget (N67). The member cap bounds the
+#: index this walk pays for; it does not bound the *time*: 1 500 000 members
+#: measured ~12 min of CPU (``deploy/scripts/acceptance/archive_member_index_memory.py``),
+#: which is 12 minutes of a ``maint`` slot a create waits on. A pathological
+#: *input* again, so it is named apart from the corrupt-payload reasons.
+TIME_BUDGET_EXCEEDED = "archive-time-budget-exceeded"
 
 class ArchiveRefusal(Exception):
     """A named, fail-closed refusal from one archive extraction."""
@@ -111,6 +121,43 @@ def resolve_member_max() -> int:
     except ValueError:  # unset, empty, or not a number: the default stands
         return DEFAULT_ARCHIVE_MAX_MEMBERS
     return value if value >= 0 else DEFAULT_ARCHIVE_MAX_MEMBERS
+
+
+#: The wall-clock budget for one unpack: how long a single archive may take
+#: before the walk refuses it. On by default for the same reason the member cap
+#: is: the payload is the caller's, so every unpack call site is covered
+#: without passing anything. Three minutes is a value the *product* can hold --
+#: a full 1 GiB quota tree unpacks in well under a minute, while the 12-minute
+#: pathological walk the member cap still admits is refused.
+DEFAULT_ARCHIVE_MAX_SECONDS = 180.0
+
+#: Members read between two clock reads. ``time.monotonic()`` per member is a
+#: syscall-scale cost on a 1.5 M-member walk, so the clock is *sampled*: once
+#: at the first member (a tiny archive under a tiny budget still refuses) and
+#: then every this many members.
+TIME_BUDGET_CHECK_EVERY = 4096
+
+
+def resolve_time_budget() -> float:
+    """The unpack budget for this process, from ``E2B_ARCHIVE_MAX_SECONDS``.
+
+    Same discipline as :func:`resolve_member_max`: read at call time, so every
+    unpack call site is covered without passing anything; empty or unparsable
+    falls back to :data:`DEFAULT_ARCHIVE_MAX_SECONDS`; ``0`` -- and only ``0``
+    -- disables the check. A float, not an int, so a sub-second budget is
+    settable (the tests' own lever).
+    """
+    raw = os.environ.get("E2B_ARCHIVE_MAX_SECONDS", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:  # unset, empty, or not a number: the default stands
+        return DEFAULT_ARCHIVE_MAX_SECONDS
+    return value if value >= 0 else DEFAULT_ARCHIVE_MAX_SECONDS
+
+
+def _now() -> float:
+    """The clock the unpack budget reads (patched by the tests' own lever)."""
+    return time.monotonic()
 
 
 def _guard_member(dest: Path, name: str, safe_parents: set[str]) -> None:
@@ -228,7 +275,11 @@ def _reason_for_filter_error(exc: BaseException) -> str:
 
 
 def extract_sandbox_archive(
-    archive_path: Path, dest: Path, *, max_members: int | None = None
+    archive_path: Path,
+    dest: Path,
+    *,
+    max_members: int | None = None,
+    max_seconds: float | None = None,
 ) -> int:
     """Unpack ``archive_path`` into the existing directory ``dest``.
 
@@ -237,9 +288,13 @@ def extract_sandbox_archive(
 
     ``max_members`` defaults to :func:`resolve_member_max` (``None`` means "read
     the environment"), so the cap is on for every caller that passes nothing;
-    ``0`` disables it.
+    ``0`` disables it. ``max_seconds`` is the same shape over
+    :func:`resolve_time_budget`: the walk refuses with
+    :data:`TIME_BUDGET_EXCEEDED` once the wall clock it has spent passes the
+    budget, sampled (never per member) so the check stays cheap.
     """
     limit = resolve_member_max() if max_members is None else max_members
+    budget = resolve_time_budget() if max_seconds is None else max_seconds
     destination = Path(dest)
     resolved_dest = destination.resolve()
     if not resolved_dest.is_dir():
@@ -249,6 +304,8 @@ def extract_sandbox_archive(
     written = 0
     seen = 0
     safe_parents: set[str] = set()
+    # Read once, before the walk: the budget is over the *whole* unpack.
+    started = _now() if budget else 0.0
     try:
         with tarfile.open(Path(archive_path), "r:*") as tar:
             for member in tar:
@@ -265,6 +322,19 @@ def extract_sandbox_archive(
                         f"(seen {seen} so far; E2B_ARCHIVE_MAX_MEMBERS, "
                         "0 disables it)",
                     )
+                # Sampled on purpose: one ``monotonic()`` per member would be a
+                # syscall-scale cost on the walk the cap already admits (1.5 M
+                # members), so the clock is read once at the first member and
+                # then every ``TIME_BUDGET_CHECK_EVERY``.
+                if budget and (seen == 1 or seen % TIME_BUDGET_CHECK_EVERY == 0):
+                    elapsed = _now() - started
+                    if elapsed > budget:
+                        raise ArchiveRefusal(
+                            TIME_BUDGET_EXCEEDED,
+                            f"{archive_path} exceeded its {budget:g}s unpack "
+                            f"budget after {elapsed:.3f}s ({seen} members seen; "
+                            "E2B_ARCHIVE_MAX_SECONDS, 0 disables it)",
+                        )
                 if member.issym() and os.path.isabs(member.linkname):
                     # A volume mount from the source node: the path does not
                     # exist here and provisioning re-creates it.
@@ -286,6 +356,196 @@ def extract_sandbox_archive(
     except OSError as exc:
         raise ArchiveRefusal(PARTIAL_UNPACK, f"{archive_path}: {exc}") from exc
     return written
+
+
+# ---------------------------------------------------------------------------
+# Landing an archive in a live tree without leaving half of one
+# ---------------------------------------------------------------------------
+#
+# ``extract_sandbox_archive`` writes into the directory it is handed, so a
+# refusal halfway through a *live* tree leaves the members it already wrote
+# there. For the control plane that never mattered: ``stage_tree_from_archive``
+# unpacks into a dot-named sibling and removes it on failure. The two worker
+# call sites (a snapshot restore and the agent's materialization) unpacked
+# straight into the tree root, so a payload refused at the member cap left
+# 1.5 M files in a sandbox's own tree -- with no record that would let the TTL
+# sweeper see them (N68).
+#
+# ``extract_into_place`` is that operation done where a refusal costs nothing.
+# It is the one implementation both worker call sites use; the staging logic
+# deliberately stays out of ``extract_sandbox_archive`` because the control
+# plane's path already stages for itself.
+
+
+def extract_into_place(
+    archive_path: Path,
+    dest: Path,
+    *,
+    max_members: int | None = None,
+    max_seconds: float | None = None,
+) -> int:
+    """Unpack ``archive_path`` beside ``dest``, then publish it at ``dest``.
+
+    The archive lands in ``<dest>.importing`` -- same parent, so the publish is
+    a rename within one filesystem and never ``EXDEV``. Nothing reaches
+    ``dest`` until every member has been written, and a refusal (the archive's
+    own, or the destination guards') removes the staging tree and re-raises the
+    same exception, unchanged: the caller sees exactly what a direct unpack
+    would have raised, and the live tree is exactly as it was.
+
+    The publish follows what ``dest`` already is:
+
+    * **absent** -- ``os.rename`` the staged tree into place, one step. The
+      target must not be a mount point for this to work (``rename(2)`` onto a
+      mount point is ``EBUSY``); none of this repo's shapes makes one at a
+      tree root -- ``workspace-root`` is mounted at ``E2B_WORKSPACE_BASE`` and
+      a tree is a subdirectory of it, while volume slices are bound *inside*
+      the tree.
+    * **an existing directory** -- merge the staged entries into it
+      (``os.replace`` per entry, recursing into directories that are already
+      there). That is the shape the agent's materialization has always had: a
+      snapshot merges at the tree root and keeps what the previous incarnation
+      left (``dirs_exist_ok`` semantics), so a rename onto a non-empty tree
+      would both fail with ``ENOTEMPTY`` and drop files the tree still needs.
+
+    Either way the destination guards are re-run against ``dest`` first: the
+    unpack itself only ever saw the clean staging directory, so "the tree holds
+    a link on the way to a member" has to be checked on the side that keeps it.
+    """
+    target = Path(dest)
+    staging = target.parent / f"{target.name}.importing"
+    if target.exists() or target.is_symlink():
+        if not target.resolve().is_dir():
+            raise ArchiveRefusal(
+                PARTIAL_UNPACK, f"the destination {target} is not a directory"
+            )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ArchiveRefusal(
+            PARTIAL_UNPACK, f"cannot create the parent of {target}: {exc}"
+        ) from exc
+    # A leftover from a run that died before it could clean up: it is not a
+    # tree this call may merge into.
+    _discard_staging(staging)
+    try:
+        staging.mkdir()
+    except OSError as exc:
+        raise ArchiveRefusal(
+            PARTIAL_UNPACK, f"cannot stage the unpack at {staging}: {exc}"
+        ) from exc
+    try:
+        written = extract_sandbox_archive(
+            Path(archive_path),
+            staging,
+            max_members=max_members,
+            max_seconds=max_seconds,
+        )
+        _publish_staged_tree(staging, target)
+    except BaseException:
+        _discard_staging(staging)
+        raise
+    return written
+
+
+def _publish_staged_tree(staging: Path, target: Path) -> None:
+    """Move a completed staging tree to ``target`` (or merge it there)."""
+    if not (target.exists() or target.is_symlink()):
+        os.rename(staging, target)
+        return
+    # Everything the merge would touch is checked *before* anything moves, so
+    # a refusal here leaves ``target`` exactly as it was.
+    _guard_staged_tree(staging, target)
+    _merge_staged_tree(staging, target)
+    _discard_staging(staging)
+
+
+def _guard_staged_tree(staging: Path, target: Path) -> None:
+    """Re-apply the destination guards to every staged entry against ``target``.
+
+    The unpack checked this against the *staging* directory, which it made
+    itself and therefore holds no links. What can still be wrong is the tree
+    the bytes are about to land in: a link the previous incarnation left at or
+    above a member's path is the §4.3.1 refusal, and it must not be skipped
+    just because the payload was unpacked somewhere else first.
+    """
+    safe_parents: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(staging):
+        base = Path(dirpath)
+        for name in dirnames + filenames:
+            entry = base / name
+            relative = entry.relative_to(staging).as_posix()
+            _guard_member(target, relative, safe_parents)
+            if name in dirnames and not entry.is_symlink():
+                _guard_directory(target, relative)
+
+
+def _merge_staged_tree(staging: Path, target: Path) -> None:
+    """Move every entry under ``staging`` into ``target``, merging directories.
+
+    ``target`` is an existing tree: entries the archive names replace what is
+    there (``os.replace``, one rename each), directories merge recursively, and
+    entries the archive does not name are left alone -- the semantics the
+    unpack always had, now with nothing half-written on the way.
+    """
+    with os.scandir(staging) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        source = staging / name
+        destination = target / name
+        try:
+            if source.is_dir() and not source.is_symlink():
+                if destination.is_symlink():
+                    # ``_guard_staged_tree`` already refused a link here; kept
+                    # as a second layer rather than trusted alone.
+                    raise ArchiveRefusal(
+                        DESTINATION_IS_A_SYMLINK,
+                        f"the destination holds a symbolic link at {name!r}: "
+                        "refusing to write through it",
+                    )
+                if destination.exists() and not destination.is_dir():
+                    raise ArchiveRefusal(
+                        PARTIAL_UNPACK,
+                        f"{destination} is not a directory to merge into",
+                    )
+                if destination.exists():
+                    _merge_staged_tree(source, destination)
+                    continue
+                os.replace(source, destination)
+                continue
+            if destination.is_dir() and not destination.is_symlink():
+                raise ArchiveRefusal(
+                    PARTIAL_UNPACK,
+                    f"{destination} is a directory in the way of {name!r}",
+                )
+            os.replace(source, destination)
+        except OSError as exc:
+            raise ArchiveRefusal(
+                PARTIAL_UNPACK, f"publishing {source} at {destination}: {exc}"
+            ) from exc
+
+
+def _discard_staging(staging: Path) -> None:
+    """Remove a staging tree (or file/symlink), best effort, and loudly.
+
+    Never raises: its two callers are cleaning a leftover from a previous run
+    (which must not stop this one) and unwinding a refusal (whose own exception
+    is what the caller has to see). A failure is a named WARNING, because a
+    half-unpacked staging tree left on disk is exactly the residue this helper
+    exists to keep out of the live tree.
+    """
+    try:
+        if staging.is_symlink() or staging.is_file():
+            staging.unlink()
+            return
+        if staging.is_dir():
+            shutil.rmtree(staging)
+    except OSError as exc:
+        logger.warning(
+            "archive-staging-leftover: cannot remove the staging tree %s: %s",
+            staging,
+            exc,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,9 @@ from gateway_common.archive import (
     ArchiveRefusal,
     BoundedTreeWriter,
     TreeCopyTooLargeError,
+    extract_into_place,
+    # Kept imported on purpose: the shared-object pin (``test_snapshot_tar``)
+    # asserts this module still names the one extractor, not a private copy.
     extract_sandbox_archive,
     publish_staged_tree,
     stage_tree_from_archive,
@@ -3150,7 +3153,6 @@ def _agent_finalize_sandbox(request: Request, settings: Settings, payload: dict)
     snapshot_id = payload.get("snapshotID")
     materialized = payload.get("materialized") is True
     if not materialized:
-        workspace_dir.mkdir(parents=True, exist_ok=True)
         if snapshot_id:
             # N57: the store hangs off the platform namespace root (the shared
             # export root), not off the tree root -- the record beside this
@@ -3165,12 +3167,17 @@ def _agent_finalize_sandbox(request: Request, settings: Settings, payload: dict)
             # Task 2: the writer emits ``fs.tar``, and everything snapshot older
             # than that is an exploded ``fs/`` directory -- this path (the
             # control plane did *not* materialize the tree, so the worker does
-            # it) reads both, through the same shared extractor the agent's
-            # materialize instruction uses.
+            # it) reads both. The tar goes in through ``extract_into_place``
+            # (N68): it unpacks beside the tree and publishes only a complete
+            # one, so a payload refused at the member cap or the time budget
+            # leaves no tree at all instead of a half one. The tree root is
+            # deliberately *not* made before this call -- for the tar shape the
+            # publish makes it, which is what keeps this path's refusal clean.
             try:
                 if snapshot_tar.is_file():
-                    extract_sandbox_archive(snapshot_tar, workspace_dir)
+                    extract_into_place(snapshot_tar, workspace_dir)
                 elif snapshot_fs.is_dir():
+                    workspace_dir.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(
                         snapshot_fs, workspace_dir, dirs_exist_ok=True, symlinks=True
                     )

@@ -43,11 +43,15 @@ from c3_agent.fileops import (
 )
 from gateway_common.archive import (
     ArchiveRefusal,
+    extract_into_place,
+    # Kept imported on purpose: the shared-object pin (``test_snapshot_tar``)
+    # asserts this module still names the one extractor, not a private copy.
     extract_sandbox_archive,
     tree_payload_bytes,
 )
 from gateway_common.archive import (
     DESTINATION_IS_A_SYMLINK as ARCHIVE_DESTINATION_IS_A_SYMLINK,
+    TIME_BUDGET_EXCEEDED as ARCHIVE_TIME_BUDGET_EXCEEDED,
     TOO_MANY_MEMBERS as ARCHIVE_TOO_MANY_MEMBERS,
 )
 from gateway_common.paths import (
@@ -68,6 +72,11 @@ BAD_PLAN = "bad-plan"
 #: big (the ``maint`` container is 2 GiB -- Task 3 raised it from the 512 MiB
 #: that the 900 MiB restore already OOMed; ``docs/create-local-first-design.md`` §3.0).
 TREE_TOO_LARGE = "tree-too-large"
+#: Task 15 (N67), surfaced by name here: the archive crossed the unpack's own
+#: wall-clock budget. Same family as :data:`TOO_MANY_MEMBERS` -- a well-formed
+#: archive the *node* must not spend more time on -- and named apart from
+#: :data:`PARTIAL_COPY` for the same reason.
+TIME_BUDGET_EXCEEDED = "archive-time-budget-exceeded"
 #: Task 4 (N63), surfaced by name here (N69): the payload carries more members
 #: than the unpack may index. It is not :data:`PARTIAL_COPY` -- that reason is
 #: "the payload is not what it claims", while this one is a *capacity* refusal
@@ -77,14 +86,16 @@ TREE_TOO_LARGE = "tree-too-large"
 #: the refusal on every image (an operator greps one word).
 TOO_MANY_MEMBERS = "archive-too-many-members"
 
-#: Two archive refusals have a name of their own on this side too. A clean
+#: Three archive refusals have a name of their own on this side too. A clean
 #: member name that lands outside the tree means the **destination** holds a
 #: link, and the caller has to be able to see that; a payload over the member
-#: cap is a capacity refusal the operator has to be able to tell from a broken
-#: payload. Everything else the shared extractor refuses is "the payload is not
-#: what it claims", which is a step that ran and failed (502), never a bad plan.
+#: cap -- or over the unpack's own time budget (N67) -- is a capacity refusal
+#: the operator has to be able to tell from a broken payload. Everything else
+#: the shared extractor refuses is "the payload is not what it claims", which
+#: is a step that ran and failed (502), never a bad plan.
 _ARCHIVE_REFUSALS = {
     ARCHIVE_DESTINATION_IS_A_SYMLINK: DESTINATION_IS_A_SYMLINK,
+    ARCHIVE_TIME_BUDGET_EXCEEDED: TIME_BUDGET_EXCEEDED,
     ARCHIVE_TOO_MANY_MEMBERS: TOO_MANY_MEMBERS,
 }
 
@@ -358,7 +369,14 @@ def _take_snapshot_payload(
             f"the snapshot source {source} is not a tar or a directory",
         )
     try:
-        extract_sandbox_archive(source, root)
+        # ``extract_into_place`` (N68), not ``extract_sandbox_archive``: the
+        # tree root is already there (the create made and chmod-ed it), so the
+        # unpack lands in ``<root>.importing`` and only a *complete* payload is
+        # merged in. A refusal at the member cap or the time budget leaves the
+        # root exactly as it was instead of holding up to 1.5 M members of a
+        # half tree; the merge keeps the ``dirs_exist_ok`` semantics this path
+        # has always had (a migrated tree keeps the files it had).
+        extract_into_place(source, root)
     except ArchiveRefusal as exc:
         raise MaterializeRefusal(
             _ARCHIVE_REFUSALS.get(exc.reason, PARTIAL_COPY),

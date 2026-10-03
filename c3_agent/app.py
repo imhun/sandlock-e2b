@@ -112,6 +112,8 @@ from c3_agent.materialize import (
     MaterializeRefusal,
     materialize_tree,
     PARTIAL_COPY,
+    TIME_BUDGET_EXCEEDED,
+    TOO_MANY_MEMBERS,
     TREE_TOO_LARGE,
 )
 from c3_agent.scan import InventoryScanner, scanner_for
@@ -756,9 +758,18 @@ def _materialize_status(reason: str) -> int:
     over the byte cap (Task 3) is neither: the plan is fine and nothing was
     applied, and the size is the whole refusal -- 413, the same status the
     worker's snapshot capture and import answer.
+
+    A payload over the *member* cap (Task 4/N63) or over the unpack's own time
+    budget (Task 15/N67) is a broken/hostile payload, not a bad plan: both come
+    out of ``gateway_common.archive``'s "the payload is what is wrong" family,
+    so both answer 502 -- the same step-ran-and-failed status ``partial-copy``
+    uses, and never a 400 that would read as "the control plane derived
+    something this agent will not act on".
     """
     if reason == PARTIAL_COPY:
         return 502
     if reason == TREE_TOO_LARGE:
         return 413
+    if reason in (TOO_MANY_MEMBERS, TIME_BUDGET_EXCEEDED):
+        return 502
     return 400
