@@ -10,7 +10,7 @@
 
 **Spec:** 无独立设计文档；本计划的规格就是下面 Global Constraints 里逐字记录的 2026-10-03 用户裁定。
 
-## 当前进度（2026-10-03：**Task 1–5 代码与钉子全部完成，未上线**）
+## 当前进度（2026-10-03：**Task 1–5 + N77 全部完成并上线 `0.1.0-965-gb5f194a-20261003-193743`；两条现场验收已过**）
 
 | Task | 状态 | 提交 |
 |---|---|---|
@@ -22,9 +22,12 @@
 | 5 无戳孤儿回落 | ✅ | `06ded8b`（`manager.py::_ttl_reapable` + `tests/unit/test_sandbox_registry.py` 3 条，贴在既有 N22 钉子旁） |
 | 验收探针 | ✅ | `d73398a`（`deploy/scripts/acceptance/probe_idle_pause.py` + `tests/unit/test_probe_idle_pause_script.py`，4 条） |
 | 回归 | ✅ | `tests/unit` **2419 passed / 12 skipped / 3 failed**（3 条是既有的 macOS-only：`test_real_root_gate` 与 2 条 `test_xfs_quotactl_backend`，需要 Linux `libc.so.6`） |
-| 上线 + 现场验收 | ⬜ **待控制者** | 见下面"上线后验收"：`apply.sh` + 探针 + `sleep` 反向对照 + 读数回填 |
+| 上线 | ✅ | `0.1.0-963`（本批）→ 现场抓到 N77 → `0.1.0-965` 重上；发版记录见 `docs/deploy-clusters.md` §7.36 |
+| 现场验收 1：闲置 → 暂挂 → 恢复 | ✅ | `t+302.4 running → t+317.5 paused → connect 200 → running`；控制面日志 `idle pause: sandbox … idle 309s (>= 300s); paused` |
+| 现场验收 2：静默 hold 的流不算闲置 | ✅ | 150 s hold 期间始终 `running`、`lastActiveAt` 动 7 次；脚本已固化为 `deploy/scripts/acceptance/probe_stream_keepalive.py` |
+| **N77（本轮现场抓到的 bug）** | ✅ 已修 + 已上线 | 判死读本副本缓存而非共享行 ⇒ 误判活节点、把活沙箱标孤儿（被本批的 orphan TTL 放大成 5 分钟后真拆）。修 `8c5b4ec`，先红钉子 `test_redis_multireplica.py::test_the_health_sweep_reads_the_shared_view_not_the_local_cache`；登记在 `docs/open-issues.md` N77 |
 
-两处与原计划不同的做法（都记在上面各自 Task 里）：Task 2 用 `_state_of(ctx)` 一个访问器替掉 16 处调用点改动；Task 5 的钉子放进了 `tests/unit/test_sandbox_registry.py`，没有另起文件。
+三处与原计划不同的做法（都记在上面各自 Task 里）：Task 2 用 `_state_of(ctx)` 一个访问器替掉 16 处调用点改动；Task 5 的钉子放进了 `tests/unit/test_sandbox_registry.py`，没有另起文件；探针在**现场**被改了两回（先读错载荷：`GET /sandboxes/{id}` 不含 `state`；再把"返回字符串的 fetch"套进按 payload 解析的 `state_of` —— 两次都补了钉子）。
 
 ## Global Constraints
 
@@ -357,7 +360,7 @@ git commit -m "fix(cp): a stampless orphan ages from end_at when the orphan TTL 
 
 1. 构建 + `apply.sh`（两个新 env 随 CP 滚动生效；`DRY_RUN=1 ... | kubectl diff -f -` 先看 0 行）。
 2. `deploy/scripts/acceptance/probe_idle_pause.py`（本期新建，只读+一次建箱/删箱）：建一个 `timeout=900` 的沙箱 → 不发任何请求 → 6 分钟内 `GET /sandboxes/<id>` 必须看到 `state: paused`、`pausedAt` 非空；再 `POST /sandboxes/<id>/connect` → `state: running`；最后 `DELETE`，两节点预约回到 `0/0`。
-3. 反向对照：`commands.run("sleep 600")` 期间（CPU≈0、无新流量）不得被暂挂 —— 6 分钟后仍是 `running`。
+3. 反向对照：`deploy/scripts/acceptance/probe_stream_keepalive.py`（**本轮已把它从 tmp 固化进仓库**）——150 s 静默 hold 期间状态必须始终 `running` 且 `lastActiveAt` 至少动 3 次（`0.1.0-965` 现场：动 7 次）。
 4. 三条读数回填 `docs/deploy-clusters.md` 新 §7.36 与 `docs/open-issues.md`（N61 行的"下一步"改写成本版的实测结论）。
 
 ## 本期明确不做
