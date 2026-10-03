@@ -346,6 +346,19 @@ spec:
               value: http://control-plane:3000
             - name: E2B_SHARED_WORKSPACE_ROOT
               value: /var/lib/e2b-sandboxes
+            # N65: the volume store's root, spelled the same as the worker's
+            # (`worker.yaml`: `E2B_SHARED_VOLUME_ROOT`). The control plane
+            # derives every volume path from it (`app.py`: `volume_root =
+            # settings.shared_volume_root or platform_root / "_volumes"`) and
+            # the create/migration judge reads the same value to decide whether
+            # a volume is *shared*. Left unset, the store still lands under the
+            # platform root, but the volume records' default `node_id` ("local")
+            # then reads as a real pin to a node no worker has -- and the pin
+            # was dropped by placement with no trace. Set here, the two halves
+            # of the fact (the store's root and the judge's input) agree, and
+            # the pair is pinned by tests/unit/test_volume_pin_fact.py.
+            - name: E2B_SHARED_VOLUME_ROOT
+              value: /var/lib/e2b-sandboxes
             # N57 / Task 3: the *tree* root now lives on each **node's own
             # disk** (`/var/lib/e2b/workspaces`, the worker's and face B's
             # hostPath). This pod has no mount there and never touches a tree:

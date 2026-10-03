@@ -1108,27 +1108,19 @@ async def _create_sandbox_attempt(
             if registry.get_pending(sandbox_id_hdr) is not None:
                 raise OfficialError(503, "Sandbox create still in progress")
 
-    # Select a compute node and reserve its quota (volume/snapshot affinity).
-    volume_node_id: str | None = None
-    if snapshot is not None:
-        volume_node_id = snapshot.node_id
-    elif volume_mounts:
-        volume_records = [
-            request.app.state.volumes.get(m["name"]) for m in volume_mounts
-        ]
-        shared_root = settings.shared_volume_root
-        shared = bool(
-            shared_root
-            and all(
-                r.path is not None and r.path.is_relative_to(Path(shared_root).resolve())
-                for r in volume_records
-            )
-        )
-        if not shared:
-            node_ids = {r.node_id for r in volume_records}
-            if len(node_ids) > 1:
-                raise OfficialError(400, "all volume mounts must be on the same node")
-            volume_node_id = next(iter(node_ids)) if node_ids else None
+    # Select a compute node and reserve its quota (volume affinity, N65).
+    #
+    # Two things changed here and both are deliberate:
+    #  * the **snapshot pin is gone**. ``snapshot.node_id`` is a soft pin at
+    #    best -- a snapshot is a tar on the shared volume, so pinning its
+    #    create to the node that happened to capture it bought no locality --
+    #    and its ``elif`` shape let a snapshot skip the volume check entirely
+    #    whenever a snapshot *and* a node-local volume were both in play. A pin
+    #    now comes from one place only: a volume whose bytes are not shared.
+    #  * "is this volume shared?" is answered from where the bytes actually
+    #    live (``_non_shared_volume_node_id``), not from whether the deployment
+    #    remembered to export ``E2B_SHARED_VOLUME_ROOT``.
+    volume_node_id = _non_shared_volume_node_id(request, volume_mounts)
     node = request.app.state.select_node(
         base_image=base_image,
         volume_node_id=volume_node_id,
@@ -2536,21 +2528,45 @@ async def _stop_source_runtime(request, record, node) -> bool:
     return resp.status_code == 204
 
 
-def _migration_volume_node_id(request, record) -> str | None:
-    """Return the node pinning non-shared volumes, else ``None``."""
-    if not record.volume_mounts:
+def _non_shared_volume_node_id(
+    request, volume_mounts: list[dict[str, str]] | None
+) -> str | None:
+    """The node holding this sandbox's **non-shared** volumes, else ``None``.
+
+    N65: "is this volume shared?" is a fact about where the bytes live, and it
+    is answered here from the volume records' paths -- never from whether the
+    deployment remembered to export ``E2B_SHARED_VOLUME_ROOT``. A volume is
+    shared when its path sits under that root (when it is named) **or** under
+    the platform's own namespace root, which is exactly the root ``create_app``
+    derives the volume store from when the env is unset
+    (``platform_root / "_volumes"``).
+
+    Reading only the env made every volume of a deployment that never set it
+    look node-local: ``POST /volumes`` records ``node_id`` as the default
+    ``"local"``, so a create was pinned to ``"local"`` -- a node no worker has
+    -- and placement dropped the pin with no trace. The shared store's path is
+    the verifiable half of the fact; the env is only a hint. The two callers
+    (create admission and migration) share this one judge so they cannot drift.
+
+    Raises the same 400 when the records disagree about which node holds them.
+    """
+    if not volume_mounts:
         return None
     volume_registry = request.app.state.volumes
     settings = request.app.state.settings
     shared_root = settings.shared_volume_root
-    volume_records = [volume_registry.get(m["name"]) for m in record.volume_mounts]
-    shared = bool(
-        shared_root
-        and all(
-            r.path is not None
-            and r.path.is_relative_to(Path(shared_root).resolve())
-            for r in volume_records
+    platform_root = Path(request.app.state.platform_root).resolve()
+    volume_records = [volume_registry.get(m["name"]) for m in volume_mounts]
+    shared = all(
+        r.path is not None
+        and (
+            (
+                shared_root is not None
+                and r.path.is_relative_to(Path(shared_root).resolve())
+            )
+            or r.path.is_relative_to(platform_root)
         )
+        for r in volume_records
     )
     if shared:
         return None
@@ -2558,6 +2574,11 @@ def _migration_volume_node_id(request, record) -> str | None:
     if len(node_ids) > 1:
         raise OfficialError(400, "all volume mounts must be on the same node")
     return next(iter(node_ids)) if node_ids else None
+
+
+def _migration_volume_node_id(request, record) -> str | None:
+    """Return the node pinning non-shared volumes, else ``None``."""
+    return _non_shared_volume_node_id(request, record.volume_mounts)
 
 
 def _platform_namespace_shared_root(settings) -> str | None:

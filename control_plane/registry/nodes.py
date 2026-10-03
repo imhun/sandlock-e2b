@@ -267,8 +267,13 @@ class NodeRegistry:
         self._ns = namespace
         self._quota_store = None
         self._view = None
+        #: N70: the atomic reservation counters (``e2b:node:res:<id>``), kept
+        #: apart from the JSON view row so a heartbeat's read-modify-write of
+        #: the row cannot clobber a release made by another replica.
+        self._res_store = None
         if redis_client is not None:
             from control_plane.registry.redis_backend import (
+                RedisNodeReservationStore,
                 RedisNodeStore,
                 RedisQuotaStore,
             )
@@ -279,6 +284,7 @@ class NodeRegistry:
             # same reservations. The process dict stays as a cache for the
             # single-process deployment (no Redis).
             self._view = RedisNodeStore(redis_client, namespace)
+            self._res_store = RedisNodeReservationStore(redis_client, namespace)
         #: A view nobody refreshes has to retire itself: the worker is gone,
         #: not quiet. Several heartbeat windows wide, so one lost reply cannot
         #: erase a live node from the fleet's view.
@@ -313,9 +319,49 @@ class NodeRegistry:
             payload = self._view.get(node_id)
             if payload is not None:
                 record = NodeRecord.from_storage_dict(payload)
+                self._overlay_reservations([record])
                 self._nodes[node_id] = record
                 return record
         return self._nodes.get(node_id)
+
+    def _overlay_reservations(self, records: list[NodeRecord]) -> None:
+        """Take ``reserved_*`` from the atomic counter hashes (N70).
+
+        The JSON row also carries ``reserved_*`` -- that is the pre-N70 shape,
+        kept so a rolling upgrade reads sensibly in both directions -- but the
+        row is one string written whole, so a heartbeat on one replica can
+        overwrite a release made on another. The counter hash is the atomic
+        copy and therefore wins wherever it exists; a node with no counter yet
+        (an older replica's row) keeps the row's own fields as the fallback.
+
+        The counters are read in one round trip, and the in-process
+        (``local://``) node is skipped: it is never published to the shared
+        store, so it can have no counter there.
+        """
+        shared = [r for r in records if r.address != "local://"]
+        if self._res_store is None or not shared:
+            return
+        counters = self._res_store.get_many([r.node_id for r in shared])
+        for record in shared:
+            values = counters.get(record.node_id)
+            if values is None:
+                continue
+            record.reserved_memory_mb = values.get(
+                "memory", record.reserved_memory_mb
+            )
+            record.reserved_cpu_percent = values.get(
+                "cpu", record.reserved_cpu_percent
+            )
+            record.reserved_disk_mb = values.get("disk", record.reserved_disk_mb)
+            record.reserved_processes = values.get(
+                "processes", record.reserved_processes
+            )
+
+    def _bump_reservation_counter(self, node_id: str, dims: dict[str, int]) -> None:
+        """Move the atomic reservation counter (N70); no-op without Redis."""
+        if self._res_store is None:
+            return
+        self._res_store.add(node_id, dims)
 
     def _persist_locked(self, record: NodeRecord) -> None:
         """Publish one node's view. Callers hold ``self._lock``.
@@ -479,6 +525,20 @@ class NodeRegistry:
             record.reserved_cpu_percent = max(0, cpu_percent)
             record.reserved_disk_mb = max(0, disk_mb)
             record.reserved_processes = max(0, processes)
+            # N70: the counter hash is the atomic copy of these four fields, so
+            # a registration reconciliation has to move it too -- writing only
+            # the row would let the next heartbeat's read-modify-write restore
+            # the value this call just corrected.
+            if self._res_store is not None:
+                self._res_store.set(
+                    record.node_id,
+                    {
+                        "memory": record.reserved_memory_mb,
+                        "cpu": record.reserved_cpu_percent,
+                        "disk": record.reserved_disk_mb,
+                        "processes": record.reserved_processes,
+                    },
+                )
             self._persist_locked(record)
             return record
 
@@ -557,6 +617,7 @@ class NodeRegistry:
                 records.extend(
                     r for r in self._nodes.values() if r.address == "local://"
                 )
+                self._overlay_reservations(records)
                 for record in records:
                     self._nodes[record.node_id] = record
                     self._status_of(record)
@@ -667,6 +728,13 @@ class NodeRegistry:
                     )
                 ):
                     continue
+                # N70: the counter hash is the authoritative copy of exactly
+                # those four fields, so a row that reads empty must not be
+                # dropped while the counters still hold something.
+                if self._res_store is not None:
+                    counters = self._res_store.get(node_id)
+                    if counters is not None and any(counters.values()):
+                        continue
                 if now - record.heartbeat_at <= (
                     self._PRUNE_AFTER_WINDOWS * self._heartbeat_timeout
                 ):
@@ -681,6 +749,11 @@ class NodeRegistry:
                         self._view.delete(node_id)
                     except Exception:  # pragma: no cover - defensive
                         pass
+                if self._res_store is not None:
+                    try:
+                        self._res_store.delete(node_id)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
                 pruned.append(node_id)
         return pruned
 
@@ -693,6 +766,18 @@ class NodeRegistry:
                 except Exception:  # pragma: no cover - defensive
                     logger.warning(
                         "could not retire the node view for %s", node_id, exc_info=True
+                    )
+            if self._res_store is not None:
+                # N70: the counters go with the row, so a later re-registration
+                # under the same id starts from the ledger and the records
+                # rather than from a counter nobody withdrew.
+                try:
+                    self._res_store.delete(node_id)
+                except Exception:  # pragma: no cover - defensive
+                    logger.warning(
+                        "could not retire the node reservation counter for %s",
+                        node_id,
+                        exc_info=True,
                     )
 
     def add_local_node(
@@ -730,8 +815,12 @@ class NodeRegistry:
             # Placement sees the *fleet*, not just the nodes this replica has
             # heard from: the shared view is refreshed on every read, and the
             # admission decision itself stays atomic in the quota store below.
-            for payload in self._view.list():
-                record = NodeRecord.from_storage_dict(payload)
+            fresh = [
+                NodeRecord.from_storage_dict(payload)
+                for payload in self._view.list()
+            ]
+            self._overlay_reservations(fresh)
+            for record in fresh:
                 self._nodes[record.node_id] = record
         self._sweep_health_locked()
         now = time.time()
@@ -792,6 +881,45 @@ class NodeRegistry:
             "disk_limit_mb": disk_limit,
         }
 
+    def _pin_miss_reason_locked(
+        self,
+        node_id: str,
+        *,
+        exclude_node_id: str | None,
+        memory_mb: int,
+        cpu_percent: int,
+        disk_mb: int,
+        processes: int,
+    ) -> str:
+        """Why the pinned node is not among the placeable candidates (N65).
+
+        The order mirrors ``_placeable_candidates_locked``'s filters, so the
+        named gate is the first one that actually kept the node out of
+        placement. Callers hold ``self._lock`` and have just refreshed the
+        fleet into ``self._nodes``, so a missing record really means "no such
+        node".
+        """
+        record = self._nodes.get(node_id)
+        if record is None:
+            return "there is no such node in the fleet"
+        if record.status != "healthy":
+            return "it is unhealthy"
+        if node_id == exclude_node_id:
+            return "it is excluded from this placement"
+        if record.draining:
+            return "it is draining"
+        if (
+            record.address != "local://"
+            and time.time() - record.heartbeat_at > PLACEMENT_MAX_HEARTBEAT_AGE_S
+        ):
+            return "it has not heartbeated recently enough for new work"
+        dimension = record.blocking_dimension(
+            memory_mb, cpu_percent, disk_mb, processes
+        )
+        if dimension is not None:
+            return f"it does not fit the sandbox ({dimension})"
+        return "it is not placeable"
+
     def select_and_reserve(
         self,
         *,
@@ -819,11 +947,17 @@ class NodeRegistry:
         candidate.
 
         A ``volume_node_id`` turns that off: a pin is a **requirement**, not a
-        preference (the caller wants the node the snapshot or the non-shared
-        volume lives on, and ``migrate`` passes one for the same reason), so a
-        store refusal on the pinned node keeps today's ``503`` -- it is named
-        as a *pinned* refusal instead of quietly placing the sandbox off its
-        volume.
+        preference (the caller wants the node the non-shared volume lives on,
+        and ``migrate`` passes one for the same reason), so a store refusal on
+        the pinned node keeps today's ``503`` -- it is named as a *pinned*
+        refusal instead of quietly placing the sandbox off its volume.
+
+        N65: a pin that names a node **no candidate can be** used to be dropped
+        with no trace -- ``rank_candidates`` simply ranked the rest and the
+        sandbox landed somewhere else. That is still the placement decision
+        (a nominal pin must not refuse a legal create, so this is deliberately
+        not a ``503``), but it is now named: the pinned node, the gate that
+        kept it out, and the fallback are one WARNING.
         """
         with self._lock:
             ranked = rank_candidates(
@@ -835,6 +969,23 @@ class NodeRegistry:
                 disk_mb=disk_mb,
                 processes=processes,
             )
+            if volume_node_id is not None and ranked and not any(
+                n.node_id == volume_node_id for n in ranked
+            ):
+                logger.warning(
+                    "volume pin to node %s could not be honoured (%s); the pin "
+                    "is ignored and placement falls back to the ranked "
+                    "candidates",
+                    volume_node_id,
+                    self._pin_miss_reason_locked(
+                        volume_node_id,
+                        exclude_node_id=exclude_node_id,
+                        memory_mb=memory_mb,
+                        cpu_percent=cpu_percent,
+                        disk_mb=disk_mb,
+                        processes=processes,
+                    ),
+                )
             #: Without a pin, every ranked candidate is a legitimate answer, so
             #: they are tried in order. With one, the only acceptable answer is
             #: the pinned node (or, when the pin cannot fit at all, the same
@@ -886,6 +1037,15 @@ class NodeRegistry:
                             )
                         continue
                 node.reserve(memory_mb, cpu_percent, disk_mb, processes)
+                self._bump_reservation_counter(
+                    node.node_id,
+                    {
+                        "memory": memory_mb,
+                        "cpu": cpu_percent,
+                        "disk": disk_mb,
+                        "processes": processes,
+                    },
+                )
                 self._persist_locked(node)
                 return node
             # Reached only when the loop above never returned, i.e. when the
@@ -946,6 +1106,15 @@ class NodeRegistry:
                 if not ok:
                     return None
             record.reserve(memory_mb, cpu_percent, disk_mb, processes)
+            self._bump_reservation_counter(
+                record.node_id,
+                {
+                    "memory": memory_mb,
+                    "cpu": cpu_percent,
+                    "disk": disk_mb,
+                    "processes": processes,
+                },
+            )
             self._persist_locked(record)
             return record
 
@@ -990,4 +1159,15 @@ class NodeRegistry:
                     },
                 )
             record.release(memory_mb, cpu_percent, disk_mb, processes)
+            # N70: give the reservation back in the atomic counter too. A value
+            # that lands below zero is named by the store, not clamped here.
+            self._bump_reservation_counter(
+                node_id,
+                {
+                    "memory": -memory_mb,
+                    "cpu": -cpu_percent,
+                    "disk": -disk_mb,
+                    "processes": -processes,
+                },
+            )
             self._persist_locked(record)

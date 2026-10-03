@@ -382,6 +382,113 @@ class RedisNodeStore:
         self._client.delete(self._key(node_id))
 
 
+class RedisNodeReservationStore:
+    """Per-node reservation counters, in their own atomic hash (N70).
+
+    ``RedisNodeStore`` keeps a whole node view as **one JSON string**, so a
+    heartbeat and a delete both do read-modify-write on it and two replicas
+    lose each other's updates. The live shape: the view's ``reserved_*`` came
+    out *higher* than the sandbox records (worker-0 holding a phantom 1024 MB),
+    the shared quota ledger was clean, no warning was logged, and only a
+    re-registration pressed the view back down.
+
+    The counters therefore live in a hash of their own, where ``HINCRBY`` is
+    atomic, and ``NodeRegistry`` merges them over the row on every read. The row
+    keeps carrying ``reserved_*`` as well (that is the pre-N70 shape): a replica
+    that has never written a counter for a node reads the row, so a rolling
+    upgrade stays self-consistent in both directions.
+
+    Negative counters are **named, never clamped**: a value below zero means
+    the counter and the sandbox records disagree, and quietly flooring it to
+    zero would hide exactly the drift this class exists to make visible.
+    """
+
+    #: The four dimensions, in the order the warnings name them (stable text).
+    DIMENSIONS = ("memory", "cpu", "disk", "processes")
+
+    def __init__(self, client: Any, namespace: str) -> None:
+        self._client = client
+        self._ns = namespace
+
+    def _key(self, node_id: str) -> str:
+        return f"{self._ns}:node:res:{node_id}"
+
+    def add(self, node_id: str, dims: dict[str, int]) -> None:
+        """Move each dimension by ``dims`` atomically; name a negative result.
+
+        A reserve passes positive values, a release negated ones -- either way
+        it is one ``HINCRBY`` per dimension inside one pipeline, so no replica
+        can read a half-applied reservation and write it back over another's.
+        """
+        key = self._key(node_id)
+        with self._client.pipeline() as pipe:
+            for dim in self.DIMENSIONS:
+                pipe.hincrby(key, dim, int(dims.get(dim, 0)))
+            values = pipe.execute()
+        self._name_negatives(
+            node_id, dict(zip(self.DIMENSIONS, (int(v) for v in values)))
+        )
+
+    def set(self, node_id: str, dims: dict[str, int]) -> None:
+        """Set every dimension (registration reconciliation); name a negative."""
+        values = {dim: int(dims.get(dim, 0)) for dim in self.DIMENSIONS}
+        self._client.hset(self._key(node_id), mapping=values)
+        self._name_negatives(node_id, values)
+
+    def get(self, node_id: str) -> dict[str, int] | None:
+        """Every dimension, or ``None`` when this node has no counter yet.
+
+        ``None`` is the fallback signal the registry needs: a node without a
+        counter hash (an older replica's row, or a write that has not landed)
+        must read its reservations from the JSON view row, not from zero.
+        """
+        return self.get_many([node_id])[node_id]
+
+    def get_many(
+        self, node_ids: Sequence[str]
+    ) -> dict[str, dict[str, int] | None]:
+        """The counter for each id in one round trip (``None`` when absent)."""
+        ids = list(node_ids)
+        if not ids:
+            return {}
+        with self._client.pipeline() as pipe:
+            for node_id in ids:
+                pipe.hgetall(self._key(node_id))
+            rows = pipe.execute()
+        out: dict[str, dict[str, int] | None] = {}
+        for node_id, raw in zip(ids, rows):
+            if not raw:
+                out[node_id] = None
+                continue
+            values = {
+                (k.decode() if isinstance(k, bytes) else k): int(v)
+                for k, v in raw.items()
+            }
+            self._name_negatives(node_id, values)
+            out[node_id] = values
+        return out
+
+    def delete(self, node_id: str) -> None:
+        self._client.delete(self._key(node_id))
+
+    @staticmethod
+    def _name_negatives(node_id: str, values: dict[str, int]) -> None:
+        """Name a negative counter instead of clamping it to zero."""
+        negative = ", ".join(
+            f"{dim}={values[dim]}"
+            for dim in RedisNodeReservationStore.DIMENSIONS
+            if values.get(dim, 0) < 0
+        )
+        if negative:
+            logger.warning(
+                "node %s reservation counter is negative (%s); the shared "
+                "counter and the sandbox records disagree, and the counter is "
+                "read as it stands rather than clamped to 0",
+                node_id,
+                negative,
+            )
+
+
 class RedisUidLedger:
     """Fleet-wide host-uid allocations, authoritative outside the volume.
 

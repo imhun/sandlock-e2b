@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 
 import pytest
@@ -317,6 +318,98 @@ def test_only_one_replica_sweeps_each_round():
 
 def test_without_redis_this_process_is_the_sweeper():
     assert NodeRegistry().try_acquire_sweep(ttl_s=1) is True
+
+
+# --------------------------------------------------------------- N70
+#
+# The view row (``e2b:node:view:<id>``) is **one JSON string** written whole, so
+# the heartbeat and the delete path both do read-modify-write on it and two
+# replicas lose each other's updates. The live shape (2026-10-02): the view's
+# ``reserved_*`` came out *higher* than the sandbox records -- worker-0 holding a
+# phantom 1024 MB -- the shared quota ledger was clean, no warning was logged,
+# and only a re-registration pressed the view back down. The reservations now
+# live in an atomic counter hash of their own, which the registry merges over
+# the row on every read; the row keeps carrying the fields for a rolling
+# upgrade, so a node with no counter hash still reads sensibly.
+
+
+def test_concurrent_heartbeat_and_release_do_not_lose_the_release():
+    """Replica B's stale read-modify-write must not un-release A's release."""
+    server = fakeredis.FakeServer()
+    nodes_a = NodeRegistry(redis_client=fakeredis.FakeRedis(server=server))
+    nodes_b = NodeRegistry(redis_client=fakeredis.FakeRedis(server=server))
+    _register(nodes_a)
+
+    placed = nodes_a.select_and_reserve(
+        base_image=None, memory_mb=1024, cpu_percent=200, disk_mb=8192, processes=512
+    )
+    assert placed is not None
+    assert placed.reserved_memory_mb == 1024
+
+    # The heartbeat on replica B read the row *before* the release, so the copy
+    # it is about to write back still says the reservation is held.
+    stale = nodes_b.get("node_shared")
+    assert stale.reserved_memory_mb == 1024
+
+    nodes_a.release_quota(
+        "node_shared", memory_mb=1024, cpu_percent=200, disk_mb=8192, processes=512
+    )
+    nodes_b.publish(stale)  # whole-row write-back of the pre-release numbers
+
+    # The row says 1024 again; the atomic counter says 0, and it wins.
+    assert nodes_a.get("node_shared").reserved_memory_mb == 0
+    assert nodes_b.get("node_shared").reserved_memory_mb == 0
+
+
+def test_a_missing_counter_hash_falls_back_to_the_row():
+    """A node with no counter yet (rolling upgrade) reads the row's fields."""
+    server = fakeredis.FakeServer()
+    client = fakeredis.FakeRedis(server=server)
+    nodes_a = NodeRegistry(redis_client=client)
+    nodes_b = NodeRegistry(redis_client=fakeredis.FakeRedis(server=server))
+    _register(nodes_a)
+
+    record = nodes_a.get("node_shared")
+    record.reserved_memory_mb = 700
+    record.reserved_cpu_percent = 42
+    record.reserved_disk_mb = 300
+    record.reserved_processes = 7
+    nodes_a.publish(record)
+
+    assert client.exists("e2b:node:res:node_shared") == 0
+    seen = nodes_b.get("node_shared")
+    assert (
+        seen.reserved_memory_mb,
+        seen.reserved_cpu_percent,
+        seen.reserved_disk_mb,
+        seen.reserved_processes,
+    ) == (700, 42, 300, 7)
+
+
+def test_a_negative_counter_is_named_not_clamped(caplog):
+    """A counter below zero is reported verbatim, never floored to zero."""
+    server = fakeredis.FakeServer()
+    client = fakeredis.FakeRedis(server=server)
+    nodes = NodeRegistry(redis_client=client)
+    _register(nodes)
+    client.hset(
+        "e2b:node:res:node_shared",
+        mapping={"memory": -512, "cpu": 0, "disk": 0, "processes": 0},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        seen = nodes.get("node_shared")
+
+    assert seen.reserved_memory_mb == -512
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ] == [
+        "node node_shared reservation counter is negative (memory=-512); the "
+        "shared counter and the sandbox records disagree, and the counter is "
+        "read as it stands rather than clamped to 0"
+    ]
 
 
 # --------------------------------------------------------------- F11 step 3
