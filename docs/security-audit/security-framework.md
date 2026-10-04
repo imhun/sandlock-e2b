@@ -25,75 +25,87 @@ containerd 2.3.4、Rocky 10.2、部署版本 `0.1.0-979`）实测的。
 ## 架构图
 
 ```mermaid
-flowchart TD
-    A["沙箱进程发起 syscall"] --> B{"① seccomp 内层<br/>blocklist 76 条（按名字）<br/>arg 过滤 3 处：clone/socket/ioctl"}
-    B -->|拒| E1["EPERM<br/><i>名单外一律落这里</i>"]
-    B -->|过| C{"② Landlock · ABI 6<br/>六项保护 floor 2/3/4/5/6/6<br/>全部够得着"}
-    C -->|拒| E2["EACCES / EPERM<br/><i>ABI 不够则建箱阶段就失败</i>"]
-    C -->|过| D{"③ 中介层 · supervisor 代执行<br/>路径翻译 / proc 合成<br/>netlink 虚拟 / connect 代建连"}
-    D -->|拒| E3["EOPNOTSUPP / EAFNOSUPPORT / EIO<br/><i>语义拒绝，不是权限</i>"]
-    D -->|过| F["worker 容器（pod 独立 pid ns）<br/>uid 65534 · cap drop ALL"]
-    F --> G{"④ 外层 seccomp profile<br/>SCMP_ACT_ERRNO + 416 条允许"}
-    G -->|拒| E4["ENOSYS 38<br/><i>指纹与 ① 的 EPERM 不同</i>"]
-    G -->|过| H["宿主机 kernel"]
-
-    H["宿主机 kernel"]:::host
-    E1:::deny
-    E2:::deny
-    E3:::deny
-    E4:::deny
-
-    classDef host fill:#7f1d1d,stroke:#ef4444,stroke-width:2px,color:#fff
-    classDef deny fill:#1f2937,stroke:#6b7280,color:#e5e7eb
-    style F fill:#1e3a5f,stroke:#3b82f6,color:#fff
-    style A fill:#1e3a5f,stroke:#3b82f6,color:#fff
-```
-
-```mermaid
-flowchart TB
-    C["客户端"]:::ext
-
-    subgraph OUT["集群外"]
-        C
+flowchart LR
+    subgraph DEF["防护层 · 谁拦什么"]
+        direction TB
+        L1["<b>L1 准入</b><br/>API key · 配额 · 记账<br/><i>control_plane</i>"]
+        L2["<b>L2 令牌</b><br/>X-Access-Token →<br/>runtime registry<br/><i>envd 两半守卫</i>"]
+        L3["<b>L3 seccomp 内层</b><br/>blocklist 76 + arg 过滤 3<br/>EPERM"]
+        L4["<b>L4 Landlock</b><br/>ABI 6 · 路径 + IOCTL_DEV<br/>EACCES"]
+        L5["<b>L5 中介层</b><br/>路径翻译 · /proc 合成<br/>netlink 虚拟 · 代执行"]
+        L6["<b>L6 外层 profile</b><br/>SCMP_ACT_ERRNO + 416<br/>ENOSYS(38)"]
+        L7["<b>L7 网络策略</b><br/>NetworkPolicy blackhole<br/><i>c3-agent 唯一隔离</i>"]
     end
 
-    subgraph CP["控制面 :3000 — 对外唯一入口"]
-        GW["gateway<br/>准入 / 配额 / 记账<br/>X-Access-Token"]:::cp
-    end
-
-    subgraph CLUSTER["k0s cluster · namespace sandlock"]
-        subgraph WPOD["e2b-worker pod · pod 独立 pid ns"]
-            ENVD["envd 执行代理"]:::worker
-            SUP["supervisor<br/>持 seccomp notify fd"]:::worker
-            subgraph SB["沙箱 · pid ns 独立（E2B_PID_NS）· net ns 独立"]
-                P["沙箱进程"]:::sandbox
+    subgraph TOPO["部署拓扑 · namespace sandlock"]
+        direction TB
+        C["客户端"]
+        subgraph NPD["集群外"]
+            C
+        end
+        subgraph NS["k0s namespace sandlock"]
+            direction TB
+            GW["control-plane Deployment<br/><b>对外唯一入口 :3000</b>"]
+            RD[("redis")]
+            BK["buildkit<br/><i>compose 侧仅 unix socket</i>"]
+            subgraph WPOD["e2b-worker StatefulSet pod<br/>runAsUser 65534 · cap drop ALL<br/>hostPID 未设 · pod 独立 pid ns"]
+                direction TB
+                ENVD["envd 执行代理"]
+                SUP["supervisor<br/><i>持 seccomp notify fd</i>"]
+                subgraph SBX["沙箱 · E2B_PID_NS · E2B_ENABLE_NET_ISOLATION<br/>uid 池内独占 · pid/net ns 独立"]
+                    P["沙箱进程"]
+                end
+                NAS[("共享 NAS<br/>workspaces/ · state/_images")]
+                ENVD --> SUP --> SBX
+                SBX <--> NAS
             end
-            NAS[("共享 NAS<br/>workspaces/ · state/_images")]:::store
-            ENVD --> SUP --> P
-            P <--> NAS
+            subgraph APOD["e2b-c3-agent DaemonSet pod<br/>⚠ hostPID=true · 无 seccompProfile"]
+                AG["c3-agent 私有文件步"]
+            end
+            SI["seccomp-installer DaemonSet<br/><i>安装 L6 profile</i>"]
         end
-
-        subgraph APOD["e2b-c3-agent pod"]
-            AG["c3-agent<br/>hostPID=true<br/>无 seccompProfile"]:::agent
-        end
-
-        NP["NetworkPolicy<br/>worker pod IP 全量 blackhole"]:::policy
+        HOST["宿主机 kernel<br/>6.12.0-211.34.1.el10_2"]
     end
 
-    C -->|"HTTPS + API key"| GW
-    GW -->|"内部 API · 不对外暴露"| ENVD
-    NP -.->|"唯一隔离手段"| AG
-    SB -.->|"到不了"| NP
+    C -->|"① HTTPS"| GW
+    GW -->|"② 内部 API"| ENVD
+    WPOD ==> HOST
+    SBX -.->|"✕ 穿不过去"| HOST
 
-    classDef ext fill:#374151,stroke:#6b7280,color:#f3f4f6
-    classDef cp fill:#1e3a5f,stroke:#3b82f6,color:#fff
-    classDef worker fill:#14532d,stroke:#22c55e,color:#fff
-    classDef sandbox fill:#78350f,stroke:#f59e0b,color:#fff
-    classDef store fill:#374151,stroke:#6b7280,color:#f3f4f6
+    L1 -.-> GW
+    L2 -.-> ENVD
+    L3 -.-> SBX
+    L4 -.-> SBX
+    L5 -.-> SUP
+    L6 -.-> WPOD
+    L7 -.-> APOD
+
+    classDef client fill:#374151,stroke:#6b7280,color:#f3f4f6
+    classDef layer fill:#1f2937,stroke:#60a5fa,color:#e5e7eb
+    classDef svc fill:#14532d,stroke:#22c55e,color:#fff
+    classDef sbx fill:#78350f,stroke:#f59e0b,color:#fff
     classDef agent fill:#7f1d1d,stroke:#ef4444,color:#fff
-    classDef policy fill:#1f2937,stroke:#f59e0b,color:#e5e7eb
-    style SB fill:#451a03,stroke:#f59e0b,color:#fff
+    classDef host fill:#1c1917,stroke:#a8a29e,stroke-width:3px,color:#fff
+    classDef store fill:#374151,stroke:#6b7280,color:#f3f4f6
+    classDef guard fill:#1e3a5f,stroke:#3b82f6,color:#fff
+
+    class C client
+    class L1,L2,L3,L4,L5,L6,L7 layer
+    class GW,ENVD,SUP,SI svc
+    class P sbx
+    class AG agent
+    class HOST host
+    class RD,NAS store
+    class SBX guard
 ```
+
+左右两轴：**左边是防护层**（谁拦什么、各自的拒绝指纹），**右边是部署拓扑**（真实的 namespace / workload / pod）。虚线表示该层管住哪些单元。
+
+看图的三件事：
+
+1. **L6 外层 profile 之下就是宿主 kernel** —— 它是唯一通到宿主的层。L3/L4/L5 全穿也只到 worker 容器。
+2. **c3-agent 那一格是红的**：hostPID=true 且无 seccompProfile，只有 L7 一条 NetworkPolicy 挡着 —— 改一个策略就打通。
+3. **L7 的虚线指向 pod 而不是 agent 本身** —— 因为 blackhole 的是 worker pod IP，agent 仍然看得见节点上的一切。
 
 两张图答两个问题：第一张答"改哪一层会破什么"，第二张答"谁看得见谁"。
 判定链里只有第 ④ 层通到宿主，所以它是唯一值得当边界看的那层 —— 打穿前三层只到 worker 容器。
