@@ -3,10 +3,16 @@
 
 The worker's `diskUsed` now comes from the mediator's dirty set instead of a
 whole-tree walk, and the whole point of the change is that the two agree. An
-independent measurement is taken where the bytes live -- inside the sandbox,
-summing `os.path.getsize` over the tree, which is the same quantity
-`priv_helpers.dir_size` computes -- so this cannot pass by comparing a
-subsystem with itself.
+independent measurement is taken where the bytes live -- inside the sandbox --
+so this cannot pass by comparing a subsystem with itself.
+
+**The truth is the platform's own definition, not "sum of file sizes"**
+(pinned 2026-10-04 while measuring S4): `priv_helpers.dir_size` is *files plus
+directories*, where each directory contributes `st_blocks * 512` (N31). On this
+filesystem a small directory reports 0 blocks, which is why a file-only sum
+passed every scenario this probe had -- until a 20 000-entry directory showed
+up and contributed 796 KiB that the file-only sum never saw (the platform's
+number was right; the probe's truth was wrong).
 
 The sequence is chosen to hit each kind of mark the mediator can make: new
 files at several depths, a new directory, a rename, a whole-branch removal,
@@ -21,9 +27,12 @@ from e2b import Sandbox
 MIB = 1024 * 1024
 
 TREE_SIZE = (
-    "python3 -c \"import os,sys;t='/home/user';"
-    "print(sum(os.path.getsize(os.path.join(r,f)) "
-    "for r,_d,fs in os.walk(t) for f in fs))\""
+    "python3 -c \"import os;t='/home/user';f=0;d=0\n"
+    "for r,_ds,fs in os.walk(t):\n"
+    "    d += os.stat(r).st_blocks * 512\n"
+    "    for n in fs:\n"
+    "        f += os.stat(os.path.join(r, n)).st_size\n"
+    "print(f + d)\""
 )
 
 MUTATE = r"""

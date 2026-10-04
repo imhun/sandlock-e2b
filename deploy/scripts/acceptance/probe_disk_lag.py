@@ -50,10 +50,18 @@ import time
 
 from e2b import Sandbox
 
+#: The platform's own definition (``priv_helpers.dir_size``, N31): file
+#: ``st_size`` **plus** each directory's ``st_blocks * 512``. A file-only sum
+#: matches until a directory gets big enough to matter -- measured 2026-10-04:
+#: one 20 000-entry directory contributes 796 KiB, and the file-only truth read
+#: it as "never converged" while the platform was already right.
 TREE_SIZE = (
-    "python3 -c \"import os;t='/home/user';"
-    "print(sum(os.path.getsize(os.path.join(r,f)) "
-    "for r,_d,fs in os.walk(t) for f in fs))\""
+    "python3 -c \"import os;t='/home/user';f=0;d=0\n"
+    "for r,_ds,fs in os.walk(t):\n"
+    "    d += os.stat(r).st_blocks * 512\n"
+    "    for n in fs:\n"
+    "        f += os.stat(os.path.join(r, n)).st_size\n"
+    "print(f + d)\""
 )
 
 
