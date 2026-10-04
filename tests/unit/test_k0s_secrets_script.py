@@ -57,7 +57,16 @@ MANAGED_KEYS = (
     # the rest so a fresh cluster gets one -- the agent refuses to start without
     # it, and no worker manifest may ever carry it.
     "E2B_C3_AGENT_TOKEN",
+    # N49's step ①: one credential per node, bound to that node. Managed here
+    # (shape ``{"<key>": "<node_id>"}``) so a fresh cluster binds its workers;
+    # absent from the Secret, the worker falls back to the fleet key.
+    "E2B_INTERNAL_NODE_KEYS",
 )
+
+#: N49: the map ``_seed_internal_window`` seeds, and what the tests compare
+#: against. A fixed string (not generated) so a run can only change it if the
+#: script decides to.
+SEEDED_NODE_KEYS = '{"node0-key":"e2b-worker-0","node1-key":"e2b-worker-1"}'
 
 #: 行为用例的假 `kubectl`：只认识 `secrets.sh` 与集群身份闸门真的会发的调用
 #: （闸门的 `config current-context` / `version -o json` / `get nodes -o json`，
@@ -361,7 +370,15 @@ def test_a_fresh_run_creates_the_four_keys_and_prints_only_fingerprints(stub_clu
     assert result.returncode == 0
     stored = _state(state_path)
     assert list(stored) == list(MANAGED_KEYS)
-    for value in stored.values():
+    for key, value in stored.items():
+        if key == "E2B_INTERNAL_NODE_KEYS":
+            # N49: still a secret, but structured -- one credential per node.
+            # Pin the shape, not just "some string".
+            mapping = json.loads(value)
+            assert sorted(mapping.values()) == ["e2b-worker-0", "e2b-worker-1"]
+            for credential in mapping:
+                assert re.fullmatch(r"[0-9a-f]{64}", credential)
+            continue
         assert re.fullmatch(r"[0-9a-f]{64}", value)
     assert result.stdout == _fingerprint_table(stored)
     # 断言的是"值不出现在输出里"——这必须按子串找，否则没法证明它没漏。
@@ -503,6 +520,9 @@ def _seed_internal_window(
         "E2B_REDIS_PASSWORD": "redis-old",
         "E2B_SECRET_MASTER_KEY": "master-old",
         "E2B_C3_AGENT_TOKEN": "agent-old",
+        # N49: managed like the rest, so a seeded Secret already carries it and
+        # a plain run has nothing to backfill.
+        "E2B_INTERNAL_NODE_KEYS": SEEDED_NODE_KEYS,
     }
     if keys is not None:
         payload["E2B_INTERNAL_API_KEYS"] = keys
@@ -567,6 +587,7 @@ def test_rotate_internal_key_keeps_the_old_key_in_the_window_list(stub_cluster):
         "保留 E2B_REDIS_PASSWORD（已有值；要换值请显式 --rotate E2B_REDIS_PASSWORD）",
         "保留 E2B_SECRET_MASTER_KEY（已有值；要换值请显式 --rotate E2B_SECRET_MASTER_KEY）",
         "保留 E2B_C3_AGENT_TOKEN（已有值；要换值请显式 --rotate E2B_C3_AGENT_TOKEN）",
+        "保留 E2B_INTERNAL_NODE_KEYS（已有值；要换值请显式 --rotate E2B_INTERNAL_NODE_KEYS）",
         "secret/e2b-secrets configured",
     ]
 
@@ -607,6 +628,7 @@ def test_finalize_internal_key_rotation_removes_the_named_key(stub_cluster):
             "E2B_REDIS_PASSWORD": "redis-old",
             "E2B_SECRET_MASTER_KEY": "master-old",
             "E2B_C3_AGENT_TOKEN": "agent-old",
+            "E2B_INTERNAL_NODE_KEYS": SEEDED_NODE_KEYS,
         },
     )
 
@@ -630,6 +652,7 @@ def test_finalize_internal_key_rotation_removes_the_named_key(stub_cluster):
         "保留 E2B_REDIS_PASSWORD（已有值；要换值请显式 --rotate E2B_REDIS_PASSWORD）",
         "保留 E2B_SECRET_MASTER_KEY（已有值；要换值请显式 --rotate E2B_SECRET_MASTER_KEY）",
         "保留 E2B_C3_AGENT_TOKEN（已有值；要换值请显式 --rotate E2B_C3_AGENT_TOKEN）",
+        "保留 E2B_INTERNAL_NODE_KEYS（已有值；要换值请显式 --rotate E2B_INTERNAL_NODE_KEYS）",
         "secret/e2b-secrets configured",
     ]
 
@@ -669,6 +692,7 @@ def test_finalize_internal_key_rotation_refuses_an_unknown_key_or_an_empty_list(
             "E2B_REDIS_PASSWORD": "redis-old",
             "E2B_SECRET_MASTER_KEY": "master-old",
             "E2B_C3_AGENT_TOKEN": "agent-old",
+            "E2B_INTERNAL_NODE_KEYS": SEEDED_NODE_KEYS,
         },
     )
     empty = _run(stub_cluster, "--finalize-internal-key-rotation", "internal-old")
@@ -713,6 +737,7 @@ def test_rotate_api_keys_appends_a_new_key_and_keeps_the_old_one(stub_cluster):
         "保留 E2B_REDIS_PASSWORD（已有值；要换值请显式 --rotate E2B_REDIS_PASSWORD）",
         "保留 E2B_SECRET_MASTER_KEY（已有值；要换值请显式 --rotate E2B_SECRET_MASTER_KEY）",
         "保留 E2B_C3_AGENT_TOKEN（已有值；要换值请显式 --rotate E2B_C3_AGENT_TOKEN）",
+        "保留 E2B_INTERNAL_NODE_KEYS（已有值；要换值请显式 --rotate E2B_INTERNAL_NODE_KEYS）",
         "secret/e2b-secrets configured",
     ]
 
@@ -729,6 +754,7 @@ def test_finalize_api_key_rotation_removes_the_named_key_but_never_the_last_one(
             "E2B_REDIS_PASSWORD": "redis-old",
             "E2B_SECRET_MASTER_KEY": "master-old",
             "E2B_C3_AGENT_TOKEN": "agent-old",
+            "E2B_INTERNAL_NODE_KEYS": SEEDED_NODE_KEYS,
         },
     )
 
@@ -747,6 +773,7 @@ def test_finalize_api_key_rotation_removes_the_named_key_but_never_the_last_one(
         "保留 E2B_REDIS_PASSWORD（已有值；要换值请显式 --rotate E2B_REDIS_PASSWORD）",
         "保留 E2B_SECRET_MASTER_KEY（已有值；要换值请显式 --rotate E2B_SECRET_MASTER_KEY）",
         "保留 E2B_C3_AGENT_TOKEN（已有值；要换值请显式 --rotate E2B_C3_AGENT_TOKEN）",
+        "保留 E2B_INTERNAL_NODE_KEYS（已有值；要换值请显式 --rotate E2B_INTERNAL_NODE_KEYS）",
         "secret/e2b-secrets configured",
     ]
 
@@ -822,6 +849,7 @@ def test_the_single_slot_rotate_of_a_windowed_key_points_at_the_window_pair(
         "E2B_REDIS_PASSWORD": "redis-old",
         "E2B_SECRET_MASTER_KEY": "master-old",
         "E2B_C3_AGENT_TOKEN": "agent-old",
+        "E2B_INTERNAL_NODE_KEYS": SEEDED_NODE_KEYS,
     }
 
     warned = _run(stub_cluster, "--rotate", "E2B_API_KEYS")

@@ -185,10 +185,23 @@ spec:
             # cannot verify a claim. A node-scoped request whose claim does not
             # resolve to a pod address is refused (503), and the address the
             # control plane dials back is the pod's -- never `body["address"]`.
-            # `E2B_INTERNAL_NODE_KEYS` (per-node credentials, the design's
-            # near-term hardening) is deliberately *not* set here; read
-            # `docs/open-issues.md` N49 for exactly what this does and does not
-            # close.
+            # N49 step ① (2026-10-03): per-node credentials are now shipped --
+            # the map `{"<key>": "<node_id>"}` that `secrets.sh` generates, one
+            # credential per worker. A request presenting a bound key must claim
+            # that same node (403 otherwise), so the identity comes from the
+            # *credential* and the source IP becomes the second factor rather
+            # than the only one. `optional: true`: without the map (an older
+            # Secret, or a lane that ships none) the fleet key above is accepted
+            # exactly as before, with the once-per-key warning naming the gap.
+            # What this does *not* close (still N49): a compromise inside a
+            # worker pod is that node's trust domain either way; the end state
+            # is a pod identity (SA token / mTLS), not a shared bearer.
+            - name: E2B_INTERNAL_NODE_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_INTERNAL_NODE_KEYS
+                  optional: true
             - name: E2B_NODE_ADDRESS_MODE
               value: k8s
             - name: E2B_NODE_ADDRESS_NAMESPACE

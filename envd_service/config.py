@@ -644,8 +644,14 @@ class Settings:
 
         Node-bound when ``E2B_INTERNAL_NODE_KEYS`` carries this node (N49's
         step ①: the credential says who is calling), the fleet key otherwise.
+        The map is ``{credential: node_id}`` -- the control plane's
+        ``node_id_for_key`` reads it that way -- so this looks up the
+        credential whose *value* is this node.
         """
-        return self.internal_node_keys.get(self.node_id, "") or self.internal_api_key
+        for key, node_id in self.internal_node_keys.items():
+            if node_id == self.node_id:
+                return key
+        return self.internal_api_key
 
     def __post_init__(self) -> None:
         """Give ``state_base`` its default: *this* object's workspace base.

@@ -194,6 +194,13 @@ KEY_CLASSES: dict[str, set[str]] = {
     },
     # The rotation window (E3.6): the examples name one internal key.
     "rotation_window": {"E2B_INTERNAL_API_KEYS"},
+    # N49 step ① (2026-10-03): the per-node credential map
+    # (`{"<key>": "<node_id>"}`, one credential per StatefulSet ordinal, minted
+    # by `secrets.sh`). k8s-only: the compose examples ship no map, so their
+    # workers present the fleet key -- which is what every lane did before this
+    # landed. Absent from the Secret, the k8s worker falls back the same way
+    # (`optional: true`).
+    "k8s_internal_node_keys": {"E2B_INTERNAL_NODE_KEYS"},
     # C3 (Task 4 slice B): which shape performs the worker's privileged file
     # steps. The worker image no longer ships the file-capability binaries, so
     # `auto` would silently resolve none and degrade to the in-process E5.1
@@ -325,6 +332,7 @@ _FLEET_STACK_MISSING = (
     | KEY_CLASSES["k8s_disk_enforcement"]
     | KEY_CLASSES["k8s_real_root_and_checkpoint"]
     | KEY_CLASSES["k8s_tree_copy_bound"]
+    | KEY_CLASSES["k8s_internal_node_keys"]
 )
 
 #: The compose example stacked with a control plane + Redis: it declares the

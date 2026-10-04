@@ -66,7 +66,30 @@ NAMESPACE="${NAMESPACE:-sandlock}"
 SECRET_NAME="${SECRET_NAME:-e2b-secrets}"
 
 #: 本脚本负责创建的键，顺序 = 新 Secret 里的书写顺序。
-KEYS=(E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_REDIS_PASSWORD E2B_SECRET_MASTER_KEY E2B_C3_AGENT_TOKEN)
+KEYS=(E2B_API_KEYS E2B_INTERNAL_API_KEY E2B_REDIS_PASSWORD E2B_SECRET_MASTER_KEY E2B_C3_AGENT_TOKEN E2B_INTERNAL_NODE_KEYS)
+
+#: N49 的 step ①：每个 worker 一把**绑定到自己节点**的内部凭据，控制面据此
+#: 推出"谁在说话"（`node_id_for_key`），不再只靠"请求来自哪个 pod IP"。
+#: 节点 id 就是 StatefulSet 的固定序号（worker 清单里 `E2B_NODE_ID` 取
+#: `metadata.name`），所以这里是这份部署的事实，不是可推导的东西。
+NODE_IDS=(e2b-worker-0 e2b-worker-1)
+
+#: 生成一个键的值：普通键是 32 hex 字节；`E2B_INTERNAL_NODE_KEYS` 是
+#: `{"<key>": "<node_id>"}`（值和上面对齐）。
+gen_value() {
+    local key="$1"
+    if [ "$key" = "E2B_INTERNAL_NODE_KEYS" ]; then
+        local parts=() id
+        for id in "${NODE_IDS[@]}"; do
+            parts+=("\"$(openssl rand -hex "$RAND_BYTES")\":\"$id\"")
+        done
+        local joined
+        joined="$(IFS=,; printf '%s' "${parts[*]}")"
+        printf '{%s}' "$joined"
+        return 0
+    fi
+    openssl rand -hex "$RAND_BYTES"
+}
 
 #: 主 key 单独对待：换它是**不可逆**的两窗操作，本脚本拒绝就地换（见 die 那句）。
 MASTER_KEY=E2B_SECRET_MASTER_KEY
@@ -492,7 +515,7 @@ if [ "$mode" != "fingerprint" ]; then
         else
             say "补缺 $key（新生成）"
         fi
-        set_out "$key" "$(openssl rand -hex "$RAND_BYTES")"
+        set_out "$key" "$(gen_value "$key")"
     done
 
     if [ "${#rotated[@]}" -gt 0 ] && is_rotate E2B_REDIS_PASSWORD; then

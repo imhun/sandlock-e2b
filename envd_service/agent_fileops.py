@@ -306,6 +306,20 @@ _ACTIVE: list[AgentFileOps | None] = [None]
 AGENT_TRANSPORT = "agent"
 
 
+def _internal_key_for(settings) -> str:
+    """The ``X-Internal-Key`` this worker presents for file ops.
+
+    Node-bound when the settings carry a per-node map entry for this worker
+    (``Settings.outbound_internal_key``, N49's step ①), the fleet key
+    otherwise -- including for the stubs and harnesses that pass a plain
+    object with only ``internal_api_key``.
+    """
+    bound = getattr(settings, "outbound_internal_key", None)
+    if bound:
+        return str(bound)
+    return getattr(settings, "internal_api_key", "") or ""
+
+
 def transport_setting(settings) -> str:
     """``E2B_PRIV_HELPER_TRANSPORT`` -- the same switch the exec shape uses.
 

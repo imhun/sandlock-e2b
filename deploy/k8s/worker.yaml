@@ -146,6 +146,19 @@ spec:
                   name: e2b-secrets
                   key: E2B_INTERNAL_API_KEYS
                   optional: true
+            # N49 step ①: this worker's **own** node-bound credential, the map
+            # `{"<key>": "<node_id>"}` the Secret carries (secrets.sh generates
+            # one per node). With it the control plane derives "who is calling"
+            # from the credential instead of leaning on the source IP alone.
+            # `optional: true` keeps an older Secret (or a lane that ships no
+            # map -- compose, tests) starting: the worker then presents the
+            # fleet key above, exactly as today.
+            - name: E2B_INTERNAL_NODE_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: e2b-secrets
+                  key: E2B_INTERNAL_NODE_KEYS
+                  optional: true
             # N57 / Task 3: the sandbox **trees** live on the node's own disk
             # (`/var/lib/e2b/workspaces`, the hostPath below), not on the
             # shared NAS. The premise is measured, not assumed, and it is two

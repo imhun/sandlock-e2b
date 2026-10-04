@@ -290,6 +290,7 @@ MANAGED_KEYS = (
     "E2B_REDIS_PASSWORD",
     "E2B_SECRET_MASTER_KEY",
     "E2B_C3_AGENT_TOKEN",
+    "E2B_INTERNAL_NODE_KEYS",  # N49 step ①: one credential per node
 )
 
 MASTER = "E2B_SECRET_MASTER_KEY"
