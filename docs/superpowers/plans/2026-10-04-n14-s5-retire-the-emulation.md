@@ -141,7 +141,7 @@ git commit -m "refactor(n14-S5): the executor has no real-root-off branch (the r
 
 **这是本计划唯一不能在本仓库里完成的任务**（fork 有自己的 git 历史与 CI）。
 
-- [ ] **Step 1: 先产出删除清单**（不猜）：按 §4.2 的判据表逐 handler 过一遍，写成 `删除 / 保留 / 理由` 三列，**review 通过后才动代码**
+- [x] **Step 1: 先产出删除清单**（不猜）：按 §4.2 的判据表逐 handler 过一遍，写成 `删除 / 保留 / 理由` 三列 —— 见 `docs/superpowers/plans/2026-10-04-n14-s5-t3-deletion-list.md`（14 个 handler + 13 个 `legacy_*` 逐个过；结论：删 exec 的注入半段与其两个只此一处调用的 helper、chdir 的 `ReturnValue(0)` 尾巴、getcwd 的改写半段；其余保留，`reported_to_virtual` 的映射回调按 N43 继续保留）。**review 通过后才动代码**
 - [ ] **Step 2: 每个 handler 一条测试**（fork 侧）：`child_is_pivoted` 恒真后，原先走翻译的输入必须仍被策略/COW 正确处理
 - [ ] **Step 3: 删代码 + `cargo test` 全绿**（口径：`core_integ` 559 + `test_chroot` 51 + `test_instance_exec` 28 + `test_cow` 26 + `test_restore` 5 + `test_procfs`）
 - [ ] **Step 4: fork 提交 → 父仓 `git add third_party/sandlock` → `./deploy/scripts/build-sandlock-wheels.sh`**
