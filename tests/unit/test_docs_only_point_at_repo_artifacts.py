@@ -223,6 +223,7 @@ ALLOWED_TMP_REFERENCES = {
     "tmp/audit3/s3_reach_allowout.py": "一次性线上审计探针（需集群 + API key），结论见 findings-k0s-2026-10-04.md §3.2",
     "tmp/audit3/s4_secure_flag.py": "一次性线上审计探针（需集群 + API key），`secure` 字段取证；结论已转成 tests/security/test_envd_token_fail_closed.py",
     "tmp/audit3/s5_rce_proof.py": "一次性线上审计探针（SEC-R3-01 决定性证据，需集群 + API key）；结论已转成 tests/security/test_envd_token_fail_closed.py",
+    "tmp/audit3/s5_postfix_matrix.py": "修复后一次性线上矩阵驱动（需集群 + API key）：原 s5_rce_proof.py 修复后建箱即被 400 拒而不可复用；结论已转成 tests/security/test_envd_token_fail_closed.py 与 docs/deploy-clusters.md §7.37",
     "tmp/audit3/in_pod_rce.py": "s5 的集群内半边（Connect 信封协议），随 s5 一起记录",
     "tmp/audit3/s6_escalation.py": "一次性线上审计探针（需集群 + API key），结论见 findings-k0s-2026-10-04.md §2",
     "tmp/audit3/s7_cross_tenant_reach.py": "一次性线上审计探针（需集群 + API key），结论见 findings-k0s-2026-10-04.md §3.2",
