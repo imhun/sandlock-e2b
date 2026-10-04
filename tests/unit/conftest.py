@@ -107,6 +107,37 @@ def publish_spy(monkeypatch: pytest.MonkeyPatch) -> _PublishSpy:
     return spy
 
 
+@pytest.fixture(autouse=True)
+def _the_worker_can_build_a_sandbox_root(request):
+    """The N35 gate asks the *node* whether it can build a sandbox root.
+
+    Since N14 S5 the real root is the shape, so every `SandlockExecutor` with a
+    root consults the mount-family probe at construction. The probe needs a
+    Linux worker (``libc.so.6``, ``pivot_root``, the mount admission in the
+    seccomp profile), so on this dev host it answers "no" and the create is
+    refused before a case can look at what it is about -- a statement about the
+    laptop, not about the code under test.
+
+    `test_real_root_gate.py` is the one file that pins the gate itself (and the
+    probe's own answers), so it opts out of this stub.
+    """
+    if request.module.__name__.rsplit(".", 1)[-1] == "test_real_root_gate":
+        yield
+        return
+    import envd_service.executors.sandlock as sandlock_mod
+
+    # Plain setattr rather than `monkeypatch`: asking for that fixture here
+    # would reorder its teardown in the modules on the lane, and
+    # `test_real_root_gate`'s cache-clearing fixture needs to run while the
+    # file's own `monkeypatch` is still in place.
+    original = sandlock_mod._real_root_capability
+    sandlock_mod._real_root_capability = lambda: ""
+    try:
+        yield
+    finally:
+        sandlock_mod._real_root_capability = original
+
+
 def ledger_settings(**overrides) -> Settings:
     """Settings for a registry whose only subject is the ledger.
 

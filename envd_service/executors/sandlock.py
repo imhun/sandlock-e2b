@@ -302,11 +302,13 @@ def _real_root_capability() -> str:
     step failed (:data:`_REAL_ROOT_PROBE`), so the caller can name the fix
     instead of failing every create with "instance is closed".
 
-    Why this exists: the flag and the worker's seccomp profile have to travel
-    together (the profile has to admit the mount family before `E2B_REAL_ROOT`
-    means anything). Without this check a node that has not been updated fails
-    every sandbox create with "instance is closed" and no reason -- measured
-    cost of finding that out the hard way is a whole debugging session.
+    Why this exists: the shape and the worker's seccomp profile have to travel
+    together (the profile has to admit the mount family before a sandbox can
+    pivot into a root of its own). Since N14 S5 the real root is the shape, so
+    this is asked for every sandbox that has one. Without this check a node that
+    has not been updated fails every sandbox create with "instance is closed"
+    and no reason -- measured cost of finding that out the hard way is a whole
+    debugging session.
     """
     try:
         completed = subprocess.run(
@@ -825,7 +827,6 @@ class SandlockExecutor(Executor):
         fd_inject_connect: bool = False,
         bind_inject: bool = False,
         pid_ns: bool = False,
-        real_root: bool = False,
         port_mappings: dict | None = None,
         network: dict | None = None,
         network_deny_cidrs: tuple[str, ...] = (),
@@ -867,7 +868,6 @@ class SandlockExecutor(Executor):
         self._fd_inject_connect = fd_inject_connect
         self._bind_inject = bool(bind_inject)
         self._pid_ns = bool(pid_ns)
-        self._real_root = bool(real_root)
         self._port_mappings = {
             int(host): int(sandbox) for host, sandbox in (port_mappings or {}).items()
         }
@@ -893,17 +893,19 @@ class SandlockExecutor(Executor):
         self._fs_mounts = dict(fs_mounts or {})
         self._sandbox_id = sandbox_id
         self._pure_rootfs_dir = Path(pure_rootfs_dir) if pure_rootfs_dir else None
-        if self._real_root and self._has_sandbox_root:
-            # The flag and the worker's seccomp profile have to travel together;
-            # probe once per process and fail with the operator's next action
-            # instead of failing every create with "instance is closed".
+        if self._has_sandbox_root:
+            # N14 S5: the real root is the shape, so this probe is no longer
+            # behind a flag -- but it still has to travel with the worker's
+            # seccomp profile. Probe once per process and fail with the
+            # operator's next action instead of failing every create with
+            # "instance is closed".
             reason = _real_root_capability()
             if reason:
                 raise RuntimeError(
-                    "E2B_REAL_ROOT is on, but this worker cannot build a sandbox "
-                    f"root: {reason}. Apply deploy/seccomp/sandlock-worker.json "
+                    "this worker cannot build a sandbox root: "
+                    f"{reason}. Apply deploy/seccomp/sandlock-worker.json "
                     "(it admits the mount-family syscalls the sandbox's own user "
-                    "namespace needs) to every node before enabling the flag."
+                    "namespace needs) to every node."
                 )
         # Route B (one ``sandlock-supervise`` per sandbox, euid == the
         # sandbox's host uid). ``None`` / ``off`` keeps the in-process
@@ -2565,23 +2567,20 @@ class SandlockExecutor(Executor):
             # first (unprivileged CLONE_NEWPID) and does that in an intermediate
             # process, so this is independent of net_isolation.
             kwargs["pid_ns"] = True
-        if self._real_root:
-            # N35: build a real root instead of emulating one, so the kernel
-            # resolves paths (a `#!` interpreter, a static binary) inside the
-            # sandbox's own tree. Only meaningful with a chroot root, and the
-            # setting is deployment-wide while the shape is per-sandbox: a
-            # sandbox with neither an image rootfs nor a synthesized one has
-            # nothing to pivot into, so the flag is a no-op there (loud once per
-            # executor) rather than a failed create.
-            if self._has_sandbox_root:
-                kwargs["real_root"] = True
-            else:
-                logger.warning(
-                    "E2B_REAL_ROOT is set but sandbox %s has no image rootfs "
-                    "and no synthesized root (pure shape): real_root has no "
-                    "effect for it",
-                    self._sandbox_id or "<unnamed>",
-                )
+        # N35, unconditional since N14 S5: build a real root instead of
+        # emulating one, so the kernel resolves paths (a `#!` interpreter, a
+        # static binary) inside the sandbox's own tree. Only meaningful with a
+        # chroot root, and the shape is per-sandbox: one with neither an image
+        # rootfs nor a synthesized one has nothing to pivot into, so it is a
+        # no-op there (loud once per executor) rather than a failed create.
+        if self._has_sandbox_root:
+            kwargs["real_root"] = True
+        else:
+            logger.warning(
+                "sandbox %s has no image rootfs and no synthesized root (pure "
+                "shape): the real root has nothing to pivot into for it",
+                self._sandbox_id or "<unnamed>",
+            )
         if self._enable_net_isolation:
             kwargs["net_isolation"] = True
             if self._port_mappings:
@@ -2813,23 +2812,20 @@ class SandlockExecutor(Executor):
             # first (unprivileged CLONE_NEWPID) and does that in an intermediate
             # process, so this is independent of net_isolation.
             kwargs["pid_ns"] = True
-        if self._real_root:
-            # N35: build a real root instead of emulating one, so the kernel
-            # resolves paths (a `#!` interpreter, a static binary) inside the
-            # sandbox's own tree. Only meaningful with a chroot root, and the
-            # setting is deployment-wide while the shape is per-sandbox: a
-            # sandbox with neither an image rootfs nor a synthesized one has
-            # nothing to pivot into, so the flag is a no-op there (loud once per
-            # executor) rather than a failed create.
-            if self._has_sandbox_root:
-                kwargs["real_root"] = True
-            else:
-                logger.warning(
-                    "E2B_REAL_ROOT is set but sandbox %s has no image rootfs "
-                    "and no synthesized root (pure shape): real_root has no "
-                    "effect for it",
-                    self._sandbox_id or "<unnamed>",
-                )
+        # N35, unconditional since N14 S5: build a real root instead of
+        # emulating one, so the kernel resolves paths (a `#!` interpreter, a
+        # static binary) inside the sandbox's own tree. Only meaningful with a
+        # chroot root, and the shape is per-sandbox: one with neither an image
+        # rootfs nor a synthesized one has nothing to pivot into, so it is a
+        # no-op there (loud once per executor) rather than a failed create.
+        if self._has_sandbox_root:
+            kwargs["real_root"] = True
+        else:
+            logger.warning(
+                "sandbox %s has no image rootfs and no synthesized root (pure "
+                "shape): the real root has nothing to pivot into for it",
+                self._sandbox_id or "<unnamed>",
+            )
         if self._enable_net_isolation:
             kwargs["net_isolation"] = True
             if self._port_mappings:

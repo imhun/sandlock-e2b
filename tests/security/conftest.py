@@ -266,7 +266,6 @@ def route_b_sandbox(
     # value is refused at startup by `refuse_retired_root_levers`.
     shape = Settings()
     pure_rootfs = shape.pure_rootfs
-    real_root = True
     pure_rootfs_dir = os.environ.get("E2B_PURE_ROOTFS_DIR") or str(
         sandbox_tmpdir(suffix="-pure-rootfs")
     )
@@ -276,7 +275,6 @@ def route_b_sandbox(
         image_rootfs=rootfs,
         host_uid=host_uid,
         per_sandbox_uid=per_sandbox_uid,
-        real_root=real_root,
         pure_rootfs_dir=(Path(pure_rootfs_dir) if pure_rootfs == "synth" else None),
         memory_mb=512,
         cpu_percent=100,

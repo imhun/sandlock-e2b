@@ -40,9 +40,6 @@ def _settings(executor: str) -> SimpleNamespace:
         sandbox_notify_rate_limit=0,
         iam_signing_key="k",
         image_cache_dir=Path("tmp/cache"),
-        # N35: the factory forwards this one too (settings.real_root ->
-        # SandlockExecutor(real_root=...)), so the fake has to carry it.
-        real_root=False,
         # N16 carries the same way, and its two halves are read together: the
         # fake spells the switch with its default so the `off` branch is the
         # one these cases take.

@@ -111,10 +111,8 @@ def build_executor(shape: str, grant: bool):
     rootfs = resolve_test_rootfs(image) if chroot else None
     host_uid = SANDBOX_UID if os.geteuid() == 0 else None
     extra = ["/workspace", "/home/user"] if (chroot and grant) else []
-    # Mirrors `Settings.real_root` (E2B_REAL_ROOT): the probes build their own
-    # executor, so the switch has to be read here rather than through the
-    # factory. Default off, like the setting.
-    real_root = os.environ.get("E2B_REAL_ROOT", "0").strip() == "1"
+    # Since N14 S5 the real root is the shape, not a switch the probe reads:
+    # a sandbox with a root of its own (`chroot` here) pivots into it.
     pid_ns = os.environ.get("E2B_PID_NS", "0").strip() == "1"
     executor = SandlockExecutor(
         workspace_dir=str(workspace),
@@ -130,7 +128,6 @@ def build_executor(shape: str, grant: bool):
         allow_internet_access=False,
         enable_network=False,
         extra_fs_writable=extra,
-        real_root=real_root,
         pid_ns=pid_ns,
         sandbox_id=f"sbx_n35_{uuid.uuid4().hex[:8]}",
         route_b=RouteBConfig(

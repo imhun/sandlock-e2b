@@ -54,7 +54,7 @@
 - Produces: `RealRootRetiredError` / 既有 `PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR` 被**取代**为"退役即拒"；`resolve_real_root(...) -> bool` 不再有 `None` 分支
 - Consumes: 既有 `Settings` 字段（`pure_rootfs`、`real_root`）
 
-- [ ] **Step 1: Write the failing tests**（每条一个钉子）
+- [x] **Step 1: Write the failing tests**（每条一个钉子）
 
 ```python
 def test_real_root_zero_is_refused_by_name():
@@ -67,19 +67,19 @@ def test_unset_and_on_are_the_only_accepted_values():
     # 不设 / =1 / =true -> 通过，且 resolve_real_root() is True
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_pure_rootfs_config.py -q`
 Expected: 三条新钉子红（今天 `=0` 是**合法**的退路，`=off` 亦然）
 
-- [ ] **Step 3: Implement**（闭集合 + 具名拒绝；删掉 identity 档相关的配对分支）
+- [x] **Step 3: Implement**（闭集合 + 具名拒绝；删掉 identity 档相关的配对分支）
 
-- [ ] **Step 4: Run**
+- [x] **Step 4: Run**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_pure_rootfs_config.py tests/unit/test_worker_env_key_sets.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**（`b8d9d72`）
 
 ```bash
 git add envd_service/config.py tests/unit/test_pure_rootfs_config.py
@@ -98,7 +98,7 @@ git commit -m "feat(n14-S5): E2B_REAL_ROOT=0 / E2B_PURE_ROOTFS=off are retired a
 - Produces: `SandlockExecutor` 不再接受 `real_root=False`（签名去掉该参数或在构造时断言）
 - Consumes: Task 1 的新契约
 
-- [ ] **Step 1: 先写会红的钉子**
+- [x] **Step 1: 先写会红的钉子**
 
 ```python
 def test_a_pure_sandbox_always_gets_the_synthesized_root():
@@ -108,19 +108,19 @@ def test_the_executor_refuses_real_root_off():
     # SandlockExecutor(..., real_root=False) -> RuntimeError（今天它是合法入参）
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**（`test_the_executor_has_no_real_root_knob` 红：`real_root` 当时还在签名里）
 
 Run: `.venv/bin/python -m pytest tests/unit/test_real_root_gate.py -q`
 Expected: 两条红
 
-- [ ] **Step 3: 实现**：`_real_root_capability()` 删除；`self._real_root` 相关 6 处分支塌成单分支；`factory.py` 不再传 `real_root=`；`app.py`/`agent.py`/`gateway_common/paths.py` 跟随
+- [x] **Step 3: 实现**：`self._real_root` 与构造参数删除、两处 `if self._real_root:` 塌成"有根即真根"、`factory.py` 不再传；**偏离一处**：`_real_root_capability()` 保留，改为**无条件**的构造期门（有根就问一次）——它挡的是"节点 seccomp 没放行 mount 族"这条现场故障，与开关无关，删掉只会退回"每次 create 都 instance is closed 且无原因"
 
-- [ ] **Step 4: Run**
+- [x] **Step 4: Run**：`tests/unit` **2455 passed / 12 skipped / 3 failed**（3 条为既有 macOS-only：pivot_root 探针、两条 `test_xfs_quotactl_backend`）；`tests/security` 采集 85 条不破。macOS 侧新增 `tests/unit/conftest.py` 的 autouse 桩（探针是"节点属性"，本机不是 Linux worker），`test_real_root_gate.py` 退出该桩，它钉门本身
 
 Run: `.venv/bin/python -m pytest tests/unit/test_real_root_gate.py tests/unit/test_pure_rootfs_config.py tests/unit/test_worker_env_key_sets.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add envd_service tests/unit/test_real_root_gate.py gateway_common/paths.py

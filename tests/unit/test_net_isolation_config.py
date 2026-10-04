@@ -107,8 +107,6 @@ def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
         sandbox_notify_rate_limit=0,
         iam_signing_key="k",
         image_cache_dir=Path("tmp/cache"),
-        # N35 carries the same way as the switches above.
-        real_root=True,
         # N16 too: the factory reads the switch and the directory together.
         pure_rootfs="off",
         pure_rootfs_dir=Path("tmp/cache/pure"),
@@ -130,7 +128,6 @@ def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
     )
     assert executor._enable_net_isolation is True
     assert executor._fd_inject_connect is True
-    assert executor._real_root is True
     # S2.5 bind injection: the mapped port is served by a socket the sandbox
     # itself listens on, so the supervisor never traps the event loop's
     # readiness syscalls (see docs/production-deployment-requirements.md).
@@ -167,7 +164,6 @@ def test_policy_ceiling_requests_bind_injection(monkeypatch) -> None:
             sandbox_notify_rate_limit=0,
             iam_signing_key="k",
             image_cache_dir=Path("tmp/cache"),
-            real_root=False,
             pure_rootfs="off",
             pure_rootfs_dir=Path("tmp/cache/pure"),
             command_stream_limit_mb=32,

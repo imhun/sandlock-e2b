@@ -166,8 +166,9 @@ RUNTIME_DIR_NAME = "_runtime"
 #: ``<base>/_pure_rootfs/<id>`` (see
 #: ``envd_service.executors.sandlock._synthetic_rootfs_mounts``), so the pure
 #: shape can use the fork's ``real_root`` as well, with
-#: ``E2B_PURE_ROOTFS_DIR`` overriding the base. Never created when the switch
-#: is off: the pure shape then keeps N15's identity translation.
+#: ``E2B_PURE_ROOTFS_DIR`` overriding the base. It is synthesized for every
+#: pure sandbox since N14 S5 retired the identity root (the only shape left
+#: with no root of its own is one built by hand).
 #:
 #: It has to be traversable by the sandbox's own host uid -- the binds and the
 #: ``chdir`` into the root run inside the sandbox's *user* namespace, as the

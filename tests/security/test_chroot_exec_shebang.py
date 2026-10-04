@@ -131,9 +131,9 @@ async def test_shebang_script_written_into_the_workspace_runs():
     `#!` interpreter outside the mediator's rewrite, and the lookup is refused
     (EACCES once the file's own inode is exec-allowed and its write descriptor
     has been released, ETXTBSY while the mediator still holds that descriptor).
-    With `real_root` (the fork's mount namespace + pivot_root, E2B
-    `E2B_REAL_ROOT=1`) the interpreter resolves inside the sandbox's own tree
-    and the script simply runs -- which is what this test then asserts.
+    With the real root (the fork's mount namespace + pivot_root, the only shape
+    since N14 S5) the interpreter resolves inside the sandbox's own tree and the
+    script simply runs -- which is what this test then asserts.
     """
     executor, workspace = _chroot_sandbox()
     try:
@@ -143,17 +143,6 @@ async def test_shebang_script_written_into_the_workspace_runs():
             "printf '#!/bin/sh\\necho script-hi\\n' > ./n35_script "
             "&& chmod +x ./n35_script && ./n35_script",
         )
-        if not getattr(executor, "_real_root", False):
-            # The gap has to be *there* when the shape that closes it is off: if
-            # this ever stops holding, the case moved rather than regressed, and
-            # the suite should say so instead of quietly accepting an xfail.
-            assert (code, out.strip(), err) != (0, b"script-hi", b""), (
-                "the shebang gap closed without a real root"
-            )
-            pytest.xfail(
-                "N35: refused without a real root (EACCES/ETXTBSY) -- "
-                "docs/chroot-workspace-exec.md"
-            )
         assert (code, out.strip(), err) == (0, b"script-hi", b"")
     finally:
         executor.close()
@@ -182,14 +171,6 @@ async def test_script_whose_interpreter_was_written_in_the_same_command_runs():
             "&& chmod +x ./n35_uses_interp "
             "&& ./n35_uses_interp interp-marker; echo rc=$?",
         )
-        if not getattr(executor, "_real_root", False):
-            assert not (code == 0 and b"interp-marker" in out), (
-                "the workspace-interpreter gap closed without a real root"
-            )
-            pytest.xfail(
-                "N35: a workspace-resident interpreter is refused without a "
-                "real root -- docs/chroot-workspace-exec.md"
-            )
         assert code == 0, f"exit={code} stderr={err!r}"
         assert b"interp-marker" in out, out
     finally:
@@ -248,14 +229,6 @@ async def test_a_format_handler_resolves_its_interpreter_inside_the_sandbox():
         code, out, err = await run_sh(
             executor, workspace, "/workspace/n35_binfmt_payload"
         )
-        if not getattr(executor, "_real_root", False):
-            assert not (code == 0 and b"binfmt-ran" in out), (
-                "binfmt_misc resolution succeeded without a real root"
-            )
-            pytest.xfail(
-                "N35: a format handler's interpreter is resolved in the host's "
-                "path space without a real root -- docs/chroot-workspace-exec.md"
-            )
         assert code == 0, f"exit={code} stderr={err!r}"
         assert b"binfmt-ran" in out, out
         assert err == b"", err
@@ -267,10 +240,10 @@ async def test_a_format_handler_resolves_its_interpreter_inside_the_sandbox():
 async def test_the_workload_cannot_mount():
     """The seal that makes a real root safe to hand to the sandbox.
 
-    The sandbox builds its own root (when `real_root` is on) with CAP_SYS_ADMIN
-    *inside its own user namespace*, and gives that capability up before the
-    workload starts. Whatever the container's own profile admits, the workload
-    must not be able to mount, unshare a namespace or chroot -- three
+    The sandbox builds its own root (the only shape since N14 S5) with
+    CAP_SYS_ADMIN *inside its own user namespace*, and gives that capability up
+    before the workload starts. Whatever the container's own profile admits, the
+    workload must not be able to mount, unshare a namespace or chroot -- three
     independent mechanisms say so: the capability is gone, the sandbox's own
     seccomp filter refuses those syscalls, and (for the kernel-resolved cases)
     the mount namespace is the sandbox's own.

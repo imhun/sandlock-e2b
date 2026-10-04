@@ -196,7 +196,6 @@ def test_the_factory_puts_the_pure_shape_on_its_own_root_by_default(
     assert executor._synthetic_rootfs == settings.pure_rootfs_dir / "sbx_switch"
     assert executor._has_sandbox_root is True
     assert executor._chroot_root == str(settings.pure_rootfs_dir / "sbx_switch")
-    assert executor._real_root is True
     assert calls == ["probed"]
 
 
@@ -207,11 +206,15 @@ def test_the_factory_has_no_shape_without_a_real_root(monkeypatch, tmp_path) -> 
     is the second half -- a hand-built executor cannot select the emulated root
     either, because the branch that produced it no longer exists.
     """
-    _stub_probe(monkeypatch)
+    calls = _stub_probe(monkeypatch)
     settings, executor = _factory(monkeypatch, tmp_path, switch="off")
 
     assert settings.pure_rootfs == "off"
-    assert executor._real_root is True
+    # No image, no synthesized root: there is no root of its own, and the
+    # capability probe is never asked (nothing to pivot into).
+    assert executor._has_sandbox_root is False
+    assert executor._sandbox_root is None
+    assert calls == []
 
 
 def test_the_factory_hands_over_the_root_once_the_switch_is_synth(
@@ -225,18 +228,22 @@ def test_the_factory_hands_over_the_root_once_the_switch_is_synth(
     assert executor._pure_rootfs_dir == settings.pure_rootfs_dir
     assert executor._synthetic_rootfs == settings.pure_rootfs_dir / "sbx_switch"
     assert executor._has_sandbox_root is True
-    assert executor._real_root is True
     assert calls == ["probed"]
 
 
-def test_the_factory_arms_the_real_root_for_an_explicit_pair(
+def test_an_explicit_real_root_env_no_longer_changes_the_shape(
     monkeypatch, tmp_path
 ) -> None:
+    """`E2B_REAL_ROOT=1` used to be one half of the pair that armed the root.
+
+    The value is accepted (only `=0` is a retired lever) but nothing branches on
+    it any more: the root comes with the shape.
+    """
     calls = _stub_probe(monkeypatch)
     _settings, executor = _factory(
         monkeypatch, tmp_path, switch="synth", real_root="1"
     )
-    assert executor._real_root is True
+    assert executor._has_sandbox_root is True
     assert calls == ["probed"]
 
 
@@ -264,7 +271,6 @@ def test_the_image_shape_gets_the_real_root_too(
     assert executor._synthetic_rootfs is None
     assert executor._has_sandbox_root is True
     assert executor._chroot_root == str(rootfs)
-    assert executor._real_root is True
     # And it now asks the worker whether it can do it: the real root used to be
     # armed only for the pure shape, so this shape never probed the capability.
     assert calls == ["probed"]
@@ -287,7 +293,6 @@ def test_the_security_helper_mirrors_the_shape_switch(monkeypatch, tmp_path) -> 
         assert executor._has_sandbox_root is True
         assert executor._synthetic_rootfs.parent == tmp_path / "_pure_rootfs"
         assert executor._chroot_root == str(executor._synthetic_rootfs)
-        assert executor._real_root is True
         assert calls == ["probed"]
     finally:
         executor.close()
@@ -304,7 +309,6 @@ def test_the_security_helper_defaults_to_the_synthesized_root(
     executor, _workspace = route_b_sandbox(None, None)
     try:
         assert executor._has_sandbox_root is True
-        assert executor._real_root is True
         assert calls == ["probed"]
     finally:
         executor.close()

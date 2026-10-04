@@ -41,9 +41,9 @@ def build_executor(shape: str):
     image = "python:3.11-slim" if chroot else None
     rootfs = resolve_test_rootfs(image) if chroot else None
     host_uid = SANDBOX_UID if os.geteuid() == 0 else None
-    # Same env knobs the executor's Settings read, so this probe can measure
-    # either shape.
-    real_root = os.environ.get("E2B_REAL_ROOT", "0").strip() == "1"
+    # The remaining env knob the executor's Settings read. The real root is the
+    # shape since N14 S5 (no `real_root=` parameter), so the shape itself
+    # decides it: a root of its own means the fork pivots into it.
     pid_ns = os.environ.get("E2B_PID_NS", "0").strip() == "1"
     executor = SandlockExecutor(
         workspace_dir=str(workspace),
@@ -51,7 +51,6 @@ def build_executor(shape: str):
         image_rootfs=rootfs,
         host_uid=host_uid,
         per_sandbox_uid=True,
-        real_root=real_root,
         pid_ns=pid_ns,
         memory_mb=512,
         cpu_percent=100,
@@ -136,7 +135,7 @@ async def main_async() -> int:
         require_mediation_capable(executor)
         print(
             "== shape=" + shape + " route_b_active=" + str(executor._route_b_active)
-            + " real_root=" + str(getattr(executor, "_real_root", False))
+            + " real_root=" + str(executor._has_sandbox_root)
             + " id=" + token
         )
         sys.stdout.flush()

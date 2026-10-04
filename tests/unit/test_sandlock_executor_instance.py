@@ -47,6 +47,20 @@ class _FakeDeadError(RuntimeError):
     """Stand-in for ``sandlock.InstanceDeadError``."""
 
 
+def _no_root_note(sandbox_id: str) -> str:
+    """The N14 S5 shape note a rootless pure executor logs before anything else.
+
+    These lifecycles build the pure shape with neither an image rootfs nor a
+    synthesized one, so the executor says once per call that the real root has
+    nothing to pivot into for it (`SandlockExecutor._policy_ceiling`). It is a
+    WARNING on the same logger, so an exact-records assertion has to carry it.
+    """
+    return (
+        f"sandbox {sandbox_id} has no image rootfs and no synthesized root "
+        "(pure shape): the real root has nothing to pivot into for it"
+    )
+
+
 @pytest.fixture
 def typed_instance_gone(monkeypatch):
     """Classify the stand-in types as session-gone for this test."""
@@ -94,6 +108,7 @@ def test_instance_created_logs_ceiling_summary(monkeypatch, caplog) -> None:
     ):
         ex._ensure_instance()
     assert [r.message for r in caplog.records] == [
+        _no_root_note("sbx_log"),
         "sandlock instance created sandbox_id=sbx_log instance_name=sbx_log "
         "max_memory=512M max_processes=256 chroot=no"
     ]
@@ -119,6 +134,7 @@ def test_close_logs_once_and_second_close_is_silent(monkeypatch, caplog) -> None
         ex.close()
         ex.close()
     assert [r.message for r in caplog.records] == [
+        _no_root_note("sbx_abc"),
         "sandlock instance closed sandbox_id=sbx_abc instance_name=sbx_abc"
     ]
 
@@ -188,6 +204,7 @@ def test_ensure_instance_rebuilds_once_after_closed_or_dead_launch(
     assert attempts[0] == 2
     assert inst.name == "sbx_abc"
     assert [r.message for r in caplog.records] == [
+        _no_root_note("sbx_abc"),
         "sandlock instance relaunching after "
         f"{kind} sandbox_id=sbx_abc instance_name=sbx_abc",
         "sandlock instance created sandbox_id=sbx_abc instance_name=sbx_abc "
@@ -244,6 +261,7 @@ def test_message_text_never_decides_the_rebuild(monkeypatch, caplog) -> None:
     assert not isinstance(info.value, (_FakeClosedError, _FakeDeadError))
     assert attempts[0] == 1, "a text match must not trigger a rebuild"
     assert [r.message for r in caplog.records] == [
+        _no_root_note("sbx_abc"),
         "sandlock instance launch failed sandbox_id=sbx_abc "
         f"instance_name=sbx_abc error={prose}"
     ]
@@ -266,6 +284,7 @@ def test_unrelated_runtime_error_does_not_retry(monkeypatch, caplog) -> None:
             ex._ensure_instance()
     assert attempts[0] == 1
     assert [r.message for r in caplog.records] == [
+        _no_root_note("sbx_abc"),
         "sandlock instance launch failed sandbox_id=sbx_abc "
         "instance_name=sbx_abc error=sandlock_instance_launch failed"
     ]

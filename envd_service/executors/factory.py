@@ -237,10 +237,9 @@ def create_executor(
                 port_mappings=settings.port_mappings,
                 bind_inject=settings.net_bind_inject,
                 pid_ns=settings.pid_ns,
-                # N14 S5: the real root is the only shape now (an explicit
-                # `E2B_REAL_ROOT=0` is refused at startup by
-                # `refuse_retired_root_levers`), so there is nothing to resolve.
-                real_root=True,
+                # N14 S5: no `real_root=` kwarg any more -- the real root is
+                # the shape (an explicit `E2B_REAL_ROOT=0` is refused at
+                # startup by `refuse_retired_root_levers`).
                 network=network,
                 network_deny_cidrs=settings.network_deny_cidrs,
                 notify_rate_limit=settings.sandbox_notify_rate_limit,

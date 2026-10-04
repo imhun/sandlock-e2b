@@ -1,15 +1,17 @@
-"""`E2B_REAL_ROOT` refuses to arm where the worker cannot build a root.
+"""A sandbox with a root refuses to be created where the worker cannot build it.
 
-The flag and the worker's seccomp profile have to travel together: the profile
+The shape and the worker's seccomp profile have to travel together: the profile
 has to admit the mount family before a sandbox's own user namespace can use it
-(the pre-N35 profile admits neither `pivot_root` at all). Without the check in
+(the pre-N35 profile admits neither `pivot_root` at all). Since N14 S5 the real
+root is the shape -- there is no `E2B_REAL_ROOT=1` to arm -- so *every* sandbox
+with a root of its own asks the question at construction. Without the check in
 `SandlockExecutor.__init__`, a node that was not updated fails every create with
 "instance is closed" and no reason -- measured, and the whole point of the
 one-fork probe this file pins the wiring of.
 
-The probe itself is exercised end to end by the lane (`E2B_REAL_ROOT=1` running
-the security suite, and the same with a profile stripped of the allowance); here
-the fleet is faked and only the decision is under test.
+The probe itself is exercised end to end by the lane (the security suite on a
+rooted shape, and the same with a profile stripped of the allowance); here the
+fleet is faked and only the decision is under test.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from pathlib import Path
 import pytest
 
 import envd_service.executors.sandlock as sl
+from envd_service.executors.base import ExecConfig
 from envd_service.route_b import RouteBConfig
 
 WORKSPACE = "/var/lib/e2b-sandboxes/sbx_real_root/workspace"
@@ -65,36 +68,44 @@ def _fresh_probe_cache():
     sl._real_root_capability.cache_clear()
 
 
-def test_the_flag_is_refused_when_the_worker_cannot_build_a_root(monkeypatch):
+def test_the_create_is_refused_when_the_worker_cannot_build_a_root(monkeypatch):
     monkeypatch.setattr(
         sl, "_real_root_capability", lambda: "pivot_root: Operation not permitted"
     )
     with pytest.raises(RuntimeError) as excinfo:
-        _executor(real_root=True)
+        _executor()
     message = str(excinfo.value)
-    assert "E2B_REAL_ROOT is on, but this worker cannot build a sandbox root" in message
+    assert "this worker cannot build a sandbox root" in message
     assert "pivot_root: Operation not permitted" in message
     # The operator's next action has to be in the message, not in a doc.
     assert "deploy/seccomp/sandlock-worker.json" in message
 
 
-def test_the_probe_is_not_consulted_when_the_flag_is_off(monkeypatch):
-    def _boom() -> str:
-        raise AssertionError("the probe must not run for the default shape")
+def test_a_sandbox_without_a_root_neither_probes_nor_arms_the_root(monkeypatch):
+    """The one shape that is left out: nothing to pivot into.
 
-    monkeypatch.setattr(sl, "_real_root_capability", _boom)
-    assert _executor(real_root=False) is not None
+    A pure sandbox with no synthesized root has no root of its own, so the
+    capability question is not asked and ``real_root`` is not put on the create
+    -- the fork would ignore it anyway (no chroot root), and this pins that the
+    shape does not quietly ask a node to admit the mount family for a sandbox
+    that cannot use it.
+    """
+    calls: list[str] = []
 
+    def _probe() -> str:
+        calls.append("probed")
+        return ""
 
-def test_a_sandbox_without_a_rootfs_never_arms_the_flag(monkeypatch):
-    def _boom() -> str:
-        raise AssertionError("there is nothing to pivot into, so nothing to probe")
-
-    monkeypatch.setattr(sl, "_real_root_capability", _boom)
-    executor = _executor(real_root=True, base_image=None, image_rootfs=None)
-    # The declaration still reaches the policy document (the fork ignores it
-    # without a chroot root); what matters here is that no probe ran.
-    assert executor._real_root is True
+    monkeypatch.setattr(sl, "_real_root_capability", _probe)
+    executor = _executor(base_image=None, image_rootfs=None)
+    assert executor._has_sandbox_root is False
+    one_shot = executor._build_sandbox(
+        ExecConfig(
+            cmd=["/bin/sh"], env={}, cwd=str(WORKSPACE), stdin_enabled=False
+        )
+    )
+    assert "real_root" not in vars(one_shot)
+    assert calls == []
 
 
 # --------------------------------------------------------------- the probe
@@ -202,3 +213,17 @@ def test_the_probe_carries_the_table_into_the_child():
     """
     assert "__PIVOT_ROOT_NR__" not in sl._REAL_ROOT_PROBE
     assert repr(sl._PIVOT_ROOT_NR) in sl._REAL_ROOT_PROBE
+
+
+def test_the_executor_has_no_real_root_knob():
+    """N14 S5: the real root is the *shape*, not a parameter.
+
+    `SandlockExecutor(real_root=...)` used to be how a caller picked the
+    emulated root; that value is refused at startup now (`E2B_REAL_ROOT=0` is a
+    retired lever), so the parameter is gone and every shape arms the root.
+    """
+    import inspect
+
+    from envd_service.executors.sandlock import SandlockExecutor
+
+    assert "real_root" not in inspect.signature(SandlockExecutor.__init__).parameters
