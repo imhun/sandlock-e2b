@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from envd_service.config import Settings, resolve_real_root
+from envd_service.config import Settings
 from envd_service.executors.base import Executor
 from envd_service.executors.local import LocalExecutor
 from envd_service.runtime.image_resolver import resolve_image_rootfs
@@ -237,14 +237,10 @@ def create_executor(
                 port_mappings=settings.port_mappings,
                 bind_inject=settings.net_bind_inject,
                 pid_ns=settings.pid_ns,
-                # The pair (N16): an unset `E2B_REAL_ROOT` travels with the
-                # synthesized root -- the pure shape arms it, an image sandbox
-                # keeps the emulated root it has today. An explicit `=0`/`=1`
-                # still wins, which is what keeps the explicit contradiction
-                # refused at startup (`check_pure_rootfs_pairing`).
-                real_root=resolve_real_root(
-                    settings, pure_shape=base_image is None
-                ),
+                # N14 S5: the real root is the only shape now (an explicit
+                # `E2B_REAL_ROOT=0` is refused at startup by
+                # `refuse_retired_root_levers`), so there is nothing to resolve.
+                real_root=True,
                 network=network,
                 network_deny_cidrs=settings.network_deny_cidrs,
                 notify_rate_limit=settings.sandbox_notify_rate_limit,

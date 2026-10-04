@@ -14,7 +14,12 @@ from pathlib import Path
 import pytest
 
 from gateway_common.paths import PURE_ROOTFS_DIR_NAME, is_reserved_platform_namespace
-from envd_service.config import Settings, resolve_real_root
+from envd_service.config import (
+    RETIRED_PURE_ROOTFS_LEVER_ERROR,
+    RETIRED_REAL_ROOT_LEVER_ERROR,
+    Settings,
+    refuse_retired_root_levers,
+)
 
 
 def test_the_switch_defaults_to_synth(monkeypatch) -> None:
@@ -39,49 +44,49 @@ def test_the_switch_is_normalised(monkeypatch) -> None:
     assert Settings().pure_rootfs == "synth"
 
 
-def test_the_real_root_is_unset_by_default(monkeypatch) -> None:
-    """`E2B_REAL_ROOT` is a tri-state: unset is not `off` (see the pairing)."""
-    monkeypatch.delenv("E2B_REAL_ROOT", raising=False)
-    assert Settings().real_root is None
+# -- N14 S5: the two retro levers are retired ------------------------------
+#
+# `E2B_PURE_ROOTFS=off` (N15's identity root) and `E2B_REAL_ROOT=0` (the
+# emulated root) used to be the two ways back to the shape S5 deletes. They are
+# refused **by name at startup** instead of quietly served: a deployment that
+# still writes them must be told which line to delete, because the rest of the
+# fleet no longer tests that shape.
 
 
-def test_the_real_root_can_be_named_explicitly(monkeypatch) -> None:
+def test_the_retreat_lever_is_retired_and_refused_by_name(monkeypatch) -> None:
+    monkeypatch.setenv("E2B_PURE_ROOTFS", "off")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        refuse_retired_root_levers(Settings())
+
+    assert str(excinfo.value) == RETIRED_PURE_ROOTFS_LEVER_ERROR.format(value="off")
+    assert "delete the line" in str(excinfo.value)
+
+
+def test_the_emulated_root_is_retired_and_refused_by_name(monkeypatch) -> None:
     monkeypatch.setenv("E2B_REAL_ROOT", "0")
-    assert Settings().real_root is False
+
+    with pytest.raises(RuntimeError) as excinfo:
+        refuse_retired_root_levers(Settings())
+
+    assert str(excinfo.value) == RETIRED_REAL_ROOT_LEVER_ERROR
+    assert "delete the line" in str(excinfo.value)
+
+
+def test_unset_and_on_are_the_only_accepted_spellings(monkeypatch) -> None:
+    monkeypatch.delenv("E2B_REAL_ROOT", raising=False)
+    monkeypatch.delenv("E2B_PURE_ROOTFS", raising=False)
+    assert refuse_retired_root_levers(Settings()) is None
+
+    monkeypatch.setenv("E2B_REAL_ROOT", "1")
+    monkeypatch.setenv("E2B_PURE_ROOTFS", "synth")
+    assert refuse_retired_root_levers(Settings()) is None
+
+
+def test_the_real_root_reading_is_kept_but_nothing_branches_on_it(monkeypatch) -> None:
+    """`Settings.real_root` still reports the raw env; the *shape* is not a knob."""
     monkeypatch.setenv("E2B_REAL_ROOT", "1")
     assert Settings().real_root is True
-
-
-def test_the_coupled_default_follows_the_synthesized_root(monkeypatch) -> None:
-    monkeypatch.delenv("E2B_REAL_ROOT", raising=False)
-    monkeypatch.delenv("E2B_PURE_ROOTFS", raising=False)
-    settings = Settings()
-    assert resolve_real_root(settings, pure_shape=True) is True
-    assert resolve_real_root(settings, pure_shape=False) is False
-
-
-def test_the_coupled_default_does_not_survive_the_retreat_lever(monkeypatch) -> None:
-    """`E2B_PURE_ROOTFS=off` is the whole retreat, not half of it."""
-    monkeypatch.delenv("E2B_REAL_ROOT", raising=False)
-    monkeypatch.setenv("E2B_PURE_ROOTFS", "off")
-    settings = Settings()
-    assert resolve_real_root(settings, pure_shape=True) is False
-    assert resolve_real_root(settings, pure_shape=False) is False
-
-
-def test_an_explicit_real_root_outranks_the_coupling(monkeypatch) -> None:
-    monkeypatch.delenv("E2B_PURE_ROOTFS", raising=False)
-    monkeypatch.setenv("E2B_REAL_ROOT", "0")
-    assert resolve_real_root(Settings(), pure_shape=True) is False
-    monkeypatch.setenv("E2B_REAL_ROOT", "1")
-    assert resolve_real_root(Settings(), pure_shape=True) is True
-
-
-def test_an_explicit_real_root_still_reaches_the_image_shape(monkeypatch) -> None:
-    """The coupling is not the switch: `E2B_REAL_ROOT=1` keeps its old meaning."""
-    monkeypatch.delenv("E2B_PURE_ROOTFS", raising=False)
-    monkeypatch.setenv("E2B_REAL_ROOT", "1")
-    assert resolve_real_root(Settings(), pure_shape=False) is True
 
 
 def test_the_root_dir_defaults_beside_the_sandbox_trees(monkeypatch, tmp_path) -> None:
@@ -195,20 +200,18 @@ def test_the_factory_puts_the_pure_shape_on_its_own_root_by_default(
     assert calls == ["probed"]
 
 
-def test_the_factory_hands_over_no_root_when_the_lever_is_off(
-    monkeypatch, tmp_path
-) -> None:
-    """`E2B_PURE_ROOTFS=off`: N15's identity translation, and no probe at all."""
-    calls = _stub_probe(monkeypatch)
+def test_the_factory_has_no_shape_without_a_real_root(monkeypatch, tmp_path) -> None:
+    """N14 S5: the emulated root is gone, so no shape builds without the real one.
+
+    `E2B_PURE_ROOTFS=off` is refused by the app at startup (pinned below); this
+    is the second half -- a hand-built executor cannot select the emulated root
+    either, because the branch that produced it no longer exists.
+    """
+    _stub_probe(monkeypatch)
     settings, executor = _factory(monkeypatch, tmp_path, switch="off")
 
     assert settings.pure_rootfs == "off"
-    assert executor._pure_rootfs_dir is None
-    assert executor._synthetic_rootfs is None
-    assert executor._has_sandbox_root is False
-    assert executor._chroot_root == "/"
-    assert executor._real_root is False
-    assert calls == []
+    assert executor._real_root is True
 
 
 def test_the_factory_hands_over_the_root_once_the_switch_is_synth(
@@ -237,15 +240,14 @@ def test_the_factory_arms_the_real_root_for_an_explicit_pair(
     assert calls == ["probed"]
 
 
-def test_the_coupled_default_leaves_the_image_shape_where_it_was(
+def test_the_image_shape_gets_the_real_root_too(
     monkeypatch, tmp_path
 ) -> None:
-    """A sandbox with an image never had the pure switch, and does not get it.
+    """An image sandbox has no synthesized root, but it does have the real one.
 
-    `E2B_BASE_IMAGE` is set by both production manifests, so the fleet's shape
-    (and the emulated root a lane asks for with `E2B_REAL_ROOT=0`) has to stay
-    exactly where it is: the coupling is the *synthesized* root's, not the
-    flag's, and an image sandbox has no synthesized root.
+    `E2B_BASE_IMAGE` is set by both production manifests, so this is the fleet's
+    shape: `E2B_REAL_ROOT` used to decide whether it got the emulated root; that
+    value is retired (N14 S5), so the root is simply part of the shape.
     """
     calls = _stub_probe(monkeypatch)
     rootfs = tmp_path / "image-rootfs"
@@ -262,8 +264,10 @@ def test_the_coupled_default_leaves_the_image_shape_where_it_was(
     assert executor._synthetic_rootfs is None
     assert executor._has_sandbox_root is True
     assert executor._chroot_root == str(rootfs)
-    assert executor._real_root is False
-    assert calls == []
+    assert executor._real_root is True
+    # And it now asks the worker whether it can do it: the real root used to be
+    # armed only for the pure shape, so this shape never probed the capability.
+    assert calls == ["probed"]
 
 
 def test_the_security_helper_mirrors_the_shape_switch(monkeypatch, tmp_path) -> None:
@@ -306,81 +310,28 @@ def test_the_security_helper_defaults_to_the_synthesized_root(
         executor.close()
 
 
-def test_the_security_helper_follows_the_lever_to_the_identity_root(
-    monkeypatch, tmp_path
-) -> None:
-    from tests.security.conftest import route_b_sandbox
+def test_the_app_refuses_a_retired_lever_at_startup() -> None:
+    """The path a deployment takes: `create_app` with one of the old values.
 
-    calls = _stub_probe(monkeypatch)
-    monkeypatch.setenv("E2B_PURE_ROOTFS", "off")
-    monkeypatch.delenv("E2B_REAL_ROOT", raising=False)
-    executor, _workspace = route_b_sandbox(None, None)
-    try:
-        assert executor._has_sandbox_root is False
-        assert executor._chroot_root == "/"
-        assert executor._real_root is False
-        assert calls == []
-    finally:
-        executor.close()
-
-
-def test_the_explicit_contradiction_is_refused_by_name() -> None:
-    """`E2B_PURE_ROOTFS=synth` + an explicit `E2B_REAL_ROOT=0` cannot work.
-
-    The synthesized root is an empty skeleton, and only the real root (the
-    mount namespace + `pivot_root` path) binds the host system directories, the
-    workspace and the volumes into it. With the emulated root every path stays
-    inside that skeleton, so the sandbox's own `/bin/sh` does not exist: the
-    create dies with errno 13 and every later command answers `instance is
-    closed`. The guard names the two switches and the way out, so a
-    misconfigured worker refuses to start instead of serving sandboxes that are
-    dead on arrival.
+    Both spellings are refused, and the refusal names the line to delete -- the
+    values are the defaults now, so deleting it is the whole migration.
     """
     from types import SimpleNamespace
 
     from envd_service.app import create_app
-    from envd_service.config import (
-        PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR,
-        check_pure_rootfs_pairing,
-    )
 
     def _settings(pure_rootfs: str, real_root: bool | None) -> SimpleNamespace:
         return SimpleNamespace(pure_rootfs=pure_rootfs, real_root=real_root)
 
-    # The refused shape, and its exact sentence -- written out here so the
-    # retreat lever cannot fall out of the message unnoticed.
-    assert PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR == (
-        "E2B_PURE_ROOTFS=synth without E2B_REAL_ROOT=1: the synthesized root is "
-        "an empty skeleton, and only the real root (a mount namespace it binds "
-        "into) puts the host system directories, the workspace and the volumes "
-        "inside it. With the emulated root every path resolves inside that "
-        "skeleton, so the sandbox's own /bin/sh does not exist: the create dies "
-        "with errno 13 and every later command answers `instance is closed`. "
-        "Drop the explicit E2B_REAL_ROOT=0 so the pair travels together (that is "
-        "the default), or set E2B_PURE_ROOTFS=off to keep the pure shape on "
-        "N15's identity root."
-    )
-    with pytest.raises(RuntimeError) as excinfo:
-        check_pure_rootfs_pairing(_settings("synth", False))
-    assert str(excinfo.value) == PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR
-
-    # The worker refuses to come up with that same sentence, which is the path
-    # a deployment actually takes.
     with pytest.raises(RuntimeError) as excinfo:
         create_app(settings=_settings("synth", False))
-    assert str(excinfo.value) == PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR
+    assert str(excinfo.value) == RETIRED_REAL_ROOT_LEVER_ERROR
 
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings=_settings("off", None))
+    assert str(excinfo.value) == RETIRED_PURE_ROOTFS_LEVER_ERROR.format(value="off")
 
-def test_the_coupled_default_is_not_a_contradiction() -> None:
-    """`real_root` unset is the pair, not a half of it: `None` is not `False`."""
-    from types import SimpleNamespace
-
-    from envd_service.config import check_pure_rootfs_pairing
-
-    def _settings(pure_rootfs: str, real_root: bool | None) -> SimpleNamespace:
-        return SimpleNamespace(pure_rootfs=pure_rootfs, real_root=real_root)
-
-    assert check_pure_rootfs_pairing(_settings("synth", None)) is None
-    assert check_pure_rootfs_pairing(_settings("synth", True)) is None
-    assert check_pure_rootfs_pairing(_settings("off", False)) is None
-    assert check_pure_rootfs_pairing(_settings("off", True)) is None
+    # The defaults are not a refusal: unset/on (and `None` for the raw
+    # real-root reading) come up.
+    assert refuse_retired_root_levers(_settings("synth", None)) is None
+    assert refuse_retired_root_levers(_settings("synth", True)) is None

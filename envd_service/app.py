@@ -15,8 +15,8 @@ from fastapi.responses import JSONResponse
 from envd_service.config import (
     Settings,
     check_net_isolation_pairing,
-    check_pure_rootfs_pairing,
     check_seccomp_filter,
+    refuse_retired_root_levers,
 )
 from envd_service.agent import (
     NodeAgent,
@@ -240,7 +240,9 @@ def create_app(
     # stays empty and every sandbox it builds dies on its own `/bin/sh`
     # (errno 13, then `instance is closed` for every verb). Same rule as the
     # switch above: fail at startup, by name, with the way out.
-    check_pure_rootfs_pairing(settings)
+    # N14 S5: the two retro levers (`E2B_PURE_ROOTFS=off`, `E2B_REAL_ROOT=0`)
+    # are retired; a deployment that still writes them is refused by name here.
+    refuse_retired_root_levers(settings)
     # A7 follow-up (2026-09-16): the worker must actually run under the shipped
     # seccomp profile. A missing one is silent in two different ways -- no filter
     # at all (`Seccomp: 0`: the sandboxes inherit the worker's syscall surface),

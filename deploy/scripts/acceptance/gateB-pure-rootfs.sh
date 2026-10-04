@@ -8,10 +8,11 @@
 # (`docs/superpowers/plans/2026-09-26-decisions.md`, "「合成根 + 模拟根」结构性不成立"):
 #
 #   state 0 -- N15 identity: no synthesized root (`E2B_PURE_ROOTFS=off`,
-#              `E2B_REAL_ROOT=0`). Since 2026-09-27 the *default* is `synth`,
-#              so the identity lane has to name the retreat lever -- and the
-#              explicit `E2B_REAL_ROOT=0` alone would be refused by name
-#              (`PURE_ROOTFS_WITHOUT_REAL_ROOT_ERROR`).
+#              `E2B_REAL_ROOT=0`). **RETIRED (N14 S5, 2026-10-04)**: both
+#              spellings are refused by name at startup now
+#              (`refuse_retired_root_levers`), so this lane can only be run
+#              against an older image; the arm lane and this script collapse to
+#              one shape in the S5 plan's Task 4.
 #   state 1 -- synthesized root + real root (`E2B_PURE_ROOTFS=synth`,
 #              `E2B_REAL_ROOT=1`).
 #
