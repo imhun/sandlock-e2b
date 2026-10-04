@@ -527,7 +527,7 @@ spec:
             # notifications), a dirty set that overflowed, or an unreadable
             # directory all end in the whole-tree walk.
             - name: E2B_DISK_ENFORCE_DIRTY
-              value: "1"
+              value: "0"
             # N25/L2c, the two bounds that make the incremental answer safe:
             #
             #   GRACE  -- a directory that was written keeps being re-checked

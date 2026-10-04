@@ -32,7 +32,7 @@ flowchart TD
     C -->|拒| E2["EACCES / EPERM<br/><i>ABI 不够则建箱阶段就失败</i>"]
     C -->|过| D{"③ 中介层 · supervisor 代执行<br/>路径翻译 / proc 合成<br/>netlink 虚拟 / connect 代建连"}
     D -->|拒| E3["EOPNOTSUPP / EAFNOSUPPORT / EIO<br/><i>语义拒绝，不是权限</i>"]
-    D -->|过| F["worker 容器<br/>hostPID=true"]
+    D -->|过| F["worker 容器（pod 独立 pid ns）<br/>uid 65534 · cap drop ALL"]
     F --> G{"④ 外层 seccomp profile<br/>SCMP_ACT_ERRNO + 416 条允许"}
     G -->|拒| E4["ENOSYS 38<br/><i>指纹与 ① 的 EPERM 不同</i>"]
     G -->|过| H["宿主机 kernel"]
@@ -62,10 +62,10 @@ flowchart TB
     end
 
     subgraph CLUSTER["k0s cluster · namespace sandlock"]
-        subgraph WPOD["e2b-worker pod · hostPID"]
+        subgraph WPOD["e2b-worker pod · pod 独立 pid ns"]
             ENVD["envd 执行代理"]:::worker
             SUP["supervisor<br/>持 seccomp notify fd"]:::worker
-            subgraph SB["沙箱 · uid 池内独占 · pid/net ns 独立"]
+            subgraph SB["沙箱 · pid ns 独立（E2B_PID_NS）· net ns 独立"]
                 P["沙箱进程"]:::sandbox
             end
             NAS[("共享 NAS<br/>workspaces/ · state/_images")]:::store
@@ -174,6 +174,21 @@ seccomp 与 Landlock 抓不到的语义在这里：
 `hostPID: true`、**无 seccompProfile**、非 root。唯一的隔离手段是那条 NetworkPolicy：
 把 worker pod IP 全量 blackhole，所以沙箱够不到它，且沙箱不知道内部 token。
 这是当前架构里**最薄的一环** —— 一个网络策略变更就能打通。
+
+注意 `hostPID: true` 只属于 c3-agent，**worker 不是**。实测（2026-10-04）：
+
+| | hostPID | pod 内可见 pid 数 |
+|---|---|---|
+| `e2b-worker` | 未设（false） | 4–5（只有自己 pod 的） |
+| `e2b-c3-agent` | **true** | 节点全部 |
+| `seccomp-installer` / `control-plane` | 未设 | — |
+
+worker 容器另有一层 `E2B_PID_NS=true`，沙箱在自己的 pid ns 里
+（实测沙箱内 `$$` = 3，说明它不是 pod 的 pid 1）。
+
+**别拿沙箱内 `/proc` 的数字目录数当证据**：实测恒为 0，连自己 fork 出来的进程都
+数不到，而 `/proc/1` 是 `Permission denied`。那是 fork 的 procfs 规则（合成 + 拒绝），
+说明的是"看不到"，不是"不存在"。pid ns 的证据取自 pod 规格与 `$$`，不取自这里。
 
 ## 冗余原则：两道腿
 
