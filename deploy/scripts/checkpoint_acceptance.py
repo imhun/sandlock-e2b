@@ -2,7 +2,8 @@
 """Cluster acceptance for S2/S3/S4: a pause that survives its worker.
 
 仓库版（2026-09-26 从 ``tmp/k0s/checkpoint_acceptance.py`` 搬入）。它回答的是**生产形态**
-（image-rootfs + ``E2B_REAL_ROOT=1``）下这条能力到底能不能用，所以它不只是回归测试，
+（image-rootfs + 真根；后者自 N14 S5 起是唯一形态而不是开关）下这条能力到底能不能用，
+所以它不只是回归测试，
 也是"这一版能不能对外声明"的判据。用法见 ``docs/deploy-clusters.md`` §9。
 
 The one shape today cannot do, and the reason the whole feature exists:
@@ -398,13 +399,14 @@ def main(argv: list[str] | None = None) -> int:
         f"{probe.stderr.strip()}"
     )
 
-    # 开关必须真的在这版清单里（`deploy/k8s/worker.yaml`），且三件一起才构成"生产形态"：
-    # 真根、pause 抓图、平台账。哪一个没开，下面那条验收的失败原因都不是引擎。
+    # 开关必须真的在这版清单里（`deploy/k8s/worker.yaml`），且它们与真根一起才构成"生产形态"：
+    # 真根、pause 抓图、平台账。真根自 N14 S5（2026-10-04）起是**形态**而不是键
+    # （`E2B_REAL_ROOT` 已从清单删除，`=0` 启动即拒），所以这里无法再断言它 —— 少断言的是
+    # "清单里写没写"，不是"真根开没开"。
     assert worker_env("E2B_PAUSE_CHECKPOINT") == "1", (
         "worker 清单里 E2B_PAUSE_CHECKPOINT 不是 1；这一版 pause 不会写图，"
         "下面的验收测的不是这个功能"
     )
-    assert worker_env("E2B_REAL_ROOT") == "1", "worker 清单里 E2B_REAL_ROOT 不是 1"
     assert worker_env("E2B_PLATFORM_DISK_MB") == "8192", (
         "worker 清单里的平台账预算不是 8192 MiB；图会以 0=不限 的形态落盘"
     )

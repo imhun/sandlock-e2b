@@ -385,25 +385,29 @@ spec:
             # `network` still gets only the fixed domain set.
             - name: E2B_ENABLE_NETWORK
               value: "true"
-            # N35: let a sandbox build its own root (mount namespace, the
+            # N35, and since N14 S5 (2026-10-04) **not a key**: every sandbox
+            # with a root of its own builds a real root (mount namespace, the
             # image rootfs bound in as `/`, `pivot_root`, then drop
             # CAP_SYS_ADMIN) instead of having the mediator rewrite every path
-            # the emulated root would have produced. What it buys is the class
-            # of things the *kernel* resolves by itself and the emulation can
-            # only refuse: `#!` scripts (including every console script a
-            # `pip install --user` leaves in `~/.local/bin`), static ELF,
-            # binfmt handlers, `$0`/`sys.path[0]`, `mountinfo`.
+            # the emulated root would have produced. `E2B_REAL_ROOT=0` used to
+            # be the way back and is refused at startup by name now
+            # (`envd_service/config.py::refuse_retired_root_levers`).
+            # What it buys is the class of things the *kernel* resolves by
+            # itself and the emulation could only refuse: `#!` scripts
+            # (including every console script a `pip install --user` leaves in
+            # `~/.local/bin`), static ELF, binfmt handlers, `$0`/`sys.path[0]`,
+            # `mountinfo`.
             #
             # Prerequisite, and the reason this is spelled out here rather
             # than left to the operator: the *node's* worker seccomp profile
             # has to admit `mount`/`umount2`/`pivot_root` BEFORE the worker
-            # that reads this rolls. deploy/k8s/seccomp-installer.yaml ships
-            # that profile and must be applied first -- a node still on the
-            # old one refuses every Sandbox.create with EPERM. The worker now
-            # says so itself instead of leaving it to be rediscovered: it
-            # probes the whole sequence in a subprocess the first time it
-            # builds an executor and raises with the failing step and the
-            # file to apply (envd_service/executors/sandlock.py).
+            # rolls. deploy/k8s/seccomp-installer.yaml ships that profile and
+            # must be applied first -- a node still on the old one refuses
+            # every sandbox create. The worker says so itself instead of
+            # leaving it to be rediscovered: it probes the whole sequence in a
+            # subprocess the first time it builds an executor and raises with
+            # the failing step and the file to apply
+            # (envd_service/executors/sandlock.py).
             #
             # Measured 2026-09-25 on the self-hosted k0s fleet, both workers,
             # with the profile above applied first: a shebang script written
@@ -415,8 +419,6 @@ spec:
             # The workload gains nothing: `mount`/`unshare`/`chroot` stay
             # refused for it by the fork's own filter and by the dropped
             # capability (docs/chroot-workspace-exec.md §9).
-            - name: E2B_REAL_ROOT
-              value: "1"
             # S3 (`docs/checkpoint-restore-e2b-half.md`): a pause writes a
             # checkpoint image *before* it freezes, so the sandbox's **process**
             # outlives this pod, and a resume either thaws the session that is

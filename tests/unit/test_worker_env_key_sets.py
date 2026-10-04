@@ -176,10 +176,12 @@ KEY_CLASSES: dict[str, set[str]] = {
         "E2B_DISK_OVERRUN_ACTION",
         "E2B_DISK_OVERRUN_DENY_S",
     },
-    # N35/N14 real root + checkpoint/restore (`docs/deploy-clusters.md` §7/§9):
-    # both are k8s deployment decisions, default-off in the image.
-    "k8s_real_root_and_checkpoint": {
-        "E2B_REAL_ROOT",
+    # Checkpoint/restore (`docs/deploy-clusters.md` §9): a k8s deployment
+    # decision, default-off in the image. `E2B_REAL_ROOT` used to be classified
+    # here next to it; N14 S5 (2026-10-04) retired it -- the real root is the
+    # shape now, and `E2B_REAL_ROOT=0` is refused at startup -- so the class is
+    # named for what is left.
+    "k8s_checkpoint": {
         "E2B_PAUSE_CHECKPOINT",
     },
     # N57 / Task 3: the byte bound for one tree copy (a migration archive or a
@@ -328,7 +330,7 @@ EXTRA_CLASSES: dict[str, set[str]] = {
 _FLEET_STACK_MISSING = (
     KEY_CLASSES["k8s_state_layout"]
     | KEY_CLASSES["k8s_disk_enforcement"]
-    | KEY_CLASSES["k8s_real_root_and_checkpoint"]
+    | KEY_CLASSES["k8s_checkpoint"]
     | KEY_CLASSES["k8s_tree_copy_bound"]
     | KEY_CLASSES["k8s_internal_node_keys"]
 )
