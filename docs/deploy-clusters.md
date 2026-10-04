@@ -2308,7 +2308,32 @@ KUBECONFIG="$PWD/tmp/k0s/kubeconfig" DRY_RUN=1 deploy/k8s-k0s/apply.sh 2>/dev/nu
     | KUBECONFIG="$PWD/tmp/k0s/kubeconfig" kubectl diff -f - | wc -l   # 期望 0
 ```
 
-### 7.36 发版：闲置即暂挂 + N77（**2026-10-03，当前版本 `0.1.0-965-gb5f194a-20261003-193743`**）
+### 7.37 发版：SEC-K0S-003 四跳封顶 + N78 + N49 残余接线（**2026-10-04，当前版本 `0.1.0-982-gcc0f64c-20261004-180755`**）
+
+三件事一批上：① **SEC-K0S-003**（命令输出四跳全部封住：读线程闸门 / 进程输出队列 / 订阅者队列 / 中继已发送字节）；② **N78**（删除路径的长墓碑 + 释放永不写负数行 + `reconcile-global-quota.py` 修现状）；③ **N49 残余**（per-node 绑定凭据出厂接线）。设计与现场读数分别在
+`docs/security-audit/findings-k0s-2026-09-30.md` 文末复核节、`docs/open-issues.md` 的 N78 / N49 行；本节只记这一版上线时现场看到了什么。
+
+**版本线**（`deploy/stack/.version`；四个镜像同 tag）：
+
+| 版本 | 内容 |
+|---|---|
+| `0.1.0-975-g26eba34-20261003-215907` | 上一版（N78 的修复） |
+| **`0.1.0-982-gcc0f64c-20261004-180755`** | 本版：N49 残余接线（`cc0f64c` 及其前的 SEC-003/N78 提交）—— **当前** |
+
+**四条收尾读数**：三处镜像 tag ≡ `deploy/stack/.version` ✅；`kubectl get pods` **9/9 Running、0 重启** ✅；`GET /sandboxes` = `[]` ✅；`DRY_RUN=1 apply.sh | kubectl diff -f -` **0 行** ✅。
+
+**N49 现场验收（本版新增的那一层）**：
+
+| 动作 | 结果 |
+|---|---|
+| 拿 **worker-0** 的绑定 key、自称 **worker-1** | **403** `X-Internal-Key is bound to node e2b-worker-0; request claims node e2b-worker-1` —— 凭据层（step ①）在说话 |
+| 拿 **worker-0** 的绑定 key、自称 worker-0，但源 IP 不是该 pod | **403** `request for node e2b-worker-0 came from 172.18.80.140, expected 10.244.140.38` —— 源 IP 第二因子仍在 |
+| 两节点心跳（worker 发自己那把 key） | 仍 **204**；两个新 CP 副本里 `fleet key with no node binding` 告警 **0 命中**（接线前每次首用必打一条） |
+| `secrets.sh` 补缺 | `补缺 E2B_INTERNAL_NODE_KEYS（新生成）`，其余五个键**逐个指纹不变**（值不出机器） |
+
+**本版顺带修掉的三处文档滞后**：N73/N74/N75/N76 的登记原先写"未上线"，实际都随 `0.1.0-975` 生效；安全审计 10-01 文档顶部摘要表里 004/005 的"未修"也同步成"已修（代码/fork）"。
+
+### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
 把一个沙箱生命周期策略接上了：**闲置 5 分钟自动暂挂**（SIGSTOP 冻结现场 + 归还准入配额，
