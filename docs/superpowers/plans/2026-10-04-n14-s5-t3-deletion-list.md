@@ -87,4 +87,57 @@ T3 落地时要写进代码注释的那句话。
 
 - 任何代码改动（fork 有自己的 git 历史与 CI；本文件是 Step 1 的产物，评审通过后才动）。
 - `/proc` 合成、策略/COW、活账本的任何改动。
-- S5 的 E2B 侧（T1/T2/T4 已完成，见 `docs/open-issues.md` N14 行与提交 `b8d9d72`/`d8bf694`/`1478a3c`）。
+- S5 的 E2B 侧（T1/T2/T4/T5 已完成，见 `docs/open-issues.md` N14 行与提交 `b8d9d72`/`d8bf694`/`1478a3c`）。
+
+## 6. 开工落地时的实测（2026-10-05：第一步做完后暂停）
+
+按批准开工后先在 fork 里落了"创建即拒"（`Sandbox::do_create_stdio` 里 `chroot.is_some() && !real_root`
+→ 具名 `SandboxRuntimeError::Child`），再用门禁量爆炸半径。**结论：这比"删 200 行"大得多**，
+三件事必须先处理，所以暂停在这里、把半成品留在子模块 `stash@{0}`
+（`N14 S5 T3 wip: create-time refusal + test_chroot real-root conversion (incomplete)`），
+父仓工作树保持干净。
+
+### 6.1 模拟根在 fork 自己的测试里是**承重**的（28 处）
+
+`chroot(...)` 的构造点里 **28 处没设 `real_root`**（`test_chroot.rs` 13、`test_instance_chroot.rs` 8、
+`test_mediation_identity.rs` / `test_net_isolate.rs` / `test_procfs.rs` / `test_sandbox.rs` /
+`test_seccomp_enforce.rs` / `test_transaction.rs` 各 1 …）。创建即拒一开它们全红，这是预期的；
+下面那条不是。
+
+### 6.2 `test_chroot.rs` 里 **39 个用例在"静默跳过"**（本次最值钱的发现）
+
+它们都写成 `match policy.run(...) { Ok(r) => {…}, Err(e) => eprintln!("Chroot test skipped: {}", e) }`
+—— 构造失败只打一行字，用例照样算**通过**。也就是说这份"chroot 家族全绿"从来没证明它跑过。
+WIP 里已把这 39 处改成 `panic!`，而这正是让 42 条红现形的动作（正式落地必须保留）。
+这条与仓库《规范-测试规范》"禁止 SKIP、禁吞错误"直接冲突。
+
+### 6.3 把一条 chroot 用例改成真根要三件事，不止 `.real_root(true)`
+
+1. `.real_root(true)`；
+2. **`.user(euid, egid)` + `builder.userns_self_map = true`** —— 非 root 中介没有 userns 时，
+   真根子进程的 `unshare(CLONE_NEWNS)` 得 EPERM（与 E2B 侧 2026-10-04 的发现同源，见
+   `docs/open-issues.md` N14 行 T4 段）；`userns_self_map` 的生效条件还要求 `user.is_some()`
+   （`context.rs:706-722`），所以 `user` 不能省；
+3. **夹具要预建挂载点**：`realroot::build` 要求每个 `fs_mount` 目标"在 rootfs 里已存在"
+   （否则 `mount point … does not exist inside the rootfs`），而模拟根从不要求 ——
+   `build_test_rootfs` 的骨架要按各用例的挂载表补 `mkdir`。
+
+### 6.4 门禁在这个 pin 上**本来就是红的**
+
+`core_lib: baseline says 913 passed, run produced 922`（子模块干净 pin `da90921` 上原样复现，
+先 stash 掉本次改动验过）。`scripts/test-all.sh` 在**第一个**算错的相位就退出，所以自那次 pin
+之后没人跑过门禁的另一半。T3 落地时必须：① 找出这 9 条差在哪（多半是先前会话加了用例而没刷新
+`docs/test-baseline.md`）；② 刷新基线与 `core_integ` 那一档；③ 四个相位（默认 + `--oci-root` +
+`--supervise-root` + `--mediation-2uid`）全部复跑。
+
+### 6.5 建议的两次提交（而不是一次大改）
+
+1. **fork 提交 A（行为变更）**：创建即拒 `chroot && !real_root` + 28 处构造点与夹具迁到真根 +
+   6.2 的 39 处静默跳转换成 panic + 刷新 `docs/test-baseline.md`。此时模拟根已不可达，门禁
+   仍全绿（一态）。
+2. **fork 提交 B（纯删除）**：删 §1 表里那几段（exec 注入半段 + `read_pt_interp` +
+   `memfd_with_patched_interp` + chdir 尾巴 + getcwd 改写半段）与模块头注释，行为不变。
+   再重建 wheel、更新父仓指针、走一次 T5 式的上线与现场验收（`probe_real_root_shape.py`）。
+
+拆成两次的价值：A 之后"要删的东西确实不可达"是被门禁证明过的，B 就只是删死代码 —— 评审与
+回滚都简单得多。
