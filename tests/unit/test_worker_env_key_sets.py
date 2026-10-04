@@ -293,15 +293,13 @@ EXTRA_CLASSES: dict[str, set[str]] = {
     },
     # Legacy, accepted and ignored (the fork dropped per-sandbox veth/netns).
     "legacy_enable_netns": {"E2B_ENABLE_NETNS"},
-    # N16's default flip (2026-09-27): `E2B_PURE_ROOTFS` is `synth` in the
-    # product now, and the single-machine example is a *pure* stack (no base
-    # image) run under Docker's own default seccomp profile -- which does not
-    # admit `unshare`, so the real root that fills the synthesized skeleton
-    # cannot be built there (measured: `unshare(CLONE_NEWUSER): Operation not
-    # permitted`). The example names the retreat lever
-    # (`${E2B_PURE_ROOTFS:-off}`; set it to `synth` after installing
-    # `deploy/seccomp/sandlock-worker.json` on that service).
-    "demo_pure_rootfs_lever": {"E2B_PURE_ROOTFS"},
+    # N14 S5 (2026-10-04) retired the single-machine example's one extra key:
+    # `E2B_PURE_ROOTFS=off` (N16's retreat lever, which the example used
+    # because Docker's own default profile does not admit `unshare`) is
+    # refused by name at startup now, and the example carries
+    # `deploy/seccomp/sandlock-worker.json` instead -- the same profile every
+    # other deployment applies. So the demo stack now declares no key the
+    # fleet does not.
     # The test runner is an SDK client, not a worker: these are its own
     # switches (the shape it runs is selected by the runner image and the
     # suite's fixtures -- `deploy/docker/Dockerfile.test-runner`).
@@ -415,7 +413,7 @@ ALLOWED_EXTRA: dict[str, set[str]] = {
         | EXTRA_CLASSES["legacy_enable_netns"]
     ),
     COMPOSE_MULTINODE: set(),
-    COMPOSE_DEMO: EXTRA_CLASSES["demo_pure_rootfs_lever"],
+    COMPOSE_DEMO: set(),
     COMPOSE_RUNNER: EXTRA_CLASSES["runner_client"],
 }
 

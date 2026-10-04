@@ -21,7 +21,7 @@
 | 跑道 | 是什么 | 能证明 | 不能证明 |
 |---|---|---|---|
 | `x86_64 容器` | `sandlock-dev:latest`（fork 门禁）/ `e2b-sandlock-test:latest`（E2B 生产形态），docker，宿主就是 x86_64 | fork 的四条门禁相位、E2B `test-prod-shaped.sh` 两相位、`tests/security` 生产形态 | 任何 ABI/架构相关的东西（它和开发机同构） |
-| `aarch64 Lima VM` | 本机 qemu TCG 上的 Ubuntu 24.04 arm64，真内核、真 ptrace | fork 五条相位在 arm64 上的等价、`tests/security` 两态、任何 syscall 号/结构体布局/字长相关的行为 | 性能（PSS、延迟——TCG 比真机慢约 100×，`supervise_cost` 因此**不进**这条 lane） |
+| `aarch64 Lima VM` | 本机 qemu TCG 上的 Ubuntu 24.04 arm64，真内核、真 ptrace | fork 五条相位在 arm64 上的等价、`tests/security`（一态，N14 S5 起）、任何 syscall 号/结构体布局/字长相关的行为 | 性能（PSS、延迟——TCG 比真机慢约 100×，`supervise_cost` 因此**不进**这条 lane） |
 | 线上节点 | 部署出来的 aarch64 机器 | 部署形态本身 | 不再用于跑测试二进制（见纪律 1） |
 
 宿主是 **amd64 Darwin**：容器是 x86_64，arm64 只能靠 VM（`--platform linux/arm64` 是
@@ -111,16 +111,18 @@ linker 钉回 `cc`。`aarch64` 的 stub 用 `-Wl,--image-base=`（zig 拒绝 GCC
 # 五条相位（本机实测 172 s）
 limactl shell sandlock-arm -- bash -s < deploy/scripts/arm-lane/phase-run.sh
 
-# E2B 两态（先 e2b-sync.sh）
+# E2B 一态（先 e2b-sync.sh）
 deploy/scripts/arm-lane/lima-vm.sh run \
-  'cd <mirror> && sudo env E2B_REQUIRE_SECCOMP_FILTER=0 E2B_REAL_ROOT=0 \
+  'cd <mirror> && sudo env E2B_REQUIRE_SECCOMP_FILTER=0 \
      /opt/e2b-venv/bin/python -m pytest tests/security -q -p no:cacheprovider'
 ```
 
 * `E2B_REQUIRE_SECCOMP_FILTER=0` 是必需的：那个自检要求 worker 进程
   `/proc/self/status` 里 `Seccomp:` 非 0（生产 worker 跑不可信负载），而 guest 里 pytest 是
   裸跑的、没有 seccomp 档。
-* `E2B_REAL_ROOT=0/1` 就是两态开关（模拟根 / mount ns + pivot_root 真根）。
+* **N14 S5（2026-10-04）**：两态没有了。`E2B_REAL_ROOT=0`（模拟根）与
+  `E2B_PURE_ROOTFS=off`（N15 的 identity 纯根）都在启动时按名拒绝
+  （`refuse_retired_root_levers`），真根是唯一形态。
 * **不要**开 `E2B_TEST_STRICT_SKIPS=1`：guest 没有 docker，"docker is required"那几条会从
   skip 变 fail。
 
@@ -157,9 +159,9 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
 两个相位：phase 1 = root worker + 线上 cap 集 + `deploy/seccomp/sandlock-worker.json`；
 phase 2 = uid 65534 非 root worker。`-k` 只能按用例名过滤，路径参数不会缩小范围（pitfall B4）。
 
-只跑 `tests/security` 用 `deploy/scripts/arm-lane/x86-security.sh <0|1> <log>`：它复刻 phase 1
-的镜像、cap 集、seccomp 档与 registry mirror，但目标是 `tests/security` 一个目录——这样两套
-lane 的两态数字才是同一口径取的。本机实测每条约 2.5 分钟。
+只跑 `tests/security` 用 `deploy/scripts/arm-lane/x86-security.sh 1 <log>`：它复刻 phase 1
+的镜像、cap 集、seccomp 档与 registry mirror，但目标是 `tests/security` 一个目录。**N14 S5
+（2026-10-04）**：`0` 臂已退役，脚本会按名拒绝它（真根是唯一形态）。本机实测每条约 2.5 分钟。
 
 ---
 

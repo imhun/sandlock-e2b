@@ -1,42 +1,37 @@
 #!/bin/sh
-# gate B's twin: the *pure* shape (`E2B_BASE_IMAGE=""`) in both root states.
+# gate B's twin: the *pure* shape (`E2B_BASE_IMAGE=""`), one root state.
 #
-# `gateB-full.sh` is the same lane with no shape switch at all: N15's pure shape
-# (mediator root = the host root, identity translation). This one takes the
-# state as its first argument, and the two states are the ones the 2026-09-26
-# ruling leaves standing
-# (`docs/superpowers/plans/2026-09-26-decisions.md`, "「合成根 + 模拟根」结构性不成立"):
+# **N14 S5 (2026-10-04)**: there were two states, and the other one is retired.
+# `E2B_PURE_ROOTFS=off` (N15's identity root) and `E2B_REAL_ROOT=0` (the
+# emulated root) are both refused by name at startup now
+# (`refuse_retired_root_levers`), which leaves the pure shape exactly one root:
+# the synthesized skeleton (N16) plus the real root that binds it. So this lane
+# takes no state argument any more -- a run book that still passes `0` is told
+# so at the boundary rather than handed a shape nothing tests.
 #
-#   state 0 -- N15 identity: no synthesized root (`E2B_PURE_ROOTFS=off`,
-#              `E2B_REAL_ROOT=0`). **RETIRED (N14 S5, 2026-10-04)**: both
-#              spellings are refused by name at startup now
-#              (`refuse_retired_root_levers`), so this lane can only be run
-#              against an older image; the arm lane and this script collapse to
-#              one shape in the S5 plan's Task 4.
-#   state 1 -- synthesized root + real root (`E2B_PURE_ROOTFS=synth`,
-#              `E2B_REAL_ROOT=1`).
+# The state that used to be expressible and is *not* any more:
 #
-# The third combination -- `synth` with `E2B_REAL_ROOT=0` -- is structurally
-# impossible and is deliberately *not* expressible here. The synthesized root is
-# an empty skeleton, and only the real-root path (the fork's mount namespace +
-# pivot_root) performs the binds, so such a sandbox dies in the generated
-# container's `execvp("/bin/sh")` (EACCES) and every later verb answers
-# `InstanceClosed` (Task 9's 32-error log: `tmp/k0s/task9/`, and the deployment
-# settings pair is refused outright since d1c4922). A lane asking for that pair
-# would measure a configuration no deployment may have, not a shape.
+#   * `synth` with an emulated root was structurally impossible to begin with
+#     (`docs/superpowers/plans/2026-09-26-decisions.md`, "「合成根 + 模拟根」结构性
+#     不成立"): the synthesized root is an empty skeleton, and only the
+#     real-root path (the fork's mount namespace + pivot_root) performs the
+#     binds, so such a sandbox dies in the generated container's
+#     `execvp("/bin/sh")` (EACCES) and every later verb answers
+#     `InstanceClosed` (Task 9's 32-error log: `tmp/k0s/task9/`; the pair is
+#     refused outright since d1c4922 and by name since N14 S5).
 #
-# `E2B_PURE_ROOTFS` matters for a *different* reason than it looks:
-# it is what `tests/security/conftest.py::route_b_sandbox` -- the security
-# suite's only shape entry point (Task 5b, de0a817) -- mirrors into the
-# executor, *and* since 2026-09-27 it is what the product defaults to `synth`:
-# a lane that does not name it measures the synthesized root, and `=off` is the
-# one key back to the identity root.
+# `E2B_PURE_ROOTFS=synth` is still named below even though it is the product's
+# default (2026-09-27 ruling): the lane's subject is the shape, so it says the
+# shape instead of inheriting it.
+#
 # `E2B_PURE_ROOTFS_DIR` is deliberately left unset so the helper's own
 # `sandbox_tmpdir(suffix="-pure-rootfs")` default applies (a directory the
 # sandbox uid can walk into); set it to pin one, as the deployment does with
-# `<workspace_base>/_pure_rootfs`.
+# `<workspace_base>/_pure_rootfs`. `tests/security/conftest.py::route_b_sandbox`
+# -- the security suite's only shape entry point (Task 5b, de0a817) -- reads
+# the *directory* knob and synthesizes the root unconditionally since N14 S5.
 #
-# Usage: gateB-pure-rootfs.sh <state 0|1> <log> [pytest target...]
+# Usage: gateB-pure-rootfs.sh 1 <log> [pytest target...]
 # Default target is `tests` (the whole suite); the target is handed to pytest
 # unquoted on purpose so several targets/selectors can be passed.
 #
@@ -56,17 +51,18 @@ shift 2
 target="${*:-tests}"
 SECCOMP_PROFILE="$(pwd)/deploy/seccomp/sandlock-worker.json"
 
-# The state decides *both* switches (see the header): `set --` keeps the two
-# `-e` pairs as separate argv entries, one `if` per state so `set -e` is not
-# asked to interpret a failed test as an error.
-case "$state" in
-    0|1) ;;
-    *) echo "usage: $0 <state 0|1> <log> [pytest target...]" >&2; exit 2 ;;
+# The one shape (see the header). The retired state is refused by name at the
+# boundary: a run book that still says `0` has to be told, not handed a shape
+# nothing tests.
+case "${state:-}" in
+    1) ;;
+    0)
+        echo "gateB-pure-rootfs: state 0 is retired (N14 S5): the identity pure root (E2B_PURE_ROOTFS=off + E2B_REAL_ROOT=0) is refused by name at startup now, so there is no 0 state to run -- pass 1" >&2
+        exit 2
+        ;;
+    *) echo "usage: $0 1 <log> [pytest target...]" >&2; exit 2 ;;
 esac
-set -- -e E2B_PURE_ROOTFS=off -e E2B_REAL_ROOT=0
-if [ "$state" = "1" ]; then
-    set -- -e E2B_PURE_ROOTFS=synth -e E2B_REAL_ROOT=1
-fi
+set -- -e E2B_PURE_ROOTFS=synth
 
 docker run --rm --init --network host \
     --cap-drop ALL \

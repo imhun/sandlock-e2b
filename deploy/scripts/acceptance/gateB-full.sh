@@ -7,11 +7,11 @@
 # Same caps, same env as that script's phase 1, plus the registry mirror the
 # image-rootfs cases in the tree still need.
 #
-# `E2B_PURE_ROOTFS=off` (+ the `E2B_REAL_ROOT=0` below) is this lane's shape on
-# purpose: N15's identity pure root, the one shape an operator retreats to.
-# Since 2026-09-27 the product's default is the *synthesized* root, so the lane
-# names the lever instead of inheriting it -- see gateB-pure-rootfs.sh for the
-# two states side by side.
+# **N14 S5 (2026-10-04)**: this lane used to name N15's identity pure root
+# (`E2B_PURE_ROOTFS=off` + `E2B_REAL_ROOT=0`). Both spellings are refused by
+# name at startup now; the pure shape's one root is the synthesized skeleton
+# (N16) and the real root is the only root, so the lane names nothing and gets
+# the product's default.
 set -eu
 # Repo root, three levels (the same `../..`-vs-`../../..` promotion bug as
 # `gateA-full.sh`: from `deploy/scripts/acceptance/` two levels lands on
@@ -37,8 +37,6 @@ docker run --rm --init --network host \
     -e E2B_BASE_IMAGE= \
     -e E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2 \
     -e E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
-    -e E2B_REAL_ROOT=0 \
-    -e E2B_PURE_ROOTFS=off \
     -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
     -v "$(pwd):/workspace" -w /workspace \
     "$IMAGE" \

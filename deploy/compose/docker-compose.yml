@@ -90,17 +90,19 @@ services:
     # the image pre-creates /var/lib/e2b-sandboxes owned by 65534 and the
     # named volume inherits that ownership on first creation.
     user: "65534:65534"
+    # N14 S5 (2026-10-04): the identity retreat lever (`E2B_PURE_ROOTFS=off`)
+    # is refused by name at startup now, so this stack runs the one shape --
+    # and that shape builds a real root, whose mount family
+    # (`unshare`/`mount`/`pivot_root`) Docker's *default* profile does not
+    # admit. The shipped profile is what every other deployment applies; the
+    # minimal example has to carry it too.
+    security_opt:
+      - seccomp=${E2B_SECCOMP_PROFILE:-../seccomp/sandlock-worker.json}
     environment:
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
-      # N16 default flip (2026-09-27): the pure shape's root is the synthesized
-      # skeleton by default, and this stack is a *pure* stack (it sets no
-      # `E2B_BASE_IMAGE`). Building that skeleton needs the mount family in the
-      # sandbox's own user namespace -- `unshare` included, which Docker's own
-      # default profile (the one this container runs under: there is no
-      # `seccomp=` override here) does not admit. Name the retreat lever so the
-      # minimal example keeps working; to run the new default instead, install
-      # deploy/seccomp/sandlock-worker.json on this service and delete this key.
-      E2B_PURE_ROOTFS: ${E2B_PURE_ROOTFS:-off}
+      # Since N14 S5 the pure shape's root is unconditionally the synthesized
+      # skeleton (N16): there is no key to name here any more -- the profile
+      # above is what the skeleton's binds need.
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}

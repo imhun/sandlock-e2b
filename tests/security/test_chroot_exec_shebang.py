@@ -12,16 +12,18 @@ run as (see ``tests/security/conftest.py::route_b_sandbox``):
   has an opinion about. A *static* ELF in the workspace does NOT run (measured:
   EACCES, while the same binary inside the image rootfs runs), so this test is
   deliberately the dynamic case;
-* a **shebang script** does not, with ``EACCES``. The kernel resolves the
-  ``#!`` interpreter on its own, inside the same syscall and without a second
-  seccomp notification, and that lookup is refused in this shape.
+* a **shebang script** runs, including one whose ``#!`` names an interpreter
+  that was written in the same command. The kernel resolves the ``#!`` line
+  itself, inside the same syscall and without a second seccomp notification --
+  which is exactly what a real root makes work: the lookup happens in the
+  sandbox's own tree, not in the host's path space.
 
-The second case is the *gap*, not the contract: it is pinned as a strict
-``xfail`` so the suite records today's behavior, and flips to ``XPASS`` (a
-failure, on purpose) the day it is fixed by N14's real root or by a shebang
-branch in the mediator. Reasoning, evidence, the static-ELF half of the gap and
-the A/B account are in ``docs/chroot-workspace-exec.md``; the probe that
-measured it is ``deploy/scripts/acceptance/probe_n35_exec_gate.py``.
+The second bullet used to be the *gap*: under the emulated root it was refused
+with ``EACCES``/``ETXTBSY``, and the cases were pinned as strict ``xfail``s. N14
+S5 retired that root, so they assert the running behaviour unconditionally now.
+Reasoning, evidence, the static-ELF half of the story and the A/B account are
+in ``docs/chroot-workspace-exec.md``; the probe that measured it is
+``deploy/scripts/acceptance/probe_n35_exec_gate.py``.
 """
 
 from __future__ import annotations
@@ -213,11 +215,11 @@ async def test_a_format_handler_resolves_its_interpreter_inside_the_sandbox():
 
     The registration belongs to the worker (it is the host's kernel registry),
     but the interpreter path it names is resolved *by the kernel*, in whatever
-    root the exec'ing process has. Under a real root that is the image's own
-    `/bin/sh`, so the payload runs; under the emulated root the lookup lands in
-    the host's path space, where the chroot-translated ruleset has no rule, and
-    the exec is refused (measured: EACCES, rc 126 -- the same mechanism as the
-    shebang case).
+    root the exec'ing process has. With the real root (the only shape since N14
+    S5) that is the image's own `/bin/sh`, so the payload runs. Under the
+    emulated root the lookup landed in the host's path space, where the
+    chroot-translated ruleset had no rule, and the exec was refused (measured:
+    EACCES, rc 126 -- the same mechanism as the shebang case).
     """
     if not _register_binfmt_handler():
         pytest.skip("binfmt_misc needs root and a mounted binfmt_misc registry")

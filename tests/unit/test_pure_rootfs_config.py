@@ -276,16 +276,21 @@ def test_the_image_shape_gets_the_real_root_too(
     assert calls == ["probed"]
 
 
-def test_the_security_helper_mirrors_the_shape_switch(monkeypatch, tmp_path) -> None:
-    """A lane that sets the env must reach the executor the tests build.
+def test_the_security_helper_ignores_the_retired_shape_switch(
+    monkeypatch, tmp_path
+) -> None:
+    """One shape: the helper synthesizes the root whatever the env says.
 
-    `route_b_sandbox` is the only place the security suite builds a shape, so a
-    switch it does not read is a lane that silently tests the old shape.
+    `route_b_sandbox` is the only place the security suite builds a shape. It
+    used to *read* `E2B_PURE_ROOTFS`, which would build the retired identity
+    root for a lane that still set `off` -- measuring the shape the app refuses
+    at startup while reporting on the deployment. The retired value now has no
+    effect here; the directory knob is still honoured.
     """
     from tests.security.conftest import route_b_sandbox
 
     calls = _stub_probe(monkeypatch)
-    monkeypatch.setenv("E2B_PURE_ROOTFS", "synth")
+    monkeypatch.setenv("E2B_PURE_ROOTFS", "off")
     monkeypatch.setenv("E2B_PURE_ROOTFS_DIR", str(tmp_path / "_pure_rootfs"))
     monkeypatch.delenv("E2B_REAL_ROOT", raising=False)
     executor, _workspace = route_b_sandbox(None, None)

@@ -34,6 +34,17 @@ def _executor(workspace: str, **kwargs) -> SandlockExecutor:
         workspace_dir=workspace,
         base_image=kwargs.get("base_image"),
         image_rootfs=kwargs.get("image_rootfs"),
+        # N14 S5: the real root needs a user namespace of the sandbox's own
+        # (an unprivileged process cannot `unshare(CLONE_NEWNS)` without one),
+        # and the shape that provides it without a privileged mediator is the
+        # per-sandbox PID namespace -- the intermediate process creates the
+        # userns and writes the map before the final fork. Both production
+        # manifests run this way (`E2B_PID_NS=true`); the probe has to build
+        # the shape production builds, or it is measuring the retired
+        # emulated-root pairing instead. Measured 2026-10-04: without it the
+        # real-root chroot case dies in child setup with
+        # `unshare(CLONE_NEWNS): Operation not permitted`.
+        pid_ns=True,
         memory_mb=512,
         cpu_percent=100,
         disk_mb=1024,

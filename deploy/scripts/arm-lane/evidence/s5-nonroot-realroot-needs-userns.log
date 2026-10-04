@@ -1,0 +1,61 @@
+# N14 S5 finding (2026-10-04): the real root needs the sandbox's own userns
+#
+# Symptom: after T2 made the real root unconditional, `tests/security/
+# test_worker_nonroot.py` (E5.1: the non-root worker shape) failed its chroot
+# case with `FAIL rootfs sandbox: exit=-1`, while the plain and network
+# sandboxes kept passing.
+#
+# Reproduced in the probe's own container (`--privileged`,
+# `seccomp=unconfined`, `docker cp` rootfs, `setpriv --reuid 65534`), with the
+# fork's own breadcrumbs turned on (`SANLOCK_REALROOT_TRACE`):
+#
+#   $ python -c 'build the image-rootfs executor and run /bin/echo'
+#   result: Result(success=False, exit_code=-1, error='sandlock_create failed',
+#                  reason=None, signal=-1)
+#
+#   $ cat trace.log
+#   step: real_root: begin
+#   FAILURE: unshare(CLONE_NEWNS): Operation not permitted (os error 1)
+#   FAILURE: sandlock child: real root: unshare(CLONE_NEWNS): Operation not
+#            permitted (os error 1): Operation not permitted (os error 1)
+#
+# Cause: the fork skips the sandbox's user namespace when the sandbox's
+# requested identity already equals the mediator's (`context.rs`, step 5). In
+# that shape the child is an ordinary unprivileged process, and
+# `unshare(CLONE_NEWNS)` needs CAP_SYS_ADMIN in the *current* user namespace --
+# so the real root cannot be built at all. The emulated root needed no
+# namespace, which is why this case passed before T2.
+#
+# The one unprivileged lever that does create the namespace is the per-sandbox
+# PID namespace: its intermediate process runs `unshare(CLONE_NEWUSER)` and
+# writes the map before the final fork (`--pid-ns`, the retelling in N45's
+# open-issues row). Both production manifests run it (`E2B_PID_NS=true`), as
+# does the minimal compose stack, so the probe was the only shape building a
+# mediated sandbox *without* it.
+#
+# Fix (this same run): `tests/security/worker_nonroot_probe.py::_executor`
+# passes `pid_ns=True`, i.e. the probe now builds the shape production builds.
+#
+#   $ pytest tests/security/test_worker_nonroot.py -q   (x86_64 production-shaped
+#     container, shipped seccomp profile, E2B_REAL_ROOT=1)
+#   2 passed in 17.25s
+#
+# And the shape-sensitive set in the same container (x86-security.sh's legs, the
+# 0 arm retired):
+#
+#   $ pytest tests/security/test_worker_nonroot.py
+#            tests/security/test_pure_root_errno_contract.py
+#            tests/security/test_uid_isolation.py
+#            tests/security/test_real_root_denials.py
+#            tests/security/test_chroot_exec_shebang.py
+#            tests/security/test_real_root_mounts.py
+#            tests/security/test_sandlock_isolation.py
+#            tests/security/test_ioctl_inventory.py
+#            tests/security/test_socket_families.py
+#            tests/security/test_process_limits.py -q
+#   37 passed in 330.16s
+#
+# Same container, the full `tests/security`: the remaining failures are
+# environmental, not shape -- `python-mcp:3.14` is not in the local image cache
+# and the registry mirror at 127.0.0.1:5080 is not running, so every case that
+# creates a 3.14 sandbox answers 428 `warm_required` / registry 401.

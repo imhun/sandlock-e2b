@@ -45,7 +45,7 @@ tar -C "$repo" \
 # only bites on the generic-syscall-table arches, so this lane is the only place
 # it can be checked (measured 2026-09-24: the probe hardcoded x86_64's 155, which
 # on aarch64 is `sched_getattr` -- the gate was refused with ESRCH and reported
-# as a seccomp problem, so E2B_REAL_ROOT could never be armed here).
+# as a seccomp problem, so the real root could never be built here).
 tar -C "$repo" -cf - tests/unit/__init__.py tests/unit/test_real_root_gate.py \
     | guest "tar -C '$mirror' -xf -"
 

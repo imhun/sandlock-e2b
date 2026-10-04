@@ -77,7 +77,7 @@
 | gate A（镜像形态） | `deploy/scripts/acceptance/gateA-full.sh <log>` | **1772 passed / 6 skipped / 3 xfailed / 0 failed** |
 | gate B（pure） | `deploy/scripts/acceptance/gateB-full.sh <log>` | **1765 passed / 13 skipped / 3 xfailed / 0 failed** |
 | phase 2（非 root worker） | `deploy/scripts/acceptance/phase2.sh <log>` | **57 passed / 1 skipped / 0 failed** |
-| security 两态 | `deploy/scripts/arm-lane/x86-security.sh 0/1 <log>` | 默认 44 passed / 1 skipped / 3 xfailed；pure 42 passed / 3 skipped / 3 xfailed |
+| security（一态，N14 S5 起 `0` 臂按名拒绝） | `deploy/scripts/arm-lane/x86-security.sh 1 <log>` | 默认 44 passed / 1 skipped / 3 xfailed；pure 42 passed / 3 skipped / 3 xfailed |
 | F11 多副本等 9 个文件 | `deploy/scripts/acceptance/x86-security-one.sh "" <log> <paths…>` | **80 passed** |
 | 本机 | `.venv/bin/python -m pytest tests/unit` / `tests/contract` | 16 条既有 macOS 红 / 1164 绿；contract 321 绿 / 53 skipped |
 

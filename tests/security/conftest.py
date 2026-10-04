@@ -233,10 +233,10 @@ def route_b_sandbox(
     """A sandbox built the way the worker builds one, as (executor, workspace).
 
     ``image`` + ``rootfs`` are the chroot (mediated) shape; both ``None`` give
-    the pure shape. Since N15 *both* are mediated -- the pure one with the host
-    root as the mediator's root, i.e. identity translation -- so this helper is
-    also the way a test asks for "the deployment's shape" rather than for one
-    particular mediation state.
+    the pure shape. Both are mediated and both get a real root of their own
+    (N14 S5): the pure one synthesizes it (N16), the image one extracts it, so
+    this helper is also the way a test asks for "the deployment's shape" rather
+    than for one particular mediation state.
 
     ``with_route_b`` mirrors the production default (``E2B_ROUTE_B=auto``): the
     mediated shape is exactly the one auto engages a slot for. ``False`` stands
@@ -256,16 +256,16 @@ def route_b_sandbox(
     uid): the point of routing every security case through here is that no test
     hand-builds a shape the deployment does not have.
     """
-    from envd_service.config import Settings
     from envd_service.executors.sandlock import SandlockExecutor
     from envd_service.route_b import RouteBConfig
 
     # N14 S5: one shape. The pure skeleton (N16) is the only pure root and the
-    # real root (mount ns + pivot_root) is the only root, so the two switches
-    # this helper used to mirror are gone -- and a lane that sets a retired
-    # value is refused at startup by `refuse_retired_root_levers`.
-    shape = Settings()
-    pure_rootfs = shape.pure_rootfs
+    # real root (mount ns + pivot_root) is the only root. This helper used to
+    # *read* the two switches (`E2B_PURE_ROOTFS`, `E2B_REAL_ROOT`); a lane that
+    # still sets a retired value is refused at startup by
+    # `refuse_retired_root_levers`, and a helper that kept reading them would
+    # quietly build the retired shape while the fleet runs one -- so it
+    # synthesizes the root unconditionally instead.
     pure_rootfs_dir = os.environ.get("E2B_PURE_ROOTFS_DIR") or str(
         sandbox_tmpdir(suffix="-pure-rootfs")
     )
@@ -275,7 +275,7 @@ def route_b_sandbox(
         image_rootfs=rootfs,
         host_uid=host_uid,
         per_sandbox_uid=per_sandbox_uid,
-        pure_rootfs_dir=(Path(pure_rootfs_dir) if pure_rootfs == "synth" else None),
+        pure_rootfs_dir=Path(pure_rootfs_dir),
         memory_mb=512,
         cpu_percent=100,
         disk_mb=1024,

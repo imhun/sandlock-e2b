@@ -152,9 +152,10 @@ git commit -m "refactor(n14-S5): the executor has no real-root-off branch (the r
 ### Task 4: 两态测试收敛成一态（E2B 侧）
 
 **Files:**
-- Modify: `tests/security/conftest.py`（`E2B_REAL_ROOT` 的解析）、`tests/security/test_real_root_denials.py`、`test_pure_root_errno_contract.py`、`test_uid_isolation.py`、`test_socket_families.py`、`test_ioctl_inventory.py`、`test_chroot_exec_shebang.py`；`deploy/scripts/arm-lane/x86-security.sh`、`e2b-sync.sh`
+- Modify: `tests/security/conftest.py`（`E2B_REAL_ROOT` 的解析）、`tests/security/test_real_root_denials.py`、`test_pure_root_errno_contract.py`、`test_uid_isolation.py`、`test_socket_families.py`、`test_ioctl_inventory.py`、`test_chroot_exec_shebang.py`、`worker_nonroot_probe.py`；`deploy/scripts/arm-lane/x86-security.sh`、`e2b-sync.sh`；`deploy/scripts/acceptance/{gateA-full,gateB-full,gateB-pure-rootfs,x86-run-py,x86-security-one}.sh`、`deploy/compose/docker-compose.yml`
+- Add: `tests/unit/test_arm_lane_one_shape.py`（钉子；计划里预留的那个文件名最终换成了这个名字）
 
-- [ ] **Step 1: 先写会红的钉子**
+- [x] **Step 1: 先写会红的钉子**（`tests/unit/test_arm_lane_one_shape.py`）
 
 ```python
 def test_the_arm_lane_refuses_the_retired_zero_arm():
@@ -164,19 +165,14 @@ def test_the_security_fixture_resolves_one_shape_only():
     # tests/security/conftest.py 解析出的 real_root 恒为 True（不再是环境驱动）
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**：三条红（0 臂未拒、lane 仍带退役 env、夹具随 `E2B_PURE_ROOTFS=off` 变成无根形态——最后一条用 `git stash` 把旧 conftest 拿回来单独验过）
 
-Run: `.venv/bin/python -m pytest tests/unit/test_arm_lane_script.py -q`（若该文件不存在，本步先把两条钉子放进 `tests/unit/test_real_root_gate.py`）
-Expected: 红
+- [x] **Step 3: 实现**：夹具单形态（不再读两个开关，目录旋钮照读）；`x86-security.sh` 的 `$1` 只接受 `1`、`0` 具名拒绝；`gateB-pure-rootfs.sh` 的 state 0 同样退场；五个 lane/acceptance 脚本删掉退役 env；单机 compose 栈删 `E2B_PURE_ROOTFS=off` 并改带 `deploy/seccomp/sandlock-worker.json`（Docker 默认档不放行 mount 族）；`e2b-sync.sh` 与三处 security 文档串同步
+  **现场发现（本步最值钱的一条）**：真根要求**沙箱有自己的 user namespace**。fork 在"沙箱身份 == 中介身份"时跳过 userns，子进程 `unshare(CLONE_NEWNS)` 得 EPERM ⇒ 建箱失败（trace：`deploy/scripts/arm-lane/evidence/s5-nonroot-realroot-needs-userns.log`）。E5.1 非 root worker 探针的 in-process chroot 用例就是这个形态（`test_worker_nonroot` 因此红），而两份生产清单都开 `E2B_PID_NS=true`（其 userns 由中间进程建），所以**生产不受影响**——修法是把探针改成生产形态：`worker_nonroot_probe.py::_executor` 加 `pid_ns=True`
 
-- [ ] **Step 3: 实现**：夹具单形态；`x86-security.sh` 的 `$1` 只接受 `1`，`0` 具名拒绝；`e2b-sync.sh` 的注释同步
+- [x] **Step 4: Run**：x86_64 生产形态容器（镜像 + 线上 cap 集 + 出厂 seccomp 档）里 ① `tests/security/test_worker_nonroot.py` **2 passed**；② 形态相关十文件 **37 passed / 330 s**（含 N35 三条 shebang 用例——T2 拆掉的 xfail 守卫在这里变成真断言）；③ `x86-security.sh 0` **exit 2 + 具名消息**、`1` 臂跑完整套：**62 passed**，其余 17 failed / 5 error 全为环境（本地镜像缓存没有 `python-mcp:3.14`、`127.0.0.1:5080` 镜像仓未起 ⇒ 428 `warm_required` / registry 401）。arm64 lane 与集群侧留 T5 一并做
 
-- [ ] **Step 4: Run**
-
-Run: `.venv/bin/python -m pytest tests/security -q`（本机能跑的那部分）+ 集群 lane 的 `1` 臂
-Expected: PASS（0 臂已不存在）
-
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/security deploy/scripts/arm-lane

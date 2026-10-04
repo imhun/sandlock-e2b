@@ -7,11 +7,11 @@
 # Same caps, same env as that script's phase 1, plus the registry mirror the
 # image-rootfs cases in the tree still need.
 #
-# `E2B_PURE_ROOTFS=off` (+ the `E2B_REAL_ROOT=0` below) names the *emulated*
-# image root this lane has always measured. The pure sibling of that switch is
-# `synth` by default since 2026-09-27, and an explicit `E2B_REAL_ROOT=0` with it
-# is refused by name -- the guard cannot see that every sandbox in this lane has
-# an image, so the lane says which shape it means.
+# **N14 S5 (2026-10-04)**: this lane used to name the emulated root
+# (`E2B_PURE_ROOTFS=off` + `E2B_REAL_ROOT=0`). Both spellings are refused by
+# name at startup now, and the real root is the only shape, so the lane names
+# nothing: every sandbox here has an image, and an image sandbox pivots into
+# the image it extracted.
 #
 # `E2B_TEST_IMAGE` overrides the runner image (default
 # `e2b-sandlock-test:latest`), for the same reason `gateB-pure-rootfs.sh` has
@@ -41,8 +41,6 @@ docker run --rm --init --network host \
     -e E2B_BASE_IMAGE=python-mcp:3.14 \
     -e E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2 \
     -e E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
-    -e E2B_REAL_ROOT=0 \
-    -e E2B_PURE_ROOTFS=off \
     -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
     -v "$(pwd):/workspace" -w /workspace \
     "$IMAGE" \

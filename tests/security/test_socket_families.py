@@ -32,8 +32,8 @@ container-escape potential. A sandbox that can open an `AF_RXRPC` socket, or an
 `AF_NETLINK`/`NETLINK_XFRM` socket to add an ESP SA, has handed an attacker the
 input path for one of them.
 
-Run as-is for the default shape; `E2B_REAL_ROOT=1` (tests/security/conftest.py)
-runs the same file with the real root on.
+The suite runs one shape since N14 S5: the real root, through
+`tests/security/conftest.py::route_b_sandbox`.
 """
 
 from __future__ import annotations

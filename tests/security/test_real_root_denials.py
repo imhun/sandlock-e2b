@@ -1,15 +1,14 @@
-"""What a policy denial looks like *inside* the sandbox, in both root shapes.
+"""What a policy denial looks like *inside* the sandbox, under the real root.
 
 `docs/chroot-workspace-exec.md` §9.7.8 recorded the measurement without pinning
 it: `fs_denied` (`/proc/kcore`, `/sys`) and a read-only image rootfs must answer
-the same way whether the sandbox's root is emulated by the mediator or built for
-real (`real_root`: mount namespace + `pivot_root`). The real root moves those
-paths into the image tree, which could plausibly turn "denied by the mediator"
-into "absent" or even "writable" -- so the shapes are compared here, not
-asserted from the doc.
-
-Run as-is for the default shape; `E2B_REAL_ROOT=1` (tests/security/conftest.py)
-runs the same file with the real root on.
+the same way with the root built for real (`real_root`: mount namespace +
+`pivot_root`) as they did with the mediator emulating it. The real root moves
+those paths into the image tree, which could plausibly turn "denied by the
+mediator" into "absent" or even "writable" -- so the four probes below are
+measured, not asserted from the doc. (Both shapes were measured on 2026-09-24;
+the emulated one is retired since N14 S5, and this file pins the surviving
+answer.)
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ IMAGE = "python:3.11-slim"
 
 
 @pytest.mark.usefixtures("require_sandlock")
-async def test_denied_paths_answer_the_same_in_both_root_shapes():
+async def test_denied_paths_are_denied_under_the_real_root():
     """One sandbox, four probes: the kernel-side denials a policy promises."""
     rootfs = resolve_test_rootfs(IMAGE)
     executor, workspace = route_b_sandbox(IMAGE, rootfs)
@@ -43,8 +42,9 @@ async def test_denied_paths_answer_the_same_in_both_root_shapes():
         ):
             measured[label] = await run_sh(executor, workspace, script)
 
-        # Measured identical in both shapes (E2B_REAL_ROOT=0 and =1), which is
-        # the whole claim: the real root neither loosens nor rewrites a denial.
+        # Measured identical in both shapes on 2026-09-24 (E2B_REAL_ROOT=0 and
+        # =1), which is the whole claim: the real root neither loosens nor
+        # rewrites a denial.
         #   * kcore: the read is refused by the policy's `fs_denied` entry.
         #   * sys / sys_kernel: EACCES on the lookup in *both* shapes. The real
         #     root does not turn this into "an empty directory in the image

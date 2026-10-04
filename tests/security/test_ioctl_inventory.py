@@ -35,8 +35,8 @@ code comment:
    a code that is ENOTTY on the master can still be live on the slave, so
    measuring only the master understates the surface.
 
-Run as-is for the default shape; `E2B_REAL_ROOT=1` (tests/security/conftest.py)
-runs the same file with the real root on.
+The suite runs one shape since N14 S5: the real root, through
+`tests/security/conftest.py::route_b_sandbox`.
 """
 
 from __future__ import annotations
