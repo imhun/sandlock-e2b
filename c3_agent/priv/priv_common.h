@@ -51,6 +51,16 @@ void priv_uid_pool(long *start, long *size);
 /* The uid-pool gate shared by every verb: pool membership, never uid 0. */
 int priv_validate_uid(long uid, char *err, size_t errlen);
 
+/* Membership only, no uid-0 rule: is this uid inside the sandbox uid pool?
+ *
+ * The `--worker` arm of `maint.c` chown (audit STATIC-5, 2026-10-04) must NOT
+ * use `priv_validate_uid` -- the legitimate worker identities are 65534 (k8s)
+ * and 0 (compose/test), both outside the pool, and requiring pool membership
+ * would invert the rule. What it needs is the opposite question: "is this uid
+ * one a caller could act as?", which for a token holder means the sandbox uid
+ * pool. Returns 0 and leaves `err` untouched when the uid is outside the pool. */
+int priv_uid_in_pool(long uid, char *err, size_t errlen);
+
 /* The chown group gate (fix round 1 / c1): a pooled uid, or the broker's own
  * gid -- a sandbox tree is `0770 owner=<sandbox uid> group=<worker gid>`, and
  * chgrp-to-own-gid is never a privilege widening. */

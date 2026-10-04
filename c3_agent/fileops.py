@@ -316,6 +316,24 @@ def run_file_op(
                 "--worker writes into the tree; without it the owner would be "
                 "root): refusing"
             )
+        if instruction.worker_owned and instruction.recursive:
+            # Audit STATIC-5 (2026-10-04): ``--worker`` names the worker's own
+            # identity, which ``maint.c`` reads from the environment the agent
+            # builds out of the request body. Recursing it turned a
+            # single-document operation into a node-wide ownership change.
+            #
+            # Checked *after* the two identity checks above, not before: "we do
+            # not know who the worker is" is the more fundamental refusal, and
+            # reordering it would change which reason an existing caller sees.
+            # The only caller that uses this form is the slot-document scope
+            # (``control_plane/file_ops.py``), which is never recursive, so the
+            # refusal costs nothing. ``maint.c`` refuses the same combination
+            # independently -- this copy is here so the caller gets the reason
+            # without a fork.
+            raise FileOpShapeRefusal(
+                "a --worker chown is scoped to a single document and cannot be "
+                "recursive: refusing"
+            )
     argv = build_maint_argv(verb, instruction, settings=settings)
     env = maint_env(
         settings,

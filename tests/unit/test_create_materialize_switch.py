@@ -90,7 +90,7 @@ async def _create(app, settings, **extra):
     ) as client:
         return await client.post(
             "/agent/sandboxes",
-            json={"sandboxID": SANDBOX, **extra},
+            json={"sandboxID": SANDBOX, "accessToken": "tok", **extra},
             headers={"X-Internal-Key": KEY},
         )
 

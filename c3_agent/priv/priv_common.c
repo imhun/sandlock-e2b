@@ -104,6 +104,17 @@ int priv_validate_uid(long uid, char *err, size_t errlen) {
     return 0;
 }
 
+int priv_uid_in_pool(long uid, char *err, size_t errlen) {
+    long start, size;
+    priv_uid_pool(&start, &size);
+    if (uid >= start && uid <= start + size - 1) {
+        snprintf(err, errlen, "uid %ld is inside the sandbox uid pool %ld..%ld",
+                 uid, start, start + size - 1);
+        return -1;
+    }
+    return 0;
+}
+
 /* See priv_worker_uid()/priv_worker_gid() in priv_common.h. The override is a
  * decimal integer; 0 is legitimate (a root worker exists in the compose and
  * test shapes), anything else is a deployment defect, and falling back to

@@ -203,6 +203,33 @@ ALLOWED_TMP_REFERENCES = {
     # contracts, in `tests/`).
     "tmp/audit/probe_i1_replay.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings-k0s-2026-09-30.md",
     "tmp/audit2/p21_cross_rce.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings-k0s-2026-10-01.md",
+    # The k0s white-box audit probes, third round (2026-10-04): the SEC-R3-01
+    # unauthenticated-RCE proof and the STATIC-2/3/5 reproductions. Same reason as
+    # the rounds above -- each needs the live cluster plus a control-plane API key,
+    # and the shape they were written against is the deployment of that day. What
+    # became a contract lives in `tests/`: the envd fail-closed guard in
+    # `tests/security/test_envd_token_fail_closed.py`, the `e2b-maint --worker`
+    # gate in `tests/unit/test_priv_maint_worker_gate.py`, and the fork-side
+    # syscall classification in `third_party/sandlock`'s own `sys::path_surface`
+    # tests. Conclusions: `docs/security-audit/findings-k0s-2026-10-04.md`.
+    "tmp/audit3/repro_c3_maint.sh": "一次性线上审计驱动（本地编译 c3_agent 特权二进制复现 STATIC-5）；结论已转成 tests/unit/test_priv_maint_worker_gate.py",
+    "tmp/audit3/run_layer_probe.sh": "差分探针 runner（同一车道跑两遍：带 worker "
+        "profile 与 seccomp=unconfined，归因出只靠外层 profile 挡住的 syscall）；"
+        "结论见 docs/security-audit/layer-attribution-2026-10-04.md",
+    "tmp/audit3/extract_syscall_table.py": "从 syscalls crate 的 per-arch 源文件导出编号表"
+        "（差分探针的编号-名字映射来源，非手抄常量）；见 layer-attribution-2026-10-04.md",
+    "tmp/audit3/s1_notify_fd.py": "一次性线上审计探针（需集群 + API key），结论见 findings-k0s-2026-10-04.md §3.1",
+    "tmp/audit3/s2_reach.py": "一次性线上审计探针（需集群 + API key），结论见 findings-k0s-2026-10-04.md §3.2",
+    "tmp/audit3/s3_reach_allowout.py": "一次性线上审计探针（需集群 + API key），结论见 findings-k0s-2026-10-04.md §3.2",
+    "tmp/audit3/s4_secure_flag.py": "一次性线上审计探针（需集群 + API key），`secure` 字段取证；结论已转成 tests/security/test_envd_token_fail_closed.py",
+    "tmp/audit3/s5_rce_proof.py": "一次性线上审计探针（SEC-R3-01 决定性证据，需集群 + API key）；结论已转成 tests/security/test_envd_token_fail_closed.py",
+    "tmp/audit3/in_pod_rce.py": "s5 的集群内半边（Connect 信封协议），随 s5 一起记录",
+    "tmp/audit3/s6_escalation.py": "一次性线上审计探针（需集群 + API key），结论见 findings-k0s-2026-10-04.md §2",
+    "tmp/audit3/s7_cross_tenant_reach.py": "一次性线上审计探针（需集群 + API key），结论见 findings-k0s-2026-10-04.md §3.2",
+    "tmp/audit3/s8_static_repro.py": "一次性线上审计探针（需集群 + API key），STATIC-2/3/4 复现；结论见 findings-k0s-2026-10-04.md §5",
+    "tmp/audit3/s9_caps_clone.py": "一次性线上审计探针（已废弃：裸调 clone3 且 stack=0 会递归 fork，见 findings §5.3 的教训）",
+    "tmp/audit3/s10_caps_only.py": "一次性线上审计探针（需集群 + API key），能力普查；结论见 findings-k0s-2026-10-04.md §4",
+    "tmp/audit3/s11_clone3_safe.py": "一次性线上审计探针（需集群 + API key），clone3 层级归因；结论见 findings-k0s-2026-10-04.md §5.3",
     "tmp/probe/probe.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
     "tmp/signal-probe/cross_sandbox_signal.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
     "tmp/signal-probe/inside_sandbox_blast.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",

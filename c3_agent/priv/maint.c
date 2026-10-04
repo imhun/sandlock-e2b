@@ -292,7 +292,41 @@ int main(int argc, char **argv) {
             if (uid >= 0) {
                 priv_usage("--worker cannot be combined with --uid");
             }
+            /* SEC-2026-10-04 (audit STATIC-5): this arm used to hand
+             * ``priv_worker_uid()`` straight to ``lchown`` with no gate at
+             * all, while the ``--uid`` arm below runs ``priv_validate_uid``.
+             * ``priv_worker_uid()`` reads ``E2B_BROKER_WORKER_UID``, which the
+             * agent fills from the request body, so the two arms disagreed
+             * about what may be written into a privileged tree. Reproduced
+             * locally against this binary: ``chown --worker --recursive`` with
+             * the worker uid set to 1 (outside the pool) reached ``lchown``.
+             *
+             * The invariant that actually matters is narrower than "in the
+             * pool": a caller may only give a privileged tree to an identity it
+             * cannot act as. The one set of uids a caller *can* act as is the
+             * sandbox uid pool, so refusing exactly that set closes the
+             * cross-tenant hole (a tree owned by a pooled uid is a tree the
+             * matching sandbox can read and write) without breaking the
+             * legitimate deployments: the k8s worker is 65534 and the
+             * compose/test root worker is 0, both outside the pool by
+             * construction. */
             uid = priv_worker_uid();
+            if (priv_uid_in_pool(uid, err, sizeof(err)) != 0) {
+                priv_fail(
+                    "--worker would hand a privileged tree to uid %ld, which is "
+                    "inside the sandbox uid pool: refusing (%s)",
+                    uid, err);
+            }
+            /* The same audit finding, second half: ``--worker --recursive``
+             * applied that identity to an entire tree, turning one legitimate
+             * document-scope operation into a node-wide ownership change. The
+             * only caller that uses ``--worker`` is the slot-document scope
+             * (``control_plane/file_ops.py``), and it is never recursive. */
+            if (recursive) {
+                priv_usage(
+                    "--worker cannot be combined with --recursive: the worker "
+                    "identity is only ever scoped to a single document");
+            }
             if (gid < 0) {
                 gid = priv_worker_gid();
             } else if (priv_gid_allowed(gid, err, sizeof(err)) != 0) {

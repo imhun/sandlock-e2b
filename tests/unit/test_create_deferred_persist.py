@@ -63,7 +63,7 @@ async def _create(app) -> tuple[httpx.Response, float]:
         started = time.monotonic()
         resp = await client.post(
             "/agent/sandboxes",
-            json={"sandboxID": SANDBOX},
+            json={"sandboxID": SANDBOX, "accessToken": "tok"},
             headers={"X-Internal-Key": KEY},
         )
         return resp, time.monotonic() - started

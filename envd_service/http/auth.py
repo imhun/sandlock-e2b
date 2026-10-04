@@ -65,7 +65,20 @@ def require_http_sandbox(
     # executed a command in another sandbox's host worker. Do not reintroduce
     # ``allow_public_traffic`` into this condition; "public traffic" must never
     # mean "public control plane".
-    if runtime.access_token and token != runtime.access_token:
+    #
+    # SEC-R3-01 (2026-10-04): the ``runtime.access_token and`` prefix made this
+    # guard *fail open* -- an EMPTY token satisfied it. ``secure`` was a
+    # client-supplied create field (``POST /sandboxes {"secure": false}``) that
+    # stored an empty token, and the externally reachable gateway forwards to
+    # envd with no authentication of its own, so the attacker-chosen
+    # ``E2b-Sandbox-Id`` header alone became a credential. Measured end to end
+    # through the public entry: HTTP 200 and ``id`` -> ``uid=0(root)``. The
+    # control plane now refuses ``secure=false`` outright and the record loader
+    # no longer tolerates an empty token, so "no token" must fail here too.
+    # One message for both failure modes on purpose: distinguishing "this
+    # sandbox has no token" from "wrong token" would turn this into an oracle
+    # for which sandbox ids exist unauthenticated.
+    if not runtime.access_token or token != runtime.access_token:
         raise HttpAuthError(401, "Invalid access token")
     state = getattr(runtime, "state", "running")
     if mutating and state != "running":

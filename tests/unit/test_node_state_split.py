@@ -198,8 +198,13 @@ async def _post(app, payload: dict) -> httpx.Response:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://worker"
     ) as client:
+        # A create payload always carries the sandbox's envd access token (the
+        # control plane sends it as "accessToken"); the worker refuses a create
+        # without one (SEC-R3-01). Injected here so every call site inherits it.
         return await client.post(
-            "/agent/sandboxes", json=payload, headers={"X-Internal-Key": KEY}
+            "/agent/sandboxes",
+            json={"accessToken": "tok", **payload},
+            headers={"X-Internal-Key": KEY},
         )
 
 

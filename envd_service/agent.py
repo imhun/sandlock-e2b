@@ -3149,6 +3149,24 @@ def _agent_finalize_sandbox(request: Request, settings: Settings, payload: dict)
     sandbox_id = payload.get("sandboxID")
     if not sandbox_id:
         raise ValueError("sandboxID is required")
+    # SEC-R3-01 (2026-10-04): refuse a create whose access token is missing or
+    # empty, before this function builds anything. An empty token used to be
+    # stored verbatim and then made envd's guard vacuously true, so the whole
+    # control surface answered a caller who presented nothing but the
+    # sandbox id -- which the externally reachable gateway forwards for free.
+    # The control plane now rejects ``secure=false`` and always mints a token;
+    # this is the second, independent gate, because ``SandboxRecord.from_dict``
+    # defaults a persisted record's token to "" and one such record would
+    # otherwise reproduce the hole after the API-level fix.
+    #
+    # Checked first so a doomed create costs a dict lookup instead of a tree
+    # build, a quota decision and an ownership hand-over.
+    if not payload.get("accessToken"):
+        raise ValueError(
+            "refusing to create a sandbox with an empty envd access token "
+            f"(sandboxID={sandbox_id!r}): the control plane must always send one "
+            "-- see SEC-R3-01"
+        )
     workspace_dir = workspace_base / sandbox_id
     snapshot_id = payload.get("snapshotID")
     materialized = payload.get("materialized") is True
@@ -3264,7 +3282,7 @@ def _agent_finalize_sandbox(request: Request, settings: Settings, payload: dict)
             align_shared_uid_workspace(workspace_dir)
         runtime_registry.register(
             sandbox_id=sandbox_id,
-            access_token=payload.get("accessToken", ""),
+            access_token=payload["accessToken"],
             workspace_dir=str(workspace_dir),
             env_vars=dict(payload.get("envVars") or {}),
             base_image=payload.get("baseImage"),

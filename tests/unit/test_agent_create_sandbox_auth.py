@@ -61,7 +61,12 @@ async def _post_create(worker, key: str | None, sandbox_id: str):
         transport=httpx.ASGITransport(app=app), base_url="http://worker"
     ) as client:
         return await client.post(
-            "/agent/sandboxes", json={"sandboxID": sandbox_id}, headers=headers
+            # A create payload always carries the sandbox's envd access token
+            # (the control plane sends it at api/sandboxes.py "accessToken"); the
+            # worker refuses a create without one (SEC-R3-01).
+            "/agent/sandboxes",
+            json={"sandboxID": sandbox_id, "accessToken": "tok"},
+            headers=headers,
         )
 
 

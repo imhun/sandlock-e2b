@@ -1104,6 +1104,29 @@ async def _create_sandbox_attempt(
     allow_internet_access = body.get("allow_internet_access", False)
     if not isinstance(secure, bool) or not isinstance(allow_internet_access, bool):
         raise OfficialError(400, "secure and allow_internet_access must be booleans")
+    # SEC-R3-01 (2026-10-04): refuse ``secure=false`` outright instead of
+    # storing an empty ``envd_access_token``.
+    #
+    # ``secure`` used to be a client-supplied switch whose only effect was to
+    # leave ``envd_access_token`` empty (``registry/manager.py``), which made
+    # envd's guard -- ``if runtime.access_token and token != ...`` -- vacuously
+    # true. The externally reachable gateway authenticates nothing and forwards
+    # any caller-chosen ``E2b-Sandbox-Id`` to the holding worker, so the sandbox
+    # id was the whole credential: measured through the public entry, an
+    # unauthenticated ``POST /process.Process/Start`` returned HTTP 200 and ran
+    # ``id`` as uid 0.
+    #
+    # Reject rather than silently coerce: a caller who asked for an
+    # unauthenticated sandbox must be told it is gone, not left believing it has
+    # one. "Public traffic" is a different feature and must be expressed with a
+    # real credential (``traffic_access_token``), never with an empty one.
+    if not secure:
+        raise OfficialError(
+            400,
+            "secure=false is no longer supported: envd always requires an access "
+            "token. Use allowPublicTraffic for reachability, not for "
+            "authentication.",
+        )
 
     try:
         network = normalize_network_config(body.get("network"))

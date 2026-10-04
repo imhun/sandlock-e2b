@@ -1656,8 +1656,12 @@ fork 分支 `feature/network-netns`（基于 feature/network-wildcard）：
    （`POST /agent/sandboxes/{id}/network`），agent 更新 `RuntimeSandbox` 并
    调用 `SandboxRuntimeContext.update_network`；RPC `_context` 增加网络配置
    drift 检测，下条命令用新策略。
-4. **allowPublicTraffic**：envd HTTP/Connect 鉴权在
-   `runtime.allow_public_traffic` 时跳过 token 校验（仍校验 sandbox id）。
+4. **allowPublicTraffic**：⚠ **本条曾描述 SEC-K0S-005 的漏洞行为，已作废。**
+   envd HTTP/Connect 鉴权**无条件**要求 `X-Access-Token`；`allowPublicTraffic`
+   只影响可达性，**不再**、也**不得**影响鉴权（SEC-R3-01 又从 `secure` 这个
+   客户端字段上找到过同一条旁路，已一并封死）。另见
+   `docs/security-audit/findings-k0s-2026-10-04.md` §2 与
+   `remediation-SEC-R3-01.md`。
 5. **显式拒绝（no fake success）**：`egressProxy`、`maskRequestHost`、
    `rules.transform`（header 改写）返回 400，标注依赖阶段 B 代理层。
 6. **测试**：单元（校验/映射/序列化/executor kwargs）14 个；契约 5 个
