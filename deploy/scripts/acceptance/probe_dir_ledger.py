@@ -44,7 +44,16 @@ shutil.rmtree(f"{root}/a/b/c")
 PY
 """
 
-sb = Sandbox.create(timeout=900)
+# ``sandbox_url``/``api_url`` are passed explicitly, like the other probes in
+# this directory: without them the SDK builds ``49983-<id>.localhost`` from the
+# default domain, which is unroutable from outside the cluster (measured
+# 2026-10-04: `tls handshake eof`). `E2B_SANDBOX_URL` works too, but a probe
+# that needs a second env to be set is a probe that fails for the next person.
+sb = Sandbox.create(
+    timeout=900,
+    api_url=os.environ["E2B_API_URL"].rstrip("/"),
+    sandbox_url=os.environ["E2B_API_URL"].rstrip("/"),
+)
 try:
     # 1. A baseline the worker has certainly seen by now.
     time.sleep(8)
