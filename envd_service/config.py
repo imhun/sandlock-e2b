@@ -565,6 +565,19 @@ class Settings:
     internal_api_key: str = field(
         default_factory=lambda: os.getenv("E2B_INTERNAL_API_KEY", "internal-key")
     )
+    #: C3 Task 2 / N49: **this worker's own node id** and the per-node
+    #: credential map (``E2B_INTERNAL_NODE_KEYS``, ``{"<key>": "<node_id>"}``).
+    #: When the map has an entry for this node, the worker presents *that* key
+    #: as ``X-Internal-Key`` -- the control plane then derives the node from the
+    #: credential (step ① of the internal API's validation) instead of relying
+    #: on this node's network position alone. The fleet key stays as the
+    #: bootstrap/fallback for lanes that ship no map (compose, tests).
+    node_id: str = field(
+        default_factory=lambda: (os.getenv("E2B_NODE_ID") or "").strip()
+    )
+    internal_node_keys: dict[str, str] = field(
+        default_factory=lambda: _env_json_dict("E2B_INTERNAL_NODE_KEYS")
+    )
     # E3.6: rotation window (see control_plane/config.py). Workers accept
     # every key in E2B_INTERNAL_API_KEYS while the list is populated.
     internal_api_keys: tuple[str, ...] = field(
@@ -624,6 +637,15 @@ class Settings:
         if self.internal_api_key:
             keys.append(self.internal_api_key)
         return tuple(dict.fromkeys(keys))
+
+    @property
+    def outbound_internal_key(self) -> str:
+        """The ``X-Internal-Key`` this worker presents.
+
+        Node-bound when ``E2B_INTERNAL_NODE_KEYS`` carries this node (N49's
+        step ①: the credential says who is calling), the fleet key otherwise.
+        """
+        return self.internal_node_keys.get(self.node_id, "") or self.internal_api_key
 
     def __post_init__(self) -> None:
         """Give ``state_base`` its default: *this* object's workspace base.

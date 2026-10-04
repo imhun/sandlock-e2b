@@ -1929,7 +1929,7 @@ class NodeAgent:
 
     async def _pulse(self) -> None:
         """One register-or-heartbeat exchange, then whatever round it triggers."""
-        headers = {"X-Internal-Key": self._settings.internal_api_key}
+        headers = {"X-Internal-Key": self._settings.outbound_internal_key}
         async with httpx.AsyncClient(timeout=10) as client:
             payload = _register_payload(self._settings, self._declared_node_id)
             payload["address"] = self._node_address
@@ -2205,7 +2205,7 @@ class NodeAgent:
                 resp = await client.post(
                     f"{self._control_url}/internal/nodes/{self._node_id}/heartbeat",
                     json=payload,
-                    headers={"X-Internal-Key": self._settings.internal_api_key},
+                    headers={"X-Internal-Key": self._settings.outbound_internal_key},
                 )
             if resp.status_code == 404:
                 self._node_id = None
@@ -2246,7 +2246,7 @@ class NodeAgent:
         The client is per-round because the heartbeat loop closes the one it
         uses at the end of every pulse; a detached round cannot borrow it.
         """
-        headers = {"X-Internal-Key": self._settings.internal_api_key}
+        headers = {"X-Internal-Key": self._settings.outbound_internal_key}
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 summary = await self._reconcile_with_control_plane(client, headers)

@@ -363,7 +363,7 @@ def configure(
     client = AgentFileOps(
         control_plane_url=str(url),
         node_id=str(node),
-        internal_key=getattr(settings, "internal_api_key", "") or "",
+        internal_key=_internal_key_for(settings),
         timeout_s=float(getattr(settings, "file_op_timeout_s", DEFAULT_TIMEOUT_S)),
         transport=transport,
     )
