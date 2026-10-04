@@ -24,45 +24,82 @@ containerd 2.3.4、Rocky 10.2、部署版本 `0.1.0-979`）实测的。
 
 ## 架构图
 
+```mermaid
+flowchart TD
+    A["沙箱进程发起 syscall"] --> B{"① seccomp 内层<br/>blocklist 76 条（按名字）<br/>arg 过滤 3 处：clone/socket/ioctl"}
+    B -->|拒| E1["EPERM<br/><i>名单外一律落这里</i>"]
+    B -->|过| C{"② Landlock · ABI 6<br/>六项保护 floor 2/3/4/5/6/6<br/>全部够得着"}
+    C -->|拒| E2["EACCES / EPERM<br/><i>ABI 不够则建箱阶段就失败</i>"]
+    C -->|过| D{"③ 中介层 · supervisor 代执行<br/>路径翻译 / proc 合成<br/>netlink 虚拟 / connect 代建连"}
+    D -->|拒| E3["EOPNOTSUPP / EAFNOSUPPORT / EIO<br/><i>语义拒绝，不是权限</i>"]
+    D -->|过| F["worker 容器<br/>hostPID=true"]
+    F --> G{"④ 外层 seccomp profile<br/>SCMP_ACT_ERRNO + 416 条允许"}
+    G -->|拒| E4["ENOSYS 38<br/><i>指纹与 ① 的 EPERM 不同</i>"]
+    G -->|过| H["宿主机 kernel"]
+
+    H["宿主机 kernel"]:::host
+    E1:::deny
+    E2:::deny
+    E3:::deny
+    E4:::deny
+
+    classDef host fill:#7f1d1d,stroke:#ef4444,stroke-width:2px,color:#fff
+    classDef deny fill:#1f2937,stroke:#6b7280,color:#e5e7eb
+    style F fill:#1e3a5f,stroke:#3b82f6,color:#fff
+    style A fill:#1e3a5f,stroke:#3b82f6,color:#fff
 ```
-                          ┌───────────────────────────────────┐
-   客户端 ──── HTTPS ────▶ │ 控制面 gateway :3000              │
-   (API key)              │  POST /sandboxes  · 准入/配额/记账 │
-                          │  X-Access-Token → runtime registry│
-                          └───────┬───────────────────┬───────┘
-                                  │ 内部 API（零对外暴露）│
-                    ┌─────────────▼──────┐      ┌─────▼──────────────┐
-                    │ e2b-worker (pod)   │      │ e2b-c3-agent       │
-                    │  envd（执行代理）  │      │  hostPID: true     │
-                    │                    │      │  无 seccompProfile │
-                    │ ┌────────────────┐ │      │  ← NetworkPolicy   │
-                    │ │ 沙箱进程        │ │      │    把 worker pod IP │
-                    │ │ uid 池内独占    │ │      │    全量 blackhole  │
-                    │ │ PID ns / net ns│ │      └────────────────────┘
-                    │ └───────┬────────┘ │
-                    └─────────┼──────────┘
-                              │ ① seccomp 内层（fork，进程级）
-                              │ ② Landlock ABI 6（路径 + IOCTL_DEV）
-                              │ ③ chroot 中介 / procfs 合成 / netlink 虚拟
-                              ▼
-                    ┌──────────────────────────┐
-                    │  worker 容器（hostPID）  │
-                    │  ┌────────────────────┐  │
-                    │  │ supervisor（supervise）│ │  ← 代执行 send/connect
-                    │  │ 持 seccomp notify fd │ │     chroot 路径翻译
-                    │  └────────────────────┘  │
-                    │  共享 NAS: workspaces/    │
-                    │           state/_images   │
-                    └──────────────────────────┘
-                              │
-                              │ ④ 外层 seccomp profile
-                              │   （deploy/seccomp/sandlock-worker.json）
-                              ▼
-                    ┌──────────────────────────┐
-                    │  宿主机 kernel            │
-                    │  ★ 沙箱够不到的那一层 ★  │
-                    └──────────────────────────┘
+
+```mermaid
+flowchart TB
+    C["客户端"]:::ext
+
+    subgraph OUT["集群外"]
+        C
+    end
+
+    subgraph CP["控制面 :3000 — 对外唯一入口"]
+        GW["gateway<br/>准入 / 配额 / 记账<br/>X-Access-Token"]:::cp
+    end
+
+    subgraph CLUSTER["k0s cluster · namespace sandlock"]
+        subgraph WPOD["e2b-worker pod · hostPID"]
+            ENVD["envd 执行代理"]:::worker
+            SUP["supervisor<br/>持 seccomp notify fd"]:::worker
+            subgraph SB["沙箱 · uid 池内独占 · pid/net ns 独立"]
+                P["沙箱进程"]:::sandbox
+            end
+            NAS[("共享 NAS<br/>workspaces/ · state/_images")]:::store
+            ENVD --> SUP --> P
+            P <--> NAS
+        end
+
+        subgraph APOD["e2b-c3-agent pod"]
+            AG["c3-agent<br/>hostPID=true<br/>无 seccompProfile"]:::agent
+        end
+
+        NP["NetworkPolicy<br/>worker pod IP 全量 blackhole"]:::policy
+    end
+
+    C -->|"HTTPS + API key"| GW
+    GW -->|"内部 API · 不对外暴露"| ENVD
+    NP -.->|"唯一隔离手段"| AG
+    SB -.->|"到不了"| NP
+
+    classDef ext fill:#374151,stroke:#6b7280,color:#f3f4f6
+    classDef cp fill:#1e3a5f,stroke:#3b82f6,color:#fff
+    classDef worker fill:#14532d,stroke:#22c55e,color:#fff
+    classDef sandbox fill:#78350f,stroke:#f59e0b,color:#fff
+    classDef store fill:#374151,stroke:#6b7280,color:#f3f4f6
+    classDef agent fill:#7f1d1d,stroke:#ef4444,color:#fff
+    classDef policy fill:#1f2937,stroke:#f59e0b,color:#e5e7eb
+    style SB fill:#451a03,stroke:#f59e0b,color:#fff
 ```
+
+两张图答两个问题：第一张答"改哪一层会破什么"，第二张答"谁看得见谁"。
+判定链里只有第 ④ 层通到宿主，所以它是唯一值得当边界看的那层 —— 打穿前三层只到 worker 容器。
+
+ 两张图答两个问题：第一张答"改哪一层会破什么"，第二张答"谁看得见谁"。
+ 判定链里只有第 ④ 层通到宿主，所以它是唯一值得当边界看的那层。
 
 四层里前三层是沙箱代码（fork + envd），第四层是部署配置。
 **打穿前三层只能到 worker 容器，打穿第四层才到宿主** —— 第四层是唯一的宿主边界。
