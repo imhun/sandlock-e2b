@@ -184,12 +184,13 @@ git commit -m "test(n14-S5): the security suites and the arm lane have one shape
 ### Task 5: 清单与集群验收
 
 **Files:**
-- Modify: `deploy/k8s/worker.yaml`（删 `E2B_REAL_ROOT`）、`docs/env-vars.md`、`docs/n14-retire-the-emulation.md`（§6 的 S5 勾选）
+- Modify: `deploy/k8s/worker.yaml`（删 `E2B_REAL_ROOT`）、`tests/unit/test_worker_env_key_sets.py`、`deploy/scripts/checkpoint_acceptance.py`、`docs/n14-retire-the-emulation.md`（§6 的 S5 勾选）
+- 无 `docs/env-vars.md` 改动：它本来就没列 `E2B_REAL_ROOT`
 
-- [ ] **Step 1: 清单**：删退路 env；`DRY_RUN=1 apply.sh | kubectl diff -f -` 预期只剩镜像 tag/generation
-- [ ] **Step 2: 构建 + 上线**（wheel 已是 Task 3 的产物）
-- [ ] **Step 3: 现场验收**：① 两个形态各建一个沙箱（image-rootfs + pure synth），`sandbox.json` 有 root、`chain=PASS`（N16 探针）；② 旧的 `E2B_REAL_ROOT=0` 写进部署会**启动即拒**（用一次受控的 rollout 验证，然后撤回）；③ `GET /sandboxes` / `kubectl diff` 收尾读数
-- [ ] **Step 4: 回填** `docs/deploy-clusters.md` 新节 + N14 状态改成"已收口"
+- [x] **Step 1: 清单**：`deploy/k8s/worker.yaml` 删掉 `E2B_REAL_ROOT`（注释改写成"形态 + 那条仍然承重的 seccomp 前提"）；两个读它的地方跟着改（键集合守卫的类改名 `k8s_checkpoint`、`checkpoint_acceptance.py` 不再断言清单写着 `=1`）。`DRY_RUN=1 apply.sh | kubectl diff -f -` **只剩这一处 env 删除 + StatefulSet generation**
+- [x] **Step 2: 构建 + 上线**：`build-and-push.sh` → **`0.1.0-997-g96d6a29-20261004-230309`**（T3 的 fork 改动未做，wheel 不变，这一版只带 E2B 侧）；`deploy/k8s-k0s/apply.sh` 滚动完成（先 agent 后 worker），base image 预热两节点 `cached=true`
+- [x] **Step 3: 现场验收**：① 舰队形态（image-rootfs + 真根）建箱实测 —— `printf '#!/bin/sh\necho shebang-ok\n' > /home/user/s.sh && chmod +x … && …` **rc=0 / `shebang-ok`**（N35 的判据、S5 的形态证明）；`cp /bin/echo /home/user/e && chmod +x … && …` **rc=0**；沙箱内 `mountinfo` 显示自己的 rootfs 是 `/`（`ro`）+ `/home/user`、`/workspace`、`/dev/*` 在内（真根读数）—— 注意探针第一版漏了 `chmod +x`，把 `cp` 的 0644 误读成 EACCES，已改正（固化在 `deploy/scripts/acceptance/probe_real_root_shape.py`）。② 退役取值在**已上线的镜像**里拒绝：`kubectl exec e2b-worker-0 -- env E2B_REAL_ROOT=0 python3 -c "from envd_service.app import create_app; create_app()"` → `RuntimeError: E2B_REAL_ROOT=0: the emulated root is retired (N14 S5)… delete the line`（`=off` 同一条；`E2B_PURE_ROOTFS=off` 给合成的具名消息）；同样的环境下不设这两个键则 `app-created-ok`。**没有**做"把旧值写进部署再撤回"的受控 rollout —— 容器入口就是 `python -m envd_service` → `create_app`，所以 exec 里这一次与 kubelet 重启容器走的是同一行代码，而受控 rollout 只会多演示一次 CrashLoop。③ 收尾读数：9 pod Running / **0 重启**、`kubectl diff` **0 行**、`GET /sandboxes` **`[]`**
+- [x] **Step 4: 回填**：N14 行已补 S5 的 E2B 侧收口（`docs/open-issues.md`）。**`docs/deploy-clusters.md` 的新节还没写**：另一个 agent 在该文件有未提交改动，等它落库后再补，避免把它的工作一起提交
 
 ## 本计划明确不做
 
