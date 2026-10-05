@@ -380,12 +380,35 @@ def _platform_numbers(
     workspace_base, state_base=None, *, child_bytes=None
 ) -> tuple[int | None, int]:
     """``(used bytes or None, budget bytes)`` -- ``None`` is "cannot measure" (I-3)."""
+    _ensure_store_gate(workspace_base, state_base)
     return (
         measure_platform_disk_bytes(
             workspace_base, state_base=state_base, child_bytes=child_bytes
         ),
         platform_budget_bytes(),
     )
+
+
+def _ensure_store_gate(workspace_base, state_base=None) -> None:
+    """Repair the store gate's mode on a store an earlier build created.
+
+    ``_prepare_image_parent`` writes ``0755`` from today on, but a store created
+    before that is ``0711`` -- traversable, *not listable* -- and the platform
+    account is measured by walking the store's children. Repairing it here (we
+    own the directory; the sandbox cannot reach the state base at all, N27) is
+    what makes the fix take effect on a running deployment instead of only on a
+    freshly formatted volume.
+    """
+    root = (
+        resolve_state_base(workspace_base, state_base)
+        / RUNTIME_DIR_NAME
+        / CHECKPOINT_ROOT_NAME
+    )
+    try:
+        if root.is_dir() and stat.S_IMODE(root.stat().st_mode) != 0o755:
+            os.chmod(root, 0o755)
+    except OSError:  # pragma: no cover - best effort, like the modes above
+        pass
 
 
 def _executor_of(ctx):

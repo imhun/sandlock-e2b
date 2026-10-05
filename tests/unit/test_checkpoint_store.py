@@ -173,6 +173,29 @@ def test_the_image_directory_is_closed_to_the_sandbox(tmp_path: Path) -> None:
     assert root_mode == 0o755, f"the store gate must be listable, got {oct(root_mode)}"
 
 
+def test_an_old_store_gate_is_repaired_before_the_account_is_measured(
+    tmp_path: Path,
+) -> None:
+    """A store an earlier build created (0711) must become listable on use.
+
+    The account is measured by walking the store's children, so on a running
+    deployment -- whose store already exists at 0711 -- every capture after the
+    first stayed refused until the volume was recreated. Repairing the mode when
+    the account is measured is what makes the fix land without a fresh volume.
+    """
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_store")
+    root = base / "_runtime" / ".checkpoints"
+    root.mkdir(parents=True)
+    os.chmod(root, 0o711)
+
+    capture_checkpoint_image(base, _ctx(_FakeExecutor()), "sbx_store")
+
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755, (
+        "the gate must be listable after the account was measured"
+    )
+
+
 def test_the_image_directory_is_handed_to_the_slot_that_will_write_it(
     tmp_path: Path, monkeypatch
 ) -> None:
