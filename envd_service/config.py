@@ -318,19 +318,6 @@ class Settings:
     sandbox_notify_rate_limit: int = field(
         default_factory=lambda: _env_int("E2B_SANDBOX_NOTIFY_RATE_LIMIT", 5000)
     )
-    # N79: the stat family gets its own notification budget, because ordinary
-    # metadata work (`find`, `git status`, a package manager) reaches thousands
-    # of these per second and used to spend the general 5000/s window in a
-    # fraction of a second -- after which the supervisor slept out the rest of
-    # the second (measured: 852-864 ms every 1.0007 s). 20000/s is 4x the
-    # general budget and ~0.52 core at the measured 26 us per notification
-    # (a quarter of the worker pod's 2 cores). 0 = fold stats back into the
-    # general window (the pre-N79 behaviour, and the rollback).
-    sandbox_stat_notify_rate_limit: int = field(
-        default_factory=lambda: _env_int(
-            "E2B_SANDBOX_STAT_NOTIFY_RATE_LIMIT", 20000
-        )
-    )
     iam_signing_key: str = field(
         default_factory=lambda: os.getenv(
             "E2B_IAM_SIGNING_KEY", "e2b-sandlock-local-iam-key"

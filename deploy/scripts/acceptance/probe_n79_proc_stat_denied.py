@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""N79 验收钉子：stat 单列预算之后，`/proc` 的 stat 仍然被中介拒（EACCES）。
+"""验收钉子：沙箱里 `stat /proc/<宿主 pid>` **不可解析**。
 
-选项 ① 换的是"这些通知算谁的预算"，不是"拦不拦"。所以拦截语义必须原样：
-任何 `/proc/<n>`（含宿主 pid）的 stat 族调用都还在 `handle_proc_stat_family`
-手里，一律 EACCES；非 /proc 的 stat 照常放行。
+这条性质跨了两次改动，答它的人换了，性质没换：
+
+* N79 之前 / 期间：`handle_proc_stat_family` 把它拒成 **EACCES**；
+* N81 之后：中介整族退出通知表，内核在沙箱自己的**空 `/proc`** 上答
+  **ENOENT**（`probe_n81_proc_stat_shape.py` 是那条前提的取证：`stat /proc`
+  与 `stat /` 同 `st_dev`，`/proc/uptime` 之类的非数字路径本来就由内核答 ENOENT）。
+
+两种都满足判据：**这个路径拿不到宿主进程的元数据**。所以钉子接受这两个 errno
+之一，但要求非 `/proc` 的 stat 照常成功 —— 后一半让它不是"一律拒绝"的橡皮图章。
 
 用法（对着已部署的集群跑）：
 
@@ -52,11 +58,16 @@ def main() -> int:
         text = (out.stdout or "") + (out.stderr or "")
         print(text.strip())
         # `/proc/1` is the *host* pid 1: the sandbox must not be answered for
-        # it. `/etc/os-release` is an ordinary stat and must stay allowed.
-        ok = text.splitlines() == [
+        # it -- by the mediator (EACCES, pre-N81) or by the kernel on the
+        # sandbox's own empty /proc (ENOENT, N81+). `/etc/os-release` is an
+        # ordinary stat and must stay allowed; that half is what makes this a
+        # pin rather than a blanket denial.
+        lines = text.splitlines()
+        host_pid_unresolvable = bool(lines) and lines[0] in (
             "/proc/1 errno=13 Permission denied",
-            "/etc/os-release ALLOWED",
-        ]
+            "/proc/1 errno=2 No such file or directory",
+        )
+        ok = host_pid_unresolvable and lines[1:] == ["/etc/os-release ALLOWED"]
         print("PROC-PIN", "OK" if ok else "FAIL")
         return 0 if ok else 1
     finally:

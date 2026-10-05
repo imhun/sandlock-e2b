@@ -1081,7 +1081,6 @@ SUPERVISE_POLICY_FIELDS: frozenset[str] = frozenset(
         "no_huge_pages",
         "no_randomize_memory",
         "notify_rate_limit",
-        "notify_rate_limit_stat",
         "num_cpus",
         "on_error",
         "on_exit",

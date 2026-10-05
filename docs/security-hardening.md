@@ -55,7 +55,10 @@
   每秒最多处理 N 个 seccomp 通知，超限 supervisor 睡满窗口剩余时间，
   沙箱被拦截的 syscall 在内核队列积压/阻塞，防止通知洪泛压垮 supervisor。
 - worker 配置 `E2B_SANDBOX_NOTIFY_RATE_LIMIT`（默认 5000/s，0 关闭）。
-- **N79（2026-10-05）把这个预算按类拆开**：stat 族（`newfstatat`/`statx`/`faccessat`/
+- **N81（2026-10-06）之后 stat 族不再进通知表**，所以下面这条 N79 的分类预算已退役（字段
+  `notify_rate_limit_stat` 与 `E2B_SANDBOX_STAT_NOTIFY_RATE_LIMIT` 都已删除）：真根形态下沙箱的
+  `/proc` 是它自己 rootfs 里的**空目录**，内核答 `stat` 与中介代答的数字相同，拦它只买到 26 µs/次
+  的往返。下面这段保留为记录。**N79（2026-10-05）曾把这个预算按类拆开**：stat 族（`newfstatat`/`statx`/`faccessat`/
   `faccessat2`/`readlinkat` + 旧 ABI 拼写）吃自己的窗口
   （builder 字段 `notify_rate_limit_stat`，worker 侧 `E2B_SANDBOX_STAT_NOTIFY_RATE_LIMIT`，
   默认 **20000/s**）。依据是实测：普通元数据负载（`find`/`git status`/包管理器）每秒产生

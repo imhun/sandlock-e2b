@@ -7,7 +7,9 @@
 2. `stat /proc/uptime|version|meminfo|cpuinfo` 全部 `ENOENT` —— 这四条是**非数字**
    路径，`handle_proc_stat_family` 对它们本来就 `Continue`，所以这是**内核自己在答**：
    内核眼里 `/proc` 是个空目录；
-3. 对照：`stat /proc/1` 是 `EACCES`（那是中介对数字 pid 的拒绝，不是内核的答案）。
+3. 对照：`stat /proc/1` **不可解析** —— N81 之前/期间是中介拒的 `EACCES`，
+   N81 之后是内核在空目录上答的 `ENOENT`。判据接受两者之一，因为两者都等于
+   "拿不到宿主进程的元数据"，而这正是这条论证要的东西。
 
 三者合起来 = "沙箱的 `/proc` 是它自己文件系统里的普通空目录"，于是内核**不可能**把
 `/proc/<宿主pid>` 解析到宿主进程上 —— 今天那条 EACCES 是冗余的（内核会给 ENOENT）。
@@ -62,14 +64,18 @@ def main() -> int:
             lines.get(path, "").endswith("errno=2 No such file or directory")
             for path in ("/proc/uptime", "/proc/version", "/proc/meminfo", "/proc/cpuinfo")
         )
-        numeric_denied = lines.get("/proc/1", "").endswith("errno=13 Permission denied")
+        # Either the mediator's EACCES (pre-N81) or the kernel's ENOENT on the
+        # sandbox's own empty /proc (N81+): both mean "not resolvable".
+        host_pid_unresolvable = lines.get("/proc/1", "").endswith(
+            ("errno=13 Permission denied", "errno=2 No such file or directory")
+        )
 
-        ok = same_mount and kernel_says_empty and numeric_denied
+        ok = same_mount and kernel_says_empty and host_pid_unresolvable
         print(
             "PROC-SHAPE",
             "OK" if ok else "FAIL",
             f"same_st_dev={same_mount} kernel_sees_empty_dir={kernel_says_empty} "
-            f"numeric_denied_by_mediator={numeric_denied}",
+            f"host_pid_unresolvable={host_pid_unresolvable}",
         )
         return 0 if ok else 1
     finally:

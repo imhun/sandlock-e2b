@@ -243,7 +243,6 @@ def create_executor(
                 network=network,
                 network_deny_cidrs=settings.network_deny_cidrs,
                 notify_rate_limit=settings.sandbox_notify_rate_limit,
-                notify_rate_limit_stat=settings.sandbox_stat_notify_rate_limit,
                 iam_tokens=iam_tokens,
                 iam_signing_key=settings.iam_signing_key,
                 secrets_dir=settings.image_cache_dir / "secrets",
