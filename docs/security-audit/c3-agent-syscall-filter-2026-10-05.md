@@ -1,7 +1,8 @@
 # c3-agent 的 syscall 过滤：为什么 RuntimeDefault 就够，以及为什么两个 DaemonSet 不该合并
 
 写给下一个动 `deploy/k8s/c3-agent.yaml` 的人。收的是 `remediation-SEC-R3-01.md` §8.6
-STATIC-6 那五条里落地的三条（seccompProfile / SA token / 可写根 + face A 的 gid）。
+STATIC-6 那五条里落地的**四条**（seccompProfile / SA token / 可写根 / face A 的 gid）；
+第五条 `hostPID` 是设计上保留的，理由见 §5。
 
 ## 0. 口径
 
