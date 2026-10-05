@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from gateway_common.env import env_int
@@ -59,7 +60,10 @@ def platform_budget_bytes() -> int:
 
 
 def measure_platform_disk_bytes(
-    workspace_base: str | Path, state_base: str | Path | None = None
+    workspace_base: str | Path,
+    state_base: str | Path | None = None,
+    *,
+    child_bytes: "Callable[[str], int | None] | None" = None,
 ) -> int | None:
     """Allocated bytes under ``<state base>/_runtime``; 0 when it is absent.
 
@@ -87,11 +91,13 @@ def measure_platform_disk_bytes(
     runtime_dir = resolve_state_base(workspace_base, state_base) / RUNTIME_DIR_NAME
     if not runtime_dir.is_dir():
         return 0
-    size = _runtime_bytes_one_tree_at_a_time(runtime_dir)
+    size = _runtime_bytes_one_tree_at_a_time(runtime_dir, child_bytes=child_bytes)
     return None if size is None else int(size)
 
 
-def _runtime_bytes_one_tree_at_a_time(runtime_dir: Path) -> int | None:
+def _runtime_bytes_one_tree_at_a_time(
+    runtime_dir: Path, *, child_bytes: "Callable[[str], int | None] | None" = None
+) -> int | None:
     """``dir_size(<runtime>)``, split into one walk per child of ``<runtime>``.
 
     Why split: ``<state base>/_runtime`` is the **node's** namespace -- every
@@ -146,6 +152,18 @@ def _runtime_bytes_one_tree_at_a_time(runtime_dir: Path) -> int | None:
             if is_symlink:
                 continue  # ``os.walk`` lists it, never descends -- so it costs 0
             size = priv_helpers.dir_size(entry.path)
+            if size is None and child_bytes is not None:
+                # The child is out of the worker's own reach -- a ``0700``
+                # checkpoint store owned by a sandbox's uid. The **agent** is
+                # the reader that replaced ``e2b-maint`` here (that binary is
+                # retired), and its walk is keyed by the sandbox id, which is
+                # exactly this directory's name. ``None`` from the fallback
+                # keeps the account unknown, which is the same fail-closed
+                # answer as before.
+                try:
+                    size = child_bytes(entry.name)
+                except Exception:  # noqa: BLE001 - unknown stays unknown
+                    size = None
         else:
             try:
                 size = entry_size(entry.path)

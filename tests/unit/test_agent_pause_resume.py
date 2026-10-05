@@ -15,6 +15,7 @@ import pytest
 
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
+from envd_service.runtime.checkpoint_store import checkpoint_image_dir
 from envd_service.runtime.registry import RuntimeRegistry
 
 
@@ -89,6 +90,37 @@ async def test_agent_pause_freezes_live_context_204(workspace) -> None:
     assert ctx is not None
     assert ctx.paused == 1
     assert ctx.resumed == 0
+
+
+async def test_a_refused_capture_removes_the_previous_image(
+    workspace, monkeypatch
+) -> None:
+    """A pause that cannot take a new image must not leave the old one behind.
+
+    A resume cannot tell the two apart, and the stale image describes an older
+    process tree -- restoring it silently rewinds the sandbox. Measured
+    2026-10-05 on the k0s acceptance: the second pause was refused (the platform
+    account was unmeasurable), its image was never written, and the resume
+    brought back the *first* ticker, so the counter the test watched never moved
+    while the restored process kept writing the first one's file.
+    """
+    # The capture only runs when the deployment asked for it (the pause's
+    # checkpoint hook), so the test has to turn the flag on.
+    monkeypatch.setenv("E2B_PAUSE_CHECKPOINT", "1")
+    worker = _make_worker(workspace)
+    app, settings, runtime_registry = worker
+    _register_runtime(app, runtime_registry, "sbx_stale", live_context=True)
+    image = checkpoint_image_dir(workspace, "sbx_stale")
+    image.mkdir(parents=True)
+    (image / "meta.json").write_text("{}", encoding="utf-8")
+    assert image.is_dir()
+
+    resp = await _post(worker, "sbx_stale", "pause", settings.internal_api_key)
+
+    assert resp.status_code == 204
+    assert not image.exists(), (
+        "a refused capture must not leave an older image for a resume to restore"
+    )
 
 
 async def test_agent_pause_is_idempotent_at_http_level(workspace) -> None:

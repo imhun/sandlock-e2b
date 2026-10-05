@@ -3853,6 +3853,23 @@ async def _checkpoint_before_pause(
     # The image has to land where the *slot* can write it, and the slot runs as
     # the sandbox's pooled uid (route B). ``None`` on a shared-uid worker.
     runtime = request.app.state.runtime_registry.get(sandbox_id)
+
+    def _store_child_bytes(name: str) -> int | None:
+        """One child of ``<state>/_runtime``, measured by the **agent**.
+
+        The checkpoint store is ``0700`` per sandbox, so this worker cannot read
+        it in process; the agent runs as the owning uid and its
+        ``walk-checkpoint`` verb is keyed by the sandbox id -- which is exactly
+        this directory's name. ``None`` keeps the platform account unknown.
+        """
+        client = _agent_fileops()
+        if client is None:
+            return None
+        try:
+            return client.checkpoint_bytes(name)
+        except Exception:  # noqa: BLE001 - unknown stays unknown
+            return None
+
     try:
         reply = await asyncio.to_thread(
             capture_checkpoint_image,
@@ -3863,6 +3880,7 @@ async def _checkpoint_before_pause(
             state_base=_registry_state_base(
                 request.app.state.runtime_registry, settings
             ),
+            child_bytes=_store_child_bytes,
         )
     except Exception:  # noqa: BLE001 - see the docstring: the pause proceeds
         logger.warning(
@@ -3883,10 +3901,39 @@ async def _checkpoint_before_pause(
             reply.get("argv") or [],
         )
     else:
+        # A refused capture must not leave the *previous* image in place: a
+        # resume cannot tell the two apart, and the stale one describes an older
+        # process tree -- restoring it silently rewinds the sandbox. Measured
+        # 2026-10-05 on the k0s acceptance: the second pause was refused (an
+        # unmeasurable platform account), its own image was never written, and
+        # the resume brought back the *first* ticker, so the counter the test
+        # watched never moved while the restored process happily kept writing
+        # the first one's file.
+        stale_removed = False
+        try:
+            stale_removed = remove_checkpoint_images(
+                _registry_workspace_base(request.app.state.runtime_registry, settings),
+                sandbox_id,
+                state_base=_registry_state_base(
+                    request.app.state.runtime_registry, settings
+                ),
+            )
+        except Exception:  # noqa: BLE001 - the pause still proceeds
+            logger.warning(
+                "pause of sandbox %s could not remove a stale image",
+                sandbox_id,
+                exc_info=True,
+            )
         logger.info(
-            "pause of sandbox %s holds no checkpoint: %s",
+            "pause of sandbox %s holds no checkpoint: %s%s",
             sandbox_id,
             reply.get("reason"),
+            (
+                " (a previous image was removed: it describes an older process "
+                "tree, and a resume cannot tell the two apart)"
+                if stale_removed
+                else ""
+            ),
         )
 
 

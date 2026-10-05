@@ -150,11 +150,24 @@ def _prepare_image_parent(
     image = checkpoint_image_dir(workspace_base, sandbox_id, state_base=state_base)
     root = image.parent.parent
     parent = image.parent
-    # The store's own gate: traversable, not listable, owned by the worker. The
-    # slot has to reach *its* directory through it.
+    # The store's own gate: traversable **and listable**, owned by the worker.
+    #
+    # Listing matters, and it is not a privacy question: the platform-disk
+    # account measures the store one child at a time (`platform_disk`), and with
+    # a 0711 gate the worker cannot even enumerate the sandboxes whose images
+    # are inside -- so from the first capture onwards the account came back
+    # *unmeasurable*. The capture then refused to write (correctly: an unmeasured
+    # account is not an empty one) while the pause silently kept the *previous*
+    # image, and a later resume brought that older generation back (measured
+    # 2026-10-05 on the k0s acceptance: the first ticker kept advancing while the
+    # second stood still). 0755 costs no isolation: the state base is outside
+    # every sandbox's root (N27), and each `<id>` below stays 0700 owned by that
+    # sandbox's uid. The paths.py note that the worker measures this store "as
+    # root, or through `e2b-maint`" predates C3, which retired `e2b-maint`; the
+    # agent is the reader that replaced it.
     root.mkdir(parents=True, exist_ok=True)
     try:
-        os.chmod(root, 0o711)
+        os.chmod(root, 0o755)
     except OSError:  # pragma: no cover - best effort, like the modes above
         pass
     parent.mkdir(parents=True, exist_ok=True)
@@ -364,11 +377,13 @@ def checkpoint_status(
 
 
 def _platform_numbers(
-    workspace_base, state_base=None
+    workspace_base, state_base=None, *, child_bytes=None
 ) -> tuple[int | None, int]:
     """``(used bytes or None, budget bytes)`` -- ``None`` is "cannot measure" (I-3)."""
     return (
-        measure_platform_disk_bytes(workspace_base, state_base=state_base),
+        measure_platform_disk_bytes(
+            workspace_base, state_base=state_base, child_bytes=child_bytes
+        ),
         platform_budget_bytes(),
     )
 
@@ -397,6 +412,7 @@ def capture_checkpoint_image(
     *,
     owner_uid: int | None = None,
     state_base=None,
+    child_bytes=None,
 ) -> dict:
     """Take this sandbox's checkpoint, or say why there is none.
 
@@ -406,8 +422,17 @@ def capture_checkpoint_image(
     is a normal answer -- the caller (a pause, an operator) continues with the
     behaviour it had before this feature existed -- so the reason is always a
     sentence, never an empty string.
+
+    ``child_bytes(name) -> int | None`` measures one child of ``<state>/_runtime``
+    that this process cannot read itself (a ``0700`` checkpoint store owned by a
+    sandbox's uid); the caller wires it to the agent, which is the reader that
+    replaced the retired ``e2b-maint``. Without it the platform account is
+    unmeasurable from the first capture onwards and every later capture is
+    refused.
     """
-    used_before, limit = _platform_numbers(workspace_base, state_base)
+    used_before, limit = _platform_numbers(
+        workspace_base, state_base, child_bytes=child_bytes
+    )
     if used_before is None:
         # I-3: an unmeasured account is not an empty one. Refusing here (before
         # anything is written) is the same exit as "the account is full": the

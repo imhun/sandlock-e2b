@@ -147,7 +147,15 @@ def test_a_capture_lands_in_the_platforms_dir_and_is_billed_to_the_platform(
 
 
 def test_the_image_directory_is_closed_to_the_sandbox(tmp_path: Path) -> None:
-    """D2: 0700, and no other sandbox can reach it -- the image is memory."""
+    """D2: each ``<id>`` is 0700 -- the image is memory, and no other sandbox reads it.
+
+    The *gate* above it is deliberately listable (0755) instead: the
+    platform-disk account measures the store one child at a time, so the worker
+    must be able to enumerate it. The old 0711 gate made that enumeration
+    impossible, which made the account unmeasurable from the first capture
+    onwards, which refused every later capture while the pause silently kept the
+    previous image (see `_prepare_image_parent`).
+    """
     base = tmp_path / "sandboxes"
     _sandbox_tree(base, "sbx_store")
 
@@ -159,11 +167,10 @@ def test_the_image_directory_is_closed_to_the_sandbox(tmp_path: Path) -> None:
     assert parent.stat().st_uid == os.geteuid(), (
         "with no pooled uid to hand it to, it stays the worker's"
     )
-    # The store around it is the *only* thing the slot has to reach through:
-    # traverse, no listing, so one sandbox cannot even enumerate the others.
+    # The store gate is traversable *and listable*: measureable beats unlistable.
     root = parent.parent
     root_mode = stat.S_IMODE(root.stat().st_mode)
-    assert root_mode == 0o711, f"the store must be 0711, got {oct(root_mode)}"
+    assert root_mode == 0o755, f"the store gate must be listable, got {oct(root_mode)}"
 
 
 def test_the_image_directory_is_handed_to_the_slot_that_will_write_it(
@@ -409,6 +416,50 @@ def test_a_restore_without_an_image_says_so(tmp_path: Path) -> None:
     assert reply["restored"] is False
     assert reply["reason"] == "no checkpoint image for this sandbox"
     assert executor.restores == []
+
+
+def test_the_platform_account_uses_the_agent_for_a_child_out_of_reach(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """I-3 with the agent as the reader: an unreadable child does not sink the account.
+
+    ``<state>/_runtime`` holds per-sandbox ``0700`` dirs the worker cannot read,
+    so without a fallback the *whole* account came back unmeasurable -- and from
+    the first capture onwards every later capture was refused while the pause
+    silently kept the previous image (measured 2026-10-05 on the k0s
+    acceptance). The agent measures exactly that directory, keyed by the
+    sandbox id that is the directory's name.
+    """
+    from envd_service import priv_helpers
+
+    base = tmp_path / "sandboxes"
+    runtime = base / "_runtime"
+    (runtime / "sbx_a").mkdir(parents=True)
+    (runtime / "sbx_a" / "cmd.log").write_text("x" * 16, encoding="utf-8")
+
+    real = priv_helpers.dir_size
+    monkeypatch.setattr(
+        priv_helpers,
+        "dir_size",
+        lambda path: None if str(path).endswith("sbx_a") else real(path),
+    )
+
+    assert measure_platform_disk_bytes(base) is None, (
+        "the worker alone cannot measure a child it cannot read"
+    )
+
+    asked: list[str] = []
+
+    def via_agent(name: str) -> int | None:
+        asked.append(name)
+        return 4096
+
+    total = measure_platform_disk_bytes(base, child_bytes=via_agent)
+
+    assert asked == ["sbx_a"], "the fallback is asked for exactly the unreadable child"
+    assert total is not None and total >= 4096, (
+        f"the fallback's number must land in the account, got {total!r}"
+    )
 
 
 def test_a_restore_still_sees_an_image_the_worker_uid_cannot_look_into(
