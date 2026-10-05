@@ -3867,6 +3867,18 @@ async def _checkpoint_before_pause(
             return None
         try:
             return client.checkpoint_bytes(name)
+        except AgentFileOpsUnknownSandbox:
+            # A store directory whose sandbox the control plane no longer knows:
+            # a leftover the orphan sweep reclaims (`checkpointsReclaimed`).
+            # Counting it as 0 keeps *one* stale directory from making the whole
+            # platform account unmeasurable -- which refused every capture on the
+            # node, the failure this fallback exists to end.
+            logger.warning(
+                "checkpoint store %s belongs to no known sandbox; counting it "
+                "as 0 (the orphan sweep reclaims it)",
+                name,
+            )
+            return 0
         except Exception:  # noqa: BLE001 - unknown stays unknown
             return None
 

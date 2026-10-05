@@ -441,6 +441,35 @@ def test_a_restore_without_an_image_says_so(tmp_path: Path) -> None:
     assert executor.restores == []
 
 
+def test_the_store_is_measured_one_sandbox_at_a_time(tmp_path: Path) -> None:
+    """The store is not one walkable tree: measure it child by child.
+
+    ``<state>/_runtime/.checkpoints`` is listable (the gate) but every ``<id>``
+    inside belongs to that sandbox's uid, so one ``dir_size`` of the whole store
+    stops at the first unreadable child and reports *everything* as unknown --
+    which refused every capture after the first (measured 2026-10-05). The
+    fallback answers per sandbox id, which is exactly the directory name.
+    """
+    base = tmp_path / "sandboxes"
+    store = base / "_runtime" / ".checkpoints"
+    (store / "sbx_a" / "latest").mkdir(parents=True)
+    (store / "sbx_a" / "latest" / "meta.json").write_text("{}", encoding="utf-8")
+    (store / "sbx_b").mkdir()
+
+    asked: list[str] = []
+
+    def via_agent(name: str) -> int | None:
+        asked.append(name)
+        return 1024
+
+    total = measure_platform_disk_bytes(base, child_bytes=via_agent)
+
+    assert sorted(asked) == ["sbx_a", "sbx_b"], "one call per store child"
+    assert total is not None and total >= 2048, (
+        f"both children must land in the account, got {total!r}"
+    )
+
+
 def test_the_platform_account_uses_the_agent_for_a_child_out_of_reach(
     tmp_path: Path, monkeypatch
 ) -> None:

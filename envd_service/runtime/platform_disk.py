@@ -28,7 +28,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from gateway_common.env import env_int
-from gateway_common.paths import RUNTIME_DIR_NAME, resolve_state_base
+from gateway_common.paths import CHECKPOINT_ROOT_NAME, RUNTIME_DIR_NAME, resolve_state_base
 
 logger = logging.getLogger(__name__)
 
@@ -151,15 +151,31 @@ def _runtime_bytes_one_tree_at_a_time(
         if is_dir:
             if is_symlink:
                 continue  # ``os.walk`` lists it, never descends -- so it costs 0
+            if entry.name == CHECKPOINT_ROOT_NAME and child_bytes is not None:
+                # The store: listable as a gate (0755) but every ``<id>`` inside
+                # is 0700 owned by that sandbox's uid, so the worker can
+                # enumerate the names and read none of them. Measure it child by
+                # child through the fallback (the agent, keyed by exactly those
+                # names) instead of asking ``dir_size`` for the whole subtree --
+                # that walk stops at the first unreadable 0700 child and reports
+                # the *whole* store as unknown.
+                size = _store_bytes(entry.path, child_bytes)
+                if size is None:
+                    logger.warning(
+                        "cannot measure %s (a child of %s): reporting the "
+                        "platform disk account as unknown",
+                        entry.path,
+                        runtime_dir,
+                    )
+                    return None
+                total += size
+                continue
             size = priv_helpers.dir_size(entry.path)
             if size is None and child_bytes is not None:
-                # The child is out of the worker's own reach -- a ``0700``
-                # checkpoint store owned by a sandbox's uid. The **agent** is
-                # the reader that replaced ``e2b-maint`` here (that binary is
-                # retired), and its walk is keyed by the sandbox id, which is
-                # exactly this directory's name. ``None`` from the fallback
-                # keeps the account unknown, which is the same fail-closed
-                # answer as before.
+                # Any other child out of the worker's own reach. The **agent**
+                # is the reader that replaced ``e2b-maint`` here (that binary is
+                # retired); ``None`` from the fallback keeps the account
+                # unknown, which is the same fail-closed answer as before.
                 try:
                     size = child_bytes(entry.name)
                 except Exception:  # noqa: BLE001 - unknown stays unknown
@@ -183,6 +199,38 @@ def _runtime_bytes_one_tree_at_a_time(
             )
             return None
         total += size
+    return total
+
+
+def _store_bytes(
+    store_dir: Path, child_bytes: "Callable[[str], int | None]"
+) -> int | None:
+    """Bytes under the checkpoint store, one sandbox directory at a time.
+
+    ``child_bytes`` answers for a sandbox id -- which is the name of each
+    directory inside the store. A ``None`` from it (an id no reader can measure)
+    makes the whole account unknown, exactly as an unreadable child does
+    elsewhere.
+    """
+    from envd_service.runtime.brief_stat import directory_cost
+
+    try:
+        total = directory_cost(store_dir)
+    except OSError:
+        total = 0
+    try:
+        with os.scandir(store_dir) as listing:
+            names = [entry.name for entry in listing]
+    except OSError:
+        return None
+    for name in names:
+        try:
+            size = child_bytes(name)
+        except Exception:  # noqa: BLE001 - unknown stays unknown
+            size = None
+        if size is None:
+            return None
+        total += int(size)
     return total
 
 
