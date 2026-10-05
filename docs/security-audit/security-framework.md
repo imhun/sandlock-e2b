@@ -30,7 +30,7 @@ flowchart LR
         direction TB
         L1["<b>L1 准入</b><br/>API key · 配额 · 记账<br/><i>control_plane</i>"]
         L2["<b>L2 令牌</b><br/>X-Access-Token →<br/>runtime registry<br/><i>envd 两半守卫</i>"]
-        L3["<b>L3 seccomp 内层</b><br/>blocklist 76 + arg 过滤 3<br/>EPERM"]
+        L3["<b>L3 seccomp 内层</b><br/>blocklist 76 + arg 过滤 4<br/>EPERM"]
         L4["<b>L4 Landlock</b><br/>ABI 6 · 路径 + IOCTL_DEV<br/>EACCES"]
         L5["<b>L5 中介层</b><br/>路径翻译 · /proc 合成<br/>netlink 虚拟 · 代执行"]
         L6["<b>L6 外层 profile</b><br/>SCMP_ACT_ERRNO + 416<br/>ENOSYS(38)"]
@@ -108,13 +108,11 @@ flowchart LR
 3. **L7 的虚线指向 pod 而不是 agent 本身** —— 因为 blackhole 的是 worker pod IP，agent 仍然看得见节点上的一切。
 
 两张图答两个问题：第一张答"改哪一层会破什么"，第二张答"谁看得见谁"。
-判定链里只有第 ④ 层通到宿主，所以它是唯一值得当边界看的那层 —— 打穿前三层只到 worker 容器。
 
- 两张图答两个问题：第一张答"改哪一层会破什么"，第二张答"谁看得见谁"。
- 判定链里只有第 ④ 层通到宿主，所以它是唯一值得当边界看的那层。
-
-四层里前三层是沙箱代码（fork + envd），第四层是部署配置。
-**打穿前三层只能到 worker 容器，打穿第四层才到宿主** —— 第四层是唯一的宿主边界。
+判定链是**四层**（即下文各层职责的 ①②③④，不含 L1/L2 准入令牌与 L7 网络策略）：
+前 3 层是沙箱代码（fork + envd），第 4 层是部署配置。
+**打穿前三层只能到 worker 容器，打穿第四层才到宿主** —— 第四层是唯一值得当
+边界看的那层。
 
 ## 各层职责
 
@@ -127,10 +125,11 @@ flowchart LR
   perf_event_open / bpf / userfaultfd / cachestat / lsm_\* / mseal /
   四个 xattr-at / statmount 等。名字走 `syscalls` crate 解析，"加进表" 与
   "这个编号被拒" 是同一件事。
-- **arg 过滤器**（`seccomp_plan.rs`）：按**参数**。三处
+- **arg 过滤器**（`seccomp_plan.rs`）：按**参数**。四处
   - `clone`：`CLONE_NEW*` 位
-  - `socket`：`SOCK_RAW`/`SOCK_DGRAM` on `AF_INET`/`AF_INET6`（无网络规则时）
+  - `socket`：`SOCK_RAW`（无条件拒）/ `SOCK_DGRAM`（仅无网络规则时拒）on `AF_INET`/`AF_INET6`
   - `ioctl`：20 个请求码
+  - `prctl`：`PR_SET_DUMPABLE`/`PR_SET_SECUREBITS`/`PR_SET_PTRACER`
 
   ioctl 那份是重点。`ioctl` 在 seccomp 里**没有请求码粒度**，JEQ 链是唯一有粒度的地方，
   所以它列了什么就是全部。20 条分三类：
@@ -226,7 +225,7 @@ worker 容器另有一层 `E2B_PID_NS=true`，沙箱在自己的 pid ns 里
 
 | 项 | 状态 |
 |---|---|
-| CVE-2026-53362（IPv6 fraggap，KEV 已确认在野利用） | kernel `6.12.0-211` 未打（修复在 6.12.95）。**输入原语实测可达**：带网络规则的沙箱能建 UDPv6 socket、`MSG_MORE\|MSG_SPLICE_PAGES` 能进内核、超长包能进 paged 分片路径。公开 exploit（`Jevil36239/ipv6_frag_escape`）是 x86_64-only 且要 LA57 五级页表，跑不起来 —— 但那是利用链的缺失，不是漏洞的缺失。**只有打补丁能挡** |
+| CVE-2026-53362（`__ip6_append_data()` UDP corking 发送路径，CISA KEV 在列） | kernel `6.12.0-211` 未打（修复在 6.12.95）。**机制**：corked 报文跨分片边界时 `fraggap` 未计入 `alloclen`，越界 15 字节写进 `skb_shared_info`；跑在**调用进程上下文**、由 `sendmsg(2)`/`splice(2)` 驱动，**不是 softirq、不是重组路径**。**线上实测（2026-10-04，k0s，只读）**：`disable_ipv6=0`（IPv6 栈开着）；`if_inet6` 只有 link-local + `::1`，**无全局地址**；`ipv6_route` **无 `::/0`**；`udp6→fe80::1%eth0` = `ENETUNREACH`；`udp6→::1` 裸内核层**成功**；`socket(AF_INET6,SOCK_DGRAM)` 成功；MTU `lo`=65536/`eth0`=1450。**真正卡住这条链的是没有可路由的全局 IPv6 + `::1/128` 在生效的 deny 清单里**（该变量 k8s 未设，由 `config.py::_network_deny_cidrs()` 回落到内置 15 条 默认；仅显式置空才关闭）⇒ 默认配置的沙箱在 L7 就被挡。**条件 4（`NETIF_F_SG`）无法安全实测** —— 曾据 `/sys/class/net/*/flags` 断言 `lo`/`eth0` 都没有 SG 是**错的**，该文件是 IFF_* 而非 NETIF_F_*，且 `NETIF_F_*` 无 sysfs 可读；唯一确认办法是真正走 paged 分支（即触发 bug）。**缓解不止打补丁**：`MSG_SPLICE_PAGES` 是内核内部 flag、syscall 入口即被清掉（实测非页对齐 buffer 带该 flag 发送仍成功 ⇒ 用户态设不上），用户态唯一入口是 `splice(2)`；**拦 `splice` 到 socket 可切断触发链且不用改内核**，与目的地策略是独立两层。`user.max_user_namespaces=0` **不可用**（沙箱靠 userns）；`esp4`/`esp6` 屏蔽无效。**可利用性**：公开链要求 x86_64 LA57，CIQ 明确 aarch64 不受影响 ⇒ 当前 arm64 是「**可触发、不可利用**」，但**不是设计安全而是落在 arm64 的运气** —— 同架构跑 x86_64 即为实打实可逃逸，且公开 exploit 的两个前提（非特权 user namespace、容器内代码执行）正好都由本架构提供。内核提权一旦成功，容器侧加固一律无效。排期理由是「KEV + 触发入口在沙箱可拦却没拦」，**不是**已证实可提权。**命名待修**：`third_party/sandlock/netlink/handlers.rs:47` 把它与 "Dirty Frag" 并列，CIQ/RH 均明确二者独立（submodule，未改） |
 | 6.13 `*at` 族 | 15 个只靠外层 profile。见上 |
 
 **够得到，已挡，但机制是巧合而非策略**
@@ -239,7 +238,8 @@ worker 容器另有一层 `E2B_PID_NS=true`，沙箱在自己的 pid ns 里
 **架构级的已知项**（在 `findings*.md` / `open-issues.md`，此处不重复）
 
 - 平台面无租户隔离（OBS-6）：一个 API key 能管所有沙箱
-- 共享 workspace 形态下 `max_disk` 不生效（OBS-5）
+- `max_disk` 的"共享 workspace 形态不生效"记录**已更正**（OBS-5，2026-10-05）：那是
+  "没有中介的 pure 形态"，已被 N15 中介化 + N14 S5 T1 具名拒绝，集群实测六条写路径全部 EFBIG
 - `c3-agent` 无 syscall 过滤，靠网络策略单点
 
 ## 门禁在哪

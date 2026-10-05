@@ -16,7 +16,7 @@ L3 越权（沙箱→平台面）、L4 可用性（沙箱→打垮 worker/节点
 | D | 沙箱 → 网络 | `gateway_common/network.py`、`network/rules.rs`、`network/connect.rs`、`egress/libegress_proxy.c` | 目的写法矩阵（v4/v6/mapped/link-local/metadata/短写/八进制/十六进制）× 共享 netns 与 per-sandbox netns | ❌ **SEC-001（已修）** |
 | E | 沙箱 → worker 中介 | `route_b.py`、`priv_helpers.py`、seccomp 通知、fd handoff | fd 继承（两形态）、AF_NETLINK、控制通道可达性 | ✅ 干净（SL-4 族不可复现） |
 | F | 沙箱 → 平台 API | `http/auth.py`、`connect/router.py`、`control_plane/api/*` | traversal、恶意 sandbox id、内部 key 空值路径 | ✅ 本轮干净；架构级无租户隔离见 OBS-6 |
-| G | 可用性/资源 | `process/manager.py`（10 MiB 封顶）、`upload.py`、quota 链路 | 磁盘 / 内存 / 进程 / 输出四维实测 | ⚠️ `max_disk` 在共享 workspace 形态不生效（OBS-5） |
+| G | 可用性/资源 | `process/manager.py`（10 MiB 封顶）、`upload.py`、quota 链路 | 磁盘 / 内存 / 进程 / 输出四维实测 | ✅ 四维都有闸门（`max_disk` 那条旧记录已在 2026-10-05 更正，见 OBS-5） |
 | H | 生命周期 | pause/resume、snapshot、migration、orphan GC | 由既有 `tests/contract/test_pause_resume_*`、`test_orphan_tree_gc.py` 覆盖 | 本轮未新增探针，沿用基线绿 |
 
 ## 已确认干净的细节（证据见 findings.md）

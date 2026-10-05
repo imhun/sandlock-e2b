@@ -353,6 +353,16 @@ chroot/route-B 形态多出 fd 3/4/6/7，实测都是**普通 ELF 文件**（不
 - **OBS-5 `max_disk` 在共享 workspace 形态下不生效（中，已知）**：实测 64 MiB 上限下写入
   192 MiB 无任何拒绝。生产靠 **XFS prjquota**（目标机已验证 `hard_blocks=1GiB`）兜底，
   所以这是「形态依赖」而非普遍缺口；非 XFS 部署（含本地容器 lane）没有硬上限。
+  **（2026-10-05 更正与关闭）** 这条观测的形态是"**没有中介的 pure 形态**"：当时沙箱没有
+  rootfs、路径不中介 ⇒ `max_disk` 只落到 per-exec `RLIMIT_FSIZE`。该形态已不在任何出厂
+  形态里 —— N15（2026-09-26）把 pure 接进同一条中介路径（`chroot_root="/"`），活账本对它
+  与镜像形态一视同仁；N14 S5 T1（2026-10-05，`b8d9d72`）把 `E2B_PURE_ROOTFS=off` 变成
+  启动期具名拒绝。**集群实测**（第 22.5.11 节）：`dd`/`ftruncate`/`fallocate`/
+  `copy_file_range`/`sendfile`/`splice` 六条写路径全部停在天花板（EFBIG）。清单里的
+  `E2B_SHARED_WORKSPACE_ROOT=/var/lib/e2b-sandboxes` 是**导出根**（N27 之后的平台命名空间
+  根），不是绕开账本的形态 —— 拿它当"不生效"的依据是把两个概念混了。**仍然成立的边界**：
+  挂载卷（`_volumes/…`）走自己的 per-sandbox 卷配额线（E2.5），不在树预算内；NAS 上拿不到
+  XFS prjquota（O1），所以第二道带子缺席，但主闸是中介的活账本、不依赖它。
 - **OBS-6 租户隔离已有实现、但默认关闭（高，配置项非代码项）**：
   **更正上一版措辞** —— 这不是"架构级缺失"。E3.1 的租户模型已完整落地
   （`control_plane/auth.py` 的 `tenant_of` / `_require_owned` / `_require_related`，
@@ -504,7 +514,7 @@ mkdir: cannot create directory ...: Permission denied
 |---|---|
 | 内存（`max_memory`） | **真**：256 MiB 上限下进程被 SIGKILL（探针在 128 MiB 处终止） |
 | 进程数（`max_processes`） | **真**：上限 24 时第 24 个 fork 返回 EAGAIN（实测 `FORK ERR 11 after 23`） |
-| 磁盘（`max_disk`） | 共享 workspace 形态下 **不生效**（见 OBS-5），依赖 XFS prjquota 兜底 |
+| 磁盘（`max_disk`） | **真**（2026-10-05 更正，见 OBS-5）：所属形态已由 N15/N14-T1 取消，集群六条写路径实测全部 EFBIG；卷走独立的卷配额线 |
 | 命令输出 | worker 侧 10 MiB 封顶（E4.1，`CAPTURE_LIMIT_DEFAULT`），非本轮改动 |
 
 ---

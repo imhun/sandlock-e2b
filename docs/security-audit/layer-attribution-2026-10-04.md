@@ -257,7 +257,7 @@ deny 掉 = 打断沙箱里的交互式程序，换来的安全性是**零**—�
 （`tests/security/test_ioctl_inventory.py`），让缺口在前提失效时暴露，
 而不是靠一个会打坏产品的 blocklist。
 
-**deny 列表 12 → 19**（`seccomp_plan.rs`）：
+**deny 列表 12 → 20**（`seccomp_plan.rs`，12 + 补齐 1 + 新增 4 + 新增 3 = 20）：
 - 补齐 `SIOCSIFFLAGS` —— **已定义但一直没在列表里**（`SIOCSIF*` 的 get 半族被挡、
   set 半族却敞着，是半截措施）。
 - 新增 `SIOCSIFADDR` / `SIOCSIFBRDADDR` / `SIOCSIFNETMASK` / `SIOCSIFHWADDR`。
