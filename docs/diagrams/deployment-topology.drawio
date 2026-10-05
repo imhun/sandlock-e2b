@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="部署拓扑">
+    <mxGraphModel dx="1400" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1040" pageHeight="820" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="部署拓扑 · namespace sandlock" style="text;html=1;align=left;verticalAlign=middle;fontSize=20;fontStyle=1;fontColor=#f9fafb;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="620" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="左列是调用链，右列是两个作用于 worker 的平台侧 DaemonSet" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#9ca3af;" vertex="1" parent="1">
+          <mxGeometry x="40" y="50" width="800" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_c" value="客户端" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#374151;strokeColor=#6b7280;fontColor=#f3f4f6;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="230" y="80" width="200" height="56" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_gw" value="&lt;b&gt;control-plane&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#bbf7d0'&gt;对外唯一入口&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#14532d;strokeColor=#22c55e;strokeWidth=3;fontColor=#ffffff;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="200" y="180" width="260" height="84" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_pod" value="e2b-worker pod · uid 65534 · cap drop ALL" style="swimlane;startSize=28;horizontal=1;rounded=0;html=1;container=1;collapsible=0;fillColor=#1f2937;swimlaneFillColor=#1f2937;strokeColor=#22c55e;fontColor=#86efac;fontSize=12;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="170" y="370" width="320" height="310" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_sup" value="supervisor&lt;br&gt;&lt;font style='font-size:11px;color=#a7f3d0'&gt;路径翻译 · /proc 合成 · netlink 虚拟 · 代执行&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#14532d;strokeColor=#22c55e;fontColor=#ffffff;fontSize=13;" vertex="1" parent="a_pod">
+          <mxGeometry x="20" y="55" width="280" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_sbx" value="&lt;b&gt;沙箱&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#bfdbfe'&gt;独立 pid / net ns · uid 池内独占&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#1e3a5f;strokeColor=#3b82f6;strokeWidth=3;fontColor=#ffffff;fontSize=14;" vertex="1" parent="a_pod">
+          <mxGeometry x="20" y="175" width="280" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_xmark" value="✕ 网络面不通" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#111827;strokeColor=#ef4444;strokeWidth=2;dashed=1;dashPattern=6 4;fontColor=#fca5a5;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="716" y="478" width="152" height="44" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_agent" value="e2b-c3-agent · 每节点一个 DaemonSet" style="swimlane;startSize=32;horizontal=1;rounded=0;html=1;container=1;pointerEvents=0;collapsible=0;fillColor=#3b0d10;swimlaneFillColor=#3b0d10;strokeColor=#ef4444;strokeWidth=2;fontColor=#fecaca;fontSize=12;fontStyle=1;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="720" y="100" width="240" height="170" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_faceA" value="&lt;b&gt;face A · agent&lt;/b&gt; · 65534 · :49985&lt;br&gt;&lt;font style='font-size:11px;color=#93c5fd'&gt;授沙箱身份（grant-slot）&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#1f2937;strokeColor=#f87171;fontColor=#e5e7eb;fontSize=12;align=left;spacingLeft=8;" vertex="1" parent="a_agent">
+          <mxGeometry x="12" y="44" width="216" height="52" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_faceB" value="&lt;b&gt;face B · maint&lt;/b&gt; · &lt;b&gt;root&lt;/b&gt; · :49986&lt;br&gt;&lt;font style='font-size:11px;color=#fca5a5'&gt;改文件 · 节点上唯一的 root&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#1f2937;strokeColor=#f87171;fontColor=#e5e7eb;fontSize=12;align=left;spacingLeft=8;" vertex="1" parent="a_agent">
+          <mxGeometry x="12" y="106" width="216" height="52" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_installer" value="seccomp-installer&lt;br&gt;&lt;font style='font-size:11px;color=#fde68a'&gt;安装 B-2 profile&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#78350f;strokeColor=#f59e0b;strokeWidth=2;fontColor=#ffffff;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="720" y="556" width="240" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a_host" value="&lt;b&gt;宿主机 kernel&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#d6d3d1'&gt;沙箱与宿主共用内核&lt;/font&gt;" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=#0c0a09;strokeColor=#a8a29e;strokeWidth=5;fontColor=#ffffff;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="165" y="720" width="330" height="56" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_https" value="HTTPS" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#22c55e;strokeWidth=2;fontColor=#86efac;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="a_c" target="a_gw">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" x="-34" y="0" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_internal" value="内部 API" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#22c55e;strokeWidth=2;fontColor=#86efac;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="a_gw" target="a_pod">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" x="46" y="0" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_cp_down" value="&lt;b&gt;①&lt;/b&gt; :49985 授身份&lt;br&gt;&lt;b&gt;②&lt;/b&gt; :49986 改文件" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.119;exitDx=0;exitDy=0;entryX=0;entryY=0.5294;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#f87171;strokeWidth=2;fontColor=#fecaca;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="a_gw" target="a_agent">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" x="0" y="-15" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_cp_up" value="&lt;b&gt;③&lt;/b&gt; :3000 巡检上报&lt;br&gt;&lt;font style='font-size:10px'&gt;agent 唯一主动发起&lt;/font&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.7941;exitDx=0;exitDy=0;entryX=1;entryY=0.6548;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#f87171;strokeWidth=2;fontColor=#fecaca;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="a_agent" target="a_gw">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" x="0" y="15" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_agent_pod" value="&lt;b&gt;④ 存储面&lt;/b&gt; · 同路径挂载 · root 双向可写" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.875;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;startArrow=block;startSize=8;endFill=0;strokeColor=#fb923c;strokeWidth=3;fontColor=#fdba74;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="a_agent" target="a_pod">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="840" y="315" />
+              <mxPoint x="450" y="315" />
+            </Array>
+            <mxPoint as="offset" x="0" y="-15" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_net_denied" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=0.5882;exitDx=0;exitDy=0;entryX=1;entryY=0.4194;entryDx=0;entryDy=0;endArrow=none;dashed=1;dashPattern=6 4;strokeColor=#ef4444;strokeWidth=2;" edge="1" parent="1" source="a_agent" target="a_pod">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="985" y="200" />
+              <mxPoint x="985" y="500" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_sup_sbx" value="代执行" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#3b82f6;fontColor=#bfdbfe;fontSize=11;labelBackgroundColor=#1f2937;" edge="1" parent="a_pod" source="a_sup" target="a_sbx">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_installer_pod" value="装 B-2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.7226;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#f59e0b;strokeWidth=2;fontColor=#fde68a;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="a_installer" target="a_pod">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" x="0" y="-14" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_pod_host" value="&lt;b&gt;唯一宿主边界&lt;/b&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=12;strokeColor=#f59e0b;strokeWidth=5;fontColor=#fde68a;fontSize=13;fontStyle=1;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="a_pod" target="a_host">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" x="112" y="0" />
+          </mxGeometry>
+        </mxCell>
+
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

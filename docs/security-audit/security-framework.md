@@ -34,7 +34,7 @@ flowchart LR
         L4["<b>L4 Landlock</b><br/>ABI 6 · 路径 + IOCTL_DEV<br/>EACCES"]
         L5["<b>L5 中介层</b><br/>路径翻译 · /proc 合成<br/>netlink 虚拟 · 代执行"]
         L6["<b>L6 外层 profile</b><br/>SCMP_ACT_ERRNO + 416<br/>ENOSYS(38)"]
-        L7["<b>L7 网络策略</b><br/>NetworkPolicy blackhole<br/><i>c3-agent 唯一隔离</i>"]
+        L7["<b>L7 网络策略</b><br/>NetworkPolicy 只放 control-plane<br/><i>仅封网络面 · 存储面与 pid 面共享</i>"]
     end
 
     subgraph TOPO["部署拓扑 · namespace sandlock"]
@@ -104,8 +104,15 @@ flowchart LR
 看图的三件事：
 
 1. **L6 外层 profile 之下就是宿主 kernel** —— 它是唯一通到宿主的层。L3/L4/L5 全穿也只到 worker 容器。
-2. **c3-agent 那一格是红的**：hostPID=true 且无 seccompProfile，只有 L7 一条 NetworkPolicy 挡着 —— 改一个策略就打通。
-3. **L7 的虚线指向 pod 而不是 agent 本身** —— 因为 blackhole 的是 worker pod IP，agent 仍然看得见节点上的一切。
+2. **c3-agent 那一格是红的**：hostPID=true 且无 seccompProfile，**面 B 是节点上唯一的 root**，
+   而它整套隔离只有 L7 那一条 NetworkPolicy 挡着 —— 改一个策略就打通。
+3. **CP 与 agent 之间是三条具名通道，不是单向隔离** —— `ingress` 只有一个 `from` 条目
+   （`app: control-plane`），端口 `:49985` 面 A 授身份、`:49986` 面 B 做文件操作，
+   外加 agent → CP `:3000` 的巡检上报。
+   **这条策略只封网络面**：worker 与 agent 还共享四个同路径挂载点
+   （`/var/lib/e2b/{workspaces,e2b-sandboxes,state,e2b-images}`，设计如此 —— `chown`
+   必须落在 worker 看得见的树上），而 `hostPID` 让 agent 看得见 worker 全部进程。
+   风险的方向因此是"沙箱从下面够上来"，不是"agent 从上面看下来"。
 
 两张图答两个问题：第一张答"改哪一层会破什么"，第二张答"谁看得见谁"。
 
@@ -182,11 +189,29 @@ seccomp 与 Landlock 抓不到的语义在这里：
 
 ### ⑤ c3-agent
 
-`hostPID: true`、**无 seccompProfile**、非 root。唯一的隔离手段是那条 NetworkPolicy：
-把 worker pod IP 全量 blackhole，所以沙箱够不到它，且沙箱不知道内部 token。
-这是当前架构里**最薄的一环** —— 一个网络策略变更就能打通。
+`hostPID: true`、**无 seccompProfile**。一个 DaemonSet、两个容器：**面 A**（uid 65534，
+`:49985`，`grant-slot` 授身份）与**面 B**（**root**，`:49986`，`chown`/`rm`/`walk` +
+`materialize`）—— 面 B 是 C1 的 broker 退役后**这个节点上唯一的 root 组件**。
+`hostPID` 是 pod 级字段，所以面 A 也拿到它。
 
-注意 `hostPID: true` 只属于 c3-agent，**worker 不是**。实测（2026-10-04）：
+对沙箱方向的**网络**隔离手段是那条 NetworkPolicy：`ingress` 只有一个 `from`
+（`app: control-plane`）与那两个端口 ⇒ **worker 来敲在连接层就被挡**，且
+`E2B_C3_AGENT_TOKEN` 不在任何 worker manifest 或镜像里。这是当前架构里**最薄的一环**
+—— 一个网络策略变更就能打通。
+
+但**网络是唯一的被封的面**，另外两个面是开的：
+
+- **存储面共享（设计如此）**：面 B 与 worker 挂同一批卷的同一路径 ——
+  `/var/lib/e2b/workspaces`、`/var/lib/e2b-sandboxes`（RWX claim）、
+  `/var/lib/e2b/state`、`/var/lib/e2b-images`。这是必需的：`chown` 必须落在 worker
+  看得见的树上，`priv_common.c` 的白名单按**解析后的路径**比较，两侧指不到同一个
+  目录就会 `EPERM`。边界因此是**五根路径白名单**（workspace / state / node-state /
+  共享卷 / image-cache），不是任意路径。
+- **pid 面开着**：`hostPID` 是 pod 级字段，两个容器都拿到；且**无 seccompProfile** ——
+  技术上既看得见也能改 worker 的进程。挡住它的是 **op 表里没有动进程的操作**，
+  即**接口约定，不是内核强制**。
+
+`hostPID: true` 只属于 c3-agent，**worker 不是**。实测（2026-10-04）：
 
 | | hostPID | pod 内可见 pid 数 |
 |---|---|---|

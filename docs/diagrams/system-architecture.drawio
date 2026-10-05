@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="系统架构">
+    <mxGraphModel dx="1400" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1080" pageHeight="1120" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="bg" value="" style="rounded=0;html=1;fillColor=#0b1220;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="0" y="0" width="1080" height="1120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="title" value="系统架构 · sandlock-e2b" style="text;html=1;align=left;verticalAlign=middle;fontSize=20;fontStyle=1;fontColor=#f9fafb;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="520" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="五层结构：客户端 → 接入 → 控制面 → 数据面（worker 与沙箱）→ 特权面；底部是共享存储与宿主 kernel" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#9ca3af;" vertex="1" parent="1">
+          <mxGeometry x="40" y="50" width="900" height="20" as="geometry" />
+        </mxCell>
+
+        <!-- ================= 客户端与接入 ================= -->
+        <mxCell id="lane_client" value="客户端与接入" style="swimlane;startSize=28;horizontal=1;rounded=0;html=1;container=1;collapsible=0;fillColor=#111827;swimlaneFillColor=#111827;strokeColor=#4b5563;fontColor=#9ca3af;fontSize=12;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="90" width="300" height="190" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_sdk" value="&lt;b&gt;e2b SDK&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#9ca3af'&gt;Python 2.46.0 / JS 2.46.1 · 零代码修改&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#374151;strokeColor=#6b7280;fontColor=#f3f4f6;fontSize=13;" vertex="1" parent="lane_client">
+          <mxGeometry x="20" y="45" width="260" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_ingress" value="&lt;b&gt;前置 ingress / SLB&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#fed7aa'&gt;TLS 终止 · 不在本仓库内（见 R5）&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#7c2d12;strokeColor=#f97316;fontColor=#ffedd5;fontSize=13;" vertex="1" parent="lane_client">
+          <mxGeometry x="20" y="115" width="260" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ================= 控制面 ================= -->
+        <mxCell id="lane_cp" value="控制面 · control-plane（Deployment ×2 · uid 65534）" style="swimlane;startSize=28;horizontal=1;rounded=0;html=1;container=1;collapsible=0;fillColor=#14532d;swimlaneFillColor=#14532d;strokeColor=#22c55e;fontColor=#86efac;fontSize=12;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="400" y="90" width="600" height="190" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_cp" value="&lt;b&gt;control-plane + gateway :3000&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#bbf7d0'&gt;Sandbox REST API · 调度 / TTL / 配额账本&lt;br&gt;按 E2b-Sandbox-Id 透传 · autoscaler 循环&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#14532d;strokeColor=#22c55e;strokeWidth=2;fontColor=#ffffff;fontSize=14;" vertex="1" parent="lane_cp">
+          <mxGeometry x="20" y="45" width="310" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_redis" value="&lt;b&gt;Redis&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#a7f3d0'&gt;注册表 / 配额账本&lt;br&gt;--requirepass&lt;/font&gt;" style="shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=12;whiteSpace=wrap;html=1;fillColor=#14532d;strokeColor=#22c55e;fontColor=#ffffff;fontSize=13;" vertex="1" parent="lane_cp">
+          <mxGeometry x="380" y="45" width="200" height="110" as="geometry" />
+        </mxCell>
+
+        <!-- ================= 数据面 worker ================= -->
+        <mxCell id="lane_worker" value="数据面 · e2b-worker pod（uid 65534 · cap drop ALL · 无 hostPID）" style="swimlane;startSize=28;horizontal=1;rounded=0;html=1;container=1;collapsible=0;fillColor=#1f2937;swimlaneFillColor=#1f2937;strokeColor=#22c55e;fontColor=#86efac;fontSize=12;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="370" width="540" height="440" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_envd" value="&lt;b&gt;envd_service :49983&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#a7f3d0'&gt;沙箱生命周期 · 文件 · 命令&lt;br&gt;X-Access-Token fail-closed&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#14532d;strokeColor=#22c55e;fontColor=#ffffff;fontSize=13;" vertex="1" parent="lane_worker">
+          <mxGeometry x="20" y="50" width="260" height="85" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_sup" value="&lt;b&gt;supervisor（中介层）&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#a7f3d0'&gt;路径翻译 · /proc 合成 · netlink 虚拟 · 代执行&lt;br&gt;持 seccomp notify fd&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#14532d;strokeColor=#22c55e;fontColor=#ffffff;fontSize=13;" vertex="1" parent="lane_worker">
+          <mxGeometry x="20" y="150" width="260" height="85" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_sbx" value="&lt;b&gt;沙箱进程（租户代码 · 不可信）&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#bfdbfe'&gt;userns + pidns + netns · uid 池内独占&lt;br&gt;Landlock 白名单 + seccomp 内层&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#1e3a5f;strokeColor=#3b82f6;strokeWidth=3;fontColor=#ffffff;fontSize=14;" vertex="1" parent="lane_worker">
+          <mxGeometry x="20" y="250" width="260" height="95" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_b2" value="&lt;b&gt;外层 seccomp profile（B-2）&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#fde68a'&gt;SCMP_ACT_ERRNO + 416 条&lt;br&gt;唯一通到宿主的一道 · 是配置不是代码&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#78350f;strokeColor=#f59e0b;strokeWidth=2;fontColor=#ffffff;fontSize=13;" vertex="1" parent="lane_worker">
+          <mxGeometry x="300" y="150" width="220" height="95" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_installer" value="&lt;b&gt;seccomp-installer&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#9ca3af'&gt;DaemonSet：把 B-2 铺到每节点&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#374151;strokeColor=#6b7280;fontColor=#e5e7eb;fontSize=12;" vertex="1" parent="lane_worker">
+          <mxGeometry x="300" y="280" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ================= 特权面 agent ================= -->
+        <mxCell id="lane_agent" value="特权面 · e2b-c3-agent（每节点 DaemonSet）" style="swimlane;startSize=28;horizontal=1;rounded=0;html=1;container=1;collapsible=0;fillColor=#3f1d1d;swimlaneFillColor=#3f1d1d;strokeColor=#ef4444;fontColor=#fca5a5;fontSize=12;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="700" y="370" width="340" height="440" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_faceA" value="&lt;b&gt;面 A · agent :49985&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#fecaca'&gt;uid 65534 · grant-slot：写 uid_map&lt;br&gt;槽位身份的唯一授予者&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#450a0a;strokeColor=#f87171;fontColor=#ffffff;fontSize=13;" vertex="1" parent="lane_agent">
+          <mxGeometry x="20" y="50" width="300" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_faceB" value="&lt;b&gt;面 B · maint :49986 · root&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#fecaca'&gt;chown / rm / walk · 五根路径白名单&lt;br&gt;节点上唯一的 root 组件&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#7f1d1d;strokeColor=#ef4444;strokeWidth=2;fontColor=#ffffff;fontSize=13;" vertex="1" parent="lane_agent">
+          <mxGeometry x="20" y="155" width="300" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_note" value="&lt;b&gt;⚠ hostPID=true · 无 seccompProfile&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#fca5a5'&gt;网络面：NetworkPolicy 封住（✕）&lt;br&gt;存储面：同路径挂载（✓）· pid 面靠 op 表约定&lt;br&gt;风险 R1：当前架构最薄的一环&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#111827;strokeColor=#6b7280;dashed=1;dashPattern=6 4;fontColor=#e5e7eb;fontSize=12;align=left;spacingLeft=8;" vertex="1" parent="lane_agent">
+          <mxGeometry x="20" y="270" width="300" height="110" as="geometry" />
+        </mxCell>
+
+        <!-- ================= 外部依赖 / 存储 / 宿主 ================= -->
+        <mxCell id="n_ext" value="&lt;b&gt;互联网 / 内网&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#9ca3af'&gt;出站目的地由 deny CIDR 决定&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#374151;strokeColor=#6b7280;dashed=1;dashPattern=6 4;fontColor=#e5e7eb;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="40" y="870" width="240" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_storage" value="&lt;b&gt;共享存储 NAS / RWX&lt;/b&gt;&lt;br&gt;&lt;font style='font-size:11px;color=#9ca3af'&gt;workspaces · _images · state · _volumes&lt;br&gt;&lt;font style='font-size:10px;color=#fdba74'&gt;同路径挂载：worker 与 agent 指向节点上同一批目录（设计如此）&lt;/font&gt;&lt;/font&gt;" style="shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=12;whiteSpace=wrap;html=1;fillColor=#1f2937;strokeColor=#6b7280;fontColor=#ffffff;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="340" y="870" width="400" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_kernel" value="&lt;b&gt;宿主 Linux kernel 6.12（Landlock ABI 6 · seccomp）&lt;/b&gt;　—　B-2 是沙箱到宿主之间唯一的一道" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#78350f;strokeColor=#f59e0b;strokeWidth=3;fontColor=#fde68a;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1010" width="1000" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ================= 图例 ================= -->
+        <mxCell id="legend" value="&lt;b&gt;图例&lt;/b&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#111827;strokeColor=#4b5563;verticalAlign=top;fontStyle=0;fontColor=#9ca3af;fontSize=12;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="780" y="830" width="260" height="180" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lg1s" value="" style="rounded=0;html=1;fillColor=#14532d;strokeColor=#22c55e;" vertex="1" parent="legend">
+          <mxGeometry x="10" y="34" width="26" height="16" as="geometry" />
+        </mxCell>
+        <mxCell id="lg1t" value="平台组件（控制面 / 数据面）" style="text;html=1;align=left;verticalAlign=middle;fontColor=#d1d5db;fontSize=11;" vertex="1" parent="legend">
+          <mxGeometry x="44" y="30" width="206" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lg2s" value="" style="rounded=0;html=1;fillColor=#1e3a5f;strokeColor=#3b82f6;strokeWidth=2;" vertex="1" parent="legend">
+          <mxGeometry x="10" y="58" width="26" height="16" as="geometry" />
+        </mxCell>
+        <mxCell id="lg2t" value="沙箱（租户代码 · 不可信）" style="text;html=1;align=left;verticalAlign=middle;fontColor=#d1d5db;fontSize=11;" vertex="1" parent="legend">
+          <mxGeometry x="44" y="54" width="206" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lg3s" value="" style="rounded=0;html=1;fillColor=#78350f;strokeColor=#f59e0b;strokeWidth=2;" vertex="1" parent="legend">
+          <mxGeometry x="10" y="82" width="26" height="16" as="geometry" />
+        </mxCell>
+        <mxCell id="lg3t" value="seccomp 边界（B-2 / 宿主）" style="text;html=1;align=left;verticalAlign=middle;fontColor=#d1d5db;fontSize=11;" vertex="1" parent="legend">
+          <mxGeometry x="44" y="78" width="206" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lg4s" value="" style="rounded=0;html=1;fillColor=#7f1d1d;strokeColor=#ef4444;strokeWidth=2;" vertex="1" parent="legend">
+          <mxGeometry x="10" y="106" width="26" height="16" as="geometry" />
+        </mxCell>
+        <mxCell id="lg4t" value="特权面与风险（root / ✕ 拒绝）" style="text;html=1;align=left;verticalAlign=middle;fontColor=#d1d5db;fontSize=11;" vertex="1" parent="legend">
+          <mxGeometry x="44" y="102" width="206" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lg5s" value="" style="rounded=0;html=1;fillColor=#7c2d12;strokeColor=#f97316;" vertex="1" parent="legend">
+          <mxGeometry x="10" y="130" width="26" height="16" as="geometry" />
+        </mxCell>
+        <mxCell id="lg5t" value="接入网关（TLS 终止）" style="text;html=1;align=left;verticalAlign=middle;fontColor=#d1d5db;fontSize=11;" vertex="1" parent="legend">
+          <mxGeometry x="44" y="126" width="206" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lg6s" value="" style="rounded=0;html=1;fillColor=#374151;strokeColor=#6b7280;dashed=1;" vertex="1" parent="legend">
+          <mxGeometry x="10" y="154" width="26" height="16" as="geometry" />
+        </mxCell>
+        <mxCell id="lg6t" value="外部依赖与说明（虚线）" style="text;html=1;align=left;verticalAlign=middle;fontColor=#d1d5db;fontSize=11;" vertex="1" parent="legend">
+          <mxGeometry x="44" y="150" width="206" height="24" as="geometry" />
+        </mxCell>
+
+        <!-- ================= 连线 ================= -->
+        <mxCell id="e_sdk_ingress" value="HTTPS" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#f97316;fontColor=#fed7aa;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="n_sdk" target="n_ingress">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_ingress_cp" value="API key · :3000" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#f97316;fontColor=#fed7aa;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="n_ingress" target="n_cp">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" x="0" y="-18" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_cp_worker" value="&lt;b&gt;内部 API&lt;/b&gt; · X-Internal-Key + 节点身份校验" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.26;exitY=1;exitDx=0;exitDy=0;entryX=1;entryY=0.494;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#22c55e;fontColor=#86efac;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="n_cp" target="n_envd">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="501" y="462" />
+            </Array>
+            <mxPoint as="offset" x="0" y="-14" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_envd_sup" value="执行请求" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#3b82f6;fontColor=#bfdbfe;fontSize=11;labelBackgroundColor=#1f2937;" edge="1" parent="1" source="n_envd" target="n_sup">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_sup_sbx" value="代执行 · 逐层判定" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#3b82f6;fontColor=#bfdbfe;fontSize=11;labelBackgroundColor=#1f2937;" edge="1" parent="1" source="n_sup" target="n_sbx">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_installer_b2" value="装 B-2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#f59e0b;fontColor=#fde68a;fontSize=11;labelBackgroundColor=#1f2937;" edge="1" parent="1" source="n_installer" target="n_b2">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" x="40" y="0" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_cp_agent" value="&lt;b&gt;① :49985 授身份&lt;/b&gt;（写 uid_map）&lt;br&gt;&lt;b&gt;② :49986 改文件&lt;/b&gt;（五根路径白名单）" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.98;exitY=1;exitDx=0;exitDy=0;entryX=0.882;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#f87171;fontColor=#fecaca;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="n_cp" target="lane_agent">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="724" y="300" />
+              <mxPoint x="1000" y="300" />
+            </Array>
+            <mxPoint as="offset" x="0" y="16" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_agent_cp" value="&lt;b&gt;③ :3000 巡检上报&lt;/b&gt;（agent 唯一主动发起）" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.75;exitDx=0;exitDy=0;entryX=0.871;entryY=1;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#f87171;fontColor=#fecaca;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="n_faceA" target="n_cp">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="640" y="487" />
+              <mxPoint x="640" y="340" />
+              <mxPoint x="690" y="340" />
+            </Array>
+            <mxPoint as="offset" x="0" y="-20" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_net_deny" value="✕ 网络面不通" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=0.45;exitDx=0;exitDy=0;entryX=0;entryY=0.45;entryDx=0;entryDy=0;endArrow=none;dashed=1;dashPattern=6 4;strokeColor=#ef4444;strokeWidth=2;fontColor=#fca5a5;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="lane_worker" target="lane_agent">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_worker_storage" value="RWX 卷" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.3;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#fb923c;fontColor=#fdba74;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="lane_worker" target="n_storage">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_agent_storage" value="同路径挂载" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.15;exitY=1;exitDx=0;exitDy=0;entryX=0.9;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;startArrow=block;startSize=8;endFill=0;strokeColor=#fb923c;fontColor=#fdba74;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="lane_agent" target="n_storage">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_sup_ext" value="&lt;b&gt;出站&lt;/b&gt; · supervisor 代执行 + deny CIDR 15 条" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=8;strokeColor=#38bdf8;fontColor=#7dd3fc;fontSize=11;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="n_sup" target="n_ext">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="20" y="562" />
+              <mxPoint x="20" y="915" />
+            </Array>
+            <mxPoint as="offset" x="138" y="27" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_kernel" value="&lt;b&gt;唯一宿主边界 B-2&lt;/b&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.27;entryY=0;entryDx=0;entryDy=0;endArrow=block;endSize=12;strokeColor=#f59e0b;strokeWidth=5;fontColor=#fde68a;fontSize=13;fontStyle=1;labelBackgroundColor=#0b1220;" edge="1" parent="1" source="lane_worker" target="n_kernel">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" x="0" y="60" />
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
