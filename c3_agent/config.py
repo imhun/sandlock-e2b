@@ -194,6 +194,15 @@ class Settings:
     scan_backoff_max_s: float = field(
         default_factory=lambda: _env_float("E2B_C3_AGENT_SCAN_BACKOFF_MAX_S", 600.0)
     )
+    #: Refuse to serve unless this container really is in the hardened shape it
+    #: ships with: a seccomp filter loaded, and `NoNewPrivs` clear. Both
+    #: failures are silent in production (the first slot start is where they
+    #: show up), which is why the check is on by default and the way out is
+    #: named rather than implicit. Set ``E2B_C3_AGENT_REQUIRE_FILTER=0`` for the
+    #: shapes that are unfiltered on purpose; both refusals become warnings.
+    require_filter: bool = field(
+        default_factory=lambda: _env_bool("E2B_C3_AGENT_REQUIRE_FILTER", True)
+    )
     #: One report's own deadline. The scan itself is a directory read; this
     #: bounds the hop so a wedged control plane cannot pin the agent's loop.
     report_timeout_s: float = field(

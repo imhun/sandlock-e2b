@@ -473,7 +473,52 @@ def test_the_service_refuses_to_start_without_its_own_identity() -> None:
     assert _startup_error(_settings(token="")) == (
         "E2B_C3_AGENT_TOKEN is required; refusing to start without auth"
     )
-    assert _startup_error(_settings()) is None
+    # `status_text` is injected so this case means the same thing on every host:
+    # the check below reads /proc/self/status, and the test-runner image runs
+    # under `seccomp=unconfined` (Seccomp: 0), which would otherwise be a
+    # different answer here than on a developer's macOS box (no /proc at all).
+    assert _startup_error(_settings(), status_text="Seccomp:\t2\nNoNewPrivs:\t0\n") is None
+
+
+def test_the_service_refuses_to_start_unfiltered_or_with_no_new_privs() -> None:
+    """The two silent ways face A stops granting, caught before it serves.
+
+    Measured (docs/security-audit/c3-agent-syscall-filter-2026-10-05.md §1):
+    a runtime profile does **not** set NNP, so the file capabilities on
+    `as_uid` survive it -- but `NoNewPrivs: 1` kills them on the exec that
+    matters (the one a child does later, which is how `as_uid` is reached).
+    Both failures are invisible until the first slot start, and both look like
+    a capability bug rather than a flag somebody added.
+    """
+    from c3_agent.__main__ import _startup_error
+
+    assert _startup_error(
+        _settings(), status_text="Seccomp:\t2\nNoNewPrivs:\t0\n"
+    ) is None
+
+    assert _startup_error(
+        _settings(), status_text="Seccomp:\t0\nNoNewPrivs:\t0\n"
+    ) == (
+        "no seccomp filter is loaded (Seccomp: 0): this container is not "
+        "running under the profile it was hardened with "
+        "(E2B_C3_AGENT_REQUIRE_FILTER=0 runs unfiltered on purpose)"
+    )
+
+    assert _startup_error(
+        _settings(), status_text="Seccomp:\t2\nNoNewPrivs:\t1\n"
+    ) == (
+        "NoNewPrivs is set: the kernel will ignore as_uid's file "
+        "capabilities, so every grant would fail silently "
+        "(E2B_C3_AGENT_REQUIRE_FILTER=0 runs unfiltered on purpose)"
+    )
+
+    # The escape hatch, for shapes that are unfiltered on purpose (a developer's
+    # Linux box, the offline lanes). Both refusals become warnings.
+    for status in ("Seccomp:\t0\nNoNewPrivs:\t0\n", "Seccomp:\t2\nNoNewPrivs:\t1\n"):
+        assert (
+            _startup_error(_settings(require_filter=False), status_text=status)
+            is None
+        )
 
 
 # ----------------------------------------------------------------- hardening
