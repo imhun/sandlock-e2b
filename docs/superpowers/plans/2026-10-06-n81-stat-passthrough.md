@@ -114,6 +114,15 @@ FFI + 头、Python SDK、`envd_service/config.py`、`route_b.py`、`tests/unit/t
 
 - [ ] `deploy/scripts/acceptance/probe_n81_proc_stat_shape.py` → `PROC-SHAPE OK`（**新 pin**）
 - [ ] `probe_n79_proc_stat_denied.py` 改成断言 **ENOENT**（同一件事的 errno 换了）
+- [ ] **越界不可达的钉子**（新增，承重）：从沙箱里对 worker 自己的路径做 `stat`/`access`
+      —— 至少 `/etc/shadow`、`/var/lib/e2b-images`、`/var/lib/e2b-sandboxes/state`、
+      `/var/lib/e2b/workspaces`。判据不只是"这些路径不成立"，而是**更强的那条不变量**：
+      **凡是沙箱 `stat` 得成功的路径，`st_dev` 必须等于它自己根目录（`/`）的 `st_dev`**。
+      今天（改动前）的基线读数已经量过：`/etc/os-release`（dev 66306）、`/etc/shadow`
+      （dev 66306，**那是镜像自己的那份**，size 474/0640）、三条 worker 路径 ENOENT、
+      `/proc/1` EACCES —— 宿主自己的文件在**另一个 dev** 上，一旦有一天它进了沙箱的挂载命名空间，
+      这条判据会当场变红。反向对照（`/etc/os-release` 必须成功）写在同一支探针里，
+      照 `probe_n81_proc_stat_shape.py` 的体例
 - [ ] `lightweight_metrics_probe.py`：`stat` p50 应从 **25.7/26.4 µs** 掉到 **~1–2 µs**
       （裸形态 §2.4.10.2 的 1.2 µs 量级）
 - [ ] `tmp/stat_stall_hunt.py`：开口 ~37k/s 时应**跑满**（不再被 20000/s 压住），且不再有每秒一次的长停顿
@@ -126,6 +135,49 @@ FFI + 头、Python SDK、`envd_service/config.py`、`route_b.py`、`tests/unit/t
 - [ ] `docs/isolation-boundaries.md` / `security-architecture.md`：`/proc` 的 stat 关口改成
       "靠 rootfs 的空 `/proc` + 构造期守卫"，并写清 errno 从 EACCES 变 ENOENT
 - [ ] `docs/deploy-clusters.md`：发版记录
+
+---
+
+## 放行会不会引入新的漏点（2026-10-06 增补）
+
+今天的拦截不只是"拒 `/proc`"，它还是**元数据的准入闸** —— Landlock 管不到 `stat`（它只有 open/read 的权限位）。所以判据只有一条：**有没有路径是"沙箱看得见、但不在可读集里"**。
+
+`ChrootCtx::can_read` 的规则（`crates/sandlock-core/src/chroot/dispatch.rs:192-202`）是
+`!is_denied_any(vp) && (is_mounted(vp) || readable 前缀命中 || writable 前缀命中)`，
+而 `is_mounted` 是**前缀**匹配（挂载点以下的任何路径都算"挂着的、可读"）。
+
+| 沙箱可达的东西 | 今天 `stat` | 放行后 | 评价 |
+|---|---|---|---|
+| image rootfs（`fs_readable` 含 `"/"`） | 允许，**中介代答**（数值与内核相同） | 内核答同值 | 无差 |
+| 声明的挂载（workspace / 卷 / 六个 `/dev` 节点；合成根的**整棵 `/dev`**） | 允许（`is_mounted` 前缀命中） | 内核答同值 | 无差 |
+| `/proc/<n>`（宿主 pid） | **EACCES**（pid_ns 处理器） | **ENOENT**（空 `/proc`） | 不泄露；errno 变了 |
+| `/sys/*`、`/proc/kcore`（`fs_denied`） | **EACCES** | `/proc` 空 ⇒ ENOENT；`/sys` 是**镜像自己的空目录** | 不泄露宿主数据 |
+| 合成根里未绑定的骨架目录（`/var`、`/run`…） | 允许（它们本身就是空目录） | 内核答同值 | 无差 |
+| 宿主绑进来的 `/usr /bin /sbin /lib /opt` | 允许（`readable` 命中；`/sbin`→`usr/sbin`、`/bin`→`usr/bin`、`/lib`→`usr/lib` 都是软链，`/lib64` 在 worker 镜像里**不存在**） | 内核答同值 | 无差 |
+
+⇒ 两个形态里，**"可达但不在可读集"的路径只有 `fs_denied` 那两条**，而它们在真根下都是沙箱
+自己 rootfs 里的空东西。`/dev` 整棵树看着像"绑了却没声明可读"，其实 `fs_mount` 里声明了
+`/dev`，`is_mounted` 前缀命中 ⇒ **今天就已经是可读的**。
+
+**三条结构性前提**（这才是真正承重的东西，实现里要钉住，不能只写在文档里）：
+
+1. **沙箱的挂载命名空间里只有它自己的 rootfs + 声明的挂载** —— 依据是真根的
+   `pivot_root` + 策略挂载。这是"内核答的就是它自己的东西"的全部来源。
+2. **没有指向 root 之外的目录 fd** —— 否则 `fstatat(dirfd, name)` 会绕开一切
+   （`AT_EMPTY_PATH` 的 `fstat` 今天就已经走内核）。这条今天由 SL-4/SL-11 的 fd 表钉子看着；
+   放行后它从"锦上添花"变成**承重**。
+3. **`<root>/proc` 不是 procfs 挂载** —— 构造期守卫（Task 1 Step 4）。
+
+**两处不是漏点、但行为会变**：
+
+- `faccessat` 今天**只判存在就回 0**（忽略 `mode`，见 `handle_chroot_stat` 末段），放行后是内核的
+  真权限判断 ⇒ 变正确，但依赖旧行为的脚本会改走向（这是收紧，不是放松）。
+- `/proc/<n>` 的 errno 从 `EACCES` 变 `ENOENT`（`probe_n79_proc_stat_denied.py` 要跟着改）。
+
+**结论**：在生产（image rootfs）形态**不引入新的可达漏点**；纯/合成根形态同理（前提 1、2 同样
+成立）。代价是把"能不能看见元数据"完全押在前提 1、2 上 —— 所以 Task 4 要多一条**"越界不可达"的
+钉子**：从沙箱里对 worker / 平台自己的路径（例如 worker 的 `/etc/shadow`、`/var/lib/e2b*`）做
+`stat`/`access`，必须全部不成立。
 
 ---
 
