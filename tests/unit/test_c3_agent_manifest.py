@@ -1246,3 +1246,21 @@ def test_every_agent_container_runs_under_a_syscall_filter() -> None:
         assert container["securityContext"]["seccompProfile"] == {
             "type": "RuntimeDefault"
         }, name
+
+
+def test_the_agent_pod_carries_no_api_credential_and_no_writable_root() -> None:
+    """STATIC-6 剩下的三条：没有 SA token、没有可写根、face A 的 gid 是显式的。
+
+    identity 来自 `spec.nodeName` 的 env（D12），不是 API 查询，所以 agent 不需要
+    挂载任何 service account 凭据 —— 被拿下的 agent 进程应当连 API server 都敲不到。
+
+    face A 的 `runAsGroup` 此前没有声明，落到了运行时的默认值上；而 compose 那侧一直
+    是 `65534:65534`，`/var/lib/e2b-priv` 也是 `0710 root:65534`（只有那一个组位能进
+    去）。把它写成显式值，两个发行形态才是同一个口径。
+    """
+    agent = _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
+    pod = _pod_spec(agent)
+    assert pod["automountServiceAccountToken"] is False
+    for name, container in _pod_containers(agent).items():
+        assert container["securityContext"]["readOnlyRootFilesystem"] is True, name
+    assert _containers(agent)["agent"]["securityContext"]["runAsGroup"] == 65534

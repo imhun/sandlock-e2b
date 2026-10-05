@@ -57,6 +57,12 @@ spec:
       # face A 的反查要读**宿主**的进程表；这是它唯一的特权形态，且它不因此获得任何
       # 能力（只影响可见性）。
       hostPID: true
+      # STATIC-6: the agent's identity is the node name, taken from an env
+      # field (`spec.nodeName`) -- it never talks to the API server, so it has
+      # no use for a service account credential. Not mounting one means a
+      # process that wins the agent cannot reach the API server with the pod's
+      # own identity.
+      automountServiceAccountToken: false
       # 调度域与 worker/broker 完全一致：虚拟节点（ECI/任何 virtual-kubelet）跑不了
       # 这个 pod，那里也没有 worker 需要它。
       affinity:
@@ -136,6 +142,9 @@ spec:
             # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
             seccompProfile:
               type: RuntimeDefault
+            # Nothing in this image writes to its own rootfs; every path it
+            # touches is a mounted volume or hostPath.
+            readOnlyRootFilesystem: true
           command:
             - /bin/sh
             - -c
@@ -309,6 +318,9 @@ spec:
             # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
             seccompProfile:
               type: RuntimeDefault
+            # Nothing in this image writes to its own rootfs; every path it
+            # touches is a mounted volume or hostPath.
+            readOnlyRootFilesystem: true
           command:
             - /bin/sh
             - -c
@@ -562,6 +574,9 @@ spec:
             # 65534 = worker 自己的 uid：写 uid_map 要求写者 euid == 目标 user
             # namespace 的 owner，而那个 owner 就是"天生 65534"的 worker（§14.2.7）。
             runAsUser: 65534
+            # 显式写出来，别落回运行时的默认值：compose 那侧一直是 65534:65534，
+            # `/var/lib/e2b-priv` 也是 `0710 root:65534`。
+            runAsGroup: 65534
             capabilities:
               # BND 声明：`as_uid` 的 file capabilities 必须是它的子集，否则 `exec`
               # EPERM。这两条对非 root 进程**不产生** CapEff。
@@ -574,6 +589,9 @@ spec:
             # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
             seccompProfile:
               type: RuntimeDefault
+            # Nothing in this image writes to its own rootfs; every path it
+            # touches is a mounted volume or hostPath.
+            readOnlyRootFilesystem: true
           # 探针走 `exec`（容器内自连 127.0.0.1）：kubelet 的 httpGet 是从节点发起
           # 的网络请求，会被下面那条"只许 CP 进"的 NetworkPolicy 挡在半路。
           livenessProbe:
@@ -744,6 +762,9 @@ spec:
             # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
             seccompProfile:
               type: RuntimeDefault
+            # Nothing in this image writes to its own rootfs; every path it
+            # touches is a mounted volume or hostPath.
+            readOnlyRootFilesystem: true
           volumeMounts:
             # 与 worker 同一个 RWX claim、同一个路径：白名单按解析后的路径比较，
             # 属主/删除必须落在 worker 看得见的那些树上。
