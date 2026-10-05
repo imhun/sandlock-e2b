@@ -2381,6 +2381,16 @@ supervise 57/0、supervise_cost 3/0、python 457/8（pin 的 446/19 → 457/8）
 要退役应另立一条并带复测；② 清单里 `E2B_BASE_IMAGE` 仍钉旧 digest（内容相同，避免两台节点
 重拉 2 GB base image）；③ `/proc` 合成与策略/COW/活账本在真根下仍然需要，**没有**跟着退役。
 
+**跨切面冒烟（2026-10-05，本版跑过）** —— §7.38.3 记的"没跑跨切面冒烟"这次补上：两条都在
+当前版本、经租户入口 `http://172.18.78.49:3000` 跑完。
+
+| 冒烟 | 结果 |
+|---|---|
+| `deploy/scripts/multinode_smoke.py` | 4 个沙箱按 **2+2** 落在两个 worker（`10.244.140.54` / `10.244.192.210`）；commands / files / health / stdin 经 gateway 全过；kill 后两节点预约归 **0** ⇒ `MULTI-NODE SMOKE OK` |
+| `deploy/scripts/deployment_smoke.py` | 命令+文件、**跨节点迁移保文件**（worker-0 → worker-1）、网络配置回显与原子更新、远端卷挂载 + 兄弟卷隔离、**模板构建 → registry push → worker pull → image rootfs**、MCP gateway（沙箱内 + streamable HTTP 经代理）全过；kill 后预约归 **0** ⇒ `DEPLOYMENT SMOKE OK` |
+
+跑完 `GET /sandboxes` 回到 `[]`（没有留下孤儿）。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
@@ -3068,7 +3078,8 @@ TEST-NET-1 `eth0`，见 `synth.rs`）。拿模式感知的视图比模式盲的�
 真正要防的是 `docker0` / `veth*` / `br-*` 这类真接口。
 
 **未做**：本版同样没跑跨切面冒烟（同 §7.37.3 的理由：验证面是 syscall 面与鉴权面，
-冒烟不覆盖这两者）。**CVE-2026-53362 的内核补丁仍未打** —— 只有升级到 6.12.95+ 能挡，
+冒烟不覆盖这两者）。**（2026-10-05 已补跑，见 §7.40：multinode 与 deployment 两条全过。）**
+**CVE-2026-53362 的内核补丁仍未打** —— 只有升级到 6.12.95+ 能挡，
 这是当前最高优先级的未处理项。
 
 > **2026-10-04 更正**：原文写"沙箱的 seccomp/Landlock 都挡不住它"，**只说对了一半**。
