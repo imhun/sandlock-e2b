@@ -165,3 +165,9 @@ WIP 里已把这 39 处改成 `panic!`，而这正是让 42 条红现形的动�
   `core_lib`/`supervise` 两格按实测刷新并写明还有哪几格要等规范镜像；② 本机镜像跑不了
   `test_control`（缺 `sandlock` CLI）与 7 条 `test_supervise_channel`，所以 `core_integ` /
   `cli` / `python` 的整档绿要等规范镜像或 root 相位。
+* **上线（2026-10-05）**：父仓 `9666a86`（子模块指针 + 文档）→ wheel 重建 →
+  `0.1.0-1000-g9666a86-20261005-094925` 滚上两台 worker + 控制面/agent/seccomp DS，
+  9 pod Running / **0 重启**、`kubectl diff` **0 行**、`GET /sandboxes` `[]`；
+  现场探针 `deploy/scripts/acceptance/probe_real_root_shape.py` **PASS**（shebang rc=0、
+  工作区里的 ELF rc=0、沙箱内 `mountinfo` 的 rootfs 就是 `/`）。S5 至此全部收口：
+  E2B 侧 T1/T2/T4/T5 + fork 侧 T3（A/B 两次提交）。
