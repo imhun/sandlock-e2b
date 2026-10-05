@@ -1225,3 +1225,24 @@ def test_the_build_and_push_script_names_the_agent_image() -> None:
         "e2b-sandlock-{control-plane-gateway,worker,agent,quota-agent}"
         in text
     )
+
+
+def test_every_agent_container_runs_under_a_syscall_filter() -> None:
+    """STATIC-6 的第一条：全舰队唯一的 root 组件此前一个 syscall 都不拦。
+
+    `RuntimeDefault` 而不是 Localhost：运行时的默认档已经允许 face A 的授予路径
+    （`setgroups`/`setresgid`/`setresuid`，本机实测通过），所以不需要
+    `seccomp-installer` 往节点上再铺一份 profile。
+    """
+    agent = _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
+    containers = _pod_containers(agent)
+    assert sorted(containers) == [
+        "agent",
+        "maint",
+        "storage-init",
+        "workspace-root-init",
+    ]
+    for name, container in containers.items():
+        assert container["securityContext"]["seccompProfile"] == {
+            "type": "RuntimeDefault"
+        }, name

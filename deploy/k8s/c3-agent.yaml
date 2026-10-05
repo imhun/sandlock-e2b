@@ -130,6 +130,12 @@ spec:
                 - CHOWN
                 - DAC_OVERRIDE
                 - FOWNER
+            # STATIC-6: this container had no syscall filter at all before.
+            # `RuntimeDefault` is the runtime's own profile, and it does not set
+            # NNP -- so face A's file capabilities keep working (measured:
+            # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
+            seccompProfile:
+              type: RuntimeDefault
           command:
             - /bin/sh
             - -c
@@ -297,6 +303,12 @@ spec:
                 - CHOWN
                 - DAC_OVERRIDE
                 - FOWNER
+            # STATIC-6: this container had no syscall filter at all before.
+            # `RuntimeDefault` is the runtime's own profile, and it does not set
+            # NNP -- so face A's file capabilities keep working (measured:
+            # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
+            seccompProfile:
+              type: RuntimeDefault
           command:
             - /bin/sh
             - -c
@@ -556,6 +568,12 @@ spec:
               add:
                 - SETUID
                 - SETGID
+            # STATIC-6: this container had no syscall filter at all before.
+            # `RuntimeDefault` is the runtime's own profile, and it does not set
+            # NNP -- so face A's file capabilities keep working (measured:
+            # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
+            seccompProfile:
+              type: RuntimeDefault
           # 探针走 `exec`（容器内自连 127.0.0.1）：kubelet 的 httpGet 是从节点发起
           # 的网络请求，会被下面那条"只许 CP 进"的 NetworkPolicy 挡在半路。
           livenessProbe:
@@ -720,6 +738,12 @@ spec:
                 - CHOWN
                 - DAC_OVERRIDE
                 - FOWNER
+            # STATIC-6: this container had no syscall filter at all before.
+            # `RuntimeDefault` is the runtime's own profile, and it does not set
+            # NNP -- so face A's file capabilities keep working (measured:
+            # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             # 与 worker 同一个 RWX claim、同一个路径：白名单按解析后的路径比较，
             # 属主/删除必须落在 worker 看得见的那些树上。
