@@ -196,6 +196,40 @@ def test_an_old_store_gate_is_repaired_before_the_account_is_measured(
     )
 
 
+def test_a_second_capture_survives_a_chmod_it_may_not_do(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A re-pause must not die on a `chmod` of a directory that is not ours.
+
+    Measured 2026-10-05 on the k0s acceptance: the *second* pause of a sandbox
+    always failed with "the checkpoint directory could not be handed to the
+    sandbox's uid 10000: PermissionError" -- the capture chmods `<store>/<id>`
+    unconditionally, and after the first pause that directory belongs to the
+    sandbox's uid, which an unprivileged worker may not chmod. The pause then
+    kept the *previous* image for the resume to pick up.
+    """
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_store")
+    first = capture_checkpoint_image(base, _ctx(_FakeExecutor()), "sbx_store")
+    assert first["captured"] is True, first
+
+    parent = checkpoint_image_dir(base, "sbx_store").parent
+    real_chmod = os.chmod
+
+    def deny_parent(path, mode, *args, **kwargs):
+        if os.fspath(path) == os.fspath(parent):
+            raise PermissionError(1, "Operation not permitted")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", deny_parent)
+
+    second = capture_checkpoint_image(base, _ctx(_FakeExecutor()), "sbx_store")
+
+    assert second["captured"] is True, (
+        f"the second capture must tolerate the chmod it cannot do: {second}"
+    )
+
+
 def test_the_image_directory_is_handed_to_the_slot_that_will_write_it(
     tmp_path: Path, monkeypatch
 ) -> None:

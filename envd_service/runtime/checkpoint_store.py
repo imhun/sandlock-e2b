@@ -171,10 +171,28 @@ def _prepare_image_parent(
     except OSError:  # pragma: no cover - best effort, like the modes above
         pass
     parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(parent, 0o700)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        # A *re-pause* finds this directory already handed to the sandbox's uid,
+        # and an unprivileged worker may not chmod another uid's directory --
+        # EPERM, which used to abort the whole capture ("the checkpoint
+        # directory could not be handed to the sandbox's uid ..."). In that
+        # case the mode is already what this line wants (the hand-over set
+        # 0700), so best effort is correct here, exactly as it is for the gate.
+        pass
     owner = os.geteuid() if owner_uid is None else int(owner_uid)
     if owner != os.geteuid():
-        _hand_to_sandbox(parent, owner, sandbox_id=sandbox_id)
+        # Hand it over only when it is not already that uid's: the second pause
+        # of a sandbox finds its directory owned by the slot from the first, and
+        # asking the agent to chown it again is at best a wasted round trip (and
+        # at worst the same EPERM, reported as a failed capture).
+        try:
+            current_uid = parent.stat().st_uid
+        except OSError:
+            current_uid = None
+        if current_uid != owner:
+            _hand_to_sandbox(parent, owner, sandbox_id=sandbox_id)
     else:
         try:
             os.chown(parent, owner, owner)
