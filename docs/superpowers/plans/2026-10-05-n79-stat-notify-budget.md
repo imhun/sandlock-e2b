@@ -1,5 +1,9 @@
 # N79：stat 族 seccomp 通知单列预算 实施计划
 
+> **状态：Task 1–5 全部落地并上线（2026-10-05，版本 `0.1.0-1027-g0481042-20261005-221012`）。**
+> 发版记录（四条收尾读数、三条冒烟、三条专项读数）见 `docs/deploy-clusters.md` §7.44；
+> N79 行已改为"已修并上线"。派生的 N80（三进程能不能合并）是另一条，见 open-issues。
+
 **Goal:** 让 `stat` 族（`newfstatat`/`statx`/`faccessat`/`faccessat2`/`readlinkat` + 旧 ABI 的
 `stat`/`lstat`/`access`/`readlink`）在 seccomp 通知限流里吃**自己的**一秒预算，不再和通用
 5000/s 抢额度 —— 普通元数据负载（`find`/`git status`/包管理器）不再每秒被卡 0.86 s，
@@ -71,7 +75,7 @@ Python（`python/src/sandlock`）、pytest（`envd_service` 侧单测）、Docke
   `supervisor(..., notify_rate_limit: Option<u32>, notify_rate_limit_stat: Option<u32>)`。
 - Consumes: 无。
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 在 `notif.rs` 的测试模块里加（沿用文件已有的测试体例）：
 
@@ -95,7 +99,7 @@ fn the_stat_family_is_the_pid_ns_table() { ... }
 
 判据用**精确相等**（`assert_eq!` 到具体 `Duration` / 计数），不用"大约"或 `contains`。
 
-- [ ] **Step 2: 跑，确认失败**
+- [x] **Step 2: 跑，确认失败**
 
 ```bash
 docker run --rm -v "$PWD/third_party/sandlock":/src -w /src sandlock-dev:latest \
@@ -104,7 +108,7 @@ docker run --rm -v "$PWD/third_party/sandlock":/src -w /src sandlock-dev:latest 
 
 Expected: 编译失败（`stat_family_syscalls` / `WindowBudget` / 新参数还不存在）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `seccomp_plan.rs`：抽 `stat_family_syscalls()`，`pid_ns_procfs_stat_syscalls()` 改成
 `stat_family_syscalls()` 的转发（名字与注释保留，因为调用点在别处）。
@@ -113,7 +117,7 @@ Expected: 编译失败（`stat_family_syscalls` / `WindowBudget` / 新参数还�
 `WindowBudget { limit, start, count }` + `admit(now) -> Duration`；`supervisor()` 里按
 `stat_class.contains(&notif.data.nr)` 选窗口；`None` 时两个类共用一个窗口。
 
-- [ ] **Step 4: 跑整档**
+- [x] **Step 4: 跑整档**
 
 ```bash
 docker run --rm -v "$PWD/third_party/sandlock":/src -w /src sandlock-dev:latest \
@@ -122,7 +126,7 @@ docker run --rm -v "$PWD/third_party/sandlock":/src -w /src sandlock-dev:latest 
 
 Expected: 新用例绿，其余零回退。
 
-- [ ] **Step 5: commit（fork 仓）**
+- [x] **Step 5: commit（fork 仓）**
 
 ```bash
 git -C third_party/sandlock add crates/sandlock-core/src/seccomp_plan.rs crates/sandlock-core/src/seccomp/notif.rs
@@ -145,7 +149,7 @@ git -C third_party/sandlock commit -m "feat(seccomp): a stat family with its own
 - Produces: 一条从 `--policy` JSON / Python `SandboxOptions` / FFI builder 到 supervisor 的
   完整通路，字段名 `notify_rate_limit_stat`。
 
-- [ ] **Step 1..6**：按 `notify_rate_limit` 的既有 6 个落点逐一对齐（field → default → build →
+- [x] **Step 1..6**：按 `notify_rate_limit` 的既有 6 个落点逐一对齐（field → default → build →
   setter → wire key + read-back → FFI 符号 + 头文件 → Python builder fn → `_HANDLED_FIELDS` →
   `SandboxOptions` 字段），每加一处先让它红。
 
@@ -164,28 +168,28 @@ git -C third_party/sandlock commit -m "feat(seccomp): a stat family with its own
 - Produces: `settings.sandbox_stat_notify_rate_limit`，以及落到沙箱策略里的
   `"notify_rate_limit_stat"` 键。
 
-- [ ] **Step 1: 失败用例**：断言 config 默认 20000、可被 env 调、`0` 时策略里是 `None`
+- [x] **Step 1: 失败用例**：断言 config 默认 20000、可被 env 调、`0` 时策略里是 `None`
   （并回通用预算）、非 0 时落进 supervise policy 文档。
-- [ ] **Step 2..4**：实现 → 跑 `tests/unit` → commit。
+- [x] **Step 2..4**：实现 → 跑 `tests/unit` → commit。
 
 ---
 
 ### Task 4: 现场验收（N79 的口径）
 
-- [ ] **Step 1**: 重建 wheel + 镜像 + 上线（照 `docs/deploy-clusters.md` §8，先认集群）。
-- [ ] **Step 2**: 复跑 `deploy/scripts/acceptance/lightweight_metrics_probe.py`：
+- [x] **Step 1**: 重建 wheel + 镜像 + 上线（照 `docs/deploy-clusters.md` §8，先认集群）。
+- [x] **Step 2**: 复跑 `deploy/scripts/acceptance/lightweight_metrics_probe.py`：
   `stat` 的 p50 仍在 ~26 µs 量级，且**不再出现"睡满窗口"**。
-- [ ] **Step 3**: 复跑 `pidns-cost-probe.py`（§2.4.10.2 同一张表）。
-- [ ] **Step 4**: 一条钉子：`stat /proc/<宿主 pid>/…` 仍然 `EACCES`（拦截语义没丢）。
+- [x] **Step 3**: 复跑 `pidns-cost-probe.py`（§2.4.10.2 同一张表）。
+- [x] **Step 4**: 一条钉子：`stat /proc/<宿主 pid>/…` 仍然 `EACCES`（拦截语义没丢）。
 
 ---
 
 ### Task 5: 记录
 
-- [ ] `docs/open-issues.md` 的 N79 行：`待决策` → `已修并上线` + 版本号 + 现场读数。
-- [ ] `docs/benchmarks.md` §③：把"5000/s 通用预算"改成"通用 5000/s + stat 单列 20000/s"。
-- [ ] `docs/security-hardening.md` P1-5：补一句两类预算与默认值。
-- [ ] `docs/deploy-clusters.md`：一节发版记录。
+- [x] `docs/open-issues.md` 的 N79 行：`待决策` → `已修并上线` + 版本号 + 现场读数。
+- [x] `docs/benchmarks.md` §③：把"5000/s 通用预算"改成"通用 5000/s + stat 单列 20000/s"。
+- [x] `docs/security-hardening.md` P1-5：补一句两类预算与默认值。
+- [x] `docs/deploy-clusters.md`：一节发版记录。
 
 ---
 
