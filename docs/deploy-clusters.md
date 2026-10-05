@@ -1181,7 +1181,7 @@ profile 在承担**，换一个更宽 profile 的宿主就没了。修后由沙�
 ### 7.25 N54：镜像 digest 解析结果落盘缓存（**2026-10-01，已上线 `0.1.0-839-g4271c45-20261001-112409`**）
 
 提交 `4271c45`。起因是那个问题——"预热以后建箱的时间主要花在什么地方"——上一轮的逐段实测
-（README §1）给出的答案是：**0.45–0.55 s 花在向镜像仓库解析基础镜像**，不是登记、也不是落盘。
+（[benchmarks.md](benchmarks.md) §①，2026-10-05 从 README 沉淀）给出的答案是：**0.45–0.55 s 花在向镜像仓库解析基础镜像**，不是登记、也不是落盘。
 用户裁定「按 3 改」：把解析挪到预热阶段，并且**落盘**。
 
 **现象（上线前实测）**：一次建箱窗口里 worker 对
@@ -2487,7 +2487,7 @@ same runtime … the harness has to [be multi-threaded]"，同文件里**每一�
 **验收**：故意把 flavor 改回 current-thread → 0.13s 红，报错原文点名 `CurrentThread` 与修法；
 改回后那条用例单跑 **20/20 绿**（每次 0.13s）；`core_integ` 整档 **570 passed / 0 failed（89.5s）**。
 
-### 7.42.1 顺带查清：另外 3 条稳定红不是产品缺口，是本机运行器缺 `--init`
+### 7.42.1 另外 3 条稳定红：回收是沙箱自己的责任，已修（fork `3277067`）
 
 同一轮整档里还有三条**每次**都红的收尾断言（`test_popen_group_killed_on_drop`、
 `test_shutdown_group_sweep_after_compliant_grace_exit`、
@@ -2497,14 +2497,19 @@ same runtime … the harness has to [be multi-threaded]"，同文件里**每一�
 `docker run` 不给 `--init` 时 PID 1 就是我们敲的 `sh`（它不回收任何东西）。
 
 **A/B（同镜像、同命令，只差一个 flag）**：无 `--init` → 3/3 红；加 `--init`（PID 1 = `docker-init`）
-→ 3/3 绿、**0.55s**。所以这是本机运行器的缺口（真机上沙箱自带会回收的 init），不是产品缺口；
-`deploy/scripts/fork-gate.sh` 的两处 `docker run` 因此都加了 `--init`。
+→ 3/3 绿、**0.55s**。这个 A/B 只是**诊断**（"后代确实被杀了，被量的其实是**谁在回收**"），
+不是修法。查清后是两类形态、两种结论：
 
-**明确挂账（非本轮范围）**：沙箱 init 在 `Shutdown` / main 退出路径上 `signal_all_children(SIGKILL)`
-之后**直接 `_exit`**，不等待、不回收刚杀掉的孩子 —— 也就是说"被组杀的后代不留 defunct"目前
-**依赖容器 PID 1 是个 reaper**（测试文档本来的假设是"reparent 到 init，由 init 回收"）。
-要不要在退出前加一段有界的 reap 收割由产品侧定：代价是每次 teardown 多等几毫秒，
-收益是这条语义不再看 PID 1 的脸色。
+| 形态 | 结论 | 处置 |
+|---|---|---|
+| exec 会话（有 `sandlock-init`） | **产品缺口，已修**：SL-6 让 init 成为 subreaper，它 SIGKILL 掉的那棵子树就是它自己的孩子 —— 而它在 `Shutdown`/main 退出路径上**直接 `_exit`**，从不收割（`fork 3277067`） | `reap_collapsed_children`：有界（500ms）收割；完成判据是"每个进程组都 ESRCH"（僵尸仍算组成员，且 SIGKILL 是异步落地的，所以"表空"不能当退出条件） |
+| M0（`Sandbox::launch` / `popen`，**根本没有 init** —— 抓进程树确认过） | **不是产品缺口**：工作负载就是 supervisor 的直接子进程，被组杀的后代按构造孤儿化给容器的 PID 1，沙箱不可能从外面回收"别人家的孩子"。规范门禁里 PID 1 是跑 `scripts/test-all.sh` 的 `dash`，它的 `wait3(-1)` 本来就会回收收养来的孤儿 —— 所以这三条在门禁里一直是绿的；只有当探针容器的 PID 1 是个光杆 `sleep` 时才红 | 曾把 supervisor 自己设成 subreaper 来"接管"，**已回退**（`b20c0b8`）：`seccomp::state::tests::pgid_entry_survives_leader_exit_with_live_member` 立刻红 —— subreaper 会为**所有**后代孤儿（包括无关代码里一次普通 `fork()` 留下的）接管回收责任，而库要么做不到、要么得用 `SIGCHLD` + `waitpid(-1)` 去偷调用方的状态。这条边界写在 fork 的 `docs/test-baseline.md` 里 |
+
+**验收**：`core_integ` **570/0**、`sandlock-oci` **157/0**（含 `test_init_reaper` / `test_process_groups`）、
+`sandlock-supervise` **57/0**；三条回收断言在"PID 1 = 会回收的 dash"的容器里 **3/3 绿、0.61s**。
+
+**`deploy/scripts/fork-gate.sh` 不加 `--init`**：门禁里的 PID 1 是 `dash`（本来就会回收），
+按文档原样跑即可；加 `--init` 只会掩盖"回收责任到底归谁"这件事。
 
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 

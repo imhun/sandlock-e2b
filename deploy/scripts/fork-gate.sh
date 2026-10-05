@@ -12,14 +12,20 @@
 # 再用 setpriv 以 65534 跑门禁。**门禁的全部相位都在一个容器里、跑在共享的 target 缓存上**，
 # 所以它和 CI/规范镜像的行为一致（差别只在"谁降权"这一步由脚本做）。
 #
-# `--init` 不是可选项：三条收尾断言（`test_popen_group_killed_on_drop`、
-# `test_shutdown_group_sweep_after_compliant_grace_exit`、
+# **不要给这里加 `--init`**（加过一版，已回退）。三条收尾断言
+# （`test_popen_group_killed_on_drop`、`test_shutdown_group_sweep_after_compliant_grace_exit`、
 # `test_max_lifetime_forces_shutdown_with_live_child`）问的是"被组杀掉的
-# 后代**死了且被回收**"，而它们判据是 `kill(pid, 0) != 0` —— 僵尸仍然算"活着"。
-# 沙箱 init 退出后，这类孤儿落回容器的 PID 1 去回收；`docker run` 不给 `--init`
-# 时 PID 1 就是我们自己敲的 `sh`，它不回收任何东西，于是三条断言在**本机稳定红**
-# （实测：无 --init 3/3 红且 20 分钟后仍是 state=Z；加 --init 同一镜像同一命令 3/3 绿）。
-# 真机上沙箱自带会回收的 init，所以这是本机运行器的缺口，不是产品缺口。
+# 后代**死了且被回收**"，判据是 `kill(pid, 0) != 0` —— 僵尸仍算"活着"。
+# 2026-10-05 查清（详见 docs/deploy-clusters.md §7.42.1）：
+#   * exec 会话的 init 是 subreaper，被杀的孩子是它自己的 —— 它曾经 `_exit`
+#     前不收割，这是**产品缺口**，已修（fork `3277067` 的 init 侧）；
+#   * `popen`/`launch`（M0）**根本没有 init**，被组杀的后代按构造孤儿化给
+#     容器的 PID 1 —— 这是 PID 1 的责任，不是沙箱能替的。门禁这里 PID 1 是
+#     跑 `scripts/test-all.sh` 的 `sh`（dash），它的 `wait3(-1)` 本来就会回收
+#     收养来的孤儿，所以这三条在门禁里是绿的；探针容器把 PID 1 设成光杆
+#     `sleep` 时才红。
+# 所以：`--init` 只会让"回收责任到底归谁"这件事实被掩盖（也曾用 subreaper
+# 让 supervisor 去接管，被 `seccomp::state` 那条 pgid 单测证伪后回退）。
 #
 # 用法：
 #   deploy/scripts/fork-gate.sh                 # 默认门禁（非 root 相位）
@@ -48,7 +54,7 @@ if [ "${1:-}" = "--one" ]; then
     FILTER="${2:?--one needs a test filter, e.g. 'test_chroot::'}"
     # `sh ignored "$FILTER"`: the extra word becomes `$0` so the filter lands in `$1`.
     set +e
-    docker run --privileged --init --rm --entrypoint sh \
+    docker run --privileged --rm --entrypoint sh \
         -v "$REPO_ROOT":/src -w /src/third_party/sandlock \
         "$IMAGE" -c '
 set -e
@@ -75,7 +81,7 @@ mkdir -p "$(dirname "$LOG")"
 
 echo "==> 跑门禁：$IMAGE（as uid 65534）"
 set +e
-docker run --privileged --init --rm --entrypoint sh \
+docker run --privileged --rm --entrypoint sh \
     -v "$REPO_ROOT":/src -w /src/third_party/sandlock \
     "$IMAGE" -c '
 set -e
