@@ -2408,7 +2408,12 @@ mediation_2uid `9`。刷新过程挖出三处 fork 侧问题，都已修（`77f4
 `faulthandler` 看门狗；顺带修掉一个一直存在的采集 bug —— 脚本在 `set -e` 下，套件失败时子 shell 会在写
 rc 之前退出，于是**所有**失败（含超时）都被记成笼统的 `1`/FAILED。**仍未解释**：core_integ 的
 `test_a_child_restored_into_a_session_keeps_the_session_executable` 偶发死等（本 tip 与 pre-S5 pin
-单独跑都通过）—— 现在有界，但机理没查清。
+单独跑都通过）。当天的压测把面扩大了：该用例**单跑 100 次全绿**，而**整档 `core_integ` 跑 4 次是
+1 绿 3 红、每次红的受害者都不同**（`test_restore::test_libc_workloads_resume_after_restore` 的
+`static-control` / `libc-malloc` 两臂各一次，`state=Z exit_code=2560`，即被信号 10 = SIGUSR1 带走；
+`test_the_session_parent_can_write_into_an_init_spawned_child` 一次，`/proc/<pid>/maps` 赛跑），
+第 4 次是死等且签名与 35 分钟那次完全一致 ⇒ **这是 session/exec/restore 这一族的偶发，不是单一用例**
+—— 现在有界，但机理没查清（下一步：整档循环 + 失败现场 dump `/proc/<pid>/{maps,stat,stack}`）。
 
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
