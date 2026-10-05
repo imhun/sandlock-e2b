@@ -79,6 +79,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -556,6 +557,27 @@ def _capture_reply(
     return reply
 
 
+def _image_is_there(image: Path) -> bool:
+    """Is the checkpoint image present, judged without the *worker's* eyes?
+
+    ``Path.is_dir()`` answers False for EACCES, and the image lives at
+    ``<id>/latest`` inside the sandbox's own 0700 directory -- so the worker
+    (uid 65534) cannot see it while the sandbox's uid can. Reading that False as
+    "absent" is how a paused sandbox came back from a worker replacement with
+    "no checkpoint image for this sandbox" (measured on the k0s cluster,
+    2026-10-05: the image was on the shared volume the whole time, the replacing
+    worker just could not look into the store). The slot that performs the
+    resume runs as the sandbox's uid, so the honest answer here is "cannot look,
+    not proven absent" -- it then reports the real reason itself.
+    """
+    try:
+        return stat.S_ISDIR(os.stat(image).st_mode)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def restore_checkpoint_image(
     workspace_base,
     ctx,
@@ -572,7 +594,7 @@ def restore_checkpoint_image(
     not a gate.
     """
     image = checkpoint_image_dir(workspace_base, sandbox_id, state_base=state_base)
-    if not image.is_dir():
+    if not _image_is_there(image):
         return {
             "sandbox_id": sandbox_id,
             "restored": False,
@@ -585,14 +607,17 @@ def restore_checkpoint_image(
         # this covers the shapes where it does not -- a record whose uid changed,
         # or a legacy image taken before pooled uids.
         try:
-            if image.stat().st_uid != int(owner_uid):
-                _hand_to_sandbox(
-                    image, int(owner_uid), recursive=True, sandbox_id=sandbox_id
-                )
+            # `PermissionError` here is the *normal* shape, not a failure: the
+            # store is `<id>/latest` inside the sandbox's 0700 directory, so this
+            # worker (uid 65534) cannot stat into it while the sandbox's own uid
+            # can. Only a uid we *can* read is checked for a hand-over.
+            needs_hand = image.stat().st_uid != int(owner_uid)
+        except PermissionError:
+            needs_hand = False
         except Exception as exc:  # noqa: BLE001 - reported as "not restored"
             reason = (
-                "the checkpoint image could not be handed to the sandbox's uid "
-                f"{owner_uid}: {type(exc).__name__}: {exc}"
+                "the checkpoint image could not be inspected: "
+                f"{type(exc).__name__}: {exc}"
             )
             logger.warning("sandbox %s: %s", sandbox_id, reason)
             return {
@@ -601,6 +626,23 @@ def restore_checkpoint_image(
                 "reason": reason,
                 "image": str(image),
             }
+        if needs_hand:
+            try:
+                _hand_to_sandbox(
+                    image, int(owner_uid), recursive=True, sandbox_id=sandbox_id
+                )
+            except Exception as exc:  # noqa: BLE001 - reported as "not restored"
+                reason = (
+                    "the checkpoint image could not be handed to the sandbox's uid "
+                    f"{owner_uid}: {type(exc).__name__}: {exc}"
+                )
+                logger.warning("sandbox %s: %s", sandbox_id, reason)
+                return {
+                    "sandbox_id": sandbox_id,
+                    "restored": False,
+                    "reason": reason,
+                    "image": str(image),
+                }
     if live_session_present(ctx):
         # Never quietly give a sandbox two processes: resuming an image next to a
         # running session is not what "resume" means, and the lifecycle's thaw

@@ -411,6 +411,54 @@ def test_a_restore_without_an_image_says_so(tmp_path: Path) -> None:
     assert executor.restores == []
 
 
+def test_a_restore_still_sees_an_image_the_worker_uid_cannot_look_into(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The store is the sandbox's 0700 directory, so "worker cannot look" is not
+    "there is no image".
+
+    Measured on the k0s cluster (2026-10-05): pause a sandbox, replace the worker
+    pod that hosts it, resume -- and the new worker answers "no checkpoint image
+    for this sandbox" while the image sits on the shared volume the whole time.
+    `Path.is_dir()` reports EACCES as False, and the per-sandbox directory is
+    0700 owned by the *sandbox's* uid, so the worker's own uid can never see
+    into it. The slot that performs the restore runs as that uid; it is the one
+    that should decide.
+    """
+    base = tmp_path / "sandboxes"
+    _sandbox_tree(base, "sbx_store")
+    image = checkpoint_image_dir(base, "sbx_store")
+    image.mkdir(parents=True)
+
+    real_stat = os.stat
+
+    def blind_stat(path, *args, **kwargs):
+        # Everything at or below `<id>/latest` is invisible, exactly as it is for
+        # uid 65534; the store root keeps working so the fixture still resolves.
+        if str(path).startswith(str(image.parent)) and str(path) != str(image.parent):
+            raise PermissionError(13, "Permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", blind_stat)
+    executor = _FakeExecutor(
+        live_session=False,
+        restore_reply={
+            "restored": True,
+            "reason": "",
+            "dir": str(image),
+            "child_id": 1,
+            "pid": 2,
+        },
+    )
+
+    reply = restore_checkpoint_image(base, _ctx(executor), "sbx_store")
+
+    assert reply["restored"] is True, reply
+    assert executor.restores == [str(image)], (
+        "the slot must get the chance to try: it is the uid that can read the image"
+    )
+
+
 def test_a_restore_refuses_to_add_a_process_next_to_a_live_session(
     tmp_path: Path,
 ) -> None:

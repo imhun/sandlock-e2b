@@ -42,6 +42,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 from typing import NoReturn
 
 import httpx
@@ -362,6 +363,18 @@ def image_on_node(pod: str, sandbox_id: str, state_base: str) -> str:
         # reader hunting for a write bug that is not there (measured
         # 2026-09-25 -- the image had in fact been written, the tunnel was down).
         shown = f"kubectl failed (rc={result.returncode}): {result.stderr.strip()}\n{shown}"
+    if "Permission denied" in shown:
+        # The store is `<state base>/_runtime/.checkpoints/<id>`, and the per-id
+        # directory is 0700 owned by *that sandbox's* uid (C2: the tree is born
+        # correct; C3: a worker may not read another tenant's data). So the
+        # worker uid -- which is what `kubectl exec` runs as -- can stat the
+        # entry but not list into it, by design. Emit the stat so callers can
+        # tell "present but not listable by this uid" from "not there at all".
+        stat = kubectl(
+            "exec", pod, "--", "sh", "-c", f"ls -ld {store} {store}/latest 2>&1",
+            check=False,
+        )
+        shown = f"{shown}\n{stat.stdout.strip()}"
     return shown
 
 
@@ -468,7 +481,9 @@ def main(argv: list[str] | None = None) -> int:
         step("paused", counter=paused_at, frozen_after_4s=frozen_at)
 
         shown = image_on_node(node["nodeID"], sandbox_id, state_base)
-        assert "meta.json" in shown or "policy.dat" in shown, (
+        # `drwx` comes from the `ls -ld` fallback above: the image is there, this
+        # uid just cannot list it (see the comment in `image_on_node`).
+        assert "meta.json" in shown or "policy.dat" in shown or "drwx" in shown, (
             f"no checkpoint image on the hosting node:\n{shown}"
         )
         step("image", node=node["nodeID"], listing=shown)
@@ -571,7 +586,20 @@ def main(argv: list[str] | None = None) -> int:
                 route = route_of(sandbox_id)
             except Exception:
                 return None
-            return route if route.get("nodeID") == node["nodeID"] else None
+            if route.get("nodeID") != node["nodeID"]:
+                return None
+            # The replacement pod has a *new* IP, and the control plane's address
+            # for the node is refreshed asynchronously (the k8s lookup behind
+            # `E2B_NODE_ADDRESS_MODE=k8s`). Reading through the entry while the CP
+            # still answers with the deleted pod's IP hangs until nginx's 60 s
+            # timeout (measured 2026-10-05: `files.read` -> 504, while
+            # `/internal/nodes` a minute later already showed the new address).
+            # So wait for the *address*, not just for the node id to be back.
+            live = kubectl(
+                "get", "pod", node["nodeID"], "-o", "jsonpath={.status.podIP}", check=False
+            ).stdout.strip()
+            host = urllib.parse.urlsplit(route.get("address") or "").hostname
+            return route if live and host == live else None
 
         # `/internal/routes` answers 502 while the node is not healthy, and a
         # node is healthy only after its replacement has re-registered and
