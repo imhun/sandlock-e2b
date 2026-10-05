@@ -55,6 +55,13 @@
   每秒最多处理 N 个 seccomp 通知，超限 supervisor 睡满窗口剩余时间，
   沙箱被拦截的 syscall 在内核队列积压/阻塞，防止通知洪泛压垮 supervisor。
 - worker 配置 `E2B_SANDBOX_NOTIFY_RATE_LIMIT`（默认 5000/s，0 关闭）。
+- **N79（2026-10-05）把这个预算按类拆开**：stat 族（`newfstatat`/`statx`/`faccessat`/
+  `faccessat2`/`readlinkat` + 旧 ABI 拼写）吃自己的窗口
+  （builder 字段 `notify_rate_limit_stat`，worker 侧 `E2B_SANDBOX_STAT_NOTIFY_RATE_LIMIT`，
+  默认 **20000/s**）。依据是实测：普通元数据负载（`find`/`git status`/包管理器）每秒产生
+  上千次 stat 族调用，与通用 5000/s 抢同一份额度 ⇒ 一秒里 0.86 s 全在睡。20000/s 是通用的
+  4 倍、约 0.52 核（按实测 26 µs/次），即 worker pod 2 核的四分之一；超了照样睡满该窗口
+  （仍是防洪泛闸，不是豁免）。**0 = 并回通用预算**，也就是 N79 之前的行为与回退档。
 - 需重新构建 wheel 并发布镜像后生效（见部署步骤）。
 
 ### P2-7 创建限流

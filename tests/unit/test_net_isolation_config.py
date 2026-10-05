@@ -105,6 +105,7 @@ def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
         port_mappings={"50006": "8080"},
         network_deny_cidrs=(),
         sandbox_notify_rate_limit=0,
+        sandbox_stat_notify_rate_limit=0,
         iam_signing_key="k",
         image_cache_dir=Path("tmp/cache"),
         # N16 too: the factory reads the switch and the directory together.
@@ -162,6 +163,7 @@ def test_policy_ceiling_requests_bind_injection(monkeypatch) -> None:
             port_mappings=port_mappings,
             network_deny_cidrs=(),
             sandbox_notify_rate_limit=0,
+            sandbox_stat_notify_rate_limit=0,
             iam_signing_key="k",
             image_cache_dir=Path("tmp/cache"),
             pure_rootfs="off",

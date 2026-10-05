@@ -831,6 +831,7 @@ class SandlockExecutor(Executor):
         network: dict | None = None,
         network_deny_cidrs: tuple[str, ...] = (),
         notify_rate_limit: int = 0,
+        notify_rate_limit_stat: int = 0,
         iam_tokens: dict[str, dict[str, str]] | None = None,
         stream_limit_bytes: int | None = STREAM_LIMIT_DEFAULT,
         iam_signing_key: str | None = None,
@@ -879,6 +880,7 @@ class SandlockExecutor(Executor):
             )
         self._network_deny_cidrs = tuple(network_deny_cidrs)
         self._notify_rate_limit = notify_rate_limit
+        self._notify_rate_limit_stat = notify_rate_limit_stat
         # Accepted for config compatibility (E2B_ENABLE_NETNS), but the fork
         # dropped per-sandbox netns/veth in favor of the unprivileged
         # loopback-netns mode: the real switch is `enable_net_isolation`
@@ -2545,6 +2547,7 @@ class SandlockExecutor(Executor):
             "disk_stats_path": self._disk_stats_path,
             "max_file_size": self._max_file_size_bytes(),
             "notify_rate_limit": self._notify_rate_limit or None,
+            "notify_rate_limit_stat": self._notify_rate_limit_stat or None,
             "uid": sandbox_uid,
             "gid": sandbox_gid,
         }
@@ -2787,6 +2790,7 @@ class SandlockExecutor(Executor):
             "disk_stats_path": self._disk_stats_path,
             "max_file_size": self._max_file_size_bytes(),
             "notify_rate_limit": self._notify_rate_limit or None,
+            "notify_rate_limit_stat": self._notify_rate_limit_stat or None,
             "clean_env": True,
             "env": dict(config.env),
             "cwd": config.cwd,

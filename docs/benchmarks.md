@@ -114,8 +114,11 @@ worker 容器里只有 `envd_service`，扫 worker 是量不到的）：
   **26.1–27.1 µs**；卡顿期间对照组 `getpid` 只有 **3–61 µs**、宿主 CPU 也没涨 ⇒ 不是进程被
   抢占，是限流睡。所以 **2026-10-01 记的"30 µs"与 10-05 中途出现的 159 µs 是同一分布的两次
   抽样，不是每次调用变慢**；探针已改成同时报 `p50_us/p95_us/p99_us/max_us`。
-  **"放行 stat / stat 不计入限流"已立项 [open-issues N79](open-issues.md)**（两档：stat 单列预算
-  属低风险；彻底放行的前置是 `/proc` 的 stat 语义，沙箱自己挂 procfs 当前实测 EPERM）。
+  **N79 已按"stat 单列预算"落地**（[open-issues N79](open-issues.md)）：stat 族吃自己的窗口
+  `E2B_SANDBOX_STAT_NOTIFY_RATE_LIMIT`（默认 20000/s = 通用的 4 倍），所以上面这条 5000/s
+  的一秒级停顿现在只在 **stat 流量超过 20000/s** 的持续洪泛里出现；普通元数据负载不再撞它。
+  彻底放行（省掉那 26 µs）仍是另一档，前置是 `/proc` 的 stat 语义 —— 沙箱自己挂 procfs 当前
+  三形态实测 EPERM。
 - 隔离本身几乎不加钱：开 per-sandbox 网络命名空间后**建连 p50 0.291 ms**（未隔离 0.034 ms，
   只影响短连接）；在已部署的中介形态里再加 PID 命名空间，实测增量 **≤2 µs/次**。
   pid_ns 打开后 fork 要拦 stat 族（`newfstatat`/`statx`/`faccessat`/`readlinkat`…），

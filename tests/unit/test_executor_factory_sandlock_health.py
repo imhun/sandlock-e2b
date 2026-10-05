@@ -38,6 +38,7 @@ def _settings(executor: str) -> SimpleNamespace:
         port_mappings={},
         network_deny_cidrs=(),
         sandbox_notify_rate_limit=0,
+        sandbox_stat_notify_rate_limit=0,
         iam_signing_key="k",
         image_cache_dir=Path("tmp/cache"),
         # N16 carries the same way, and its two halves are read together: the
