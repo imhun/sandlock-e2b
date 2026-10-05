@@ -2521,9 +2521,14 @@ cli_build 0 / python 465`，全部 `matches baseline`，**`==> 门禁通过`**�
   `target-linux/`）——改成相对链接 `target-linux` 后两种拼写指向同一份产物；
 * `supervise` 相位此前 33/2，两条 restore 用例红（§7.42.1 开头那条 reach 拼写 bug）。
 
-**仍是偶发（非本轮引入，fork 已在档）**：`test_the_session_parent_can_write_into_an_init_spawned_child`
-在整档里偶尔红（`process_vm_writev` EFAULT / 读 `/proc/<pid>/maps` 与子进程状态竞态）——
-同一天 8/8 那一次它绿，前一次它红；fork 的 `docs/test-baseline.md` 早把它列在"未复现的受害者"名单里。
+**最后那条偶发也修了（fork `3d128d6`）**：`test_the_session_parent_can_write_into_an_init_spawned_child`
+在整档里偶尔红（`process_vm_writev` EFAULT，同一天一轮红一轮绿）。根因在**用例自己**，不在引擎：
+`exec` 应答报的是**fork 时**的 pid，而用例立刻去读 `/proc/<pid>/maps` 并往那个地址写 —— `execve`
+会整块换掉地址空间，于是这几微秒的窗口里要么 maps 读到"正在拆的旧镜像"（找不到可写匿名映射），
+要么选中的映射在写入前失效（`EFAULT`，errno 14）。修法：等 `/proc/<pid>/exe` 变成它要求跑的那个程序
+（内核在 `exec_mmap` 里切换该链接，之后不再重映射），并断言读到的 maps 属于**那个程序**——
+后半句让这道栅栏不是装饰：把栅栏关掉，断言 3/3 红（一次点出 init 二进制、两次点出 `/usr/bin/dash`，
+正是 exec 前的两种状态）；打开后单跑 12/12 绿（0.02s），门禁两轮 8/8。
 
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
