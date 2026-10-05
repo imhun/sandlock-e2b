@@ -80,13 +80,33 @@ exec 带 file cap 的 `as_uid`。测量因此都必须用"未加 cap 的 PID 1 �
 `security-framework.md` 自己的说法，L6 是**唯一通到宿主的那一层**。这是降级，不是提权：
 不需要内核缺陷，只需要一次写文件。收益（省一个 DaemonSet）与代价不在一个量级上。
 
-真正的收获是另一件事：**这条隔离没有测试守着**。现在没有任何用例会在有人给 face B
-加上 `SYS_PTRACE` 时变红，而 `SYS_PTRACE` 恰好写在
-`test_c3_agent_manifest.py` 的 `FORBIDDEN_TOKENS` 里 —— 但那是文本级断言，它守的是
-manifest 的措辞，不是"跨 pod 真的够不到"这个事实。上节点复验时应当把它补成一条真用例
-（见 §4）。
+真正的收获是另一件事。给 face B 加上 `SYS_PTRACE` **确实**会让两条用例变红（实测：
+`test_face_b_is_the_file_face_with_c1s_capability_set`，能力集精确相等；
+`test_the_worker_and_every_agent_container_stay_outside_the_forbidden_set`，
+`FORBIDDEN_TOKENS` 里就有 `SYS_PTRACE`）。但这两条守的是 **manifest 的措辞与能力集**，
+不是"跨 pod 真的够不到"这个事实本身。它意味着：**换一条路拿到同样的可达性，没有任何
+用例会变红** —— 比如让 installer 与 agent 共享一个挂载、给 installer 挂上 agent 已有的
+某根 hostPath、或者干脆合并两个 DaemonSet（§3 开头那条路）。那才是缺的那条测试。
 
-## 4. 上节点必须复验的两条
+## 2b. 另外两条卫生字段的实测
+
+`readOnlyRootFilesystem` 与 `automountServiceAccountToken: false` 的依据是**代码审读 +
+一次运行时读数**，不是推理：
+
+* **代码审读**：`c3_agent/` 不写自身 rootfs。会临时落盘的两处都在挂载点内 ——
+  `gateway_common/paths.py` 的原子写在**目标目录旁**下 `.tmp`，`gateway_common/archive.py`
+  的 staging 写在**目标树同级**；`app.py` 没有 `UploadFile`，不会往 `/tmp` spool；日志走
+  stderr；`materialize.py` 全走 `dir_fd`。`__pycache__` 写不进去是 CPython 容忍的（非致命）。
+* **运行时读数**（同一口径）：`docker run --read-only` + `uid 65534` + `--cap-drop ALL`
+  下，uvicorn 打印 `Application startup complete.` 与
+  `Uvicorn running on http://0.0.0.0:49985`，探针回
+  `SERVICE-OK ('127.0.0.1', 49985)`；不带 `E2B_C3_AGENT_TOKEN` 时仍然
+  `refusing to start without auth`（fail-closed 守卫没被只读根影响）。
+* `automountServiceAccountToken`：`c3_agent/` 无任何 in-cluster config 或 API 调用，身份
+  来自 `spec.nodeName` 的 env，`e2b-secrets` 走 `secretKeyRef`（kubelet 注入）。
+  `deploy/k8s` 里只有 `control-plane` 声明了 `serviceAccountName`。
+
+## 4. 上节点必须复验的三条
 
 1. **containerd 的 `RuntimeDefault` 与 Docker 的默认档不是同一份实现**。§1/§2 用它代表
    `RuntimeDefault`，方向不会错，但 face A 的授予一旦被挡就是**静默**失败（表现为第一次
@@ -95,6 +115,10 @@ manifest 的措辞，不是"跨 pod 真的够不到"这个事实。上节点复�
    `seccomp=unconfined` 换成该节点实际的档。
 2. **§3 的第二行（`CAP_SYS_PTRACE`）不要在集群上跑** —— 它会真的写到另一个容器的挂载。
    要在集群上验的是第一行（无 `SYS_PTRACE` 时 `Permission denied`），且用一次性路径。
+3. **只读根**（§2b）：它今天成立靠的是"这个镜像不写自己的 rootfs"。换基础镜像、加一个
+   收 body 的 endpoint、或引入任何用 `/tmp` 的依赖，都会把它变成运行时故障 —— 而
+   manifest 里那句 "Nothing in this image writes to its own rootfs" 不会自己变旧。
+   换镜像时要重跑 §2b 的那条读数（`--read-only` 下服务真的绑定成功），不是只看代码。
 
 ## 5. 这次落地了什么、没落什么
 
