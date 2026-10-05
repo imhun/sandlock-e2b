@@ -2511,6 +2511,20 @@ same runtime … the harness has to [be multi-threaded]"，同文件里**每一�
 **`deploy/scripts/fork-gate.sh` 不加 `--init`**：门禁里的 PID 1 是 `dash`（本来就会回收），
 按文档原样跑即可；加 `--init` 只会掩盖"回收责任到底归谁"这件事。
 
+**验收（本机门禁 8/8 全绿，`0.1.0` fork `b561469`）**：
+`core_lib 927 / core_integ 570 / ffi 104 / cli 98 / supervise 57 / supervise_cost 3 /
+cli_build 0 / python 465`，全部 `matches baseline`，**`==> 门禁通过`**。
+顺带修掉本地运行器的两处对不齐：
+
+* python 相位要 `target/debug/sandlock-supervise`，而镜像 entrypoint 把 fork 的
+  `target` 设成**绝对**的 `/src/target-linux`（本容器里 `/src` 是仓库根，产物却在 fork 的
+  `target-linux/`）——改成相对链接 `target-linux` 后两种拼写指向同一份产物；
+* `supervise` 相位此前 33/2，两条 restore 用例红（§7.42.1 开头那条 reach 拼写 bug）。
+
+**仍是偶发（非本轮引入，fork 已在档）**：`test_the_session_parent_can_write_into_an_init_spawned_child`
+在整档里偶尔红（`process_vm_writev` EFAULT / 读 `/proc/<pid>/maps` 与子进程状态竞态）——
+同一天 8/8 那一次它绿，前一次它红；fork 的 `docs/test-baseline.md` 早把它列在"未复现的受害者"名单里。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版

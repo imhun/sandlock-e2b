@@ -97,6 +97,13 @@ chmod -R a+rX /root/.cargo /root/.rustup 2>/dev/null || true
 # 3. 门禁的夹具与日志都写在 fork 的 tmp/ 下，非 root 要能写。
 chmod -R a+rwX tmp 2>/dev/null || true
 mkdir -p tmp/home && chmod a+rwx tmp/home
+# 3b. 镜像的 entrypoint 把 fork 的 `target` 设成**绝对**的 `/src/target-linux`。在这个
+#     容器里 `/src` 是**仓库根**，于是 python 相位按 `target/debug/sandlock-supervise`
+#     去找二进制时会落到仓库根那个目录，而产物其实在 fork 自己的 `target-linux/`
+#     （第 4 步的 CARGO_TARGET_DIR，避免往仓库根攒 16GB）。把 fork 的 `target` 改成
+#     相对链接 `target-linux`：容器里落到 fork 的产物目录，宿主机上同样解析得到，
+#     两种拼写就指向同一份东西（fork 的 .gitignore 已忽略 `/target*`）。
+ln -sfn target-linux /src/third_party/sandlock/target
 # 4. 非 root 相位。HOME 指到可写处（规范镜像里 HOME=/root 是不可写的，脚本自己也会兜底）。
 #    `CARGO_TARGET_DIR` 必须显式指到 fork 里的 `target-linux/`：这个容器把**仓库根**挂在
 #    `/src`，而 fork 的 `target -> /src/target-linux` 是绝对路径 —— 不指的话 cargo 会把
