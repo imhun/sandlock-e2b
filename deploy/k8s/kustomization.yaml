@@ -10,6 +10,9 @@ kind: Kustomization
 
 resources:
   - namespace.yaml
+  # The namespace-wide ingress denial and its three named exceptions. First
+  # because it is the floor every other policy is an exception to.
+  - default-deny.yaml
   - pvc.yaml
   - redis.yaml
   - buildkit.yaml

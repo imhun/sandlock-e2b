@@ -1,0 +1,101 @@
+# namespace 级的 ingress 默认拒绝，加上三条具名例外。
+#
+# 为什么这一份只有 ingress：本 namespace 的 **egress 是合法地宽**的，两条都不是疏忽 ——
+#
+#   * **worker 承载沙箱的公网出口**。`fd_inject_connect` 是在 worker 的 netns 里替沙箱
+#     建连的（`docs/security-audit/attack-surface.md` 的「网络策略的正确读法」段：
+#     "netns 不是这层的防线"），所以沙箱出站表现成 worker pod 自己的流量。给它一条
+#     "只许 CP+DNS" 的 egress，等于**所有沙箱同时断网**。
+#   * **control-plane 的 buildkit sidecar 要拉公网镜像**（模板构建）。
+#
+# 这两条都得给"全部放行"，所以 egress 那半收不到任何东西；而它要额外承担一条
+# 说不清的路：k0s 的 kube-apiserver 是**宿主进程、没有 pod**，CP 经 `10.96.0.1:443`
+# 到达它，能不能用 NetworkPolicy 表达取决于 Calico 对 egress 策略按 DNAT 前还是后判
+# 地址 —— 写错的代价是下一次 apply 把整个平台断掉。收益为零、风险不为零，所以不做。
+#
+# agent 那半的 egress 早就收窄了（只许 CP:3000 + 集群 DNS），写在 `c3-agent.yaml` 里。
+#
+# 三条例外逐个具名，"谁进、进哪个端口"都在规则里：
+#
+#   * **control-plane :3000 / :49983** —— 对外入口。**必须是"任意来源"**：外部客户端
+#     经 NodePort/SLB 进来，而 **kubelet 的 `httpGet` 探针从节点 IP 进来**
+#     （`/healthz`:3000，实测线上两个副本都是），两者都不在任何 pod selector 里。
+#     c3-agent 的探针特意走 `exec` 就是为了躲这个坑；CP 躲不掉，所以这条不写 `from`。
+#   * **redis :6379 ← 只有 control-plane**（线上只有它声明 `E2B_REDIS_URL`；worker 与
+#     agent 都不连 redis，实测过）。
+#   * **e2b-worker :49983 ← 只有 control-plane**（gateway 把沙箱的 exec/PTY/文件请求
+#     代发到 envd；worker 自己没有探针，所以这里不必再开节点来源）。
+#
+# 第四条（agent :49985/:49986 ← CP）不在这里，它本来就写在 `c3-agent.yaml` 里。
+#
+# NetworkPolicy 是**并集**语义：这份 deny 与那些具名策略叠加，不会互相覆盖。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandlock-default-deny
+  namespace: sandlock
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: e2b-control-plane
+  namespace: sandlock
+spec:
+  podSelector:
+    matchLabels:
+      app: control-plane
+  policyTypes:
+    - Ingress
+  # No `from`: this is the public entry point, and the kubelet's own probes
+  # arrive from the node, which no pod selector can name.
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 3000
+        - protocol: TCP
+          port: 49983
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: e2b-redis
+  namespace: sandlock
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: control-plane
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: e2b-worker
+  namespace: sandlock
+spec:
+  podSelector:
+    matchLabels:
+      app: e2b-worker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: control-plane
+      ports:
+        - protocol: TCP
+          port: 49983
