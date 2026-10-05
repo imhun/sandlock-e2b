@@ -2453,6 +2453,59 @@ registered → **resumed before=4 after=5** → exec_after_resume(EXEC_OK) → i
 `test_a_child_restored_into_a_session_keeps_the_session_executable`；pin 与本 tip 单跑都过、整档偶发），
 现由三层超时兜住，根因未定。
 
+### 7.42 收口：那条"偶发死等"的根因是**运行时被自己的读阻塞**（**2026-10-05，fork `5288752`**）
+
+§7.41 末尾挂着的未解项，这一轮定案了。结论一句话：**测试在 current-thread 运行时里做同步
+管道读，把自己运行时上那条 seccomp 中介任务饿死，被中介的子进程卡在 `close()` 里出不来。**
+不是 restore 的偶发，是**测试夹具违反了它自己文件里写明的运行规则**。
+
+**现场证据（这次不再靠猜：冻结的进程树还在，直接取证）**。整档跑到第 4 次复现，
+`core_integ` 卡在那条用例、日志长时间不动，于是对冻结现场取证：
+
+| 观察 | 读数 | 含义 |
+|---|---|---|
+| 测试进程 `7820` 的线程表 | 只有 libtest 那几条线程，**没有任何 `tokio-runtime-worker`** | 跑的是 `#[tokio::test]` 默认的 **current-thread** 运行时，运行时线程 = 跑用例的那条 |
+| 用例线程 tid 8681 | `anon_pipe_read`，`read(20, buf, 12)` | 阻塞在"exec 子进程 stdout"那根管道上（`read_exact_bytes`，要 12 字节） |
+| 那个 exec 出的子进程 8688 | `__seccomp_filter`，`close(9)`；`/proc/8688/exe` 仍是**测试二进制** | 它**还没 execve**：卡在 stdio 布线阶段的 `close()` 上，而这个 `close` 是**被中介的系统调用**（netlink 的 close handler 无条件注册） |
+| 把 8688 杀掉 | 8681 **当秒**从 `read` 里出来，panic 在 `test_instance_exec.rs:114`：`child stdout reached EOF before 12 bytes were read` | 读者等的就是 8688 那根写端/那条命 —— 因果闭环 |
+
+**链条**：init fork 出子进程 → 回 `Started` → 用例在**同一条**运行时线程上同步 `read` →
+中介任务（同一条运行时上的一个 tokio task）再也拿不到线程去答那个 `close` →
+子进程停在布线里、永远到不了 `execve` → `still-execs` 永远不写 → 读永远等。
+它**偶发**是因为：只有子进程在那几个被中介的 `close` 里跑得比"用例走到同步读"更慢时才会踩到。
+
+**这个坑文件里本来就有防线**：`test_a_capture_does_not_wedge_a_forking_sibling` 的文档注释
+（FUP-29）写着"*Multi-threaded runtime on purpose* … the sandbox's notification loop is a task in the
+same runtime … the harness has to [be multi-threaded]"，同文件里**每一处**读管道输出的用例都是
+`flavor = "multi_thread"`；`sandbox.rs` 的 `Sandbox::popen` 也明写"不要在运行时线程上阻塞管道读"。
+后加的两条 restore 用例没抄这条规则。
+
+**修法（fork `5288752`）**：那两条用例补上 `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`；
+并让 `read_exact_bytes` **断言运行时必须是多线程**（`Handle::runtime_flavor()`），
+下次谁再犯会在 0.13s 里带着"该写什么"失败，而不是把门禁吊住。
+
+**验收**：故意把 flavor 改回 current-thread → 0.13s 红，报错原文点名 `CurrentThread` 与修法；
+改回后那条用例单跑 **20/20 绿**（每次 0.13s）；`core_integ` 整档 **570 passed / 0 failed（89.5s）**。
+
+### 7.42.1 顺带查清：另外 3 条稳定红不是产品缺口，是本机运行器缺 `--init`
+
+同一轮整档里还有三条**每次**都红的收尾断言（`test_popen_group_killed_on_drop`、
+`test_shutdown_group_sweep_after_compliant_grace_exit`、
+`test_max_lifetime_forces_shutdown_with_live_child`）。它们问的是"被组杀的后代**死了且被回收**"，
+判据是 `kill(pid, 0) != 0` —— **僵尸仍然算活着**。实测停下来的那个 pid：
+`state=Z, ppid=1, comm=sleep`，20 分钟后还在。沙箱 init 退出后这类孤儿只能由**容器的 PID 1** 回收；
+`docker run` 不给 `--init` 时 PID 1 就是我们敲的 `sh`（它不回收任何东西）。
+
+**A/B（同镜像、同命令，只差一个 flag）**：无 `--init` → 3/3 红；加 `--init`（PID 1 = `docker-init`）
+→ 3/3 绿、**0.55s**。所以这是本机运行器的缺口（真机上沙箱自带会回收的 init），不是产品缺口；
+`deploy/scripts/fork-gate.sh` 的两处 `docker run` 因此都加了 `--init`。
+
+**明确挂账（非本轮范围）**：沙箱 init 在 `Shutdown` / main 退出路径上 `signal_all_children(SIGKILL)`
+之后**直接 `_exit`**，不等待、不回收刚杀掉的孩子 —— 也就是说"被组杀的后代不留 defunct"目前
+**依赖容器 PID 1 是个 reaper**（测试文档本来的假设是"reparent 到 init，由 init 回收"）。
+要不要在退出前加一段有界的 reap 收割由产品侧定：代价是每次 teardown 多等几毫秒，
+收益是这条语义不再看 PID 1 的脸色。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
