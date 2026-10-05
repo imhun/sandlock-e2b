@@ -1264,3 +1264,21 @@ def test_the_agent_pod_carries_no_api_credential_and_no_writable_root() -> None:
     for name, container in _pod_containers(agent).items():
         assert container["securityContext"]["readOnlyRootFilesystem"] is True, name
     assert _containers(agent)["agent"]["securityContext"]["runAsGroup"] == 65534
+
+
+def test_every_compose_agent_runs_read_only_under_the_default_profile() -> None:
+    """k8s 侧的 `readOnlyRootFilesystem` + `seccompProfile: RuntimeDefault` 在 compose 里的对应物。
+
+    seccomp 那一半是**负**断言，而且必须是负的：compose 没有"默认档"的写法
+    （实测 `docker run --security-opt seccomp=default` 被 Docker 29.4.0 拒绝：
+    `opening seccomp profile (default) failed: open default: no such file or directory`）。
+    默认档由**不写 `security_opt`** 表达，所以这里钉的是"没人给它加 `unconfined`" ——
+    加上的那一刻就把 syscall 过滤整个丢掉了，而且丢得没有任何提示。
+    """
+    for path in COMPOSE_STACKS:
+        services = _compose(path)["services"]
+        for name in ("c3-agent", "c3-agent-maint"):
+            service = services[name]
+            assert service.get("read_only") is True, (path.name, name)
+            opts = service.get("security_opt") or []
+            assert not any("seccomp" in opt for opt in opts), (path.name, name, opts)

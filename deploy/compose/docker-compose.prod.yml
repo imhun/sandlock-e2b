@@ -340,6 +340,9 @@ services:
     cap_add:
       - SETUID
       - SETGID
+    # The k8s shape's `readOnlyRootFilesystem`; nothing in this image writes to
+    # its own rootfs (docs/security-audit/c3-agent-syscall-filter-2026-10-05.md §2b).
+    read_only: true
     environment:
       # D12: the agent's identity is the **host**, and the name above is the
       # one the control plane dials it by (`E2B_C3_AGENT_URL`). `c3-agent` is
@@ -375,6 +378,9 @@ services:
       - CHOWN
       - DAC_OVERRIDE
       - FOWNER
+    # The k8s shape's `readOnlyRootFilesystem`; nothing in this image writes to
+    # its own rootfs (docs/security-audit/c3-agent-syscall-filter-2026-10-05.md §2b).
+    read_only: true
     environment:
       # D12: the same host identity face A carries -- the control plane puts
       # *this host's* name in the URL path of every instruction, and each face
