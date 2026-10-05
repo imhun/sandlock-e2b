@@ -141,3 +141,27 @@ WIP 里已把这 39 处改成 `panic!`，而这正是让 42 条红现形的动�
 
 拆成两次的价值：A 之后"要删的东西确实不可达"是被门禁证明过的，B 就只是删死代码 —— 评审与
 回滚都简单得多。
+
+## 7. 落地结果（2026-10-05，A、B 两次提交都已落在子模块）
+
+* **A = fork `939bb90`**（行为变更）：`chroot && !real_root` 创建即拒；`SandboxBuilder::chroot()`
+  默认 `real_root = true`；真根在 `confine_child` 里**主动要一个 userns**（且是必需的：拿不到就
+  建箱失败，不再半途而废）；`reported_path_virtual` 把 N43 的规则用到 **cwd** 上（fchdir 穿过
+  中介注入的 fd 会让 cwd 报宿主路径，旧代码把它当虚拟拼写 ⇒ 之后每个相对路径都 EACCES，实测）。
+  测试侧：夹具迁真根（挂载点要在 rootfs 里存在；父路径已被绑定时要在**源侧**存在）、identity
+  形态的用例收敛、`test_chroot.rs` 的 45 处"静默跳过"改成 panic、删掉只覆盖模拟根的 session 用例。
+  **这批测试此前一直在"空转"**：45 个用例的构造失败只打一行 "Chroot test skipped" 就算通过。
+* **B = fork `64746d3`**（纯删除）：exec 的注入半段（-136 行）、`read_pt_interp` +
+  `memfd_with_patched_interp`（-120 行）、chdir 的 `ReturnValue(0)` 尾巴、getcwd 的改写半段、
+  模块头与 `landlock.rs` 的注释。保留：`/proc` 合成、策略/COV/账本、13 个 `legacy_*`、
+  `reported_path_virtual`。
+* **验收（本机镜像 `sandlock-dev-f17`，两次提交后都跑过）**：`core_lib` 922/0、`test_chroot`
+  50/0、`test_instance_chroot` 10/0、`test_instance_exec` 17/0、`test_restore` 5/0、`test_procfs`
+  14/0、`test_net_isolate` 25/0、`test_mediation_identity` 3/0、`ffi` 104/0、`supervise` 57/0、
+  `supervise_cost` 3/0；`python` 从 pin 上的 446 passed / 19 failed 变成 **457 / 8**（回来的 11 条
+  是 `test_fs_mount`；剩下 8 条与 pin 上逐条相同，是环境：`sandlock-supervise` 不在 PATH）。
+* **两处环境事实（不是本次引入）**：① 门禁在这个 pin 上**本来就是红的**（`core_lib: baseline
+  says 913, run produced 922`，stash 掉本次改动后原样复现）——`docs/test-baseline.md` 已把
+  `core_lib`/`supervise` 两格按实测刷新并写明还有哪几格要等规范镜像；② 本机镜像跑不了
+  `test_control`（缺 `sandlock` CLI）与 7 条 `test_supervise_channel`，所以 `core_integ` /
+  `cli` / `python` 的整档绿要等规范镜像或 root 相位。
