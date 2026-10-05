@@ -334,6 +334,24 @@ fail closed** 并点出架构名（错的号会伪装成 seccomp 问题，见上
 （`popen` / `control` / `freeze` 这类进程呈现与线程通知的用例居多，也见过 `test_chroot::` 整族 15 条
 一起红）。而**每一族单跑都是绿的**（实测 `test_chroot::` 单跑 49/0）。
 
+> **（2026-10-05 更新）B14 第 1 条已过时：本机现在有 `sandlock-dev:latest`**（1.46 GB，amd64，
+> cargo 1.98 / Python 3.11.16），而且 fork 树里的 `target` 是指向 `/src/target-linux` 的软链
+> （目录本身 777），所以规范跑法直接可用。四条相位都跑过了，**十一格全绿**：core_lib 922 /
+> core_integ 569 / ffi 104 / cli 98 / supervise 57 / supervise_cost 3 / cli_build 0 /
+> python 465 / oci 157 / supervise_root 4 / mediation_2uid 9；逐条记录与三个环境坑
+> （root 相位需要先在线预热 cargo 缓存、`cli` 的 57 条在 `cli_test` 失败后不会被跑到、
+> python 会静默加载过期的 `libsandlock_ffi.so`）都在 `third_party/sandlock/docs/test-baseline.md`
+> 的 2026-10-05 注记里，发版侧的记录在 `docs/deploy-clusters.md` §7.40。
+>
+> **上面那条"整档 core_integ 不稳定"的警告在 2026-10-05 又见了一次，但形态更糟**：不是红，是
+> **死等** —— 测试进程卡在 `futex_wait`、`restore-stub` 子进程在 `nanosleep`，日志 35 分钟不动，
+> 而门禁当时**没有任何超时**。现在有三层兜底：`scripts/test-all.sh` 每档一个硬预算
+> （`timeout`，`SANLOCK_SUITE_TIMEOUT_S` 可覆盖，超时报 `suite TIMED OUT`）、
+> `test_instance_exec.rs`/`test_restore.rs` 的 restore await 走 `bounded()`（60 s，点名是哪一步）、
+> python 每个用例一个 `faulthandler` 看门狗（dump 落到门禁会打印的文件里）。
+> 顺带修掉一个一直存在的采集 bug：脚本在 `set -e` 下，套件失败时子 shell 会在写 rc 之前退出，
+> 于是**所有**失败（包括超时）都被记成笼统的 `1`/FAILED。
+
 **B15. checkpoint 落盘踩的两个"形态"坑（2026-09-25，都是同一件事的两个面）。**
 两者都是**只在集群上才会出现**的：本机的 fork 套件要么用静态 helper、要么跑在 root 上。
 

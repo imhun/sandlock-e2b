@@ -2391,6 +2391,25 @@ supervise 57/0、supervise_cost 3/0、python 457/8（pin 的 446/19 → 457/8）
 
 跑完 `GET /sandboxes` 回到 `[]`（没有留下孤儿）。
 
+**fork 门禁四相位复跑（2026-10-05，发版后）**：规范镜像本机就有（`sandlock-dev:latest`，1.46 GB，
+amd64，cargo 1.98 / Python 3.11.16，`target -> /src/target-linux` 软链），四个相位全部跑过，
+**十一格全绿**：core_lib `922` / core_integ `569` / ffi `104` / cli `98` / supervise `57` /
+supervise_cost `3` / cli_build `0` / python `465` / oci `157` / supervise_root `4` /
+mediation_2uid `9`。刷新过程挖出三处 fork 侧问题，都已修（`77f4e52`，超时那批在 `8212efc`）：
+
+| 问题 | 性质 | 修法 |
+|---|---|---|
+| `oci` 相位**编译不过** | `Req::RunPlacedExec` 没被分类进 `init_signal_surface` 的穷尽 match；只有 oci 相位会编译那个测试目标 ⇒ 该相位自变体落地起一直是红的，而其它 lane 全绿 | 补上分类 ⇒ `157/0` |
+| cli/python 的 "allow+deny 互斥" | **过期断言**：该组合现在是受支持的 deny 优先语义（`Sandbox` 把 deny 塞进 `AllowList.denied`，注释写明是为了"连接时才解析出地址"）；cli 那条还被 S5 的提交信息误记成 "the one pre-existing environment failure" | CLI 钉"目的地对可组合 + bind 对仍被拒"；python 钉"与 deny-only 控制组一致"（实测 denylist 答 111、describe-deny-all 才答 13，写死 errno 就是钉机制） |
+| python `checkpoint restore failed` | **过期构建产物**：套件静默加载了比源码旧的 `libsandlock_ffi.so`；重建后同一用例 5/5 通过、整套 `465/0`，**没有改任何源码** ⇒ 既不是 S5 回归也不是产品缺陷（pre-S5 pin 同样中招） | 加"so 比源码旧就走红"的闸；FFI 失败时把真实错误打到 stderr（原来只有 NULL，调用方只能看到 "restore failed"） |
+
+**门禁不再可能无限等待**（本轮 35 分钟死等的直接后果）：档级硬预算（`timeout`，`SANLOCK_SUITE_TIMEOUT_S`
+可覆盖，超时报 `suite TIMED OUT`）+ restore await 的 `bounded()`（点名是哪一步）+ python 每用例
+`faulthandler` 看门狗；顺带修掉一个一直存在的采集 bug —— 脚本在 `set -e` 下，套件失败时子 shell 会在写
+rc 之前退出，于是**所有**失败（含超时）都被记成笼统的 `1`/FAILED。**仍未解释**：core_integ 的
+`test_a_child_restored_into_a_session_keeps_the_session_executable` 偶发死等（本 tip 与 pre-S5 pin
+单独跑都通过）—— 现在有界，但机理没查清。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
