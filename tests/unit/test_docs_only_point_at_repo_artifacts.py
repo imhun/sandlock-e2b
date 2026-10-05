@@ -235,6 +235,13 @@ ALLOWED_TMP_REFERENCES = {
     "tmp/signal-probe/cross_sandbox_signal.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
     "tmp/signal-probe/inside_sandbox_blast.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
     "tmp/syscall-probe/probe.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
+    # N79 的卡顿取证组（2026-10-05）：stat 族进 seccomp 通知后，撞限流会"一秒睡满 0.86 s"。
+    # 三支都需要当时那套部署 —— stat_stall_hunt 走控制面 API 建箱，另外两支要 kubectl exec
+    # 进 hostPID 的 c3-agent pod 读全宿主 /proc，脱离当时的集群形状不可复现。
+    # 结论与口径见 docs/benchmarks.md §③、docs/open-issues.md 的 N79 行。
+    "tmp/stat_stall_hunt.py": "一次性线上卡顿取证（需集群 + API key）：前台 stat 循环标出 >20 ms 的调用；结论见 docs/benchmarks.md §③",
+    "tmp/host_sampler.py": "一次性线上卡顿取证（需 kubectl exec 进 hostPID 的 c3-agent pod）：宿主侧 200 ms 采样，与 stat_stall_hunt 同源时间戳对齐",
+    "tmp/stall_snapshot.py": "一次性线上卡顿取证（需 kubectl exec 进 hostPID 的 c3-agent pod）：卡顿瞬间的 /proc 现场快照（谁烧 CPU、supervisor wchan）",
 }
 
 
