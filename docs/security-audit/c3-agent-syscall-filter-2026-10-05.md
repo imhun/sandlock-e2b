@@ -1,7 +1,8 @@
 # c3-agent 的 syscall 过滤：为什么 RuntimeDefault 就够，以及为什么两个 DaemonSet 不该合并
 
 写给下一个动 `deploy/k8s/c3-agent.yaml` 的人。收的是 `remediation-SEC-R3-01.md` §8.6
-STATIC-6 那五条里落地的三条（seccompProfile / SA token / 可写根 + face A 的 gid）。
+STATIC-6 那五条里落地的**四条**（seccompProfile / SA token / 可写根 / face A 的 gid）；
+第五条 `hostPID` 是设计上保留的，理由见 §5。
 
 ## 0. 口径
 
@@ -107,6 +108,24 @@ exec 带 file cap 的 `as_uid`。测量因此都必须用"未加 cap 的 PID 1 �
   `deploy/k8s` 里只有 `control-plane` 声明了 `serviceAccountName`。
 
 ## 4. 上节点必须复验的三条
+
+**第 1 条已复验（2026-10-05，k0s 集群，只读）。** 读数与它对上，而且同集群里有一个
+天然对照组：
+
+| pod | 容器 | `Seccomp` | `NoNewPrivs` |
+|---|---|---|---|
+| `e2b-c3-agent`（改后） | `agent` / `maint` | **2** | 0 |
+| `e2b-worker`（一档） | `worker` | 2 | 0 |
+| `seccomp-installer`（**没有** `seccompProfile`） | `installer` | **0** | 0 |
+
+第三行是这条改动的全部意义所在，也是"未加档等于不过滤"这个前提的实测证据：
+该集群 kubelet 的 `seccompDefault = False`（`/api/v1/nodes/<n>/proxy/configz`），
+所以**运行时不会替你补一份默认档** —— 没有 `seccompProfile` 就是 `Seccomp: 0`。
+Agent 那两个 `2` 是本仓库的改动在 2026-10-05 22:13（镜像
+`0.1.0-1027-g0481042-20261005-221012`）随版本上线后取到的。
+
+（`seccompDefault` 这一条也要记着：本集群是 `False`，但**默认值是 `true`**（1.27 起）。
+换一个开着它的集群，"没有 profile"就不等于"没有过滤"，第 1 条要重测。）
 
 1. **containerd 的 `RuntimeDefault` 与 Docker 的默认档不是同一份实现**。§1/§2 用它代表
    `RuntimeDefault`，方向不会错，但 face A 的授予一旦被挡就是**静默**失败（表现为第一次

@@ -136,10 +136,8 @@ spec:
                 - CHOWN
                 - DAC_OVERRIDE
                 - FOWNER
-            # STATIC-6: this container had no syscall filter at all before.
-            # `RuntimeDefault` is the runtime's own profile, and it does not set
-            # NNP -- so face A's file capabilities keep working (measured:
-            # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
+            # STATIC-6: no syscall filter before this. Why a profile is safe for
+            # face A's file capabilities: see face A, and the audit doc.
             seccompProfile:
               type: RuntimeDefault
             # Nothing in this image writes to its own rootfs; every path it
@@ -312,10 +310,8 @@ spec:
                 - CHOWN
                 - DAC_OVERRIDE
                 - FOWNER
-            # STATIC-6: this container had no syscall filter at all before.
-            # `RuntimeDefault` is the runtime's own profile, and it does not set
-            # NNP -- so face A's file capabilities keep working (measured:
-            # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
+            # STATIC-6: no syscall filter before this. Why a profile is safe for
+            # face A's file capabilities: see face A, and the audit doc.
             seccompProfile:
               type: RuntimeDefault
             # Nothing in this image writes to its own rootfs; every path it
@@ -756,10 +752,8 @@ spec:
                 - CHOWN
                 - DAC_OVERRIDE
                 - FOWNER
-            # STATIC-6: this container had no syscall filter at all before.
-            # `RuntimeDefault` is the runtime's own profile, and it does not set
-            # NNP -- so face A's file capabilities keep working (measured:
-            # docs/security-audit/c3-agent-syscall-filter-2026-10-05.md).
+            # STATIC-6: no syscall filter before this. Why a profile is safe for
+            # face A's file capabilities: see face A, and the audit doc.
             seccompProfile:
               type: RuntimeDefault
             # Nothing in this image writes to its own rootfs; every path it

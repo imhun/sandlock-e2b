@@ -1264,3 +1264,55 @@ def test_the_agent_pod_carries_no_api_credential_and_no_writable_root() -> None:
     for name, container in _pod_containers(agent).items():
         assert container["securityContext"]["readOnlyRootFilesystem"] is True, name
     assert _containers(agent)["agent"]["securityContext"]["runAsGroup"] == 65534
+
+
+def test_every_compose_agent_runs_read_only_under_the_default_profile() -> None:
+    """k8s 侧的 `readOnlyRootFilesystem` + `seccompProfile: RuntimeDefault` 在 compose 里的对应物。
+
+    seccomp 那一半是**负**断言，而且必须是负的：compose 没有"默认档"的写法
+    （实测 `docker run --security-opt seccomp=default` 被 Docker 29.4.0 拒绝：
+    `opening seccomp profile (default) failed: open default: no such file or directory`）。
+    默认档由**不写 `security_opt`** 表达，所以这里钉的是"没人给它加 `unconfined`" ——
+    加上的那一刻就把 syscall 过滤整个丢掉了，而且丢得没有任何提示。
+    """
+    for path in COMPOSE_STACKS:
+        services = _compose(path)["services"]
+        for name in ("c3-agent", "c3-agent-maint"):
+            service = services[name]
+            assert service.get("read_only") is True, (path.name, name)
+            opts = service.get("security_opt") or []
+            assert not any("seccomp" in opt for opt in opts), (path.name, name, opts)
+
+
+def test_the_rendered_k0s_agent_keeps_its_filter_and_read_only_root() -> None:
+    """The pins above read the *baseline* file; this one reads what `apply.sh` ships.
+
+    `deploy/k8s-k0s` is what `apply.sh` renders and applies. It does not patch
+    `e2b-c3-agent` today, so this is a no-op right now -- which is exactly why it
+    is cheap: the day an overlay grows a patch for this DaemonSet, the baseline
+    pins stay green while the shipped pod has quietly lost its filter. The
+    broker-retirement case (`test_the_manifest_set_ships_no_priv_broker_any_more`)
+    reads the rendered set for the same reason.
+    """
+    if shutil.which("kubectl") is None:
+        return
+    rendered = subprocess.run(
+        ["kubectl", "kustomize", str(DEPLOY / "k8s-k0s")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    docs = [doc for doc in yaml.safe_load_all(rendered.stdout) if isinstance(doc, dict)]
+    agent = _only(docs, "DaemonSet", "e2b-c3-agent")
+    containers = _pod_containers(agent)
+    assert sorted(containers) == [
+        "agent",
+        "maint",
+        "storage-init",
+        "workspace-root-init",
+    ]
+    for name, container in containers.items():
+        security = container["securityContext"]
+        assert security["seccompProfile"] == {"type": "RuntimeDefault"}, name
+        assert security["readOnlyRootFilesystem"] is True, name
