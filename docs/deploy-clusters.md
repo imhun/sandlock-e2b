@@ -2410,10 +2410,18 @@ rc 之前退出，于是**所有**失败（含超时）都被记成笼统的 `1`
 `test_a_child_restored_into_a_session_keeps_the_session_executable` 偶发死等（本 tip 与 pre-S5 pin
 单独跑都通过）。当天的压测把面扩大了：该用例**单跑 100 次全绿**，而**整档 `core_integ` 跑 4 次是
 1 绿 3 红、每次红的受害者都不同**（`test_restore::test_libc_workloads_resume_after_restore` 的
-`static-control` / `libc-malloc` 两臂各一次，`state=Z exit_code=2560`，即被信号 10 = SIGUSR1 带走；
-`test_the_session_parent_can_write_into_an_init_spawned_child` 一次，`/proc/<pid>/maps` 赛跑），
-第 4 次是死等且签名与 35 分钟那次完全一致 ⇒ **这是 session/exec/restore 这一族的偶发，不是单一用例**
-—— 现在有界，但机理没查清（下一步：整档循环 + 失败现场 dump `/proc/<pid>/{maps,stat,stack}`）。
+`static-control` / `libc-malloc` 两臂各一次，`state=Z exit_code=2560`；`test_the_session_parent_can_write_into_an_init_spawned_child`
+一次，`/proc/<pid>/maps` 赛跑），第 4 次是死等 ⇒ 这是 session/exec/restore 这一族的偶发。
+**根因当天就查清并修掉了（fork `5a23846`）**：`build_fd_plan` 把**任何普通文件路径**都当成"可重开"，
+包括**调用方自己的输出重定向文件**（`fd=1/2` = 日志文件）；stub 在**沙箱内部**重开它只能拿到
+EACCES（`die(10)`），于是恢复出来的进程当场死掉、而 `restore_*` 仍报成功。看起来"偶发"是因为
+`fd 1/2` 在门禁的 `| tee` 下是**管道**（本来就被跳过）、在 `> 日志文件` 下才是**普通文件**——
+同一份代码，两种 harness 形态。修法：`FdReach` 拿目标沙箱的可读/可写根 + 挂载点过筛，够不到的
+fd 走既有 `restore_skipped` 契约报告；`n_fds` 改成按实际写入计数；stub 的 fd 重开失败改为携带原因
+（`128+errno` / `192+fd`）。验收：原 RED 形态下 `core_integ` **569/0**、`core_lib` **925/0**
+（+3 条过筛单测）、ffi 绿、python **465/0**。剩下唯一没再复现的受害者是
+`test_the_session_parent_can_write_into_an_init_spawned_child`（读 `/proc/<pid>/maps` 与子进程赛跑），
+仍登记在案。
 
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
