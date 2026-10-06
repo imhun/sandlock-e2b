@@ -48,9 +48,14 @@ k8s 1.36 / k0s、containerd 2.3。
   `uid=65534`、`CapEff=0`、`/sys/fs/cgroup` 是 `ro,nosuid,nodev,noexec` —— 这三条保持不变。
   ~~也不给它任何 cgroup 写视图~~ ⇒ **2026-10-06 实测修正（§1.4）**：放置只能由处在 worker
   cgroupns 里的进程做，所以 worker 必须拿到一块 **rw 的 cgroupfs 视图**，且**收窄到本 pod 的
-  子树**（`subPathExpr`，§3.5）。它的写权由内核按 cgroupns + DAC 限定在"被 agent 委派的容器
-  cgroup 子树"内：实测对**别的 pod** 的一切写操作都是 EACCES、对它自己容器的 `cpu.max` 也是
-  EACCES（委派不含它）。这个形状比"agent 拿整节点 rw 视图 + 只靠代码白名单收窄"**更窄**。
+  子树**（`subPathExpr`，§3.5）。它的写权由内核按 cgroupns + DAC 限定在**"被委派给它的 uid 的那些
+  cgroup"**内：实测对**未委派**的 cgroup（含别的 pod 的）一切写操作都是 EACCES，对它自己容器的
+  `cpu.max` 也是 EACCES（委派不含它）。
+  ⚠ **2026-10-06 本地车道实测补充（Task 7 验收）**：这条边界**靠的是收窄**，不是靠 uid ——
+  compose 车道上三个 worker 同宿主、**共用 uid 65534**、挂载是整棵树（没有 `subPathExpr`），
+  于是每台能对**别的 worker 被委派的**容器 cgroup 写 `cgroup.procs`/`cgroup.subtree_control`/`mkdir`
+  （`cpu.max` 仍 EACCES）。⇒ 生产形态（k8s + 收窄）不受影响；compose 车道这条是**已知的车道级性质**，
+  已写进 `docs/deploy-clusters.md` §7.48，并作为后续项（每个 compose worker 独立 uid，或也做收窄）。
 - **agent 在形态 W 下只多一件事**：一次性委派（chown worker 容器 cgroup 目录 +
   `cgroup.procs`/`cgroup.subtree_control`/`cgroup.kill`，**不碰 `cpu.max`**）。不再需要
   "建 cgroup / 放进程 / 读用量 / kill" 四个 op（那套随 D2/D3 作废）；路径仍由它自推（QoS 无关），
@@ -232,12 +237,15 @@ downward API 的 `metadata.uid`）能正常挂载，挂载根就是本 pod 的 c
 | 4 | worker | 建箱：`mkdir sbx_<id>` → 写 `cpu.max` → spawn 槽位子进程后把 pid 写进 `sbx_<id>/cgroup.procs` → 读回校验 | F2/F7/F8；新建的 kernfs 文件属主 = 创建者（65534），worker 自己就能写 |
 | 5 | worker | 收尾：`cgroup.kill` + `rmdir` | F9 |
 
-**为什么这条比原计划更窄**：worker 的 cgroupfs 写权被**内核 DAC 限定在它自己拥有的那棵树**
-（委派后的容器 cgroup + 它自己建的 `sbx_*`）—— 别的 pod 的 cgroup 目录仍是 root:0755，它写不了；
+**为什么这条比原计划更窄**：worker 的 cgroupfs 写权被**内核 DAC 限定在"被委派给它的 uid 的 cgroup"**
+（自己的容器 cgroup + 它自己建的 `sbx_*`）—— 未委派的 cgroup 目录仍是 root:0755，它写不了；
 它也没有 CAP_CHOWN，抢不走。原计划的 agent 方案里，agent 拿的是**整节点**的 rw 视图，收窄**只能靠
-代码白名单**；本形态把收窄交给内核对 cgroupns + DAC 的既有约束。
+代码白名单**；本形态把收窄交给内核 + **挂载收窄（`subPathExpr`）**。
 **代价**：worker 从此对**自己 pod 的**沙箱子树有写权（它能节流/杀的都是它自己的沙箱 —— 它本来就能
 kill 它们）。这条与 Global Constraints 里"不给 worker 任何 cgroup 写视图"**冲突**，所以需要人拍。
+**⚠ 收窄是这条边界的一半**（2026-10-06 本地车道实测）：compose 车道上三 worker 同宿主同 uid 65534、
+挂载是整棵树 ⇒ 被委派的 **peer** 容器 cgroup 互相可写（`cpu.max` 除外）。它**不该被读成"内核对 DAC
+的约束足够"** —— 收窄（或每 worker 独立 uid）才是把边界钉回"只有自己那棵"的那一步。
 
 ### 3.3 另一条路（F）：不做 cgroup，回到 N82 的备选
 
@@ -425,6 +433,15 @@ NetworkPolicy，worker 敲不进来）；④ 对已被攻破的 CP 边际为零�
   **改善**（跨租户公平/DoS），不是新增风险。**功能变化**（非安全）：`cpu.max` ⇒ CFS 100 ms 周期
   节流（比通知限流那 860 ms 的一秒悬崖平滑得多）；`pids.max` ⇒ fork `EAGAIN`；`memory.max` ⇒
   OOM kill（Phase 2 的事）。
+
+**Task 7 验收里量到的第四条风险（车道级，2026-10-06）：同 uid 的 peer 可写。** k8s 车道上
+`subPathExpr` 把挂载收窄到本 pod，peer 根本不可见 ⇒ 边界成立。**compose 车道没有收窄**、三个 worker
+同宿主共用 uid 65534 ⇒ 每台能对**别的 worker 被委派的**容器 cgroup 写 `cgroup.procs`/
+`cgroup.subtree_control`/`mkdir`（`cpu.max` 仍 EACCES，未委派的 cgroup 仍全 EACCES，租户 payload 是池 uid
+够不着）。影响面：持 worker uid 的进程可以把进程搬进 peer 的容器 cgroup 或在其下 `mkdir`（记账/归属可被
+搬移 ⇒ 可规避自己容器级额度、消耗邻居预算）。**裁定**：不阻塞 Phase 1（生产形态是 k8s + 收窄），
+如实写进 `docs/deploy-clusters.md` §7.48，并登记为后续项 —— compose 车道要么给每个 worker **独立 uid**、
+要么也做收窄。**这条正是"收窄是边界的一半"的证据**：少了它，内核对 DAC 的约束不足以把写权钉回自己那棵。
 
 ---
 
