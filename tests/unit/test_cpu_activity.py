@@ -14,10 +14,11 @@ rides the existing `sandboxActivity` channel.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
-from envd_service.agent import NodeAgent
+from envd_service.agent import NodeAgent, _heartbeat_usage_payload
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.cpu_activity import (
     CpuActivityTracker,
@@ -102,6 +103,7 @@ class _FakeRegistry:
     def __init__(self, records) -> None:
         self._records = records
         self.marked: list[str] = []
+        self.cpu: dict[str, float] = {}
 
     def list(self):
         return list(self._records)
@@ -109,12 +111,22 @@ class _FakeRegistry:
     def mark_active(self, sandbox_id: str) -> None:
         self.marked.append(sandbox_id)
 
+    def record_cpu_percent(self, sandbox_id: str, percent: float) -> None:
+        self.cpu[sandbox_id] = percent
+
 
 class _Record:
-    def __init__(self, sandbox_id: str, host_uid: int | None, state: str = "running"):
+    def __init__(
+        self,
+        sandbox_id: str,
+        host_uid: int | None,
+        state: str = "running",
+        cpu_percent: int = 100,
+    ):
         self.sandbox_id = sandbox_id
         self.host_uid = host_uid
         self.state = state
+        self.cpu_percent = cpu_percent
 
 
 async def _round(agent: NodeAgent, sampler) -> dict[str, float]:
@@ -187,3 +199,91 @@ async def test_cpu_activity_reaches_the_heartbeat_payload(workspace) -> None:
         "what the heartbeat ships"
     )
     assert snapshot["sbx_cpu"] > 0
+
+
+async def test_the_measured_percent_rides_the_heartbeat_as_sandbox_cpu(workspace) -> None:
+    """N83 phase 0: the same walk also yields what the sandbox *cost*.
+
+    The uid covers the supervisor as well, so this is the number that shows
+    platform CPU spent on a sandbox's behalf -- reported on the heartbeat
+    (``sandboxCpu``), not enforced here.
+    """
+    registry = RuntimeRegistry(workspace)
+    sandbox_dir = workspace / "sbx_cpu"
+    sandbox_dir.mkdir()
+    (sandbox_dir / "workspace").mkdir()
+    registry.register(
+        sandbox_id="sbx_cpu",
+        access_token="tok",
+        workspace_dir=str(sandbox_dir),
+        host_uid=os.geteuid(),
+    )
+    agent = NodeAgent(
+        settings=EnvdSettings(workspace_base=workspace),
+        runtime_registry=registry,
+        control_plane_url="http://127.0.0.1:9",
+        node_address="http://127.0.0.1:9",
+    )
+    agent._cpu_tracker = CpuActivityTracker(
+        percent_threshold=5.0, ticks_per_second=100
+    )
+
+    await _round(agent, lambda: {os.geteuid(): 100})
+    await _round(agent, lambda: {os.geteuid(): 100 + 250})
+
+    cpu = registry.cpu_snapshot()
+    assert list(cpu) == ["sbx_cpu"]
+    # 250 ticks = 2.5 CPU-seconds of one core over a window that is
+    # milliseconds wide: a big number, and it does not depend on the wall
+    # clock (the same shape the activity test uses).
+    assert cpu["sbx_cpu"] > 100.0
+
+    payload = _heartbeat_usage_payload(
+        EnvdSettings(workspace_base=workspace),
+        cpu_provider=registry.cpu_snapshot,
+    )
+    assert payload["sandboxCpu"] == cpu, (
+        "the measured CPU has to ride the heartbeat, or nobody can see it"
+    )
+
+
+async def test_a_sandbox_over_its_allowance_is_named_after_consecutive_rounds(
+    workspace, caplog
+) -> None:
+    """One round is noise; three in a row is the finding (N83 phase 0)."""
+    registry = _FakeRegistry(
+        [_Record("sbx_hog", 1001, cpu_percent=100)]
+    )
+    agent = NodeAgent(
+        settings=EnvdSettings(workspace_base=workspace),
+        runtime_registry=registry,
+        control_plane_url="http://127.0.0.1:9",
+        node_address="http://127.0.0.1:9",
+    )
+    agent._cpu_tracker = CpuActivityTracker(
+        percent_threshold=5.0, ticks_per_second=100
+    )
+
+    # A warm-up round establishes the baseline; the next ticks are the reading.
+    await _round(agent, lambda: {1001: 1000})
+    ticks = 1000
+
+    def over() -> dict[int, int]:
+        """9000 CPU-seconds per round: far over the declared 100%."""
+        nonlocal ticks
+        ticks += 900_000
+        return {1001: ticks}
+
+    with caplog.at_level(logging.WARNING):
+        await _round(agent, over)
+        await _round(agent, over)
+        before = [r for r in caplog.records if "over allowance" in r.getMessage()]
+        await _round(agent, over)
+
+    after = [r for r in caplog.records if "over allowance" in r.getMessage()]
+    assert before == [], "two rounds in a row is still noise"
+    assert len(after) == 1
+    assert "sbx_hog" in after[0].getMessage()
+    assert "declared 100%" in after[0].getMessage()
+    # The measured value is recorded on every round, over or not.
+    assert registry.cpu["sbx_hog"] > 100.0

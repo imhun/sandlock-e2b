@@ -212,6 +212,70 @@ async def test_heartbeat_activity_report_marks_records(apps, control_client):
     assert registry.get(sid).last_active_at > stamp
 
 
+async def test_heartbeat_cpu_report_lands_on_the_record(apps, control_client):
+    """N83 phase 0: the worker's *measured* CPU per sandbox is recorded.
+
+    The number is summed by the sandbox's pooled uid, which covers the
+    supervisor as well -- it is the one figure that shows what the platform
+    spends on a sandbox's behalf. It is recorded, never enforced here; the
+    internal node view exposes it so an operator (and phase 1) can see who is
+    over their declared allowance.
+    """
+    control_app, _ = apps
+    registry = control_app.state.registry
+    nodes = control_app.state.nodes
+    sid = (await _create(control_client))["sandboxID"]
+    node = nodes.register(
+        node_id="node_worker",
+        address="http://127.0.0.1:39999",
+        total_memory_mb=8192,
+        total_cpu_percent=800,
+        total_disk_mb=16384,
+        total_processes=512,
+        images=[],
+    )
+    record = registry.get(sid)
+    record.node_id = node.node_id
+    registry.save(record)
+    headers = {"X-Internal-Key": control_app.state.settings.internal_api_key}
+
+    # A foreign node cannot report for this sandbox; unknown ids and malformed
+    # values are dropped -- the number is a reading of a real measurement, so a
+    # spoofed or nonsensical one must not land on a record.
+    foreign = await control_client.post(
+        "/internal/nodes/node_other/heartbeat",
+        headers=headers,
+        json={"sandboxCpu": {sid: 999.0}},
+    )
+    assert foreign.status_code == 404
+    assert registry.get(sid).measured_cpu_percent is None
+
+    ok = await control_client.post(
+        "/internal/nodes/node_worker/heartbeat",
+        headers=headers,
+        json={
+            "sandboxCpu": {
+                sid: 380.0,
+                "sbx_unknown": 12.0,
+                "sbx_negative": -1.0,
+                "sbx_nonsense": "hot",
+            }
+        },
+    )
+    assert ok.status_code == 204
+    assert registry.get(sid).measured_cpu_percent == 380.0
+
+    view = await control_client.get(
+        f"/internal/nodes/{node.node_id}/sandboxes", headers=headers
+    )
+    assert view.status_code == 200
+    body = view.json()
+    assert body["sandboxIDs"] == [sid], "the reconcile snapshot is unchanged"
+    assert body["sandboxes"] == [
+        {"sandboxID": sid, "measuredCpuPercent": 380.0}
+    ]
+
+
 async def test_heartbeat_rejects_malformed_activity(apps, control_client):
     control_app, _ = apps
     nodes = control_app.state.nodes

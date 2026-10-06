@@ -416,6 +416,7 @@ def _heartbeat_usage_payload(
     pid_namespace: str | None = None,
     worker_identity: dict[str, int] | None = None,
     container_id: str | None = None,
+    cpu_provider: Callable[[], dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     """Disk usage + quota alerts + MCP port band carried by each heartbeat."""
     payload: dict[str, Any] = {}
@@ -460,6 +461,23 @@ def _heartbeat_usage_payload(
         # what a sandbox was *sold*, so this is the only signal that sees what
         # it actually wrote. Absent when the round found nothing to report.
         payload["sandboxDiskUsage"] = dict(disk_report)
+    if cpu_provider is not None:
+        # N83 phase 0: the worker's *measured* CPU per sandbox, as percent of
+        # one core, from the same per-uid walk that feeds activity. The uid
+        # covers the supervisor too, so this is the first number that shows what
+        # the platform spends *on* a sandbox (a notification flood costs the
+        # supervisor ~1 core while the client is blocked and reads ~2%).
+        # Reported, not enforced: phase 1's per-sandbox cgroup is what enforces.
+        try:
+            cpu = cpu_provider()
+        except Exception:
+            logger.warning("sandbox cpu provider failed", exc_info=True)
+            cpu = None
+        if isinstance(cpu, dict) and cpu:
+            payload["sandboxCpu"] = {
+                str(sandbox_id): float(percent)
+                for sandbox_id, percent in cpu.items()
+            }
     if platform_disk:
         # S2/D3: the platform's own checkpoint account (``E2B_PLATFORM_DISK_MB``,
         # 0 = unlimited). It is deliberately *not* a per-sandbox number: the
@@ -1790,6 +1808,10 @@ class NodeAgent:
         self._activity_provider = getattr(
             runtime_registry, "activity_snapshot", None
         )
+        #: N83 phase 0: the measured per-sandbox CPU that rides the same
+        #: heartbeat (``sandboxCpu``). Registries without the sampler report
+        #: nothing, exactly like activity.
+        self._cpu_provider = getattr(runtime_registry, "cpu_snapshot", None)
         #: N25/L2b: measured per-sandbox tree sizes. Scanned on its own,
         #: slower cadence (``E2B_DISK_ENFORCE_INTERVAL_S``, 0 disables) and
         #: cached for every heartbeat in between: the walk is a few
@@ -1824,6 +1846,8 @@ class NodeAgent:
         self._cpu_tracker = CpuActivityTracker(
             percent_threshold=_cpu_activity_percent()
         )
+        #: N83 phase 0: consecutive-round counters for the over-allowance log.
+        self._cpu_over_rounds: dict[str, int] = {}
         self._cpu_sampler = sample_cpu_ticks
         self._cpu_trace = str(os.getenv("E2B_CPU_TRACE", "") or "").strip().lower() in {
             "1",
@@ -1976,6 +2000,7 @@ class NodeAgent:
                         worker_pid_namespace(),
                         worker_identity_fields(),
                         reported_container_id(),
+                        cpu_provider=self._cpu_provider,
                     ),
                     headers=headers,
                 )
@@ -2047,12 +2072,21 @@ class NodeAgent:
                 logger.warning("cpu activity round failed", exc_info=True)
 
     async def _cpu_activity_round(self) -> dict[str, float]:
-        """One CPU sample: mark the sandboxes that were actually working.
+        """One CPU sample: mark the sandboxes that were actually working, and
+        record what each one cost (N83 phase 0).
 
         The sample itself is a `/proc` walk, so it runs on a worker thread. Only
         the *delta* since the previous sample counts, and only above the
         configured percentage -- "there was a delta" is not activity (a process
         that wakes once a minute has one) and would make eviction impossible.
+
+        The same percents are stored per sandbox (``record_cpu_percent``) and
+        ride the heartbeat as ``sandboxCpu``. The uid they are summed by covers
+        the whole tree -- ``sandlock-superv``, the sandbox's PID 1 and its
+        payload -- so this is the number that includes what the platform spends
+        *on* the sandbox. Nothing enforces it yet; a sandbox over its declared
+        allowance for several rounds in a row is logged by name, which is what
+        phase 1 (a per-sandbox cgroup) will enforce.
 
         Returns the marked sandboxes for tests and for the trace log; a sandbox
         with no pooled uid (the shared-uid shape) is deliberately skipped, since
@@ -2062,15 +2096,23 @@ class NodeAgent:
         percents = self._cpu_tracker.observe(ticks, now=time.time())
         busy = self._cpu_tracker.busy(percents)
         marked: dict[str, float] = {}
-        if busy:
-            for record in self._runtime_registry.list():
-                uid = getattr(record, "host_uid", None)
-                if uid is None or getattr(record, "state", "running") != "running":
-                    continue
-                uid = int(uid)
-                if uid in busy:
-                    self._runtime_registry.mark_active(record.sandbox_id)
-                    marked[record.sandbox_id] = percents[uid]
+        over: dict[str, tuple[float, float]] = {}
+        for record in self._runtime_registry.list():
+            uid = getattr(record, "host_uid", None)
+            if uid is None or getattr(record, "state", "running") != "running":
+                continue
+            uid = int(uid)
+            percent = percents.get(uid, 0.0)
+            # Measured for every running sandbox, not only the busy ones: "0%"
+            # is a reading too, and it is what makes phase 1's baseline honest.
+            self._runtime_registry.record_cpu_percent(record.sandbox_id, percent)
+            allowance = float(getattr(record, "cpu_percent", 100) or 100)
+            if percent > allowance:
+                over[record.sandbox_id] = (percent, allowance)
+            if uid in busy:
+                self._runtime_registry.mark_active(record.sandbox_id)
+                marked[record.sandbox_id] = percent
+        self._report_over_allowance(over)
         if self._cpu_trace:
             logger.info(
                 "cpu trace: uids=%d busy=%d marked=%s",
@@ -2079,6 +2121,35 @@ class NodeAgent:
                 {k: round(v, 1) for k, v in marked.items()},
             )
         return marked
+
+    #: N83 phase 0: how many *consecutive* rounds a sandbox has to measure over
+    #: its declared CPU allowance before that becomes a log line. One round is
+    #: noise -- the sample window is a single interval -- three in a row is a
+    #: finding, and it is what phase 1 will act on.
+    CPU_OVER_ROUNDS = 3
+
+    def _report_over_allowance(self, over: dict[str, tuple[float, float]]) -> None:
+        """Name the sandboxes that are over their declared CPU, after a delay."""
+        counts = self._cpu_over_rounds
+        for sandbox_id in list(counts):
+            if sandbox_id not in over:
+                del counts[sandbox_id]
+        for sandbox_id, (percent, allowance) in over.items():
+            rounds = counts.get(sandbox_id, 0) + 1
+            counts[sandbox_id] = rounds
+            if rounds == self.CPU_OVER_ROUNDS:
+                # Names the sandbox, both numbers and the cadence: this is the
+                # line that answers "who is using the node's CPU" without the
+                # control plane having to be involved.
+                logger.warning(
+                    "cpu over allowance: sandbox %s measured %.0f%% of a core "
+                    "for %d rounds (declared %g%%, sample every %gs)",
+                    sandbox_id,
+                    percent,
+                    rounds,
+                    allowance,
+                    self._cpu_interval_s,
+                )
 
     def _disk_report_for_heartbeat(self) -> dict[str, int]:
         """The last measured tree sizes; a fresh scan is started, never awaited.

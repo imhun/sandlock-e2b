@@ -684,6 +684,14 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
         # E9.1: the worker is the only observer of in-sandbox traffic, so its
         # report is what makes idle detection (and eviction) possible.
         request.app.state.registry.apply_activity_report(node_id, activity)
+    cpu = body.get("sandboxCpu")
+    if cpu is not None and not isinstance(cpu, dict):
+        raise OfficialError(400, "sandboxCpu must be a JSON object")
+    if isinstance(cpu, dict) and cpu:
+        # N83 phase 0: the worker's measured CPU per sandbox (percent of one
+        # core), from the same walk that feeds activity -- and the only number
+        # that includes the supervisor's CPU. Recorded, not enforced yet.
+        request.app.state.registry.apply_cpu_report(node_id, cpu)
     disk_usage = body.get("sandboxDiskUsage")
     if disk_usage is not None and not isinstance(disk_usage, dict):
         raise OfficialError(400, "sandboxDiskUsage must be a JSON object")
@@ -732,7 +740,19 @@ async def node_sandboxes(node_id: str, request: Request) -> dict[str, Any]:
     """
     _require_node_identity(request, node_id)
     records = request.app.state.registry.list_by_node(node_id)
-    return {"nodeID": node_id, "sandboxIDs": [r.sandbox_id for r in records]}
+    # ``sandboxIDs`` is the reconcile snapshot and stays exactly as it was; the
+    # parallel list is N83 phase 0's *measured* CPU (percent of one core,
+    # supervisor included) for whoever is asking "who is using this node".
+    # ``None`` means the worker has not sampled it yet -- deliberately distinct
+    # from a measured ``0.0``.
+    return {
+        "nodeID": node_id,
+        "sandboxIDs": [r.sandbox_id for r in records],
+        "sandboxes": [
+            {"sandboxID": r.sandbox_id, "measuredCpuPercent": r.measured_cpu_percent}
+            for r in records
+        ],
+    }
 
 
 @router.post("/internal/nodes/{node_id}/reconcile")

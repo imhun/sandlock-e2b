@@ -226,6 +226,16 @@ class SandboxRecord:
     #: (``workspace_dir`` is ``None`` there), which is why ``sample_metric``
     #: used to answer a flat ``diskUsed: 0``.
     workspace_disk_used_bytes: int | None = None
+    #: N83 phase 0: the worker's **measured** CPU for this sandbox, as percent
+    #: of one core, from its per-uid ``/proc`` walk. The uid covers the whole
+    #: tree -- ``sandlock-superv``, the sandbox's PID 1 and its payload -- so
+    #: this is the one number that includes what the platform spends *on* the
+    #: sandbox (a notification flood costs the supervisor ~1 core while the
+    #: client is blocked and accounts for ~2%). ``None`` means "never measured"
+    #: (an in-process deployment, or a record written before this field
+    #: existed), deliberately distinct from a measured ``0.0``. Reported, not
+    #: enforced: phase 1's per-sandbox cgroup is what enforces.
+    measured_cpu_percent: float | None = None
     #: N28/D: why the platform moved this record out of ``running``, and when.
     #:
     #: Persisted, unlike ``logs``: the record store deliberately keeps only the
@@ -1916,6 +1926,40 @@ class SandboxRegistry:
                 continue
             if self.mark_active(record, when=moment):
                 updated += 1
+        return updated
+
+    def apply_cpu_report(
+        self, node_id: str | None, cpu: dict[str, Any] | None
+    ) -> int:
+        """Record the worker's measured per-sandbox CPU (N83 phase 0).
+
+        Entries are ``{sandbox_id: percent_of_one_core}`` from the worker's
+        per-uid ``/proc`` walk, which covers the sandbox *and* its supervisor.
+        The counterpart of :meth:`apply_activity_report`: the worker measures,
+        the control plane records. ``node_id`` guards against a worker reporting
+        for sandboxes it does not host; unknown/foreign sandboxes and malformed
+        values are ignored. Returns the number of records updated.
+
+        Nothing acts on the number yet -- phase 1 turns it into a per-sandbox
+        cgroup -- so this exists to make the cost visible (``GET
+        /internal/nodes/{id}/sandboxes``) and to give that phase a baseline.
+        """
+        updated = 0
+        for sandbox_id, value in (cpu or {}).items():
+            try:
+                percent = float(value)
+            except (TypeError, ValueError):
+                continue
+            if percent < 0:
+                continue
+            try:
+                record = self.get(str(sandbox_id))
+            except UnknownSandboxError:
+                continue
+            if node_id is not None and record.node_id != node_id:
+                continue
+            record.measured_cpu_percent = percent
+            updated += 1
         return updated
 
     def enforce_disk_budget(

@@ -185,6 +185,16 @@ class RuntimeRegistry:
         #: (combined) deployment gets it through ``_activity_callbacks``.
         self._activity: dict[str, float] = {}
         self._activity_callbacks: list[Callable[[str, float], None]] = []
+        #: N83 phase 0: the worker's **measured** CPU for each sandbox, as
+        #: percent of one core, from the same per-uid ``/proc`` walk that feeds
+        #: activity. The uid covers the whole tree -- the supervisor, the
+        #: sandbox's PID 1 and its payload -- so this is the first number that
+        #: includes the CPU the platform spends *on* the sandbox rather than the
+        #: CPU the sandbox spends on itself (measured 2026-10-06: a notification
+        #: flood costs the supervisor ~1 core while the client is blocked and
+        #: accounts for ~2%). Reported on the heartbeat; nothing enforces it
+        #: yet -- that is phase 1's cgroup.
+        self._cpu_percent: dict[str, float] = {}
         #: E3.2 host-uid allocator shared by every app that provisions
         #: sandboxes on this workspace (worker agent + local-node control
         #: plane). ``None`` = independent-uid mode disabled.
@@ -366,6 +376,18 @@ class RuntimeRegistry:
         """Copy of the per-sandbox activity timestamps, for the heartbeat."""
         with self._lock:
             return dict(self._activity)
+
+    def record_cpu_percent(self, sandbox_id: str, percent: float) -> None:
+        """Store the worker's measured CPU for ``sandbox_id`` (N83 phase 0)."""
+        with self._lock:
+            if sandbox_id not in self._records:
+                return
+            self._cpu_percent[sandbox_id] = float(percent)
+
+    def cpu_snapshot(self) -> dict[str, float]:
+        """Copy of the measured per-sandbox CPU percents, for the heartbeat."""
+        with self._lock:
+            return dict(self._cpu_percent)
 
     def disk_usage_snapshot(
         self, *, budget_s: float | None = None, dirty: bool = False
