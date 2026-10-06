@@ -10,7 +10,7 @@
 | 命名空间 | 开关 | 谁创建 | 买到什么 |
 |---|---|---|---|
 | **userns** | 形态自带（`E2B_PER_SANDBOX_UID`） | route B 槽位的子进程自己 `unshare(CLONE_NEWUSER)` | 身份翻译：**箱内 uid 0 ↔ 宿主侧沙箱池 uid** |
-| **pidns** | `E2B_PID_NS`（部署清单全开，代码默认 `false`） | fork 的**中间进程**（先 userns，再 pidns） | 箱内看不见宿主与其他沙箱的 pid |
+| **pidns** | `E2B_PID_NS`（部署清单全开，代码默认 `false`） | 建箱的 `clone3` 一次带 `NEWUSER\|NEWPID`（N80 之前是 fork 的中间进程） | 箱内看不见宿主与其他沙箱的 pid |
 | **netns** | `E2B_ENABLE_NET_ISOLATION` + `E2B_FD_INJECT_CONNECT`（**必须成对**） | fork | 箱内只有 `lo`；出口由 supervisor 代连 |
 
 ## 1. userns：身份翻译，不是隔离
@@ -44,8 +44,10 @@
   能用来探到 worker 与别的沙箱活着），自有 pid ns 时返回 **ESRCH**；
 - pid 1 会承担孤儿进程的 reaper 职责。
 
-**实现约束**：非特权 `CLONE_NEWPID` 必须先有自己的 userns，所以 fork 会在**中间进程**里
-先建 userns 再建 pid ns。这也是 2026-09-16 那个缺陷的位置：中间进程一开始只认"特权 remap"
+**实现约束**：非特权 `CLONE_NEWPID` 必须先有自己的 userns，所以建箱时一次
+`clone3(CLONE_NEWUSER|CLONE_NEWPID|…)` 同时给出两者（N80 之前由中间进程先 unshare userns、
+再 unshare pidns；两个进程角色的分工与现场读数见 [§4](#4-进程结构一个二进制两个进程角色)）。
+这也是 2026-09-16 那个缺陷的位置：当时的中间进程只认"特权 remap"
 和"自身身份"两种映射，route-B 箱在 pid_ns 下会掉回宿主槽位 uid（`id -u` = 21000），
 修法是让它按与 `confine_child` 同一套三选一挑映射（fork `5b16855`）。
 
@@ -80,7 +82,56 @@
 - `E2B_ENABLE_NETNS` 是更早的 veth-pool 形态遗留旋钮，**默认关且对现在的形态不生效**；
   worker 启动时那套 veth 池 NAT（[../envd_service/netns.py](../envd_service/netns.py)）只在旧形态下才需要。
 
-## 4. 另外两层边界（不是命名空间）
+## 4. 进程结构：一个二进制，两个进程角色
+
+沙箱活着的时候宿主侧是**两个进程**（N80 之前是三个），`exe` 全是同一个
+`bin/sandlock-supervise`，全程 fork/clone 不 exec —— `ps` 里只有一个 `sandlock-superv`：
+
+```text
+worker 里的 envd 进程
+└─ A sandlock-superv     spawn_child：clone3(NEWUSER|NEWPID|NEWNS|NEWNET) → setresuid(X) → exec
+   └─ C sandlock-init    新 userns/pidns 里的 PID 1（宿主侧的直接父就是 A）
+      └─ 主工作负载 / 之后每条 exec
+```
+
+| 角色 | comm | 线程 / wchan | 职责 |
+|---|---|---|---|
+| **A 真 supervisor** | `sandlock-superv` | 6 线程：主 + `sandlock-events` + 5×`tokio-rt-worker`；`unix_stream_data_wait` | 握 worker 的 control fd **与 seccomp listener fd**，应答每一次被拦的 syscall；用 `clone3` 建 leader 并直接 `wait` 它 |
+| **C 沙箱 PID 1** | `sandlock-init` | 1 线程；`poll_schedule_timeout` | 沙箱内控制循环：起负载、收孤儿、按组发信号 |
+
+**A 是唯一应答 seccomp 通知的那个**：listener fd 由子进程建好、把 fd 号走专用管道报回父进程
+（`crates/sandlock-core/src/sandbox.rs:2874`），接收循环 `recv_notif → handle_notification(...).await`
+（`seccomp/notif.rs:2777` / `:2812`）跑在 A 自己的 tokio runtime 上 —— **限流"睡满该秒窗口"那段就在
+这个循环里**（`notif.rs:2748`，[N79](open-issues.md)）。2026-10-05 现场实测：沙箱里 hammer 3×6000 次
+stat，**只有 A 烧 CPU（合计 0.48 s ≈ 26.7 µs/次，与探针 p50 26 µs 一致），B、C 全程 0 tick**。
+
+**中间进程为什么没有了（N80，2026-10-06）**：`unshare(CLONE_NEWUSER)` 拒绝多线程调用者，而 A
+握着一个 tokio runtime —— 这就是过去必须 fork 出一个单线程中间进程、由它去
+*unshare user ns → 写 map → unshare NEWPID → fork* 的全部原因。`clone3` 把新命名空间给**子进程**，
+与调用者的线程数无关，所以 A 直接 `clone3(CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNS|CLONE_NEWNET)`
+把 leader 生进四个 ns。连带消失的是中间进程留下的两样东西：leader 宿主 pid 的专用回传管道
+（现在就是 `clone3` 的返回值）和退出码转发（现在 A 直接 `wait` C）。
+`unshare(CLONE_NEWPID)` "不移动调用者、必须再 fork"的语义也从这条路上消失了。
+
+**C 是怎么被认出来的**：fork 后不 exec，靠 `prctl(PR_SET_NAME)` 改成 `sandlock-init`
+（`context.rs:414`，注释原话：*"the in-process PID-1, which has no `execve` to set its name from
+argv[0]"*）。职责（`init/mod.rs` 模块注释）：
+
+- 读 `CONTROL_FD` 上的 `Req`：`RunMain` fork+exec 主负载、`RunExec` 执行后续每条命令；
+  **每个子进程继承它的 seccomp filter 与 Landlock ruleset**（*"so they share the one supervisor"*）；
+- 每个子进程 `setpgid(0,0)` 自成进程组 ⇒ guest 的 `killpg` 只打得到自己那棵子树，不连坐容器（SECE-6）；
+- 自称 child subreaper，每轮 `waitpid(-1, WNOHANG)` 收养并收割所有孤儿（SL-6）；
+- 实例级信号 = 先 `killpg` + 对跑出自己组/会的逃逸者补 `pidfd_send_signal`（FUP-10）；
+  **线上没有"按 pid 发信号"的动词**，控制通道被攻破也只能要求实例级投递；
+- 主负载退出 ⇒ 给每个注册组发信号、自己退出 ⇒ 容器结束。
+
+**箱内看不到这两个进程**：`/proc` 在真根下是个**空目录**（内核 procfs 挂不上，三形态实测 EPERM），
+但只要 open/stat `/proc/*`，拦下来的进程直接回 **EACCES**（内核对空目录本该回 ENOENT）—— stat 族
+那个 EACCES 出自 `crates/sandlock-core/src/procfs.rs:920 handle_proc_stat_family`，**正是
+[N79](open-issues.md) 要动的那条**；顺带用 shell 连做 6000 次 `[ -e ]`（每次一个 stat）实测
+0.99 / 1.04 / 1.04 s（5000 次预算 ≈133 ms 忙 + ~870 ms 限流睡），把 N79 的算式现场复现了一遍。
+
+## 5. 另外两层边界（不是命名空间）
 
 - **Landlock**：文件系统访问白名单（`fs_writable` / `fs_mount` 落到策略里），
   这是"沙箱只能碰自己的树"的第一道；
