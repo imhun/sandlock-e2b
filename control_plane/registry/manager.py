@@ -443,6 +443,7 @@ class SandboxRecord:
             ),
             "host_uid": self.host_uid,
             "workspace_disk_used_bytes": self.workspace_disk_used_bytes,
+            "measured_cpu_percent": self.measured_cpu_percent,
             "pause_reason": self.pause_reason,
             "paused_at": (
                 to_iso_z(self.paused_at) if self.paused_at is not None else None
@@ -501,6 +502,11 @@ class SandboxRecord:
             workspace_disk_used_bytes=(
                 int(data["workspace_disk_used_bytes"])
                 if data.get("workspace_disk_used_bytes") is not None
+                else None
+            ),
+            measured_cpu_percent=(
+                float(data["measured_cpu_percent"])
+                if data.get("measured_cpu_percent") is not None
                 else None
             ),
             pause_reason=data.get("pause_reason"),
@@ -1958,8 +1964,14 @@ class SandboxRegistry:
                 continue
             if node_id is not None and record.node_id != node_id:
                 continue
-            record.measured_cpu_percent = percent
-            updated += 1
+            # Persist, not just mutate: the shared store hands out a fresh
+            # object per `get`, so an assignment alone is lost on the next read
+            # (measured on the fleet before this line existed: the worker logged
+            # "382% of a core" and the record still said None).
+            if record.measured_cpu_percent != percent:
+                record.measured_cpu_percent = percent
+                self.save(record)
+                updated += 1
         return updated
 
     def enforce_disk_budget(

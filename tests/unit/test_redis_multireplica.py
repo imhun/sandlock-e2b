@@ -48,6 +48,36 @@ def _create(registry, **kw):
     return registry.create(**kwargs)
 
 
+def test_a_worker_cpu_report_crosses_replicas():
+    """N83 phase 0: the measured CPU has to be *persisted*, not just mutated.
+
+    The shared store hands out a fresh object per ``get``, so a report that only
+    assigns the field is gone by the next read. Measured on the fleet before
+    this test existed: the worker logged ``cpu over allowance: … 382% of a
+    core`` while the record still read ``None`` on the control plane.
+    """
+    server = fakeredis.FakeServer()
+    client_a = fakeredis.FakeRedis(server=server)
+    client_b = fakeredis.FakeRedis(server=server)
+    registry_a = SandboxRegistry(_settings(), redis_client=client_a)
+    registry_b = SandboxRegistry(_settings(), redis_client=client_b)
+
+    sid = _create(registry_a).sandbox_id
+    record = registry_a.get(sid)
+    record.node_id = "node_worker"
+    registry_a.save(record)
+
+    assert registry_a.apply_cpu_report("node_worker", {sid: 380.0}) == 1
+    # Replica B only sees what was written to the store.
+    assert registry_b.get(sid).measured_cpu_percent == 380.0
+
+    # A foreign node cannot report for this sandbox, and an unchanged value is
+    # not a write.
+    assert registry_b.apply_cpu_report("node_other", {sid: 5.0}) == 0
+    assert registry_b.get(sid).measured_cpu_percent == 380.0
+    assert registry_b.apply_cpu_report("node_worker", {sid: 380.0}) == 0
+
+
 def test_redis_sandbox_quota_atomic_across_replicas():
     server = fakeredis.FakeServer()
     client_a = fakeredis.FakeRedis(server=server)
