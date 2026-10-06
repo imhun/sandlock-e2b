@@ -909,6 +909,23 @@ def test_the_refusal_predicate_tracks_the_forks_privilege_rule(
 
 # ------------------------------------- N83 phase 1: the declared cpu share
 
+#: Route B's own words for the only decline these cases reach: a worker that
+#: knows no control plane cannot report a slot identity (C3: the child
+#: unshares and the agent writes it), so the slot is declined.
+NO_REPORTER_DECLINE = (
+    "E2B_SLOT_IDENTITY=agent-grant needs the control-plane reporter, and this "
+    "worker does not know where its control plane is (E2B_CONTROL_PLANE_URL "
+    "and E2B_NODE_ID)"
+)
+
+
+class _HandleStub:
+    """Only present, to satisfy ``required ⇒ a handle`` (fix round 1, Finding 1).
+
+    R15's refusal happens while the executor is constructed -- before a slot is
+    leased -- so nothing in this double is ever called.
+    """
+
 
 async def test_the_declared_cpu_share_rides_the_lease_unclamped(monkeypatch) -> None:
     """``200`` reaches the pool as ``200`` -- the fork policy's clamp is not it.
@@ -941,19 +958,25 @@ def test_an_in_process_sandbox_is_refused_when_the_cgroup_is_required(
     fail the create by name instead of starting an uncapped sandbox.
     """
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
-    with pytest.raises(
-        RuntimeError,
-        match=r"^E2B_SANDBOX_CGROUP=required refuses an in-process sandbox: ",
-    ) as excinfo:
+    with pytest.raises(RuntimeError) as excinfo:
         _executor(
             monkeypatch,
             route_b=_config(
-                mode="auto", identity_reporter=None, sandbox_cgroup="required"
+                mode="auto",
+                identity_reporter=None,
+                sandbox_cgroup="required",
+                sandbox_cgroups=_HandleStub(),
             ),
         )
-    # The decline's own words are in the refusal: the operator gets the fix,
-    # not just the switch that failed.
-    assert "needs the control-plane reporter" in str(excinfo.value)
+    # The decline's own words are in the refusal, in full: the operator gets
+    # the fix, not just the switch that failed.
+    assert str(excinfo.value) == (
+        "E2B_SANDBOX_CGROUP=required refuses an in-process sandbox: this "
+        "sandbox would run without a per-sandbox cgroup "
+        f"({NO_REPORTER_DECLINE}). Give the sandbox a route-B slot (per-sandbox "
+        "host uid + the control-plane reporter), or set "
+        "E2B_SANDBOX_CGROUP=off to accept uncapped sandboxes."
+    )
 
 
 def test_an_in_process_sandbox_still_falls_back_when_the_cgroup_is_off(
@@ -966,4 +989,4 @@ def test_an_in_process_sandbox_still_falls_back_when_the_cgroup_is_off(
         route_b=_config(mode="auto", identity_reporter=None, sandbox_cgroup="off"),
     )
     assert ex._route_b_active is False
-    assert "needs the control-plane reporter" in ex._route_b_decline
+    assert ex._route_b_decline == NO_REPORTER_DECLINE

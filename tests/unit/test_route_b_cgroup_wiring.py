@@ -252,14 +252,48 @@ def test_the_switch_resolves_to_no_handle_at_all_when_off() -> None:
 
 def test_an_unknown_switch_value_is_refused_by_name() -> None:
     """A typo must not read as "off": that would be a quota-less fleet."""
+    expected = (
+        "E2B_SANDBOX_CGROUP must be 'off' or 'required': 'requried' would "
+        "leave every sandbox running without a per-sandbox quota while "
+        "looking configured -- delete the line (the default is off), or set "
+        "it to 'required'"
+    )
     settings = _settings(sandbox_cgroup="requried")
     with pytest.raises(ValueError) as excinfo:
         rb.sandbox_cgroups_for(settings)
-    assert "E2B_SANDBOX_CGROUP must be 'off' or 'required'" in str(excinfo.value)
-    assert "'requried'" in str(excinfo.value)
+    assert str(excinfo.value) == expected
     with pytest.raises(ValueError) as excinfo:
         RouteBConfig.from_settings(settings)
-    assert "E2B_SANDBOX_CGROUP must be 'off' or 'required'" in str(excinfo.value)
+    assert str(excinfo.value) == expected
+
+
+def test_required_with_no_handle_is_refused_by_name() -> None:
+    """The switch and its handle are one invariant, checked where the mode is.
+
+    Fix round 1, review Finding 1. ``from_settings`` resolves both together, so
+    the fail-open below is unreachable through the factory -- which is why the
+    check belongs here: ``RouteBConfig`` is built by hand in tests and by
+    embedders, and a live pool with ``required`` and no handle would attach
+    nothing at all (``_attach_cgroup`` returns early on ``None``), running every
+    sandbox without a quota while the switch says otherwise.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        RouteBConfig(sandbox_cgroup="required")
+    assert str(excinfo.value) == (
+        "E2B_SANDBOX_CGROUP=required needs a SandboxCgroups handle: without "
+        "one the pool attaches nothing and every sandbox runs without its "
+        "per-sandbox quota, which is the fail-open this switch exists to "
+        "prevent -- build the handle with sandbox_cgroups_for(settings), or "
+        "set E2B_SANDBOX_CGROUP=off"
+    )
+    # The other direction stays legal: a handle with the default ``off`` mode is
+    # a caller's explicit hand-off, not the fail-open shape above.
+    assert RouteBConfig(sandbox_cgroups=FakeCgroups()).sandbox_cgroup == "off"
+    # ...and the production shape is untouched: ``from_settings`` resolves the
+    # switch and the handle together, so ``required`` still builds a fleet there.
+    resolved = RouteBConfig.from_settings(_settings(sandbox_cgroup="required"))
+    assert resolved.sandbox_cgroup == "required"
+    assert resolved.sandbox_cgroups is not None
 
 
 def test_the_required_switch_builds_one_handle_for_the_whole_process(
@@ -476,12 +510,24 @@ def test_a_refused_release_is_a_named_warning_and_teardown_still_ends(
     pool, _spawned, _reports = _pool(tmp_path, order, sandbox_cgroups=fake)
     pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
 
+    # The acquire above warns about the slot documents' mode when the test runs
+    # unprivileged (an unrelated, pre-existing warning). Narrow the capture to
+    # the retire under test, then demand it in full.
+    caplog.clear()
     with caplog.at_level(logging.WARNING, logger=rb.__name__):
         pool.release_sync(SANDBOX_ID)
 
     assert fake.released == [SANDBOX_ID]
     assert pool.acquired_uid(SANDBOX_ID) is None
-    assert "cgroup-refusal release-rmdir: busy" in caplog.text
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == rb.__name__
+    ] == [
+        "route-B slot rb-sbx_cgroup: the cgroup for sandbox sbx_cgroup was "
+        "not released (cgroup-refusal release-rmdir: busy); the subtree stays "
+        "for the next create to refuse or the node's GC to reclaim"
+    ]
     # ...and the uid is immediately leasable again: teardown completed.
     assert pool.acquire_sync("sbx_next", {"ceiling": {}}, uid=20001).uid == 20001
 
@@ -538,9 +584,18 @@ async def test_the_startup_lane_delegates_first_then_self_checks(
         await asyncio.wait_for(task, timeout=5)
 
     assert order == ["delegate", "setup"]
-    assert "/kubepods/burstable/podabc/3f2a1b0c9d8e" in caplog.text
-    assert "cgroup.procs" in caplog.text
-    assert "cgroup ready parent=/pod-cgroup/3f2a1b0c9d8e drained=1" in caplog.text
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == node_agent.__name__
+    ] == [
+        "cgroup delegation answer (attempt 1): nodeID=worker-1 "
+        "containerCgroup=/kubepods/burstable/podabc/3f2a1b0c9d8e "
+        "delegated=['.', 'cgroup.procs', 'cgroup.subtree_control'] "
+        "workerAnchor=None",
+        "cgroup lane ready (attempt 1): cgroup ready "
+        "parent=/pod-cgroup/3f2a1b0c9d8e drained=1 subtree_control=cpu",
+    ]
 
 
 async def test_a_failed_attempt_is_retried_and_does_not_crash_the_worker(
@@ -592,8 +647,24 @@ async def test_a_failed_attempt_is_retried_and_does_not_crash_the_worker(
         "delegate-4",
         "setup-3",
     ]
-    assert "connection refused" in caplog.text
-    assert "cgroup-refusal delegation-timeout: not yet" in caplog.text
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == node_agent.__name__
+    ] == [
+        "cgroup lane not ready (attempt 1): the control plane is unreachable "
+        "for the cgroup delegation: connection refused -- retrying in 0.0s; "
+        "sandbox creates are refused by name until it lands "
+        "(E2B_SANDBOX_CGROUP=required, N83 phase 1)",
+        "cgroup lane not ready (attempt 2): cgroup-refusal "
+        "delegation-timeout: not yet -- retrying in 0.0s; sandbox creates are "
+        "refused by name until it lands (E2B_SANDBOX_CGROUP=required, "
+        "N83 phase 1)",
+        "cgroup lane not ready (attempt 3): cgroup-refusal "
+        "delegation-timeout: not yet -- retrying in 0.0s; sandbox creates are "
+        "refused by name until it lands (E2B_SANDBOX_CGROUP=required, "
+        "N83 phase 1)",
+    ]
 
 
 async def test_a_hop_that_never_lands_keeps_retrying_without_raising(
@@ -628,7 +699,12 @@ def test_an_unknown_switch_value_is_refused_at_startup(monkeypatch) -> None:
     """A typo is a configuration refusal, not a silent "off"."""
     with pytest.raises(ValueError) as excinfo:
         node_agent.start_cgroup_lane(_settings(sandbox_cgroup="on"))
-    assert "E2B_SANDBOX_CGROUP must be 'off' or 'required'" in str(excinfo.value)
+    assert str(excinfo.value) == (
+        "E2B_SANDBOX_CGROUP must be 'off' or 'required': 'on' would leave "
+        "every sandbox running without a per-sandbox quota while looking "
+        "configured -- delete the line (the default is off), or set it to "
+        "'required'"
+    )
 
 
 async def test_the_node_agent_owns_the_startup_lane(monkeypatch) -> None:

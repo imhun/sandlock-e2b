@@ -82,6 +82,20 @@ CGROUP_MODE_ERROR = (
     "delete the line (the default is off), or set it to 'required'"
 )
 
+#: The switch and its handle are one invariant, not two independent fields:
+#: ``required`` without a handle is exactly the fail-open this task exists to
+#: close -- the pool stays live, ``_attach_cgroup`` returns early on ``None``,
+#: and every sandbox runs uncapped while the deployment believes otherwise.
+#: Refused by name where the mode itself is validated, so a hand-built config
+#: (``from_settings`` always resolves both together) cannot reach that shape.
+CGROUP_HANDLE_MISSING_ERROR = (
+    "E2B_SANDBOX_CGROUP=required needs a SandboxCgroups handle: without one "
+    "the pool attaches nothing and every sandbox runs without its per-sandbox "
+    "quota, which is the fail-open this switch exists to prevent -- build the "
+    "handle with sandbox_cgroups_for(settings), or set "
+    "E2B_SANDBOX_CGROUP=off"
+)
+
 #: One handle per (mount, worker uid, lane token). Exactly one object may run
 #: ``setup()``: an ``attach`` can only succeed through the instance whose
 #: self-check landed, so every caller in this process has to get the same one.
@@ -2117,6 +2131,12 @@ class RouteBConfig:
         if mode not in SANDBOX_CGROUP_MODES:
             raise ValueError(CGROUP_MODE_ERROR.format(value=mode))
         self.sandbox_cgroup = mode
+        # ...and the mode and the handle are one invariant (fix round 1,
+        # review Finding 1): a hand-built ``required`` config with no handle
+        # would otherwise be a live fleet that silently attaches nothing --
+        # the exact fail-open direction every other refusal here closes.
+        if mode == "required" and self.sandbox_cgroups is None:
+            raise ValueError(CGROUP_HANDLE_MISSING_ERROR)
 
     @classmethod
     def from_settings(cls, settings) -> "RouteBConfig":
