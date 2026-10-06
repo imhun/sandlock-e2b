@@ -15,7 +15,9 @@ N83 Phase 1（``docs/superpowers/plans/2026-10-06-n83-per-sandbox-cgroup.md`` §
   EACCES ⇒ "worker 抬不了自己的额度"这条钉子）。
 * **路径从哪来**：**agent 自己推**，绝不接受调用方给的路径（R-D）。内核那半在
   :meth:`c3_agent.lookup.ProcLookup.worker_container_cgroup`；这里做的是"把它落回
-  **本进程的挂载视图**"。
+  **本进程的挂载视图**"。那个 lookup 的判据是「车道锚点 + 容器 init + **CP 下发的
+  worker uid**」—— uid 是 k8s 上把它与同 pod 的 pause（sandbox）容器分开的判别式
+  （线上实测 65534 vs 65535；``docs/deploy-clusters.md`` §7.49）。
 
 **为什么不是简单拼接。** ``/proc/<pid>/cgroup`` 的路径是**相对读进程自己的 cgroup
 namespace 根**的读数（本机 Docker VM 实测 2026-10-06：另一个容器读作

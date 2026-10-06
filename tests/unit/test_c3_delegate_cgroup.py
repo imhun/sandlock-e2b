@@ -9,8 +9,11 @@
 
 * **定位**（``ProcLookup.worker_container_cgroup``）：按车道取锚点（k8s 的
   ``pod<uid>`` / compose 的容器 id），候选必须**同时**带着锚点**且是容器 init**
-  （``NSpid`` 末位为 1）—— ``kubectl exec`` 的兄弟 cgroup 也带着锚点，只有 init 是
-  worker 自己。零个 / 多于一个 ⇒ 具名 ``LookupRefusal``。
+  （``NSpid`` 末位为 1）**且 uid 等于 CP 下发的 expected worker uid** —— ``kubectl
+  exec`` 的兄弟 cgroup 也带着锚点，只有 init 是 worker 自己；而 **k8s 上锚点本身仍
+  歧义**：同一个 ``pod<uid>`` 里 pause（sandbox）容器与 worker 都是 init（线上实测
+  65535 vs 65534，``docs/deploy-clusters.md`` §7.49），guest uid 才是判别式。
+  零个 / 多于一个 / uid 都不符 ⇒ 具名 ``LookupRefusal``。
 * **委派白名单**（``c3_agent.cgroups.delegate_worker_subtree``）：**只** chown
   *目录 + ``cgroup.procs`` + ``cgroup.subtree_control``*。``cpu.max`` **必须**留在
   白名单之外 —— §1.4 负例 N1 实测：不委派 ``cpu.max``，worker 写自己的 CPU 上限就是
@@ -58,6 +61,19 @@ ANCHOR = CONTAINER_ID[:12]
 EXEC_ID = "cfee67b0a1d2e3f405162738495a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6"
 WORKER_UID = 65534
 WORKER_GID = 65534
+#: k8s 的 **pause**（sandbox）容器：与 worker 同一个 pod、同样是容器 init
+#: （``NSpid`` 末位为 1），uid 却是 65535 —— 线上实测的那两行。
+PAUSE_UID = 65535
+PAUSE_PID = 4323
+PAUSE_CONTAINER_ID = (
+    "668b76ca0f3e1d2c3b4a5968778899aabbccddeeff00112233445566778899aa"
+)
+#: 另一个「uid 不同」的容器 init（不是 pause，也不是 worker）。
+OTHER_UID = 9000
+OTHER_PID = 4324
+OTHER_CONTAINER_ID = (
+    "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
+)
 #: 容器 init 与 exec 兄弟在宿主 pid 空间里的 pid（合成树里的那两个）。
 INIT_PID = 4321
 EXEC_PID = 4322
@@ -145,8 +161,100 @@ def test_the_k8s_anchor_selects_the_container_init_dir_not_the_exec_sibling(
     )
 
     assert _lookup(root).worker_container_cgroup(
-        node_id=WORKER, pod_uid=POD_UID
+        node_id=WORKER, pod_uid=POD_UID, worker_uid=WORKER_UID
     ) == f"/../../../burstable/pod{POD_UID}/{CONTAINER_ID}"
+
+
+def test_the_k8s_uid_discriminator_picks_the_worker_over_the_pause_container(
+    tmp_path: Path,
+) -> None:
+    """k8s 形状：同一 pod 锚点命中**两个**容器 init —— pause（65535）与 worker（65534）。
+
+    线上实测（``docs/deploy-clusters.md`` §7.49）：``pod<uid>`` 锚点同时带着
+    ``/pause`` 与 ``python -m envd_service``，两者都是容器 init，于是旧的
+    「锚点 + 容器 init」规则**具名拒绝（ambiguous）**，车道永远起不来。guest uid
+    才是判别式：pause 是 65535，worker 是 65534。
+    """
+    root = _proc(tmp_path / "proc")
+    # pause（k8s sandbox）容器：同一个 pod 锚点、同样是 init，uid 65535。
+    _process(
+        root,
+        PAUSE_PID,
+        cgroup=_k8s_cgroup(PAUSE_CONTAINER_ID),
+        nspid=f"{PAUSE_PID}\t1",
+        uid=PAUSE_UID,
+        gid=PAUSE_UID,
+        comm="pause",
+    )
+    # worker 本体：同一个 pod 锚点、init、uid 65534。
+    _process(root, INIT_PID, cgroup=_k8s_cgroup(CONTAINER_ID), nspid=f"{INIT_PID}\t1")
+
+    assert _lookup(root).worker_container_cgroup(
+        node_id=WORKER, pod_uid=POD_UID, worker_uid=WORKER_UID
+    ) == f"/../../../burstable/pod{POD_UID}/{CONTAINER_ID}"
+
+
+def test_a_pod_whose_inits_all_carry_other_uids_is_refused_by_name(
+    tmp_path: Path,
+) -> None:
+    """反例：锚点 + init 都在，但**没有**一个候选带着 expected uid ⇒ 具名拒绝。
+
+    不能退化成"取第一个"：这正是 k8s 上 pause（65535）会被误选的那条路。
+    """
+    root = _proc(tmp_path / "proc")
+    _process(
+        root,
+        PAUSE_PID,
+        cgroup=_k8s_cgroup(PAUSE_CONTAINER_ID),
+        nspid=f"{PAUSE_PID}\t1",
+        uid=PAUSE_UID,
+        gid=PAUSE_UID,
+        comm="pause",
+    )
+    _process(
+        root,
+        OTHER_PID,
+        cgroup=_k8s_cgroup(OTHER_CONTAINER_ID),
+        nspid=f"{OTHER_PID}\t1",
+        uid=OTHER_UID,
+        gid=OTHER_UID,
+        comm="envd",
+    )
+
+    with pytest.raises(LookupRefusal) as refused:
+        _lookup(root).worker_container_cgroup(
+            node_id=WORKER, pod_uid=POD_UID, worker_uid=WORKER_UID
+        )
+
+    assert str(refused.value) == (
+        "worker e2b-worker-0's container-init processes carry uids "
+        f"{sorted([PAUSE_UID, OTHER_UID])} but not the expected worker uid "
+        f"{WORKER_UID}: refusing to locate its container cgroup"
+    )
+
+
+def test_the_compose_anchor_also_requires_the_expected_uid(tmp_path: Path) -> None:
+    """compose 车道的锚点（容器 id）本来就精确，uid 判别式在这里同样成立。"""
+    root = _proc(tmp_path / "proc")
+    _process(
+        root,
+        INIT_PID,
+        cgroup=_compose_cgroup(CONTAINER_ID),
+        nspid=f"{INIT_PID}\t1",
+        uid=OTHER_UID,
+        gid=OTHER_UID,
+    )
+
+    with pytest.raises(LookupRefusal) as refused:
+        _lookup(root).worker_container_cgroup(
+            node_id=WORKER, container_id=ANCHOR, worker_uid=WORKER_UID
+        )
+
+    assert str(refused.value) == (
+        "worker e2b-worker-0's container-init processes carry uids "
+        f"[{OTHER_UID}] but not the expected worker uid {WORKER_UID}: "
+        "refusing to locate its container cgroup"
+    )
 
 
 def test_the_compose_anchor_selects_the_container_init_dir_not_the_exec_sibling(
@@ -167,7 +275,7 @@ def test_the_compose_anchor_selects_the_container_init_dir_not_the_exec_sibling(
     )
 
     assert _lookup(root).worker_container_cgroup(
-        node_id=WORKER, container_id=ANCHOR
+        node_id=WORKER, container_id=ANCHOR, worker_uid=WORKER_UID
     ) == f"/../{CONTAINER_ID}"
 
 
@@ -177,7 +285,9 @@ def test_an_anchor_no_container_init_carries_is_refused_by_name(tmp_path: Path) 
     _process(root, EXEC_PID, cgroup=_k8s_cgroup(EXEC_ID), nspid=f"{EXEC_PID}\t71")
 
     with pytest.raises(LookupRefusal) as refused:
-        _lookup(root).worker_container_cgroup(node_id=WORKER, pod_uid=POD_UID)
+        _lookup(root).worker_container_cgroup(
+            node_id=WORKER, pod_uid=POD_UID, worker_uid=WORKER_UID
+        )
 
     assert str(refused.value) == (
         "worker e2b-worker-0's container holds no process this agent can identify "
@@ -193,7 +303,9 @@ def test_two_container_inits_carrying_one_anchor_are_refused_by_name(
     _process(root, EXEC_PID, cgroup=_k8s_cgroup(EXEC_ID), nspid=f"{EXEC_PID}\t1")
 
     with pytest.raises(LookupRefusal) as refused:
-        _lookup(root).worker_container_cgroup(node_id=WORKER, pod_uid=POD_UID)
+        _lookup(root).worker_container_cgroup(
+            node_id=WORKER, pod_uid=POD_UID, worker_uid=WORKER_UID
+        )
 
     assert str(refused.value) == (
         "worker e2b-worker-0's container anchor matches more than one "
@@ -208,10 +320,10 @@ def test_a_neighbour_containers_init_is_never_the_answer(tmp_path: Path) -> None
     _process(root, EXEC_PID, cgroup=_compose_cgroup(EXEC_ID), nspid=f"{EXEC_PID}\t1")
 
     assert _lookup(root).worker_container_cgroup(
-        node_id=WORKER, pod_uid=POD_UID
+        node_id=WORKER, pod_uid=POD_UID, worker_uid=WORKER_UID
     ) == f"/../../../burstable/pod{POD_UID}/{CONTAINER_ID}"
     assert _lookup(root).worker_container_cgroup(
-        node_id=WORKER, container_id=EXEC_ID[:12]
+        node_id=WORKER, container_id=EXEC_ID[:12], worker_uid=WORKER_UID
     ) == f"/../{EXEC_ID}"
 
 
@@ -219,24 +331,29 @@ def test_a_neighbour_containers_init_is_never_the_answer(tmp_path: Path) -> None
     ("kwargs", "message"),
     [
         (
-            {"pod_uid": "not-a-pod-uid"},
+            {"pod_uid": "not-a-pod-uid", "worker_uid": WORKER_UID},
             "the pod uid ('not-a-pod-uid') carried for worker e2b-worker-0 is not "
             "a pod uid: refusing",
         ),
         (
-            {"container_id": "SHORT"},
+            {"container_id": "SHORT", "worker_uid": WORKER_UID},
             "the container id ('SHORT') carried for worker e2b-worker-0 is not a "
             "container id: refusing",
         ),
         (
-            {},
+            {"worker_uid": WORKER_UID},
             "worker e2b-worker-0 names no single cgroup anchor (pod uid or "
             "container id): refusing",
         ),
         (
-            {"pod_uid": POD_UID, "container_id": ANCHOR},
+            {"pod_uid": POD_UID, "container_id": ANCHOR, "worker_uid": WORKER_UID},
             "worker e2b-worker-0 names both a pod uid and a container id: "
             "refusing to locate its container cgroup",
+        ),
+        (
+            {"pod_uid": POD_UID, "worker_uid": 0},
+            "worker e2b-worker-0 carries no usable worker uid (0): refusing to "
+            "locate its container cgroup",
         ),
     ],
 )
@@ -532,7 +649,9 @@ async def test_the_delegate_op_answers_the_k8s_anchor_with_the_view_and_cpu_owne
         settings=_settings(tmp_path), lookup=_lookup(root), delegator=delegator
     )
 
-    resp = await _post(app, {"worker": {"node_id": WORKER, "pod_uid": POD_UID}})
+    resp = await _post(
+        app, {"worker": {"node_id": WORKER, "pod_uid": POD_UID, "uid": WORKER_UID}}
+    )
 
     assert resp.status_code == 200
     assert resp.json() == {
@@ -566,7 +685,10 @@ async def test_the_delegate_op_carries_the_compose_anchor_to_the_delegator(
         settings=_settings(tmp_path), lookup=_lookup(root), delegator=delegator
     )
 
-    resp = await _post(app, {"worker": {"node_id": WORKER, "container_id": ANCHOR}})
+    resp = await _post(
+        app,
+        {"worker": {"node_id": WORKER, "container_id": ANCHOR, "uid": WORKER_UID}},
+    )
 
     assert resp.status_code == 200
     assert delegator.calls == [
@@ -584,7 +706,9 @@ async def test_the_delegate_op_refuses_by_name_when_nothing_carries_the_anchor(
         settings=_settings(tmp_path), lookup=_lookup(root), delegator=delegator
     )
 
-    resp = await _post(app, {"worker": {"node_id": WORKER, "pod_uid": POD_UID}})
+    resp = await _post(
+        app, {"worker": {"node_id": WORKER, "pod_uid": POD_UID, "uid": WORKER_UID}}
+    )
 
     assert resp.status_code == 502
     assert resp.json() == {
@@ -611,7 +735,10 @@ async def test_the_delegate_op_refuses_by_name_when_the_mount_is_absent(
         delegator=ProcCgroupDelegator(),
     )
 
-    resp = await _post(app, {"worker": {"node_id": WORKER, "container_id": ANCHOR}})
+    resp = await _post(
+        app,
+        {"worker": {"node_id": WORKER, "container_id": ANCHOR, "uid": WORKER_UID}},
+    )
 
     assert resp.status_code == 502
     assert resp.json() == {
@@ -625,8 +752,10 @@ async def test_the_delegate_op_refuses_by_name_when_the_mount_is_absent(
 @pytest.mark.parametrize(
     "worker",
     [
-        {"node_id": WORKER, "pod_uid": POD_UID, "container_id": ANCHOR},
-        {"node_id": WORKER},
+        {"node_id": WORKER, "pod_uid": POD_UID, "container_id": ANCHOR, "uid": WORKER_UID},
+        {"node_id": WORKER, "uid": WORKER_UID},
+        # uid 是必填：只有锚点、没有 uid 的指令到不了面 B。
+        {"node_id": WORKER, "pod_uid": POD_UID},
     ],
 )
 async def test_a_body_that_does_not_name_exactly_one_anchor_is_a_shape_refusal(

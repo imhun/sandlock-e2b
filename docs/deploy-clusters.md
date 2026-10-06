@@ -3012,6 +3012,50 @@ pause 容器 —— 这是"本地全绿 ≠ 线上成立"的一个具体案例�
 `E2B_SANDBOX_CGROUP` 翻回 `"off"` + `apply.sh` ⇒ 行为逐字节回到 Phase 1 之前；**没有**需要额外清理的
 cgroup（这一版从未建过 `sbx_*`）。集群与用户的本地 `compose` 栈都没有别的改动。
 
+**修复（2026-10-06，分支 `n83/deleg-uid`，基于 `main`=`816d33f`；尚未重建/重滚）**：按上面的
+修法把 **uid 判别式**落进了代码，四个点一一对应 —— ① CP 的 `POST /internal/nodes/{node_id}/
+cgroup-delegate` 读节点记录的 `worker_uid`（与文件操作路径同一字段），`None` ⇒ 具名 503
+（`node … has reported no worker identity (workerUID/workerGID): refusing to instruct the agent`），
+否则随指令下发；② `control_plane/c3_agent_client.py::delegate_cgroup` 在 `{"worker": {...}}`
+里带上 `"uid"`，锚点仍然**恰好一个**；③ agent 的 `DelegateCgroupWorker` 增加必填 `uid: int`
+（`ge=1`）并透传；④ `ProcLookup.worker_container_cgroup` 增加必填 `worker_uid`，候选在
+「锚点 + 容器 init」之上还要求自己的 `/proc/<pid>/status` `Uid:` 等于它 —— **零候选 / 没有候选
+带 expected uid / 多于一个匹配**都是具名 `LookupRefusal`，绝不"取第一个"。返回的仍然是内核拼写的
+路径 + `container_cgroup_name`，所以 `c3_agent.cgroups` 的按目录名落回视图不受影响；chown 的目标
+uid 依旧从被定位到的 init 读（与 expected uid 相等，二者一致）。compose 车道不变形：仍按容器 id
+定位，uid 判别式同样成立（worker 65534）。
+
+**RED/GREEN（本轮实测，exact）**：
+
+```bash
+# RED —— 只加测试、不实现：k8s 形状（pause 65535 + worker 65534）被旧的「锚点 + init」规则
+#        判成歧义，正是线上那条具名拒绝。
+.venv/bin/python -m pytest \
+  tests/unit/test_c3_delegate_cgroup.py::test_the_k8s_uid_discriminator_picks_the_worker_over_the_pause_container -q
+# E   c3_agent.lookup.LookupRefusal: worker e2b-worker-0's container anchor matches more than one
+#     container-init process: refusing (ambiguous)      （c3_agent/lookup.py:519）
+# 1 failed in 1.72s
+
+# 全量 RED（测试先写）：21 failed, 101 passed in 6.19s
+# GREEN（实现后）：
+.venv/bin/python -m pytest tests/unit/test_c3_delegate_cgroup.py tests/unit/test_c3_agent_service.py \
+  tests/unit/test_c3_slot_identity_lookup.py tests/unit/test_c3_internal_api_shape.py \
+  tests/unit/test_c3_agent_client.py -q
+# 122 passed in 3.29s
+```
+
+新增的 k8s 形状单测（这正是旧单测缺的那条）：**同一个 pod cgroup** 里放两个容器 init ——
+pause（`/pause`，uid 65535）与 worker（`python -m envd_service`，uid 65534）—— 断言选中 worker
+自己的目录；反例（两个候选都不是 expected uid）断言具名拒绝、不选第一个；compose 锚点补一条
+uid 不符的拒绝。整仓单测 2572 passed / 13 skipped / 17 failed，**17 条与本次改动无关**
+（`test_docs_only_point_at_repo_artifacts.py` 2 条、`test_worker_manifest_permissions.py` 2 条
+等 —— 在 `main`=`816d33f` 的干净工作树上用 `git stash` 复跑，同样 17 failed，逐条同因：本工作树
+没有 `deploy/stack/.version`、且 `E2B_SANDBOX_CGROUP` 按纪律仍是 `off`）。
+
+**尚未验证（诚实记）**：本分支**没有**重建镜像、没有重滚 k0s、没有动清单，`E2B_SANDBOX_CGROUP`
+在仓库里仍是 `off`；本地 compose 车道与线上两段式复跑留给重滚那一轮（按 `AGENTS.md`：本地先绿、
+再上集群）。集群当前仍是「新镜像 + 车道 off」的惰性状态，本条修复只到"代码就位 + 单测证据"。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版

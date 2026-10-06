@@ -692,6 +692,7 @@ class C3AgentClient:
         self,
         *,
         node_id: str,
+        worker_uid: int,
         worker_container_id: str | None = None,
     ) -> dict[str, Any]:
         """Instruct the node's agent to delegate the worker's cgroup subtree.
@@ -719,9 +720,21 @@ class C3AgentClient:
         on the way and no request can name. A lane with neither refuses here, by
         name: the agent could not locate the container the delegation is for,
         and "send it anyway" is exactly the instruction that must not be sent.
+
+        ``worker_uid`` is the control plane's own record for the node (the same
+        value the file-op path carries as ``worker.uid``) and rides **beside**
+        the anchor, never instead of it: on k8s the pod-uid anchor plus the
+        agent's container-init rule match both the worker and the pod's sandbox
+        (pause) container, so the agent needs the guest uid to tell them apart
+        (measured 65535 vs 65534; ``docs/deploy-clusters.md`` §7.49). The worker
+        never supplies this value -- the control plane names it (hard rules
+        1/3).
         """
         target = self._target(node_id)
-        worker: dict[str, Any] = {"node_id": node_id}
+        worker: dict[str, Any] = {
+            "node_id": node_id,
+            "uid": int(worker_uid),
+        }
         if worker_container_id is not None:
             if not validate_container_id(worker_container_id):
                 raise AgentClientError(

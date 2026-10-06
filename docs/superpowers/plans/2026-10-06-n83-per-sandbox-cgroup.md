@@ -357,8 +357,12 @@ worker-1:
    不必等委派超时，报错直接点名"挂载根不像本 pod 的 cgroup"；
 2. **权威判据**：等 agent 的委派落地 —— **恰好一个子目录的属主是 worker 自己的 uid（65534）**，
    有界等待（`E2B_CGROUP_DELEGATE_WAIT_S`，默认 30 s）；等不到、或出现两个 ⇒ 具名拒绝启动。
-   这条同时**独立验证了 agent 的路径推导**（它走的是 QoS 无关的 `kubepods/*/pod<pod_uid>` +
-   `lookup.py` 的容器 init 规则）⇒ 两侧不会以同一种方式同时错；
+  这条同时**独立验证了 agent 的路径推导**（它走的是 QoS 无关的 `kubepods/*/pod<pod_uid>` +
+   `lookup.py` 的容器 init **+ expected worker uid** 规则）⇒ 两侧不会以同一种方式同时错；
+   （uid 判别式是 2026-10-06 上线第二段暴露的缺口：k8s 的 `pod<uid>` 锚点同时命中
+   pause（sandbox，65535）与 worker（65534）两个容器 init ⇒ agent 具名拒绝、车道起不来。
+   CP 把节点记录里的 `worker_uid` 随指令下发，agent 再按候选自己的 `Uid:` 收窄到 worker。
+   见 `docs/deploy-clusters.md` §7.49。）
    （**两条车道同一条规则，搜索空间不同**：k8s 的挂载根就是 pod 目录 ⇒ 只看一层；compose 在 2026-10-06
    收窄**之前**是整棵 VM 树 ⇒ 在挂载内做一次有界走查，按容器 id（= 容器 hostname，现成的
    `container_cgroup_token`）先缩到候选，再确认它归 65534。收窄（§3.5 ①bis）之后两块挂载的根都恰好
@@ -411,7 +415,7 @@ worker 容器 cgroup（k8s 的 cpu.max = 本节点核数；腾空后 subtree_con
 
 | 时刻 | 谁 | 动作 |
 |---|---|---|
-| **一次性（worker 启动时）** | agent 面 B | **新增**：委派 —— 把 worker 容器 cgroup 目录 + `cgroup.procs`/`cgroup.subtree_control` chown 给 65534（**`cpu.max` 不委派** ⇒ worker 抬不了自己的上限，§1.4 负例 N1；`cgroup.kill` 也不在名单里 —— 理由见 §3.2 的 `delegate_worker_subtree`）。路径由 agent 自推（QoS 无关：`kubepods/*/pod<pod_uid>` + `lookup.py` 的容器 init 规则） |
+| **一次性（worker 启动时）** | agent 面 B | **新增**：委派 —— 把 worker 容器 cgroup 目录 + `cgroup.procs`/`cgroup.subtree_control` chown 给 65534（**`cpu.max` 不委派** ⇒ worker 抬不了自己的上限，§1.4 负例 N1；`cgroup.kill` 也不在名单里 —— 理由见 §3.2 的 `delegate_worker_subtree`）。路径由 agent 自推（QoS 无关：`kubepods/*/pod<pod_uid>` + `lookup.py` 的容器 init **+ expected worker uid** 规则 —— uid 是 k8s 上把 worker 与同 pod 的 pause 容器分开的判别式，见 §7.49） |
 | 同上 | worker | **新增**：启动自检（§3.5 保险 2）→ `mkdir worker/` → 把自己搬进去（腾空）→ `+cpu` |
 | 建箱（第一条命令触发槽位） | worker | 已有：`clone3(CLONE_NEWUSER)` → 上报 `{sandbox_id, pid}` → CP；**新增**：`mkdir sbx_<id>` → 写 `cpu.max` → 子进程 spawn 后把它的 pid 写进 `sbx_<id>/cgroup.procs` → 读回校验。**顺序仍然安全**：子进程在身份落盘前不 exec，fork 只能发生在 exec 之后（§3.2 步骤 4） |
 | 同上 | CP | **不再需要新通道**：限额来自 worker 自己的 record（`cpu_percent`），CP 不下发、不校验 |
@@ -587,10 +591,13 @@ NetworkPolicy，worker 敲不进来）；④ 对已被攻破的 CP 边际为零�
 
 **Interfaces:**
 - Produces（Task 4/6 依赖）：
-  - `ProcLookup.worker_container_cgroup(*, node_id, pid_namespace, pod_uid=None, container_id=None) -> str`
+  - `ProcLookup.worker_container_cgroup(*, node_id, worker_uid, pod_uid=None, container_id=None) -> str`
     —— **按车道**定位 worker 容器 cgroup 目录（与 `worker_uid_gid` / `host_pid` 同一套候选规则）：
     k8s 用 `pod_cgroup_token(pod_uid)`（**QoS 无关**），compose 用 `container_cgroup_token(container_id)`；
-    两边都用 `_is_container_init` 把 exec 兄弟目录排除掉。找不到 / 多于一个 ⇒ `LookupRefusal`
+    两边都用 `_is_container_init` 把 exec 兄弟目录排除掉，并且要求候选自己的 `Uid:`
+    等于 CP 下发的 `worker_uid`。找不到 / 没有候选带 expected uid / 多于一个 ⇒ `LookupRefusal`
+    （uid 判别式：k8s 上 `pod<uid>` 锚点同时命中 pause 65535 与 worker 65534 两个容器 init，
+    见 `docs/deploy-clusters.md` §7.49）
   - `c3_agent.cgroups.delegate_worker_subtree(*, mount: Path, container_cgroup: Path, worker_uid: int) -> tuple[str, ...]`
     —— 只 chown **三条：`.`（目录本身）+ `cgroup.procs` + `cgroup.subtree_control`**，返回被 chown
     的条目名；**`cpu.max` 必须在返回值之外**（§1.4 负例 N1 的钉子）。**`cgroup.kill` 也不在名单里**
@@ -598,8 +605,9 @@ NetworkPolicy，worker 敲不进来）；④ 对已被攻破的 CP 边际为零�
     它（65534），`cgroup.kill` 本来就是它的；这份委派清单只为"worker 要写它**容器** cgroup"这一件
     事开条子，多列一个 `cgroup.kill` 会让文档比实现宽（Minor 1 修正前就是这个状态）。
   - agent op `delegate-cgroup`（挂在**面 B**，与 `chown`/`rm`/`walk`/`materialize` 同一张 op 表）：
-    body `{"worker": {"node_id", "pod_uid"?, "container_id"?}}` —— **锚点按车道二选一**，与
-    `WorkerCredentials` 的 D21/D25 规则同形（k8s 传 `pod_uid`、compose 传 `container_id`）→
+    body `{"worker": {"node_id", "uid", "pod_uid"?, "container_id"?}}` —— **锚点按车道二选一**，与
+    `WorkerCredentials` 的 D21/D25 规则同形（k8s 传 `pod_uid`、compose 传 `container_id`）；
+    `uid` 必填，是 CP 节点记录里的 `worker_uid`（worker 不自称，硬规则 1/3）→
     回答 `{"op", "containerCgroup", "delegated": [...], "cpuMaxOwner": "0:0"}`
 
 - [ ] **Step 1: 写失败测试**：① 两个候选目录（容器 + exec cgroup）时**只选含容器 init 的那个**；
