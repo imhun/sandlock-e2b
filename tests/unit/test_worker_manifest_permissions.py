@@ -416,9 +416,10 @@ def test_k8s_worker_is_a_statefulset_so_its_node_ids_survive_a_restart() -> None
     is required for the stable per-pod DNS that makes the ordinals real, and
     StatefulSet updates are already delete-then-create, one pod at a time. That last
     part is also why there is no `maxSurge: 0` to look for any more -- this workload
-    declares no `requests`, so Kubernetes copies the 2-CPU limit into the request and
-    a surge pod cannot fit a 4-core node (measured 2026-09-17: a Deployment rollout
-    stalled with `0/2 nodes are available: 1 Insufficient cpu`).
+    *used to* declare no `requests`, so Kubernetes copied the 2-CPU limit into the
+    request and a surge pod could not fit a 4-core node (measured 2026-09-17: a
+    Deployment rollout stalled with `0/2 nodes are available: 1 Insufficient cpu`);
+    it now pins small explicit requests (`500m/512Mi`).
     """
     assert K8S_WORKER.startswith("apiVersion: apps/v1\nkind: StatefulSet\n")
     assert "  serviceName: worker-headless\n" in K8S_WORKER
@@ -2389,14 +2390,39 @@ def _k8s_container_env(container: dict) -> dict:
     return {entry["name"]: entry for entry in container.get("env") or []}
 
 
+#: The two resources Kubernetes' Guaranteed rule looks at (and that admission
+#: defaults, below). Anything else in a manifest -- ephemeral storage,
+#: hugepages -- is irrelevant to the pin and only widens it past the objects it
+#: is about.
+_QOS_RESOURCES = ("cpu", "memory")
+
+
 def _qos_class_from_resources(containers: list[dict]) -> str:
     """Kubernetes' own Pod QoS derivation, spelled out for the pin.
 
-    ``Guaranteed`` requires every container to write ``requests == limits`` for
-    every resource; ``BestEffort`` requires none of them to write either;
-    everything else is ``Burstable``. This is the derivation plan §3.5 pin 1
-    wants to compare the manifest's literal QoS segment against (``kubectl
-    explain pod.spec`` / ``docs/deploy-clusters.md`` name the same three).
+    The three classes, faithfully (upstream ``Resources``/``QoS``; the node
+    layout they produce is measured in plan §1.4 / ``docs/deploy-clusters.md``):
+
+    * **Guaranteed** -- every app container sets a cpu **and** a memory request
+      and limit, and each pair is equal;
+    * **BestEffort** -- no app container sets any cpu/memory request or limit;
+    * **Burstable** -- everything else.
+
+    The admission **defaulting** rule is load-bearing and is the bug this
+    derivation was fixed for (review round 1): "If you specify a limit for a
+    resource but do not specify any request, and no admission-time mechanism has
+    applied a default request for that resource, then Kubernetes copies the
+    limit you specified and uses it as the requested value." So a
+    **limits-only** container is Guaranteed-shaped (``request == limit``), *not*
+    Burstable -- which is exactly what ``deploy/k8s/worker.yaml`` was before this
+    fix. Calling it Burstable would let the pinned ``burstable`` literal point at
+    the empty cgroup kubelet fabricates for a missing QoS segment (§1.4) while
+    both assertions stayed green.
+
+    Only **app** containers are passed in (``pod["containers"]``); init
+    containers are excluded, exactly as Kubernetes excludes them from QoS. This
+    pod has no init container, and no machinery is built for sidecars -- a second
+    app container is simply folded in by the loop below.
     """
     guaranteed = True
     best_effort = True
@@ -2406,8 +2432,13 @@ def _qos_class_from_resources(containers: list[dict]) -> str:
         limits = resources.get("limits") or {}
         if requests or limits:
             best_effort = False
-        if not requests or requests != limits:
-            guaranteed = False
+        for name in _QOS_RESOURCES:
+            limit = limits.get(name)
+            # Admission copies a set limit into a missing request; a resource
+            # with no limit at all can never be Guaranteed.
+            request = requests.get(name, limit)
+            if limit is None or request != limit:
+                guaranteed = False
     if best_effort:
         return "BestEffort"
     if guaranteed:
@@ -2470,10 +2501,14 @@ def test_worker_carries_the_narrowed_writable_cgroup_view() -> None:
 def test_worker_cgroup_view_qos_segment_matches_the_derived_qos() -> None:
     """§3.5 pin 1: the literal QoS segment == the QoS `resources` derives.
 
-    The baseline worker declares a limit and no request (so it is Burstable
-    even before the k0s patch moves `requests` under `limits`). The mismatch
-    this catches is *silent* on the node (plan §1.4: kubelet fabricates the
-    missing path), so the equality has to be machine-checked here.
+    The baseline worker pins small explicit requests (`500m/512Mi`) under its
+    `2Gi`/`2` limits, so it is Burstable **on its own** -- not only after the
+    k0s overlay rewrites `resources`. Until review round 1 the baseline was
+    limits-only, which Kubernetes defaults to a Guaranteed shape (see
+    `_qos_class_from_resources`): the pinned literal would then have been true
+    only in the overlay view. The mismatch this catches is *silent* on the node
+    (plan §1.4: kubelet fabricates the missing path), so the equality has to be
+    machine-checked here.
     """
     worker = _only_doc(K8S_WORKER, "StatefulSet", "e2b-worker")
     pod = _pod_spec_of(worker)
@@ -2492,6 +2527,52 @@ def test_worker_cgroup_view_qos_segment_matches_the_derived_qos() -> None:
         )
     ]
     assert qos_paths == ["/sys/fs/cgroup/kubepods/burstable"]
+
+
+def test_qos_derivation_defaults_a_missing_request_to_its_limit() -> None:
+    """Review round 1: a **limits-only** container is Guaranteed, not Burstable.
+
+    Upstream, "If you specify a limit for a resource but do not specify any
+    request ... Kubernetes copies the limit ... and uses it as the requested
+    value", so admission turns a limits-only container into ``request ==
+    limit`` before the QoS class is computed. The first draft compared the raw
+    request and limit dicts instead, and would therefore have called the
+    baseline worker "Burstable" when the node saw "Guaranteed" -- letting the
+    ``burstable`` literal point at the empty cgroup kubelet fabricates (§1.4)
+    with every other assertion green. This is the trip wire so that
+    simplification cannot come back.
+    """
+    # The defaulting rule itself: only limits set ⇒ Guaranteed.
+    assert _qos_class_from_resources(
+        [{"resources": {"limits": {"cpu": "2", "memory": "2Gi"}}}]
+    ) == "Guaranteed"
+    # ...and the three classes it sits among, each from an unambiguous shape.
+    assert _qos_class_from_resources([{}]) == "BestEffort"
+    assert _qos_class_from_resources(
+        [
+            {
+                "resources": {
+                    "requests": {"cpu": "500m", "memory": "512Mi"},
+                    "limits": {"cpu": "2", "memory": "2Gi"},
+                }
+            }
+        ]
+    ) == "Burstable"
+    assert _qos_class_from_resources(
+        [
+            {
+                "resources": {
+                    "requests": {"cpu": "1", "memory": "1Gi"},
+                    "limits": {"cpu": "1", "memory": "1Gi"},
+                }
+            }
+        ]
+    ) == "Guaranteed"
+    # The mirror of the defaulting rule: a request with no limit is not
+    # Guaranteed (Kubernetes requires *both* halves), so it is Burstable.
+    assert _qos_class_from_resources(
+        [{"resources": {"requests": {"cpu": "1", "memory": "1Gi"}}}]
+    ) == "Burstable"
 
 
 def test_k0s_overlay_requires_the_cgroup_and_keeps_the_same_qos() -> None:

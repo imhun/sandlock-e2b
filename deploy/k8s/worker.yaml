@@ -39,10 +39,12 @@ spec:
   podManagementPolicy: Parallel
   # StatefulSet updates are delete-then-create, one pod at a time (reverse ordinal),
   # so there is no surge pod to schedule. That is also what the old `maxSurge: 0` was
-  # for: this workload declares no `requests`, so Kubernetes copies the 2-CPU limit
-  # into the request and a second pod cannot fit on a 4-core node -- measured
-  # 2026-09-17 on k0s, where a Deployment rollout stalled with
-  # `0/2 nodes are available: 1 Insufficient cpu`.
+  # for: this workload *used to* declare no `requests`, so Kubernetes copied the
+  # 2-CPU limit into the request and a second pod could not fit on a 4-core node --
+  # measured 2026-09-17 on k0s, where a Deployment rollout stalled with
+  # `0/2 nodes are available: 1 Insufficient cpu`. The container below now pins
+  # small explicit requests (500m/512Mi, the overlay's own numbers), so a surge pod
+  # would fit too; the delete-then-create strategy is what removes the question.
   updateStrategy:
     type: RollingUpdate
   selector:
@@ -672,6 +674,18 @@ spec:
             - name: E2B_CGROUP_MOUNT
               value: /pod-cgroup
           resources:
+            # N83 phase 1 / Task 2 (review round 1): explicit small requests,
+            # NOT a limits-only container. Kubernetes copies a limit into a
+            # missing request and then derives QoS **Guaranteed** from that --
+            # which would contradict the cgroup view's pinned `burstable`
+            # segment and point it at the empty cgroup kubelet fabricates for a
+            # missing QoS segment (plan §1.4). The two numbers are the same ones
+            # `deploy/k8s-k0s/worker-capacity.patch.yaml` uses, so the baseline
+            # and the overlay land on the same scheduler shape (small reserve,
+            # capacity declared through `E2B_NODE_*`).
+            requests:
+              cpu: 500m
+              memory: 512Mi
             limits:
               memory: 2Gi
               cpu: "2"
