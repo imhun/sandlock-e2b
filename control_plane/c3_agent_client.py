@@ -68,6 +68,14 @@ DEFAULT_AGENT_MAINT_PORT = 49986
 #: op vocabulary, and it is exempt from the instruction semaphore below.
 MATERIALIZE_OP = "materialize"
 
+#: N83 phase 1 (shape W): the worker's one-shot cgroup delegation. It rides
+#: face B -- the privileged executor, beside ``chown``/``rm``/``walk``/
+#: ``materialize`` -- and it is **not** a file op: the body names the worker the
+#: agent has to locate (and nothing else), and the agent derives the container
+#: cgroup, chowns the subtree (``cpu.max`` excluded) and answers. The worker
+#: never asks for a path, a uid, or a second delegation.
+DELEGATE_CGROUP_OP = "delegate-cgroup"
+
 
 def _host_source_ips(host: str) -> tuple[str, ...]:
     """The IPs a host name resolves to, for the source-IP second factor.
@@ -679,6 +687,74 @@ class C3AgentClient:
             ),
         }
         return await self._file_op(node_id, "walk", body)
+
+    async def delegate_cgroup(
+        self,
+        *,
+        node_id: str,
+        worker_container_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Instruct the node's agent to delegate the worker's cgroup subtree.
+
+        N83 phase 1 (shape W): the worker manages its own ``sbx_<id>`` cgroups
+        under its container cgroup, and the only privileged step is this
+        **one-time** handshake -- face B (root) chowns the worker's container
+        cgroup directory plus ``cgroup.procs`` / ``cgroup.subtree_control`` /
+        ``cgroup.kill`` (never ``cpu.max``), and the worker's uid then owns the
+        subtree the kernel's cgroupns + DAC already limit to its own pod.
+
+        The instruction rides **face B**, with the file-op deadline and refusal
+        handling (D22: face A is the ``uid_map`` owner; the privileged executor
+        is face B, and a shape that named no face B refuses by name rather than
+        dialling one that cannot serve it).
+
+        The body carries exactly one anchor, chosen by the deployment's lane
+        (D21 option 2 as amended by D25): ``worker_container_id`` -- present when
+        the shape defers to the kernel (compose) -- is the value the *worker*
+        reported and the *control plane's record* holds; without it (k8s) the
+        anchor is ``target.pod_uid``, which the resolver read out of the pod API
+        on the way and no request can name. A lane with neither refuses here, by
+        name: the agent could not locate the container the delegation is for,
+        and "send it anyway" is exactly the instruction that must not be sent.
+        """
+        target = self._target(node_id)
+        worker: dict[str, Any] = {"node_id": node_id}
+        if worker_container_id is not None:
+            if not validate_container_id(worker_container_id):
+                raise AgentClientError(
+                    f"the container-id anchor carried for node {node_id} is not "
+                    "a container id: refusing to instruct the agent",
+                    status_code=503,
+                )
+            worker["container_id"] = worker_container_id
+        elif target.pod_uid:
+            worker["pod_uid"] = target.pod_uid
+        else:
+            raise AgentClientError(
+                f"node {node_id} carries no anchor the agent can locate its "
+                "worker container by (compose: the worker's container id; k8s: "
+                "the worker pod uid): refusing to instruct the agent",
+                status_code=503,
+            )
+        # D22: face B's own endpoint, with its own deadline -- the same shape
+        # every privileged instruction takes. A shape that named none refuses
+        # by name here rather than dialling face A.
+        if not target.maint_url:
+            raise AgentClientError(
+                f"cannot determine the cgroup-delegation agent address for node "
+                f"{node_id} (E2B_C3_AGENT_MAINT_URL / E2B_C3_AGENT_MAINT_PORT): "
+                "refusing to instruct an agent the control plane cannot locate",
+                status_code=503,
+            )
+        return await self._instruct(
+            target,
+            node_id,
+            DELEGATE_CGROUP_OP,
+            {"worker": worker},
+            url=target.maint_url,
+            refusal="refused the cgroup delegation",
+            timeout_tail="the cgroup delegation is fail-closed",
+        )
 
     async def materialize(
         self,
