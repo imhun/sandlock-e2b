@@ -620,39 +620,27 @@ def test_the_worker_profile_never_denies_clone3() -> None:
     assert len(allowed) >= 1, "clone3 must be explicitly allowed"
 
 
-def test_the_worker_profile_admits_unshare_only_for_the_slot_handshake() -> None:
-    """N80: `unshare` has exactly one caller left, and it is not the engine's.
+def test_the_worker_profile_denies_unshare_outright() -> None:
+    """N80: nothing in the worker calls unshare any more.
 
     The engine creates the user, PID, mount and network namespaces with one
-    clone3 call, and both capability probes (the seccomp self-check and the
-    real-root check) were rewritten to probe with clone3. What is left is
-    route B's slot identity handshake: it unshares CLONE_NEWUSER so that the
-    process about to exec `sandlock-supervise` is the one inside the namespace
-    -- the opposite of what clone3 does, which puts a *child* there. One
-    masked single-bit rule admits it; NEWPID, NEWNS, NEWNET and the
-    cgroup/uts/ipc trio fall through to defaultAction.
+    clone3 call. The two capability probes (the seccomp self-check and the
+    real-root check) were rewritten to probe with clone3. And route B's slot
+    identity handshake -- the last caller -- creates its user namespace with
+    clone3 too: it waits for the granted identity *without* exec'ing, because
+    `execve` clears the fresh namespace's capabilities, which is exactly what
+    `setresuid(X)` needs. All three arms are measured in
+    `deploy/scripts/acceptance/probe_slot_clone3_shape.py`.
 
-    A second entry, a widened mask, or a rule that stops being masked is the
-    change this test catches.
-
-    This rule is **terminal, not debt**: a clone3 handshake was probed and
-    rejected (`deploy/scripts/acceptance/probe_slot_clone3_shape.py`). clone3
-    puts the namespaces on the child, and `execve` then clears the fresh user
-    namespace's capabilities -- the uid is still unmapped, so the process has
-    no valid identity there -- which is exactly the CAP_SETUID the handshake
-    needs for `setresuid(X)` once the grant lands. Measured both ways: without
-    the exec the same `uid_map` write succeeds. `unshare` keeps the
-    capabilities because it enters the namespace *after* exec.
+    With no caller left, the profile denies the call through defaultAction and
+    the masked rules are gone. A `unshare` entry reappearing means a caller
+    came back; that is the change this test catches.
     """
     profile = json.loads(WORKER_SECCOMP_TEXT)
     entries = [group for group in profile["syscalls"] if "unshare" in group["names"]]
-    assert [group["names"] for group in entries] == [["unshare"]]
-    assert entries[0]["action"] == "SCMP_ACT_ALLOW"
-    assert not entries[0].get("includes") and not entries[0].get("excludes")
-    assert entries[0]["args"] == [
-        {"index": 0, "value": 268435456, "valueTwo": 268435456,
-         "op": "SCMP_CMP_MASKED_EQ"}
-    ]
+    assert entries == [], (
+        f"unshare must be denied by defaultAction: no caller is left, got {entries}"
+    )
 
 
 def test_seccomp_installer_rolls_when_the_profile_changes() -> None:

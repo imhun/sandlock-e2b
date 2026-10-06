@@ -173,14 +173,33 @@ def test_the_pool_never_gets_a_broker_spawner(monkeypatch: pytest.MonkeyPatch) -
     assert agent_grant.identity_reporter is not None
 
 
-def test_the_child_is_started_without_any_privileged_helper() -> None:
-    """The child's argv is our own unshare-and-poll helper, nothing else.
+def test_the_child_comes_from_clone3_and_the_parent_half_never_execs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No privileged helper, and no ``python -m`` hop either.
 
     ``e2b-slot-spawn`` (the broker) and ``setpriv`` are what the *old* path
     needed; this one must not reach for either -- the worker is unprivileged and
-    the identity comes from the agent.
+    the identity comes from the agent. N80 (2026-10-06) also dropped the
+    ``python -m envd_service.slot_identity`` hop: ``clone3`` creates the child
+    inside the namespace, so the only thing that ever execs is
+    ``sandlock-supervise``, and it does so in the child half.
     """
-    argv = si.child_argv(
+    import envd_service.slot_identity as si
+
+    cloned: list[str] = []
+
+    def _fake_clone3() -> int:
+        cloned.append("clone3")
+        # The parent half: a pid that is not our child, so poll() reports it
+        # gone instead of blocking the test.
+        return 999_999
+
+    executed: list[tuple] = []
+    monkeypatch.setattr(si, "_clone3_new_user_namespace", _fake_clone3)
+    monkeypatch.setattr(si.os, "execvpe", lambda *a, **k: executed.append(a))
+
+    process = si.spawn_child(
         uid=20001,
         supervise_argv=[
             "/wheels/sandlock/bin/sandlock-supervise",
@@ -188,30 +207,19 @@ def test_the_child_is_started_without_any_privileged_helper() -> None:
             "/tmp/policy.json",
             "--uid",
             "20001",
-            "--control-fd",
-            "7",
         ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
-    assert argv[:3] == [sys.executable, "-m", "envd_service.slot_identity"]
-    assert argv[3:6] == ["--uid", "20001", "--"]
-    assert argv[6] == "/wheels/sandlock/bin/sandlock-supervise"
-    assert "setpriv" not in argv
-    assert not any("e2b-slot-spawn" in arg for arg in argv)
-
-    # With the handshake (the production form): the descriptor comes before the
-    # ``--`` separator, and the slot's own argv is untouched after it.
-    with_fd = si.child_argv(
-        uid=20007,
-        supervise_argv=["/wheels/sandlock/bin/sandlock-supervise", "--uid", "20007"],
-        unshared_fd=9,
-    )
-    assert with_fd[3:7] == ["--uid", "20007", "--unshared-fd", "9"]
-    assert with_fd[7:] == [
-        "--",
-        "/wheels/sandlock/bin/sandlock-supervise",
-        "--uid",
-        "20007",
-    ]
+    try:
+        assert cloned == ["clone3"]
+        assert process.pid == 999_999
+        # The parent half hands the child its stdio and returns; it never execs.
+        assert executed == []
+        assert process.stderr is not None
+    finally:
+        process.kill()
+        process.stderr.close()
 
 
 # ------------------------------------------------------------- the report itself
@@ -371,159 +379,6 @@ def test_the_worker_has_neither_the_agents_address_nor_its_token() -> None:
 
 
 # ------------------------------------------------------------ the pool's wiring
-
-
-def _fake_child(si_module, monkeypatch, body: str):
-    """Make ``child_argv`` produce a stand-in child with a controlled body.
-
-    The real child is ``python -m envd_service.slot_identity``; a stand-in whose
-    signal time the test controls is how the ordering claim becomes measurable
-    instead of a coin flip. The lane that runs the *real* child is
-    ``tests/contract/test_c3_slot_identity_grant.py``.
-    """
-
-    def _argv(*, uid: int, supervise_argv, unshared_fd: int | None = None):
-        fd = -1 if unshared_fd is None else unshared_fd
-        return [sys.executable, "-c", body.replace("__FD__", str(fd))]
-
-    monkeypatch.setattr(si_module, "child_argv", _argv)
-
-
-class _RecordedPopen:
-    """Records every Popen the module starts, so a killed child is visible."""
-
-    instances: list["_RecordedPopen"] = []
-
-    def __init__(self, *args, **kwargs) -> None:
-        self.inner = _REAL_POPEN(*args, **kwargs)
-        type(self).instances.append(self)
-
-    def __getattr__(self, name):
-        return getattr(self.inner, name)
-
-
-def test_the_starter_returns_only_after_the_child_signals_its_unshare(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """D11: the report must follow the child's ``unshare``, not its ``execve``.
-
-    ``Popen`` returns when the child has *exec'd*; the child's ``unshare``
-    happens later, inside the child module. Reporting on the spawn therefore
-    races the grant -- and when the grant wins, ``as_uid`` sees the initial
-    namespace's full-range map and refuses, so the create fails. The child here
-    signals after a known delay, and the starter must still be inside its
-    handshake when that delay has not elapsed.
-    """
-    import envd_service.slot_identity as si
-
-    delay = 0.4
-    _fake_child(
-        si,
-        monkeypatch,
-        "import os, time\n"
-        f"time.sleep({delay})\n"
-        "os.write(__FD__, b'x')\n"
-        "os.close(__FD__)\n"
-        "time.sleep(60)\n",
-    )
-    started = time.monotonic()
-    process = si.spawn_child(
-        uid=20001,
-        supervise_argv=[sys.executable, "-c", "pass"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    elapsed = time.monotonic() - started
-    try:
-        # It waited for the signal: a starter that reported on the spawn alone
-        # would be back in a few milliseconds.
-        assert elapsed >= delay
-    finally:
-        process.kill()
-        process.wait(timeout=10)
-
-
-def test_a_child_that_never_signals_is_named_and_killed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A child wedged before ``unshare`` fails the create by name, not a hang."""
-    import envd_service.slot_identity as si
-
-    _fake_child(si, monkeypatch, "import time; time.sleep(60)\n")
-    monkeypatch.setattr(si, "unshared_timeout_s", lambda: 0.3)
-    monkeypatch.setattr(si.subprocess, "Popen", _RecordedPopen)
-    _RecordedPopen.instances = []
-    with pytest.raises(si.UnshareHandshakeError) as excinfo:
-        si.spawn_child(
-            uid=20001,
-            supervise_argv=[sys.executable, "-c", "pass"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-    assert str(excinfo.value) == (
-        f"the slot child (pid {_RecordedPopen.instances[0].pid}) did not report "
-        "its user namespace within 0.3s: refusing (the identity grant would "
-        "race the unshare)"
-    )
-    # Nothing was left behind to poll setresuid forever.
-    assert _RecordedPopen.instances[0].inner.wait(timeout=10) == -signal.SIGKILL
-
-
-def test_a_child_that_dies_before_signalling_is_named(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """EOF on the handshake is "the child is gone", and it says so."""
-    import envd_service.slot_identity as si
-
-    _fake_child(si, monkeypatch, "raise SystemExit(3)\n")
-    monkeypatch.setattr(si.subprocess, "Popen", _RecordedPopen)
-    _RecordedPopen.instances = []
-    with pytest.raises(si.UnshareHandshakeError) as excinfo:
-        si.spawn_child(
-            uid=20001,
-            supervise_argv=[sys.executable, "-c", "pass"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-    assert str(excinfo.value) == (
-        f"the slot child (pid {_RecordedPopen.instances[0].pid}) exited before "
-        "reporting its user namespace: refusing"
-    )
-
-
-def test_the_pool_reports_only_after_the_childs_handshake(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The two together: the CP is told about a child that has already unshared."""
-    import envd_service.slot_identity as si
-
-    delay = 0.4
-    _fake_child(
-        si,
-        monkeypatch,
-        "import os, time\n"
-        f"time.sleep({delay})\n"
-        "os.write(__FD__, b'x')\n"
-        "os.close(__FD__)\n"
-        "time.sleep(60)\n",
-    )
-    marks: list[float] = []
-
-    def _reporter(sandbox_id: str, pid: int):
-        marks.append(time.monotonic())
-        return {"status": "ok"}
-
-    pool, _spawned, order, _reports = _pool(
-        tmp_path, spawner=None, identity_reporter=_reporter
-    )
-    started = time.monotonic()
-    handle = pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
-    try:
-        assert len(marks) == 1
-        assert marks[0] - started >= delay
-    finally:
-        handle.process.kill()
-        handle.process.wait(timeout=10)
 
 
 def test_the_register_and_heartbeat_payloads_carry_the_identity(

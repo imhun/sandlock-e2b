@@ -52,23 +52,6 @@
 	"syscalls": [
 		{
 			"names": [
-				"unshare"
-			],
-			"action": "SCMP_ACT_ALLOW",
-			"args": [
-				{
-					"index": 0,
-					"value": 268435456,
-					"valueTwo": 268435456,
-					"op": "SCMP_CMP_MASKED_EQ"
-				}
-			],
-			"comment": "N80: the one caller left is route B's slot identity handshake (envd_service/slot_identity.py) -- it unshares CLONE_NEWUSER so that the process about to exec `sandlock-supervise` is the one inside the namespace. A clone3 handshake was probed and REJECTED (deploy/scripts/acceptance/probe_slot_clone3_shape.py): clone3 puts the namespace on the child, and execve then clears the fresh user namespace's capabilities -- the uid is still unmapped, so the process has no valid identity there -- which is exactly the CAP_SETUID the handshake needs to setresuid(X) once the grant lands (measured: without exec the same write succeeds). unshare keeps them because it enters the namespace *after* exec. NEWPID, NEWNS, NEWNET and the cgroup/uts/ipc trio still fall through to defaultAction.",
-			"includes": {},
-			"excludes": {}
-		},
-		{
-			"names": [
 				"_llseek",
 				"_newselect",
 				"accept",

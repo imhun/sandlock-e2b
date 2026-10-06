@@ -226,20 +226,20 @@ def _spawn_slot_identity(
     stderr,
     control_fd: int | None = None,
     events_fd: int | None = None,
-) -> subprocess.Popen:
-    """The C3 starter: fork a child that unshares and waits for its identity.
+) -> "SlotProcess":
+    """The C3 starter: clone3 a child into its own user namespace, then wait.
 
     No root, no ``setpriv``, no file-capability broker. The child
-    (:mod:`envd_service.slot_identity`) unshares a user namespace and polls
-    ``setresuid(X)``; the pool reports its container pid to the control plane,
-    which instructs agent face A to write the map. The child is the one that
-    execs ``sandlock-supervise`` -- so the process tree, the cgroup and the
-    session stay the worker's (hard rule 1).
+    (:mod:`envd_service.slot_identity`) is created by ``clone3(CLONE_NEWUSER)``
+    and polls ``setresuid(X)``; the pool reports its container pid to the
+    control plane, which instructs agent face A to write the map. The child is
+    the one that execs ``sandlock-supervise`` -- so the process tree, the cgroup
+    and the session stay the worker's (hard rule 1).
 
-    It returns only **after** the child's handshake byte (D11): reporting on the
-    spawn alone races the child's ``unshare``, and a grant that wins that race is
-    refused by face A ("this pid has not unshared a user namespace"), which is an
-    intermittent create failure.
+    N80 (2026-10-06): this used to return only after a handshake byte proving
+    the child had unshared. ``clone3`` makes that proof unnecessary -- it
+    returns only once the namespace exists -- so the report may go out as soon
+    as this returns, and D11's race has no window left to live in.
     """
     from envd_service.slot_identity import spawn_child
 

@@ -108,6 +108,60 @@ PARENT = textwrap.dedent(
 
 
     arm("B exec-first", exec_then_write)
+
+    def wait_then_exec():
+        # Arm C: the shape the slot would actually take -- clone3 puts us in the
+        # namespace, this process does NOT exec, it polls for the identity the
+        # parent is writing, then execs. Caps are still ours (arm A proved it),
+        # so setresuid works once the map lands.
+        import time
+
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                os.setresgid(real_uid, real_uid, real_uid)
+                os.setresuid(real_uid, real_uid, real_uid)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    print("C wait-then-exec: identity never landed", flush=True)
+                    os._exit(4)
+                time.sleep(0.05)
+        print(
+            "C wait-then-exec: identity landed uid=%d, execing" % os.getuid(),
+            flush=True,
+        )
+        os.execvpe(
+            sys.executable,
+            [sys.executable, "-c", "import os; print('C POST-EXEC uid=%d' % os.getuid())"],
+            os.environ,
+        )
+        os._exit(9)
+
+
+    # Arm C needs the parent to write the child's maps (the agent's job in the
+    # real path: `as_uid` writes `<uid> <uid> 1`). The worker is the userns
+    # owner, so writing its own ids is allowed -- same rule `as_uid` relies on.
+    pid, err = clone()
+    if pid < 0:
+        print("C wait-then-exec: FAIL clone3 errno=%d (%s)" % (err, os.strerror(err)))
+    elif pid == 0:
+        wait_then_exec()
+    else:
+        try:
+            with open("/proc/%d/setgroups" % pid, "w") as fh:
+                fh.write("deny")
+            with open("/proc/%d/uid_map" % pid, "w") as fh:
+                fh.write("%d %d 1\\n" % (real_uid, real_uid))
+            with open("/proc/%d/gid_map" % pid, "w") as fh:
+                fh.write("%d %d 1\\n" % (real_gid, real_gid))
+            print("C parent: maps written for pid=%d" % pid, flush=True)
+        except OSError as exc:
+            print(
+                "C parent: map write errno=%d %s" % (exc.errno, exc.strerror),
+                flush=True,
+            )
+        os.waitpid(pid, 0)
     """
 )
 
