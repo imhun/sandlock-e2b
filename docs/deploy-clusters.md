@@ -2959,6 +2959,59 @@ worker-1,worker-2,worker-3 --worker-exec-template 'docker exec -i n83acc2-{node}
 末尾一行 `"ok": true`）。**首次 create 可能撞 `428: warm_required`**（base 镜像正在目标节点上预热）——
 稍等片刻用同一条命令重跑即绿。→ `docker compose -p n83acc2 … down`。
 
+### 7.49 上线尝试：N83 Phase 1 滚 k0s —— **第二段被拒，已回退；集群停在"新镜像 + 车道 off"**（2026-10-06，版本 `0.1.0-1084-gc9f347c-20261006-190506`）
+
+**结论先说**：镜像构建/推送、第一段（`off`）滚动与冒烟都通过；**第二段（`required`）在 k8s 上暴露一个
+只在 k8s 存在的定位缺陷** —— agent 的委派 op 具名拒绝了，车道永远起不来，于是**建箱能成功、第一条命令
+被拒**（`cgroup-refusal setup-not-run`）⇒ 线上跑不了命令。按 §7.48 的回退杆**立刻翻回 `off` 并 apply**，
+集群恢复（回退后冒烟 `rollback-ok-aarch64` 通过）。**当前线上状态 = 新镜像（含全部 N83 代码）+ 车道
+`off`（惰性）**，即"代码已发布、功能未启用"。**没有**任何沙箱 cgroup 被创建过。
+
+**做过什么（按序）**
+
+1. `main` 合并 N83 Phase 1（merge `c9f347c`，26 提交，其中非本次的 4 个都是纯文档）；
+   `git log --oneline b98f5aa..HEAD` 核对过：**不含别人未发布的代码**（§7.46.1 的纪律）。
+2. `deploy/scripts/build-and-push.sh` ⇒ **`0.1.0-1084-gc9f347c-20261006-190506`**（多架构，含 base image
+   mirror 重建），已推 ACR；`deploy/stack/.version` 同步。
+3. **第一段**：覆盖层临时 `off` → `DRY_RUN=1 apply.sh` 看差异（`configmap/sandlock-worker-seccomp`
+   **unchanged** ⇒ 与 seccomp profile 无耦合）→ `apply.sh`（agent 先、worker 后、base image 预热）。
+   **冒烟通过**：建箱 `sbx_69741f7a51e046c1`、`echo smoke-$(uname -m)` ⇒ `smoke-aarch64`、`python3 -c 'print(2+2)'`
+   ⇒ `4`（exit 0）、files API 正常（`workspace` owner `10000:65534`）、kill 正常。
+4. **第二段**：覆盖层翻回 `required` → `apply.sh` ⇒ worker 滚到 revision `e2b-worker-54db6c6996`。
+   **核验发现三件事**：① 收窄成立（worker 的 `/pod-cgroup` 只有本 pod 目录 + 一个容器目录，
+   `kubepods`/`docker`/`init.scope`/`system.slice` 全**看不到**）；② 但**自己的容器 cgroup 属主仍是 `0`**、
+   `cgroup.procs`/`subtree_control` 写是 `Permission denied` ⇒ **委派根本没落地**；③ 建箱**成功**、
+   第一条命令被拒 —— 因为门在 route-B 槽位（第一条命令才建槽，§7.48 坑 3）。
+5. 根因来自 worker 日志（具名）：`the agent for node e2b-worker-0 refused the cgroup delegation:
+   worker e2b-worker-0's container anchor matches more than one container-init process: refusing (ambiguous)`。
+6. **回退**：覆盖层翻回 `off` → `apply.sh` ⇒ worker 回到 revision `e2b-worker-775c5449b8`，冒烟恢复。
+
+**根因（实测，不是推断）**：在节点上按 agent 的判据枚举（cgroup 含 `pod<uid>` 且 `NSpid` 末位为 1）命中
+**两个**进程 ——
+
+| pid | uid | cgroup | cmd |
+|---|---|---|---|
+| 80107 | **65535** | `…/pod<uid>/668b76ca…` | `/pause` （k8s 的 sandbox/pause 容器） |
+| 80138 | **65534** | `…/pod<uid>/d6caee90…` | `python -m envd_service` （worker 本体） |
+
+Task 3 的定位规则（`c3_agent/lookup.py::worker_container_cgroup`）只按 **pod uid 锚点 + 容器 init** 选
+候选，**没有再区分**，于是两个都命中 ⇒ 具名拒绝（`ambiguous`）。**fail-closed 的方向是对的**（宁可拒绝
+也不猜），缺的是**第二个判别式**。compose 车道抓不到这个缺陷：它的锚点是**容器 id**（精确），而且没有
+pause 容器 —— 这是"本地全绿 ≠ 线上成立"的一个具体案例，也说明 §7.48 的 Step 3"线上只复验形状事实"
+那一步不能省。
+
+**修法（待做，尚未实施）**：给委派再加一个判别式 —— **worker 的 uid**。CP 的节点记录里已经有这个值
+（`worker_uid`，由 worker 上报、且是 CP 侧验证过的），把它随委派指令下发；agent 在"锚点 + 容器 init"
+之上再要求候选的 **uid 相符** ⇒ 上表只剩 worker 那一行（65534），pause（65535）被排除。要点：
+① uid 由 **CP 命名**（不给 worker 自称的机会，与硬规则 1/3 一致）；② 零候选/多候选仍然具名拒绝；
+③ 必须补一条**用 k8s 形状（pause 65535 + worker 65534 两个候选）**的单测 —— 现有单测是单候选形状，
+所以它绿着也没发现这件事；④ 按 `AGENTS.md`，修完先在**本地 compose 车道**复跑五条验收，再重新构建、
+再走两段式上线。
+
+**回退杆复核（本次实际用过，有效）**：`deploy/k8s-k0s/worker-capacity.patch.yaml:41-42` 的
+`E2B_SANDBOX_CGROUP` 翻回 `"off"` + `apply.sh` ⇒ 行为逐字节回到 Phase 1 之前；**没有**需要额外清理的
+cgroup（这一版从未建过 `sbx_*`）。集群与用户的本地 `compose` 栈都没有别的改动。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
