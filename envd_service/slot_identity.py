@@ -112,6 +112,27 @@ def _close_fds_except(keep: set[int]) -> None:
             pass
 
 
+def _keep_inheritable(fds: Sequence[int]) -> None:
+    """Clear close-on-exec on the descriptors the slot is handed.
+
+    ``subprocess.Popen(pass_fds=...)`` did this for the old starter, and the
+    clone3 one replaced ``Popen`` without it. Python builds the slot's control
+    and events channels with ``socket.socketpair()``, which is ``O_CLOEXEC``:
+    a descriptor ``_close_fds_except`` deliberately kept would still be closed
+    by the child's ``execve``, and ``sandlock-supervise`` would find
+    ``--control-fd`` gone ("control fd N is not open: Bad file descriptor").
+    clone3 copies the descriptor table but changes no flags, so the starter
+    clears them itself -- in the child, whose table is its own copy.
+    """
+    for fd in fds:
+        try:
+            os.set_inheritable(fd, True)
+        except OSError:
+            # Already closed on the worker's side: the slot's own failure names
+            # the descriptor it wanted, which beats a silent substitution.
+            pass
+
+
 class SlotProcess:
     """The slot's child, in place of the ``Popen`` this used to return.
 
@@ -175,7 +196,7 @@ DEFAULT_TIMEOUT_S = 30.0
 #: (worker → CP → agent → kernel).
 POLL_INTERVAL_S = 0.05
 
-def timeout_s() -> float:
+def identity_wait_timeout_s() -> float:
     """``E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S`` (seconds, default 30).
 
     Deliberately not the same knob as the worker→CP report deadline
@@ -183,6 +204,11 @@ def timeout_s() -> float:
     round trip (report → CP → agent → kernel), so its bound has to be the
     outer one. Two names keep a tightened report deadline from silently cutting
     the child's wait short.
+
+    Named apart from ``spawn_child``'s ``timeout_s`` argument on purpose: the
+    argument shadows this function inside that body, and calling the argument
+    (``None`` by default, and route B never passes one) as if it were the helper
+    killed every child with ``os._exit(4)`` before its first ``setresuid``.
     """
     raw = os.getenv("E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S")
     if not raw:
@@ -289,7 +315,12 @@ def spawn_child(
             os.close(stderr_reader)
             os.close(stderr_writer)
             _close_fds_except({0, 1, 2, *pass_fds})
-            limit = timeout_s() if timeout_s is None else float(timeout_s)
+            _keep_inheritable(pass_fds)
+            limit = (
+                identity_wait_timeout_s()
+                if timeout_s is None
+                else float(timeout_s)
+            )
             if not _await_identity(uid, deadline_s=limit):
                 os._exit(3)
             os.execvpe(argv[0], argv, env if env is not None else os.environ)

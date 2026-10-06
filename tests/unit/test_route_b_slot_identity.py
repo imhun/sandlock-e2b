@@ -222,6 +222,131 @@ def test_the_child_comes_from_clone3_and_the_parent_half_never_execs(
         process.stderr.close()
 
 
+def _drive_the_child_half(monkeypatch: pytest.MonkeyPatch, *, pass_fds=()):
+    """Run ``spawn_child`` as the clone3 child and report what it reached.
+
+    The child half only runs when ``_clone3_new_user_namespace`` returns 0, and
+    it ends in ``os._exit``/``execvpe``. Both are replaced here so the test can
+    see the order instead of dying with the child.
+    """
+    import envd_service.slot_identity as si
+
+    class _ChildFinished(Exception):
+        """Unwinds the child half at its own ``os._exit``."""
+
+    monkeypatch.setattr(si, "_clone3_new_user_namespace", lambda: 0)
+    monkeypatch.setattr(si, "_close_fds_except", lambda keep: None)
+    monkeypatch.setattr(si.os, "dup2", lambda fd, target: None)
+
+    polls: list[float] = []
+    executed: list[tuple] = []
+    exits: list[int] = []
+
+    def _fake_await(uid: int, *, deadline_s: float, **kwargs) -> bool:
+        polls.append(deadline_s)
+        return True
+
+    def _fake_exit(code: int) -> None:
+        exits.append(code)
+        raise _ChildFinished(code)
+
+    monkeypatch.setattr(si, "_await_identity", _fake_await)
+    monkeypatch.setattr(
+        si.os,
+        "execvpe",
+        lambda file, *a, **k: executed.append(
+            (file, a[0], {fd: os.get_inheritable(fd) for fd in pass_fds})
+        ),
+    )
+    monkeypatch.setattr(si.os, "_exit", _fake_exit)
+
+    with pytest.raises(_ChildFinished):
+        si.spawn_child(
+            uid=20001,
+            supervise_argv=["/wheels/sandlock/bin/sandlock-supervise"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            pass_fds=pass_fds,
+        )
+    return polls, executed, exits
+
+
+def test_the_child_half_reaches_the_poll_with_the_modules_own_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The child must not call its own ``timeout_s`` parameter as a helper.
+
+    ``spawn_child``'s ``timeout_s`` argument shadows the module function of the
+    same name; the default path called the *argument* -- ``None`` -- as if it
+    were the helper, so every real child (route B never passes the argument)
+    died with ``os._exit(4)`` before its first ``setresuid``. The worker still
+    reported the pid, the agent then aimed ``as_uid`` at a dead process, and the
+    create failed with "cannot write uid_map for pid N: Permission denied": a
+    reaped task's id-map files are root-owned, so a 65534 grantor cannot even
+    open them.
+    """
+    monkeypatch.setenv("E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S", "7.5")
+
+    polls, executed, exits = _drive_the_child_half(monkeypatch)
+
+    assert exits == [9], "the child must reach exec, not die on the way there"
+    assert polls == [7.5], "the env knob must be read through the helper"
+    assert executed == [
+        (
+            "/wheels/sandlock/bin/sandlock-supervise",
+            ["/wheels/sandlock/bin/sandlock-supervise"],
+            {},
+        )
+    ]
+
+
+def test_the_child_half_defaults_to_the_module_default_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shipped path: route B passes no ``timeout_s`` at all."""
+    monkeypatch.delenv("E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S", raising=False)
+
+    polls, _executed, exits = _drive_the_child_half(monkeypatch)
+
+    assert exits == [9]
+    assert polls == [si.DEFAULT_TIMEOUT_S]
+
+
+def test_the_child_half_clears_close_on_exec_for_the_slots_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``pass_fds`` must survive the child's ``execve``.
+
+    ``subprocess.Popen(pass_fds=...)`` cleared close-on-exec on those
+    descriptors; the clone3 starter replaced ``Popen`` but not that step.
+    Python builds the slot's control and events channels with
+    ``socket.socketpair()``, which is ``O_CLOEXEC``, so the descriptors
+    ``_close_fds_except`` deliberately kept were still closed by ``execvpe`` --
+    ``sandlock-supervise`` then died with "control fd 21 is not open: Bad file
+    descriptor", and the create failed with "route-B slot ... exited before
+    answering on control fd".
+    """
+    reader, writer = os.pipe()
+    try:
+        assert os.get_inheritable(writer) is False
+
+        _polls, executed, exits = _drive_the_child_half(
+            monkeypatch, pass_fds=(writer,)
+        )
+
+        assert exits == [9]
+        assert executed == [
+            (
+                "/wheels/sandlock/bin/sandlock-supervise",
+                ["/wheels/sandlock/bin/sandlock-supervise"],
+                {writer: True},
+            )
+        ]
+    finally:
+        os.close(reader)
+        os.close(writer)
+
+
 # ------------------------------------------------------------- the report itself
 
 

@@ -9,6 +9,13 @@
 真实路径里 map 由 agent face A 写（`as_uid`），这里用非特权自映射替代 —— 那一段没变，
 本探针只回答“clone3 + 立刻 exec 这条链成不成立”。
 
+**它答对了内核那一问，但不要把它当成端到端证据。** 2026-10-06 的现场是：本探针 C 臂全绿，
+而真实 `spawn_child` 每次建箱必失败（`as_uid: refused: cannot write uid_map … Permission
+denied`）—— 因为那条路径上有一个与内核无关的 Python 缺陷（`spawn_child` 的形参 `timeout_s`
+遮蔽同名模块函数 ⇒ 子进程在第一次 `setresuid` 之前就 `os._exit(4)`，agent 于是打一个已死的
+pid，僵尸的 id-map 文件属主是 root ⇒ EACCES）。要验真实路径请直接驱动
+`envd_service.slot_identity.spawn_child`（`tmp/n80/spawn_child_probe.py` 是那种探针）。
+
 必须在 worker 容器里跑（真实 seccomp 档 + 真实线程形态）：
 
     deploy/scripts/open-cluster-tunnel.sh

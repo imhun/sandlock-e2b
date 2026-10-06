@@ -2739,6 +2739,34 @@ worker + control-plane（本意是避开并发会话还没上线的 seccomp prof
 `cherry-pick` 本版提交），再 `set image` 定位升级 —— 本次 Phase 0 正是这么上的。
 另外：临时把 `E2B_SANDBOX_NOTIFY_RATE_LIMIT` 置 0 的那次实验（N82 的"关掉限流"读数）已原样撤回。
 
+#### 7.46.2 更正：那次 `as_uid … Permission denied` 的根因不是 profile（2026-10-06 查穿）
+
+上面把症状归给"镜像比 seccomp 档新"，**这条归因是错的**。同一症状 2026-10-06 在本地 compose 栈上
+按分钟级复现并被查穿：真正的原因是 `4e3a7db` 引入的代码缺陷 —— `envd_service/slot_identity.py::spawn_child`
+的形参 `timeout_s` **遮蔽**了同名模块函数 `timeout_s()`，而默认路径（route B 从不传该参数）写成
+`limit = timeout_s() if timeout_s is None else float(timeout_s)` ⇒ 调用的其实是那个 `None` 形参，
+`TypeError` 落到子进程的 `except BaseException: os._exit(4)`。于是：
+
+1. worker 的 clone3 子进程**在第一次 `setresuid` 轮询之前就死了**（实测 `handle.poll() == 4`）；
+2. worker 照样把 pid 报给控制面（`clone3` 已返回，报告不再等握手字节 —— 那正是这次改动的一部分）；
+3. `as_uid` 于是写一个**已死进程**的 map。僵尸的 `task->mm` 已清空，`fs/proc/base.c::task_dump_owner()`
+   对 `mode != (S_IFDIR|S_IRUGO|S_IXUGO)` 且 `get_dumpable(mm) != SUID_DUMP_USER` 的进程把 id-map 文件
+   的属主记为 **uid 0**；65534 的 `as_uid` 因此在 `open(O_WRONLY)` 就吃 **EACCES**（"Permission denied"），
+   根本走不到 `map_write()` 那层判据（那层只会给 EPERM —— 出错号不同正是当初误判的线索）。
+
+同一次改动还漏了 `subprocess.Popen(pass_fds=…)` 替调用方做的另一件事：清 `O_CLOEXEC`。Python 的
+`socket.socketpair()` 默认非继承，`_close_fds_except` 虽然把控制 fd 留着，`execve` 仍会关掉它，
+`sandlock-supervise` 随即报 `control fd N is not open: Bad file descriptor`。
+
+**实测位置**（都在本地 compose 三 worker 栈上）：子进程侧打点 `owner[before/after]` + 轮询循环、
+父进程侧 20 Hz 观察 `/proc/<pid>/uid_map` 属主（翻转发生在进程**退出**那一刻，0:0 = 僵尸），
+以及独立驱动真实 `spawn_child`（`handle.poll()` → 4，伴随子进程 traceback）。
+**修法**：模块函数改名为 `identity_wait_timeout_s()`（不再与形参同名）+ 新增
+`_keep_inheritable(pass_fds)`，两条钉子用例在 `tests/unit/test_route_b_slot_identity.py`。
+修复后本地：三 worker 栈 **`MULTI-NODE SMOKE OK`**、kill 后预约 0/0/0、`sandlock-supervise`
+实测以沙箱自己的宿主 uid 在跑。**"镜像与 seccomp 档同批"仍然是该守的纪律**（旧镜像 + 新档会把
+route B 的 unshare 直接拒掉），但它不是这次故障的原因。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
