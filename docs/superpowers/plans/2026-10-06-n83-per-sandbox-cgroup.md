@@ -52,6 +52,44 @@ op 表，是权限面最小的一步。
 - **内存语义变化要写进文档**：`memory.max` 超限是 OOM kill，今天是 mmap 记账回 ENOMEM；
   建议 `memory.high` 节流 + `memory.max` 兜底，记账保留给**虚拟化**（`/proc/meminfo`、`sysinfo`）。
 
+## 安全风险（2026-10-06 实测后写死；这是批准 Phase 1 时要一起看的）
+
+**结论先说：它不给沙箱开新的逃逸面 —— 新增的风险全在"节点 root 组件多出来的一类权力"和"那块 rw
+挂载的范围"上。**
+
+**今天 agent 对沙箱进程是只读的（实测）**：`CapEff = 0x0b`（只有 `CHOWN|DAC_OVERRIDE|FOWNER`，
+**没有 `CAP_KILL`/`CAP_SYS_PTRACE`/`CAP_SYS_ADMIN`**）；即便 uid 0，对池 uid（10000+）的
+`sandlock-superv` 做 `kill -0` / `kill -TERM` 都是 **EPERM**，但 `cat /proc/<pid>/status` 可以。
+⇒ cgroup 写权限把它从"能读、能在五根白名单里改文件"变成"**能节流、能 OOM、能杀**"——这是一类**新的
+权力**，不是同类的加量。
+
+**不新增的**：① 沙箱自己拿不到任何东西（它的挂载命名空间里没有 cgroupfs，写不了自己的限额；`/proc/self/cgroup`
+本来就只读可看）；② pod/节点限额不被削弱（每箱 cgroup 是**嵌套**子节点，pod 的 4 核/4 GiB 仍然生效，
+取二者较小）；③ 可达性不变（op 仍走 CP→agent 的 token + NetworkPolicy，worker 敲不进来）；④ 对已被
+攻破的 CP 边际为零（它本来就能 `DELETE /sandboxes/{id}`）。
+
+**真正的风险点，按严重度排**：
+
+1. **挂载范围**：hostPath 无法指向"动态的每 pod 路径"（pod uid 每次都变），所以现实里只能挂
+   `/sys/fs/cgroup/kubepods.slice`（含 kube-system 的 pod）或整棵 cgroupfs ⇒ **代码里的白名单是唯一
+   收窄**，一个路径解析 bug 就等于"能节流/杀掉本节点任意 pod 的进程"。
+2. **白名单必须在解析后的路径上做**（`c3_agent/priv/priv_common.c` 已经踩过这个坑：符号链接/`..` 都要先
+   解析再比较），而且 **op 不接受 CP 传来的路径**：agent 自己由 `sandbox_id` + 目标 worker pod uid 拼。
+3. **一个具体的 fail-open 形态**：若 worker pod slice 的 `cgroup.subtree_control` 没有下发 `cpu`/`memory`，
+   子 cgroup 里写 `cpu.max` 会**不生效**（限额静默失效）⇒ 落地时必须**建完回读**（`cpu.max`/`memory.max`
+   读回 + 一条自旋探针），把"限额真的生效"当成验收判据，而不是写完就算。
+4. **TOCTOU**：spawn 之后再写 `cgroup.procs`，窗口里 fork 出去的进程会留在 worker 的 cgroup（**逃出限额**）
+   ⇒ 用 `clone3(CLONE_INTO_CGROUP)`（fork 已经在往这个方向走）或先停住再放。
+5. **不要把沙箱移出 pod slice**（换成节点级 `sandlock.slice` 虽然能把挂载收窄到那一棵，但会失去 k8s pod
+   的 CPU/内存兜底，也要重做 pod 的用量记账）⇒ 保持嵌套在 worker pod 之下。
+6. **fail 方向钉死 closed**：建不出 cgroup / 写不上限额 ⇒ **拒绝建箱**，绝不"无额度放行"。代价是 agent
+   变成建箱的硬依赖（它本来就是：槽位 spawn 与文件操作都走它）。
+
+**备选（不扩大任何权限）**：N82 里那条——supervisor 自记账（`getrusage(SELF)` 并进沙箱用量）+ **无条件
+arm 沙箱自己的 `max_cpu`**（今天 `cpu_percent=100` 时根本不 arm，实测 4 个自旋能到 3832 mcore）。两件都在
+fork 内、纯代码，覆盖"supervisor 替它花的那半"与"沙箱自己烧的那半"；代价是没有内核级精确度，`memory.max`/
+`pids.max` 那两块仍走老路。**Phase 1 与它二选一，或先备选后 cgroup。**
+
 ## Tasks
 
 ### Phase 0 —— 计量（**✅ 已上线 2026-10-06**）
