@@ -2824,6 +2824,76 @@ worker 启动自检 `seccomp self-check: filter mode active, user namespaces all
 `unknown: blob upload unknown to registry`，构建本身两平台都已成功），**原样重跑一次即成功**；
 下次遇到这个报错直接重试，不要当成配置问题。
 
+### 7.48 本地车道验收：N83 Phase 1 每沙箱 cgroup —— **local compose lane 全绿，k0s 还没滚**（2026-10-06）
+
+**先说这一节是什么、不是什么**：这是"**本地 lane 先绿**"的读数（`AGENTS.md` 的顺序），**不是上线记录**
+—— 自建 k0s（`172.18.80.94` / `.80.140`）这次**一个 pod 都没碰**。验收脚本、RED→GREEN 全文、
+每一条原始读数在 `docs/reports/n83-task-7-cgroup-acceptance.md`，脚本本体是
+`deploy/scripts/acceptance/cgroup_acceptance.py`（对任何 E2B endpoint 都跑得动：endpoint/key +
+"怎么看进 worker 容器"的命令都是参数，k0s 车道只要换 `--worker-exec-template` 与 `--nodes`）。
+
+**车道**：本机 compose 多节点栈 `deploy/compose/docker-compose.multinode.yml`（3 worker + 控制面 +
+redis + agent 两面），**项目名 `n83acc`、宿主端口 `3200`** —— 用户那套 live 栈（project `compose`、
+3100）全程没动，也**没有**对它跑过 `up/down/build`；验收完 `docker compose -p n83acc … down` 拆掉
+（镜像留着）。三处 override 的来历（都在 `tmp/`，gitignored）：① 端口用 `ports: !override` 覆盖
+hardcode 的 `3100:3000`（compose 对 `ports` 是**追加**合并，只写新端口会同时绑 3100 ⇒ 撞车）；
+② 盘/进程两维照抄用户 `tmp/n80/compose-override.yml`（Docker VM 整盘已用 ~111 GB，而清单里
+`E2B_NODE_DISK_MB: 4096` 是准入配额 ⇒ 不覆盖就是 `503 No resources available`）；③ 本次自己的
+`E2B_SANDBOX_CGROUP=required` 与 `E2B_SANDBOX_NOTIFY_RATE_LIMIT=0`（后者**只在这次验收里**关掉
+通知限流，用来量"洪泛花自己的额度"，量完随栈拆掉 = 撤回）。agent 两面用 **本 worktree 现构建的
+镜像**（`docker build -f deploy/docker/Dockerfile.agent -t e2b-sandlock-agent:n83acc .` 后由
+`AGENT_IMAGE` 指过去），否则跑的是旧 registry 镜像、委派 op 根本不存在。
+
+**RED → GREEN（同一条车道、同一支脚本，只翻 `E2B_SANDBOX_CGROUP`）**：
+
+| 检查 | RED（`off`，限流关） | GREEN（`required`，限流关） |
+|---|---|---|
+| ① 额度是真的 | 4 自旋 ⇒ CP 内部视图 `measuredCpuPercent = **400.47**`（声明 100）；沙箱**没有** cgroup 可读 | `measuredCpuPercent = **99.98**`（= 声明额度）；`cpu.max` 读回 `100000 100000`；同节点第二个沙箱往返 min 32.0 ms vs 静默基线 31.5 ms（不掉速） |
+| ② 内核在强制 | 无 `sbx_<id>` ⇒ 具名失败（没有可节流的东西） | 3.12 s 自旋：`usage_usec +3,107,035`（0.995 核）、**`nr_throttled +32`**、`throttled_usec +9.61 s` |
+| ③ 洪泛花自己的额度 | 探针 8935 op/s；**`sbx` cgroup 不存在**（这笔 CPU 记不到沙箱账上） | 探针单跑 **9737 op/s / 0.836 核**（≤ 1 核额度）；**四路并发 11,887 op/s（2971×4）/ 0.991 核 ≤ 额度、`nr_throttled +8`** —— 额度真的 binding |
+| ④ 收窄/视图形状 | 无被委派目录（worker 的 cgroup 视图里没有 `worker/` 子树） | 三台 worker：自家容器 cgroup 属主 **65534**、`cgroup.procs`/`cgroup.subtree_control` **可写**、`/proc/self/cgroup = 0::/worker`；**视野内别的容器** cgroup 的 `cpu.max`/`cgroup.procs`/`mkdir` 全 **EACCES**（JSON 里 `foreign_visible: true`、`foreign_closed: true`）。⚠ compose 的挂载是**整棵 VM 树**（没有 `subPathExpr`），所以收窄不是靠挂载而是靠**委派 + DAC**，这正是本地版 ④ 的判据 |
+| ⑤ 负例（fail closed） | — | 三台 worker 对**自家** `cpu.max` 的 `open(O_WRONLY)` 全 **EACCES**（委派故意不含它） |
+
+**"邻居付账"这条症状的直接读数（RED 的补充，一次性探针）**：同一条 `openclose` 洪泛（限流关、无
+每沙箱 cgroup）期间，`worker-3` **自己容器 cgroup** 的 `cpu.stat` 涨 **0.857 核（中位）/ 0.872 核（峰）**，
+另两台 0.03 核 —— 也就是 N82 量到的"CPU 记在 worker pod 上、租户账上是 0"。GREEN 里同一笔 CPU
+落在 `sbx_<id>` 子树里（0.84 核），租户账与归属第一次合一。
+
+**上线剧本（Step 3，两点纪律）**：`git log --oneline <在版 sha>..HEAD` 看清镜像带什么 → 构建 →
+**第一次 apply 让 `E2B_SANDBOX_CGROUP=off` 滚完并冒烟建箱**（确认新镜像 + 新清单本身没问题、delegation
+op 在位但惰性）→ **第二次 apply** 把 `deploy/k8s-k0s/worker-capacity.patch.yaml` 里那行翻成
+`required` 再滚 → 线上只复验**本地证明不了的形状事实**：④ 的 k8s 版（worker 内 `ls /pod-cgroup`
+**看不到** `kubepods/`，因为 `subPathExpr` 把挂载收窄到本 pod；自家容器 cgroup 是 65534 所有、
+`cpu.procs`/`subtree_control` 可写）+ 一条端到端冒烟（② 的 3 s 自旋读数）。任何一条红 ⇒ 立刻用
+下面的回退杆。
+
+**回退杆（停一次就够）**：把 `deploy/k8s-k0s/worker-capacity.patch.yaml` 里
+`E2B_SANDBOX_CGROUP` 的 `value` 从 `"required"` 翻回 **`"off"`** 并 apply（compose 车道同理：
+`deploy/compose/docker-compose.multinode.yml` 的 `${E2B_SANDBOX_CGROUP:-off}`）。`off` 是代码默认，
+于是行为逐字节回到 Phase 1 之前；**已经在跑的沙箱 cgroup 会在它被拆除时照常 `cgroup.kill` + `rmdir`
+释放**，不需要额外清理（worker 重建时 `worker/` 目录由自检复用/拒绝，见 `sandbox_cgroup.py`）。
+
+**这次踩到的三个坑（都会在 k0s 上再遇到，先记下）**：
+
+1. **沙箱 cgroup 目录名是 `sbx_<sandbox_id>`，而 CP 给的 `sandbox_id` 本身就带 `sbx_` 前缀**
+   ⇒ 实际目录是 `sbx_sbx_<hex>`。别用"看起来对不对"去猜路径，脚本是**按模块写死的那条规则**拼的。
+2. **compose 里每台 worker 都能看到整棵 VM 树** ⇒ 单靠"哪个 worker 找得到 `sbx_<id>`"判不出
+   hosting 节点（三台都找得到）。定位必须两步：先问**控制面自己的逐节点记录**
+   （`GET /internal/nodes/{node}/sandboxes`，从该 worker 内部发——它是 node-scoped + 源 IP 第二因子），
+   再用"**自家被委派的容器 cgroup 之下**"作为归属判据。
+3. **`sbx_<id>` 是"第一条命令"建的，不是 create 建的**（plan §4）；create 之后立刻找 cgroup 会 0 命中。
+   另外：额度被自己的进程占满后，**再往这个沙箱排新命令会撞 30 s 命令队列超时**（RPC `RateLimitException`）
+   —— 所以"多客户端压力"要在**同一条命令**里起（这也正是 ③ 的四路并发那样写的原因）。
+
+**怎么再跑一遍**：`deploy/compose/.env` 从 `.env.example` 复制（`AGENT_IMAGE` 指向本 worktree 构建的
+agent 镜像）→ `docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f
+tmp/n83-acc-override.yml up -d` → 等三台 worker 日志出现 `cgroup lane ready (attempt N): cgroup ready
+parent=…` → 跑
+`python deploy/scripts/acceptance/cgroup_acceptance.py --api-url http://127.0.0.1:3200 --api-key
+"$E2B_API_KEY" --internal-key internal-key --internal-url http://control-plane:3000 --nodes
+worker-1,worker-2,worker-3 --worker-exec-template 'docker exec -i n83acc-{node}-1 bash -lc'`（~100 s，
+末尾一行 `"ok": true`）→ `docker compose -p n83acc … down`。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
