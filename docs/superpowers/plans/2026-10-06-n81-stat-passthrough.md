@@ -39,6 +39,12 @@ k0s（现场验收）。
 **Spec:** `docs/open-issues.md` 的 N79 行（选项 ②）与本次新增的 N81 行；
 `docs/benchmarks.md` §③；探针 `deploy/scripts/acceptance/probe_n81_proc_stat_shape.py`。
 
+> **状态：已实现并上线（2026-10-06，版本 `0.1.0-1038-ge4ab14f-20261006-081417`）。** 落地时发现并修掉了
+> 一个自己的缺陷（谓词被"启动器视图"与"已 pivot 的子进程视图"各算一次 ⇒ 通知照进表却没有处理器），
+> 两轮都记在 `docs/deploy-clusters.md` §7.45。实现里与计划的两处差异：**没有加构造期"拒绝"**，而是
+> 让谓词**按形态保留拦截**（identity `/`、无根、策略在 `/proc` 上有挂载——没有一种形态会因此拒服）；
+> Task 3 按用户裁定走**选项 A：N79 的预算整体退役**。
+
 ## Global Constraints
 
 - **`readlinkat`/`readlink` 不许动**：动了就断 `/proc/self/exe`、`/proc/self/fd/N`，而且那是
@@ -81,11 +87,11 @@ k0s（现场验收）。
 - Modify: `crates/sandlock-core/src/resolved.rs` / `seccomp/notif.rs`（`real_root` 进 features/NotifPolicy）
 - Test: `seccomp_plan.rs` 的 `#[cfg(test)]`（计划级三条：有根不带 metadata、无根带、link 永远在）
 
-- [ ] **Step 1: 写失败用例**（三条，精确相等断言，不用 contains）
-- [ ] **Step 2: 跑，确认失败**
-- [ ] **Step 3: 实现**（`features.real_root && features.chroot` ⇒ 不放 metadata）
-- [ ] **Step 4: 守卫**：`<root>/proc` 是 procfs ⇒ 建箱具名拒绝（含 RED→GREEN 一条）
-- [ ] **Step 5: commit（fork）**
+- [x] **Step 1: 写失败用例**（三条，精确相等断言，不用 contains）
+- [x] **Step 2: 跑，确认失败**
+- [x] **Step 3: 实现**（`features.real_root && features.chroot` ⇒ 不放 metadata）
+- [x] **Step 4: 守卫**：`<root>/proc` 是 procfs ⇒ 建箱具名拒绝（含 RED→GREEN 一条）
+- [x] **Step 5: commit（fork）**
 
 ### Task 2: fork —— 删掉 metadata 的处理器与账本
 
@@ -97,8 +103,8 @@ k0s（现场验收）。
 - Modify: `crates/sandlock-core/src/sys/path_surface.rs`（账本：7 个名字移到"有意不中介 + 理由"）
 - Test: 上述两处的单测 + `path_surface` 的 pin
 
-- [ ] **Step 1..4**: 删代码 ⇒ 账本红 ⇒ 改账本 ⇒ 全绿
-- [ ] **Step 5: commit（fork）**
+- [x] **Step 1..4**: 删代码 ⇒ 账本红 ⇒ 改账本 ⇒ 全绿
+- [x] **Step 5: commit（fork）**
 
 ### Task 3: N79 的 stat 单列预算退役（建议）
 
@@ -106,15 +112,15 @@ k0s（现场验收）。
 `crates/sandlock-core/src/sandbox/builder.rs`、`sandbox.rs`、`sandlock-supervise/src/policy.rs`、
 FFI + 头、Python SDK、`envd_service/config.py`、`route_b.py`、`tests/unit/test_notify_rate_budget.py`
 
-- [ ] 二选一（**需要拍**）：
+- [x] 二选一（**需要拍**）：
   - **A（建议）退役**：字段/环境变量/`_HANDLED_FIELDS`/策略线键集一起删，N79 行改"由 N81 取代"。
   - **B 留空**：保留字段，但钉一条"stat 类今天没有成员"的用例 + 文档写明它不生效。
 
 ### Task 4: 现场验收
 
-- [ ] `deploy/scripts/acceptance/probe_n81_proc_stat_shape.py` → `PROC-SHAPE OK`（**新 pin**）
-- [ ] `probe_n79_proc_stat_denied.py` 改成断言 **ENOENT**（同一件事的 errno 换了）
-- [ ] **越界不可达的钉子**（新增，承重）：从沙箱里对 worker 自己的路径做 `stat`/`access`
+- [x] `deploy/scripts/acceptance/probe_n81_proc_stat_shape.py` → `PROC-SHAPE OK`（**新 pin**）
+- [x] `probe_n79_proc_stat_denied.py` 改成断言 **ENOENT**（同一件事的 errno 换了）
+- [x] **越界不可达的钉子**（新增，承重）：从沙箱里对 worker 自己的路径做 `stat`/`access`
       —— 至少 `/etc/shadow`、`/var/lib/e2b-images`、`/var/lib/e2b-sandboxes/state`、
       `/var/lib/e2b/workspaces`。判据不只是"这些路径不成立"，而是**更强的那条不变量**：
       **凡是沙箱 `stat` 得成功的路径，`st_dev` 必须等于它自己根目录（`/`）的 `st_dev`**。
@@ -123,18 +129,18 @@ FFI + 头、Python SDK、`envd_service/config.py`、`route_b.py`、`tests/unit/t
       `/proc/1` EACCES —— 宿主自己的文件在**另一个 dev** 上，一旦有一天它进了沙箱的挂载命名空间，
       这条判据会当场变红。反向对照（`/etc/os-release` 必须成功）写在同一支探针里，
       照 `probe_n81_proc_stat_shape.py` 的体例
-- [ ] `lightweight_metrics_probe.py`：`stat` p50 应从 **25.7/26.4 µs** 掉到 **~1–2 µs**
+- [x] `lightweight_metrics_probe.py`：`stat` p50 应从 **25.7/26.4 µs** 掉到 **~1–2 µs**
       （裸形态 §2.4.10.2 的 1.2 µs 量级）
-- [ ] `tmp/stat_stall_hunt.py`：开口 ~37k/s 时应**跑满**（不再被 20000/s 压住），且不再有每秒一次的长停顿
-- [ ] `MULTI-NODE SMOKE` / `DEPLOYMENT SMOKE` / `checkpoint_acceptance.py`
+- [x] `tmp/stat_stall_hunt.py`：开口 ~37k/s 时应**跑满**（不再被 20000/s 压住），且不再有每秒一次的长停顿
+- [x] `MULTI-NODE SMOKE` / `DEPLOYMENT SMOKE` / `checkpoint_acceptance.py`
 
 ### Task 5: 记录
 
-- [ ] `docs/open-issues.md`：N81 新行 + N79 行改"由 N81 取代"
-- [ ] `docs/benchmarks.md` §③：新的 p50 与"限流不再作用于 stat"
-- [ ] `docs/isolation-boundaries.md` / `security-architecture.md`：`/proc` 的 stat 关口改成
+- [x] `docs/open-issues.md`：N81 新行 + N79 行改"由 N81 取代"
+- [x] `docs/benchmarks.md` §③：新的 p50 与"限流不再作用于 stat"
+- [x] `docs/isolation-boundaries.md` / `security-architecture.md`：`/proc` 的 stat 关口改成
       "靠 rootfs 的空 `/proc` + 构造期守卫"，并写清 errno 从 EACCES 变 ENOENT
-- [ ] `docs/deploy-clusters.md`：发版记录
+- [x] `docs/deploy-clusters.md`：发版记录
 
 ---
 
