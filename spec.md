@@ -1,7 +1,7 @@
 # E2B-Sandlock 网关：完整方案文档
 
 **文档版本**：v2.0.0
-**最后更新**：2026-09-06（M4 D6：`max_processes` 整箱默认 64→256）
+**最后更新**：2026-10-06（N83 Phase 2：内存与任务数改由内核强制；N84 收口）
 **状态**：设计就绪，待实现
 
 ## 1. 目标与兼容定义
@@ -168,6 +168,9 @@ python3 -c "import sandlock; print(sandlock.landlock_abi_version())"
 | `iam` | 支持：`{tokens: {name: {audience, tokenType}}}`；`${e2b.identity.tokens.<name>}` 占位符在代理内替换为签发的 JWT-SVID（HS256，`E2B_IAM_SIGNING_KEY`，默认本地开发密钥） |
 | `mcp` | 支持：base stdio server（command）；GitHub MCP 返回 `400` |
 | `volumeMounts` | 支持：挂载到 rootfs 内 `/home/user/<path>`（或工作区符号链接） |
+| `cpuCount` | 正整数（核）：真的成为 `record.cpu_count`（N83 Phase 2 收口 N84 —— 从前它恒为 1、这个字段被静默忽略）。不传 ⇒ 走 `E2B_DEFAULT_CPU_PERCENT` 的换算（`control_plane/registry/manager.py::cores_from_percent`，向上取整、至少 1 核）；`0`/负数/非整数 ⇒ `400 cpuCount must be a positive integer`；超过请求**落点节点**的单箱上限 ⇒ `400 cpuCount 8 exceeds this node's per-sandbox maximum (4)`；该节点还没上报上限（混版本窗口）⇒ 具名 `503` |
+| `memoryMB` | 正整数（MiB）：落成 `record.memory_mb`，也就是沙箱的 `memory.high`/`memory.max`。`0`/负数/非整数 ⇒ `400 memoryMB must be a positive integer`；超过落点节点的单箱上限（`E2B_MAX_SANDBOX_MEMORY_MB`）⇒ 与 `cpuCount` 同形的具名 `400` |
+| `diskSizeMB` | **今天仍被静默忽略**（N84 副问题① 点名的第三个字段；D6 只收了 cpu/内存这一对） |
 
 模板与基础镜像映射：
 
@@ -429,9 +432,9 @@ e2b-sandlock-gateway/
 | `fs_readable` | `/usr`、`/lib`、`/bin` |
 | `fs_writable` | 仅沙箱工作目录 |
 | `fs_denied` | `/proc/kcore`、`/sys` |
-| `max_memory` | `max_memory="1024M"`，seccomp user notification 内存跟踪（updated 2026-09-06: per-sandbox default 1024, FUP3） |
+| `max_memory` | `max_memory="1024M"`（updated 2026-09-06: per-sandbox default 1024, FUP3）。**强制者是每沙箱 cgroup 的 `memory.high`/`memory.max`**（同一根线，D2）：内核先回收/节流，撑不住就把**分配者 SIGKILL**（不是回 `ENOMEM`），`memory.oom.group` 保持 `0` ⇒ 同箱旁观者存活（D3）。`E2B_SANDBOX_CGROUP=off` 时才退回 fork 的 seccomp user notification 记账（mmap 族），也才回到"超限回 `ENOMEM`、不含 supervisor"的旧语义。真 cgroup v2 实测（`.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-3-report.md`）：两个限额逐字回读、超 `memory.max` 的分配 `SIGKILL(9)`、`memory.events.oom_kill=1`、邻居箱存活 |
 | `max_cpu` | `max_cpu=100`。**强制者是每沙箱 cgroup 的 `cpu.max`（内核 CFS，100 ms 周期）**，额度**含 supervisor**（它与载荷同一个 cgroup）；`E2B_SANDBOX_CGROUP=off` 时退回老的 SIGSTOP/SIGCONT 占空比节流器，而它只在 `max_cpu < 100` 时才 arm ⇒ 默认 100 时**没有强制者**（N82 实测：4 个自旋能吃到 3.83 核）。详见 §6.6 的「谁在强制」与 `docs/deploy-clusters.md` §7.49 |
-| `max_processes` | `max_processes=256`，seccomp user notification 并发进程计数（M4 D6 whole-box semantics, 2026-09-06） |
+| `max_processes` | `max_processes=256`，整箱预算（M4 D6 whole-box semantics, 2026-09-06）。**强制者是每沙箱 cgroup 的 `pids.max`**（= `max_processes`，D4），数的是**任务数（含线程）**，超了 `fork`/`clone` 拿 `EAGAIN`（与今天同一种错误）；**平台自己的进程也占这个预算**（supervise 树与载荷同一个 cgroup）。`E2B_SANDBOX_CGROUP=off` 时退回 fork 的 clone 族计数（语义不变）。真 cgroup v2 实测（`.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-3-report.md` / `task-5-report.md`）：8 条任务预算 ⇒ 第 8 条 `EAGAIN(11)`、`pids.current=3`（2 线程 + 1 进程）、`pids.events.max=1` |
 | `max_open_files` | `max_open_files`，RLIMIT_NOFILE |
 | `max_disk` | `max_disk`，仅作用于 COW storage 配额 |
 | 默认用户 | 非 Root 用户 |
@@ -570,9 +573,9 @@ Control Plane 必须同时限制沙箱数量和宿主总资源，避免 `E2B_MAX
 | 资源 | 默认值 |
 |------|--------|
 | 内存 | `E2B_DEFAULT_MEMORY_MB=1024`（updated 2026-09-06: per-sandbox default 1024, FUP3） |
-| CPU | `E2B_DEFAULT_CPU_PERCENT=100`，映射 `max_cpu=100` ⇒ 每沙箱 cgroup `cpu.max`（内核强制，含 supervisor；今天恒为 `100000 100000`）。⚠ 这个 env 只决定**准入预留的维度**，**不决定沙箱自己的额度** —— 送到沙箱的是 `record.cpu_count × 100`，而 `cpu_count` 在创建路径上从不被赋值（恒 1）⇒ 把它调大只会让**节点少放几个沙箱**，不会给单个沙箱更多核 |
+| CPU | `E2B_DEFAULT_CPU_PERCENT=100` ⇒ 每沙箱 cgroup `cpu.max=100000 100000`（内核强制，含 supervisor）。**N84 已收口（2026-10-06，N83 Phase 2 / Task 2）**：这个 env 现在只给**没带尺寸的请求**当缺省，创建请求里的 `cpuCount` 被真的读进 `record.cpu_count`，准入台账的 cpu 维度也由它导出（`cpu_count × 100`）⇒ 送进沙箱的额度、台账与记录三者同源；把它调大不再只是"让节点少放几个沙箱" |
 | 磁盘 | `E2B_DEFAULT_DISK_MB=1024`，非 COW 时为准入预留 |
-| 并发进程 | `E2B_DEFAULT_MAX_PROCESSES=256`，映射 `max_processes=256`（M4 D6 whole-box semantics, 2026-09-06） |
+| 并发进程 | `E2B_DEFAULT_MAX_PROCESSES=256`，映射 `max_processes=256`（M4 D6 whole-box semantics, 2026-09-06）；内核那份是沙箱 cgroup 的 `pids.max`，**任务数（含线程）**，平台自己的进程也占预算 |
 
 宿主总上限：
 
@@ -588,10 +591,31 @@ Control Plane 必须同时限制沙箱数量和宿主总资源，避免 `E2B_MAX
 | 资源 | 强制者 | 备注 |
 |------|--------|------|
 | CPU | **每沙箱 cgroup `cpu.max`**（内核 CFS，100 ms 周期） | 额度含 supervisor（同一 cgroup）；`E2B_SANDBOX_CGROUP=off` 时没有强制者（老的占空比节流器只在 `max_cpu < 100` 时 arm） |
-| 内存 | fork 的 seccomp user-notification 记账（mmap 族） | 超限回 `ENOMEM`；**不含** supervisor 自身的占用；cgroup 的 `memory.max`/`memory.high` 是 Phase 2（尚未接） |
-| 并发进程 | 同上（clone 族记账） | 整箱语义（M4 D6）；`pids.max` 是 Phase 2（尚未接） |
+| 内存 | **每沙箱 cgroup `memory.high`/`memory.max`**（内核，D2：两根线同值） | 先回收/节流，撑不住就把**分配者 SIGKILL**；`memory.oom.group=0` ⇒ 同箱旁观者存活（D3）。supervise 树与载荷同一个 cgroup ⇒ 它的内存也计入（与 CPU 一致）。副作用：`required` 车道上箱内 `MemFree` 不再跟中介账本（账本已退役）|
+| 并发进程 | **每沙箱 cgroup `pids.max`**（内核，= `max_processes`，D4） | 数的是**任务数（含线程）**，超了 `EAGAIN`（与今天同一种错误）；**平台自己的进程也占这个预算**。`E2B_SANDBOX_CGROUP=off` 时退回 fork 的 clone 族计数（语义不变） |
 | 磁盘 | XFS project quota（经 quota-agent）+ 活账本 | worker 只发 HTTP；见 `docs/sandbox-disk-quota.md` |
 | 节点聚合 | 控制面的**预留**配额（准入时预留、kill/TTL 时归还） | 预留制，不是等实际用量超限；见下面的准入算法 |
+
+**单箱上限（策略，不是内核读数）**：`E2B_MAX_SANDBOX_CPU_PERCENT` / `E2B_MAX_SANDBOX_MEMORY_MB` /
+`E2B_MAX_SANDBOX_PROCESSES` 是一箱最多能配到多少；**未设或 `<=0` ⇒ 跟随本节点总量**（worker 读
+`E2B_NODE_*`，控制面读 `E2B_MAX_TOTAL_*`），**绝不默认成"无上限"**（两侧共读
+`gateway_common/sandbox_ceiling.py` 里那一条规则）。worker 启动时拿它与自己容器 cgroup 的内核限额
+交叉校验：**策略 > 内核 ⇒ 具名拒绝启动**（不夹取、不 WARN），**内核 = `max` ⇒ 启动成功 + 一行 WARN**
+（compose 三条车道实测就是 `max`）。请求超过**落点节点**的上限 ⇒ 具名 `400`；节点还没上报上限 ⇒
+具名 `503`。四条真 cgroup v2 形状（基线 2 核/2 GiB + 策略 200/2048/256 ⇒ 通过；策略 400 ⇒
+`cgroup-refusal ceiling-exceeds-kernel`；compose 无 limits ⇒ 通过 + WARN；k0s 覆盖层 4 核/4 GiB +
+策略 400/4096/1024 ⇒ 通过）与五份清单的取值见 `.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/`
+的 `task-1-report.md`；请求侧的具名 400/503 见同目录 `task-2-report.md`。
+
+**撞墙可见（D3 / Review Focus §4）**：`memory.events` 的 `oom_kill`/`oom_group_kill` 与 `pids.events`
+的 `max` 由 worker 采样（活箱每 `E2B_CGROUP_EVENTS_INTERVAL_S`（默认 5 s）一次，加收尾一次），随心跳的
+`sandboxEvents` 上报；控制面按每箱每计数取最大值记进节点记录，**增长**就打一行点名沙箱的 WARN ——
+沙箱记录可能仍读作 `running`，不让用户只看到"进程莫名其妙没了"（读数与真 cgroup v2 探针见 `.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-5-report.md`）。
+
+**一条可见的副作用**（`required` 车道）：箱内 `/proc/meminfo` 的 `MemFree` 不再跟着中介的账本走
+（那本账已被内核的 `memory.max` 取代），恒等于全额；`MemTotal` 与 `sysinfo.totalram` 照旧报**声明
+额度**（D8）。实测（`.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-4-report.md` §4）：`MemTotal` 两档都是 1048576 kB、`totalram`
+1073741824 B；`MemFree` 从 `off` 的 1025559 kB 变成 `required` 的 1048576 kB。
 
 准入算法使用预留配额，而不是等待实际用量超限：
 
@@ -672,6 +696,10 @@ await sandbox.kill()
 | `E2B_MAX_TOTAL_CPU_PERCENT` | `400` | 宿主总 CPU 上限 |
 | `E2B_MAX_TOTAL_DISK_MB` | `10240` | 宿主总磁盘上限 |
 | `E2B_MAX_TOTAL_PROCESSES` | `2048` | 宿主总并发进程上限 |
+| `E2B_MAX_SANDBOX_CPU_PERCENT` | 跟随节点总量（k8s 基线 `200`，k0s 覆盖层 `400`） | 每沙箱 CPU 上限（**策略**，不是内核读数）；未设/`<=0` ⇒ 跟随节点总量 |
+| `E2B_MAX_SANDBOX_MEMORY_MB` | 跟随节点总量（k8s `2048`，k0s `4096`） | 每沙箱内存上限（MiB），也就是沙箱 `memory.high`/`memory.max` 的上界 |
+| `E2B_MAX_SANDBOX_PROCESSES` | 跟随节点总量（k8s `256`，k0s `1024`） | 每沙箱任务数上限（= `pids.max` 的上界） |
+| `E2B_CGROUP_EVENTS_INTERVAL_S` | `5` | worker 扫每箱 `memory.events`/`pids.events` 的间隔（秒）；`0` 关周期扫，收尾那次读照常 |
 | `E2B_ENABLE_NETWORK` | `false` | 是否允许网络 |
 | `E2B_LOG_LEVEL` | `INFO` | 日志级别 |
 

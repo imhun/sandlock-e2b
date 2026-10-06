@@ -211,7 +211,7 @@ follow-up（一句，仍未做）：若将来出现"worker 必须**读成功**�
 |---|---|
 | 权限 | 分三层，**照抄会多给特权**（2026-09-10 实测，逐项见 §2.4.1）：**沙箱侧最小集 = `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`**；`CAP_DAC_OVERRIDE` 是**管理面**兜底需要（升级前遗留的 root 属主树、`1777` 卷根；c1 之后租户树是 `0770`、worker 走属组，日常数据面不再需要它）；`CAP_SYS_ADMIN` **在出厂镜像与清单形态下 worker 已不需要**（共享卷 bind 由 A4 删除、配额改由 quota-agent 提供、低端口 sysctl 由容器 spec 声明；代码里仍有两条非部署默认的路径需要它，见 §2.4.1 的限定），也**不是 E3.2 / route B 的前置**；`CAP_SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。非 root worker 现在靠**每节点 agent**（`E2B_PRIV_HELPER_TRANSPORT=agent`）建 uid 池并走 route B —— 非 root 是**目标形态**；F1 的两个 file-capability broker 与 `E2B_PRIV_HELPERS` 旋钮已在 N52（2026-09-30）删除。既不是 root、也没有 agent 的 worker 才自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1）、启动打一条 WARNING。**C1（2026-09-27）之后 k8s 基线就是这个非 root 形态**，**C3（Task 3 + Task 4 片 B）后 worker 显式 pin `runAsUser: 65534`/`runAsGroup: 65534`**（CP 的可信来源读的就是 pod spec；只靠镜像 `USER` 会被读成"未知"⇒ 不记身份、文件 op 具名 503），且**文件操作与槽位身份都由每节点一个 agent 代做**（`E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_SLOT_IDENTITY=agent-grant`，见 §5.4(b)）：worker 镜像**不再含** `/var/lib/e2b-priv/`，worker 的 BND 因此是**空集**；C1 的 `e2b-priv-broker` DaemonSet 曾保留到 Task 7 并改跑 **agent 镜像**（`e2b-maint` 只在那儿），**C3 Task 7 已把它退役**。**历史（已作废）**：2026-09-25 那轮审计写的是"线上实际是 root"（worker 自己 `runAsUser: 0` 读 NFS 上的树），那条口径已经被 C1 取代。 |
 | 容量 | 并发沙箱数受 `E2B_UID_POOL_SIZE` 约束（默认 1000，起始 `E2B_UID_POOL_START=10000`）；池满即建箱失败。多 worker 共用同一 workspace 时必须配**互不重叠**的段。 |
-| 进程/内存 | chroot 形态每沙箱多一棵 supervise 进程树（supervise + sandlock-init + 停车 M0）。**它现在落在沙箱自己的 `sbx_<id>` cgroup 里**（N83 Phase 1，2026-10-06）⇒ 它的 **CPU 计入沙箱额度**（与载荷同一个 `cpu.max`，这正是"洪泛花自己的额度"的由来）；**内存与磁盘仍不计入**（`max_memory` 是 fork 的 mmap 记账、`max_disk` 是树，两者都只覆盖载荷），`max_processes` 里也仍占 1；容量表按「N 沙箱 = N 额外进程」重算。`memory.max`/`pids.max` 接上（Phase 2）之后这条要再改一次。 |
+| 进程/内存 | chroot 形态每沙箱多一棵 supervise 进程树（supervise + sandlock-init + 停车 M0）。**它落在沙箱自己的 `sbx_<id>` cgroup 里**（N83 Phase 1，2026-10-06）⇒ **CPU、内存、任务数三项都计入沙箱额度**（与载荷同一个 `cpu.max`/`memory.high`/`memory.max`/`pids.max`）：CPU 与内存正是"洪泛花自己的额度"的由来（Phase 2 / Task 3），`max_processes` 里它也占任务（`pids.max` 数的是**任务数、含线程**；真 cgroup v2 上量到 `pids.current=3` = 2 线程 + 1 进程，见 Task 5）—— "平台自己的进程不在预算里、supervise 仍占 1"这条旧口径到此更新；**只有磁盘仍不计入**（`max_disk` 是树，只覆盖载荷；本阶段的"不做"表：cgroup v2 没有空间配额）。容量表按「N 沙箱 = N 额外进程」重算。 |
 | 回收 | route-B 代次的结束由 envd 生命周期（TTL/idle eviction/删除 → `executor.close()`）决定，不再依赖 core 的 15 min idle；槽位进程退出前该 uid 不会被再次租出（W1）。 |
 | 文件系统 | uid 只对**支持属主的存储**有意义：repo 的 virtiofs bind 挂载上 chown 是 no-op，生产请用容器原生 / XFS（本项目门禁把 workspace 放 `/var/lib/e2b-sandboxes` 的 XFS+prjquota 上）。 |
 | 关掉它 | 显式 `E2B_PER_SANDBOX_UID=false` 回到旧的共享 uid（1000）形态：**pure（无 base image）形态照常跑**；**chroot 形态在 root worker 上会被 fork 直接拒绝建箱**（沙箱 host uid 1000 ≠ 中介 euid 0 ⇒ `in-process path mediation refused: … Run sandlock-supervise as uid 1000 (route B)`，见下条）。非 root worker 不受影响（沙箱就用 worker 自己的 euid，中介身份与沙箱身份同一个）。降级逃生门已不存在：E2B 2026-09-10 不再请求它，fork B3 2026-09-11 把字段连 API 一起删除（详见下条）。 |
@@ -888,6 +888,17 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
 无 F/E。
 
 ### 2.4.9 为什么 MCP 箱里"只剩 110 MiB"：记账按预留，不按实际触碰
+
+> **车道说明（N83 Phase 2 起）**：这一节量的是 `E2B_SANDBOX_CGROUP=off` 车道的账本语义
+> （`max_memory` 由 supervisor 在 seccomp 通知里按**预留**记账，箱内 `MemFree = 上限 − 已记账`）。
+> 出厂清单跑的是 `required`：内存改由沙箱自己 cgroup 的 `memory.high`/`memory.max` 强制 —— 先
+> 回收/节流，撑不住就把**分配者 SIGKILL**（D2/P2），`memory.oom.group` 保持 `0` ⇒ 同箱旁观者存活
+> （D3）；**中介账本随之退役**，于是箱内 `MemFree` 不再跟已用量走（恒等于全额），`MemTotal` 与
+> `sysinfo.totalram` 照旧报**声明额度**（D8）。两档对照（同一支探针、同一台机）：`MemTotal`
+> 1048576 kB 与 `totalram` 1073741824 B 都不变，`MemFree` 从 `off` 的 1025559 kB 变成 `required`
+> 的 1048576 kB（`.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-4-report.md` §4）。下面
+> 那张单位成本表因此只属于 `off` 车道的**预留记账**，不能直接搬到 `required` 上（`required` 上
+> 超 `memory.max` 的分配拿 SIGKILL、`memory.events.oom_kill=1`，见同目录 `task-3-report.md`）。
 
 上面的 110 MiB 不是"箱子被谁占了 400 MiB"，而是**两个 Python 进程的地址空间预留**在这套
 记账下被全额计入。机制先说清：

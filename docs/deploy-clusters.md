@@ -3084,6 +3084,54 @@ uid 相符；评审六条规格全过），按 `AGENTS.md` 先在**本地 compos
    **65534**）。worker 的自检**按 uid 找被委派的那个目录**、不数目录个数，所以它不受影响 —— 这也是
    "别用目录个数/名字去猜路径"那条纪律的又一个理由（用 `head -1` 挑目录的探针会挑到旧的那个）。
 
+### 7.50 发版：N83 Phase 2 —— 内存与任务数交内核（**本地车道 + 真 cgroup v2 已验；线上未滚**）
+
+**结论先说**：Phase 2（T1–T5，提交 `d219797..a11f9dd`）把"沙箱能烧多少内存、能起多少任务"从
+**中介记账**换成**内核强制** —— 每个 `sbx_<id>` 同时被 `cpu.max`、`memory.high`/`memory.max`
+（同一根线）与 `pids.max` 约束。超内存**先节流、撑不住再由内核 SIGKILL 那个分配者**（不是回
+`ENOMEM` —— 这是用户已拍的产品语义变化 P2）；超任务数拿 `EAGAIN`（与今天同一种错误）；每箱的
+上限（策略）由三个显式 env 决定，worker 启动时拿它与自己容器的内核限额交叉校验。**本节写的
+全部是本地 compose 车道与一次性真 cgroup v2 容器上量到的**；线上重滚（重建镜像 + 两段式
+`off`→`required`）与验收 ⑥⑦⑧⑨ 的读数归 **Task 7 Step 4**，本节不预填（末尾留了占位）。
+
+**本批的五件事（每件都指得出量它的地方）**
+
+| # | 改了什么 | 实测出处 |
+|---|---|---|
+| T1 | 三个新 env `E2B_MAX_SANDBOX_CPU_PERCENT` / `_MEMORY_MB` / `_PROCESSES` 是**单箱上限**；未设或 `<=0` ⇒ 跟随节点总量（worker 读 `E2B_NODE_*`，控制面读 `E2B_MAX_TOTAL_*`），**绝不"无上限"**；worker 启动时与容器内核限额交叉校验，**策略 > 内核 ⇒ 具名拒绝启动**，**内核 = `max` ⇒ 一行 WARN** | 四种形状的真 cgroup v2 探针（基线 2 核/2 GiB + 策略 200/2048/256 ⇒ 通过；策略 400 ⇒ `cgroup-refusal ceiling-exceeds-kernel`；compose 无 limits ⇒ 通过 + WARN；k0s 覆盖层 4 核/4 GiB + 策略 400/4096/1024 ⇒ 通过）与两条心跳 payload 见 `.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-1-report.md` §2.3 |
+| T2 | 创建请求真的解析 `cpuCount`/`memoryMB`（N84 收口）：`record.cpu_count`/`memory_mb` 是唯一真相、台账 cpu 维度由 `cpu_count × 100` 导出；`0`/负数/非整数 ⇒ 具名 `400 must be a positive integer`；超过**落点节点**的单箱上限 ⇒ 具名 `400 cpuCount 8 exceeds this node's per-sandbox maximum (4)`；节点还没上报上限 ⇒ 具名 `503` | RED `20 failed, 1 passed` → GREEN `36 passed`；见 `task-2-report.md` §2 与 `tests/unit/test_sandbox_size_ceiling.py` |
+| T3 | `attach()` 除 `cpu.max` 再写 `memory.high`/`memory.max`/`pids.max`，**每个写完逐字回读**；`setup()` 一次使能 `+cpu +memory +pids`（腾空前 EBUSY、腾空后 ok，与 `+cpu` 同一条规则）；声明额度高于 worker 的策略上限 ⇒ 第二道具名拒绝 | 真 cgroup v2 探针 20/20：四个限额逐字回读、8 条任务预算 ⇒ 第 8 条 `EAGAIN(11)`、超 `memory.max` 的分配 `SIGKILL(9)`、`memory.events.oom_kill=1`、邻居箱存活、`memory.oom.group=0`；见 `task-3-report.md` §2 |
+| T4 | 通知表**只在 `required` 退掉地址空间那一族**（mmap/munmap/brk/mremap，及 `sysv_ipc` 允许时的 shmget）；**clone 族整族保留**（R13/R14：`resource::handle_fork` 是 `clone3` 命名空间创建禁令与 checkpoint `hold_forks` 的唯一执行点，而 cBPF 读不到用户指针后面的 `clone_args`、`clone3` 又不在默认 blocklist 里 —— 退掉它是拿安全控制换延迟） | 同一台机、同一支 `deploy/scripts/acceptance/probe_n82_traced_syscall_costs.py`：`mmap` 的 `required` **293562 op/s**（4 次 stall），`off` 2540、BEFORE 2539（两档都是 40 次/51 轮的 N82 签名）；`clone` 两档 `off` 1676 / `required` 1625 op/s（未变）；fork `831a7da` + 父仓 `e60d754`；见 `task-4-report.md` §3 |
+| T5 | 每箱 `memory.events`（`oom_kill`/`oom_group_kill`）与 `pids.events`（`max`）由 worker 采样（活箱每 `E2B_CGROUP_EVENTS_INTERVAL_S`（默认 5 s），加收尾一次），随心跳的 `sandboxEvents` 上报；控制面按每箱每计数取最大值，**增长**就打一行点名沙箱的 WARN | 真 cgroup v2 探针 21/21（修复轮后 30/30）：`pids.current=3`（2 线程 + 1 进程）、fork 与线程各撞一次 ⇒ `pids.events.max=1`、`oom_kill=1`；收尾那份读数在箱子被拆掉之后仍在；见 `task-5-report.md` §2.3 |
+
+**五份清单的单箱上限**（显式写出；值 = 该车道愿意给**一个沙箱**的上限）
+
+| 清单 | `E2B_MAX_SANDBOX_CPU_PERCENT` / `_MEMORY_MB` / `_PROCESSES` | 为什么是这个值 |
+|---|---|---|
+| `deploy/k8s/worker.yaml` | `200` / `2048` / `256` | 该 pod 的 `resources.limits` 就是 `cpu: "2"`、`memory: 2Gi` ⇒ 单箱最多 2 核 / 2 GiB；任务数跟 `E2B_NODE_PROCESSES=256` |
+| `deploy/k8s-k0s/worker-capacity.patch.yaml` | `400` / `4096` / `1024` | 覆盖层把 pod limits 抬到 `cpu: "4"`、`memory: 4Gi` ⇒ 单箱上限必须同时抬，否则 D5b 交叉校验会**具名拒绝启动**；任务数跟覆盖层的 `E2B_NODE_PROCESSES=1024` |
+| `deploy/compose/docker-compose.multinode.yml`（三个 worker） | `200` / `2048` / `256` | 三条 compose 车道没给 worker 设 `cpus`/`mem_limit`（内核那份是 `max`，实测）⇒ 这里只能给到节点总量 |
+| `deploy/compose/docker-compose.prod.yml`、`deploy/stack/docker-compose.prod.yml` | `${…:-200}` / `${…:-2048}` / `${…:-256}` | 同上；用 `:-默认` 保持这两个文件"生产可用 `.env` 覆盖"的既有风格 |
+
+**上线顺序与回退杆**
+
+- **顺序约束（R12）**：创建路径按"落点节点的单箱上限"校验，而那个上限**只**来自 worker 的心跳
+  （`sandboxCeiling`）。混版本窗口里**旧 worker 的记录没有上限 ⇒ 建箱被具名 503**；所以 Task 7
+  要么**先滚 worker 再滚控制面**，要么接受窗口期内建箱被拒（方向是 fail-closed，不是静默放行）。
+- **两段式车道**（计划 Task 7 Step 3）：先用 `off` 滚完冒烟，再翻 `required` —— Phase 2 的
+  `memory.*`/`pids.max`/事件采样只在 `required` 上生效（`off` 那条车道逐字节回到 Phase 1 之前）；
+  请求侧的尺寸解析与单箱上限是**车道无关**的（见下一条）。
+- **回退杆**：把 `E2B_SANDBOX_CGROUP` 那一条的 `value` 翻回 `"off"`（`deploy/k8s-k0s/worker-capacity.patch.yaml:55-56`，§7.49 用过、实测有效的那一杆；compose 是 `deploy/compose/docker-compose.multinode.yml` 里的 env）⇒ 不再写 `memory.*`/`pids.max`、不建事件采样循环，内存/任务数退回中介记账的
+  `ENOMEM`/`EAGAIN`；**请求侧不受这条回退影响**（`cpuCount`/`memoryMB` 的具名 400/503 读的是心跳里的
+  `sandboxCeiling`，`off` 车道照带，见 R11）。
+- **一条不可自动收回的差别**：`required` 上箱内 `/proc/meminfo` 的 `MemFree` 不再跟中介账本
+  （账本退役），恒等于全额；`MemTotal`/`sysinfo.totalram` 照旧报声明额度。两档读数（同一支探针）：
+  `MemTotal` 1048576 kB、`totalram` 1073741824 B 都不变，`MemFree` 从 `off` 的 1025559 kB 变成
+  `required` 的 1048576 kB（`task-4-report.md` §4）。
+
+**待填（Task 7 Step 4）**：重滚的版本号、线上 ⑥⑦⑧⑨ 的读数、混版本窗口的实际时长、以及"k8s pod
+层真的把 `memory`/`pids` 委派给了 worker"这条形状事实 —— 都在重滚那一轮现量现填，本节不预填数字。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
