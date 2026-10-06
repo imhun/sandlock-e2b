@@ -416,9 +416,10 @@ def test_k8s_worker_is_a_statefulset_so_its_node_ids_survive_a_restart() -> None
     is required for the stable per-pod DNS that makes the ordinals real, and
     StatefulSet updates are already delete-then-create, one pod at a time. That last
     part is also why there is no `maxSurge: 0` to look for any more -- this workload
-    declares no `requests`, so Kubernetes copies the 2-CPU limit into the request and
-    a surge pod cannot fit a 4-core node (measured 2026-09-17: a Deployment rollout
-    stalled with `0/2 nodes are available: 1 Insufficient cpu`).
+    *used to* declare no `requests`, so Kubernetes copied the 2-CPU limit into the
+    request and a surge pod could not fit a 4-core node (measured 2026-09-17: a
+    Deployment rollout stalled with `0/2 nodes are available: 1 Insufficient cpu`);
+    it now pins small explicit requests (`500m/512Mi`).
     """
     assert K8S_WORKER.startswith("apiVersion: apps/v1\nkind: StatefulSet\n")
     assert "  serviceName: worker-headless\n" in K8S_WORKER
@@ -2345,3 +2346,383 @@ def test_the_runbook_carries_the_no_double_window_table() -> None:
         "`tests/unit/test_worker_manifest_permissions.py::"
         "test_k8s_redis_auth_comes_from_the_secret_not_a_literal`" in RUNBOOK
     )
+
+
+# --------------------------------------------------------------------------
+# N83 phase 1 / Task 2 (2026-10-06): the worker's *narrowed* writable cgroupfs
+# view, the single QoS constant it is narrowed by, and the CI pins that keep a
+# "follow the resources" edit from silently mismatching them (§3.5 insurance 1
+# of docs/superpowers/plans/2026-10-06-n83-per-sandbox-cgroup.md).
+#
+# The shape (plan §3.5 ①): the worker gets ONE rw cgroupfs view, narrowed to
+# this pod's own subtree with `subPathExpr: pod$(POD_UID)`, and the QoS segment
+# (`burstable`) is written literally in the volume's `hostPath`. The failure
+# mode the pins buy is *measured* (plan §1.4): a QoS segment that does not match
+# the pod's real QoS makes kubelet `mkdir` a **fake** cgroup and mount it
+# silently -- pod `1/1 Running`, zero events, one leaked cgroup per rebuild --
+# so CI has to catch it, not the node. Hence three assertions:
+#   1. the segment equals the QoS derived from `resources`;
+#   2. `subPathExpr` carries no *second* literal QoS (only `pod$(POD_UID)`);
+#   3. the k0s overlay keeps the derived class the same after it rewrites
+#      `resources` (and flips the switch to `required`).
+# --------------------------------------------------------------------------
+
+K8S_AGENT = (REPO / "deploy" / "k8s" / "c3-agent.yaml").read_text(encoding="utf-8")
+WORKER_CAPACITY_PATCH = REPO / "deploy" / "k8s-k0s" / "worker-capacity.patch.yaml"
+
+
+def _only_doc(text: str, kind: str, name: str) -> dict:
+    """The single rendered object of that `kind`/`name` among the YAML docs."""
+    matches = [
+        doc
+        for doc in yaml.safe_load_all(text)
+        if doc and doc.get("kind") == kind and doc["metadata"]["name"] == name
+    ]
+    assert len(matches) == 1, (kind, name, [d["metadata"]["name"] for d in matches])
+    return matches[0]
+
+
+def _pod_spec_of(workload: dict) -> dict:
+    return workload["spec"]["template"]["spec"]
+
+
+def _k8s_container_env(container: dict) -> dict:
+    return {entry["name"]: entry for entry in container.get("env") or []}
+
+
+#: The two resources Kubernetes' Guaranteed rule looks at (and that admission
+#: defaults, below). Anything else in a manifest -- ephemeral storage,
+#: hugepages -- is irrelevant to the pin and only widens it past the objects it
+#: is about.
+_QOS_RESOURCES = ("cpu", "memory")
+
+
+def _qos_class_from_resources(containers: list[dict]) -> str:
+    """Kubernetes' own Pod QoS derivation, spelled out for the pin.
+
+    The three classes, faithfully (upstream ``Resources``/``QoS``; the node
+    layout they produce is measured in plan §1.4 / ``docs/deploy-clusters.md``):
+
+    * **Guaranteed** -- every app container sets a cpu **and** a memory request
+      and limit, and each pair is equal;
+    * **BestEffort** -- no app container sets any cpu/memory request or limit;
+    * **Burstable** -- everything else.
+
+    The admission **defaulting** rule is load-bearing and is the bug this
+    derivation was fixed for (review round 1): "If you specify a limit for a
+    resource but do not specify any request, and no admission-time mechanism has
+    applied a default request for that resource, then Kubernetes copies the
+    limit you specified and uses it as the requested value." So a
+    **limits-only** container is Guaranteed-shaped (``request == limit``), *not*
+    Burstable -- which is exactly what ``deploy/k8s/worker.yaml`` was before this
+    fix. Calling it Burstable would let the pinned ``burstable`` literal point at
+    the empty cgroup kubelet fabricates for a missing QoS segment (§1.4) while
+    both assertions stayed green.
+
+    Only **app** containers are passed in (``pod["containers"]``); init
+    containers are excluded, exactly as Kubernetes excludes them from QoS. This
+    pod has no init container, and no machinery is built for sidecars -- a second
+    app container is simply folded in by the loop below.
+    """
+    guaranteed = True
+    best_effort = True
+    for container in containers:
+        resources = container.get("resources") or {}
+        requests = resources.get("requests") or {}
+        limits = resources.get("limits") or {}
+        if requests or limits:
+            best_effort = False
+        for name in _QOS_RESOURCES:
+            limit = limits.get(name)
+            # Admission copies a set limit into a missing request; a resource
+            # with no limit at all can never be Guaranteed.
+            request = requests.get(name, limit)
+            if limit is None or request != limit:
+                guaranteed = False
+    if best_effort:
+        return "BestEffort"
+    if guaranteed:
+        return "Guaranteed"
+    return "Burstable"
+
+
+def _worker_cgroup_view() -> tuple[dict, dict, dict]:
+    """The worker container, its volumeMounts and the pod's volumes, by name."""
+    worker = _only_doc(K8S_WORKER, "StatefulSet", "e2b-worker")
+    pod = _pod_spec_of(worker)
+    container = next(c for c in pod["containers"] if c["name"] == "worker")
+    mounts = {m["name"]: m for m in container["volumeMounts"]}
+    volumes = {v["name"]: v for v in pod["volumes"]}
+    return container, mounts, volumes
+
+
+def test_worker_carries_the_narrowed_writable_cgroup_view() -> None:
+    """§3.5 ①: one rw view, at `/pod-cgroup`, narrowed to `pod$(POD_UID)`.
+
+    Read off the *worker container* rather than the file text: the same names
+    (`pod-cgroup`, `E2B_CGROUP_MOUNT`) occur in every compose lane as well, so
+    a bare substring could match a different object.
+    """
+    container, mounts, volumes = _worker_cgroup_view()
+    assert mounts["cgpod"]["mountPath"] == "/pod-cgroup"
+    assert mounts["cgpod"]["subPathExpr"] == "pod$(POD_UID)"
+    # Pin 2: only `pod$(POD_UID)`. The plan's alternative form
+    # (`$(E2B_CGROUP_QOS)/pod$(POD_UID)`) would be a second variable and a
+    # second place to keep the QoS honest -- the pin keeps it out.
+    assert "burstable" not in mounts["cgpod"]["subPathExpr"]
+    assert volumes["cgpod"]["hostPath"] == {
+        "path": "/sys/fs/cgroup/kubepods/burstable",
+        "type": "Directory",
+    }
+    # The mount must be rw (the shape §1.4 measured) -- `readOnly` must not be
+    # set, and the narrowed view must never be the runtime's whole cgroupfs.
+    assert mounts["cgpod"].get("readOnly") is not True
+    assert mounts["cgpod"]["mountPath"] != "/sys/fs/cgroup"
+    # `subPathExpr` expands only env the container itself declares: `POD_UID`
+    # has to come from the downward API's `metadata.uid` (a wrong field --
+    # name, namespace -- makes the expression match nothing this pod owns).
+    env = _k8s_container_env(container)
+    assert env["POD_UID"] == {
+        "name": "POD_UID",
+        "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}},
+    }
+    # Code default `off` (inert); the deploy manifest is where the value lives,
+    # exactly like the idle-pause trio. The k0s overlay flips it (pinned below).
+    assert env["E2B_SANDBOX_CGROUP"] == {
+        "name": "E2B_SANDBOX_CGROUP",
+        "value": "off",
+    }
+    assert env["E2B_CGROUP_MOUNT"] == {
+        "name": "E2B_CGROUP_MOUNT",
+        "value": "/pod-cgroup",
+    }
+
+
+def test_worker_cgroup_view_qos_segment_matches_the_derived_qos() -> None:
+    """§3.5 pin 1: the literal QoS segment == the QoS `resources` derives.
+
+    The baseline worker pins small explicit requests (`500m/512Mi`) under its
+    `2Gi`/`2` limits, so it is Burstable **on its own** -- not only after the
+    k0s overlay rewrites `resources`. Until review round 1 the baseline was
+    limits-only, which Kubernetes defaults to a Guaranteed shape (see
+    `_qos_class_from_resources`): the pinned literal would then have been true
+    only in the overlay view. The mismatch this catches is *silent* on the node
+    (plan §1.4: kubelet fabricates the missing path), so the equality has to be
+    machine-checked here.
+    """
+    worker = _only_doc(K8S_WORKER, "StatefulSet", "e2b-worker")
+    pod = _pod_spec_of(worker)
+    _, _, volumes = _worker_cgroup_view()
+    segment = volumes["cgpod"]["hostPath"]["path"].rsplit("/", 1)[1]
+    derived = _qos_class_from_resources(pod["containers"]).lower()
+    assert segment == derived
+    assert segment == "burstable"
+    # Exactly one *declared* QoS constant (comments are allowed to narrate it):
+    # no second `kubepods/<qos>` hostPath hiding in the pod's volumes.
+    qos_paths = [
+        v["hostPath"]["path"]
+        for v in volumes.values()
+        if (v.get("hostPath") or {}).get("path", "").startswith(
+            "/sys/fs/cgroup/kubepods/"
+        )
+    ]
+    assert qos_paths == ["/sys/fs/cgroup/kubepods/burstable"]
+
+
+def test_qos_derivation_defaults_a_missing_request_to_its_limit() -> None:
+    """Review round 1: a **limits-only** container is Guaranteed, not Burstable.
+
+    Upstream, "If you specify a limit for a resource but do not specify any
+    request ... Kubernetes copies the limit ... and uses it as the requested
+    value", so admission turns a limits-only container into ``request ==
+    limit`` before the QoS class is computed. The first draft compared the raw
+    request and limit dicts instead, and would therefore have called the
+    baseline worker "Burstable" when the node saw "Guaranteed" -- letting the
+    ``burstable`` literal point at the empty cgroup kubelet fabricates (§1.4)
+    with every other assertion green. This is the trip wire so that
+    simplification cannot come back.
+    """
+    # The defaulting rule itself: only limits set ⇒ Guaranteed.
+    assert _qos_class_from_resources(
+        [{"resources": {"limits": {"cpu": "2", "memory": "2Gi"}}}]
+    ) == "Guaranteed"
+    # ...and the three classes it sits among, each from an unambiguous shape.
+    assert _qos_class_from_resources([{}]) == "BestEffort"
+    assert _qos_class_from_resources(
+        [
+            {
+                "resources": {
+                    "requests": {"cpu": "500m", "memory": "512Mi"},
+                    "limits": {"cpu": "2", "memory": "2Gi"},
+                }
+            }
+        ]
+    ) == "Burstable"
+    assert _qos_class_from_resources(
+        [
+            {
+                "resources": {
+                    "requests": {"cpu": "1", "memory": "1Gi"},
+                    "limits": {"cpu": "1", "memory": "1Gi"},
+                }
+            }
+        ]
+    ) == "Guaranteed"
+    # The mirror of the defaulting rule: a request with no limit is not
+    # Guaranteed (Kubernetes requires *both* halves), so it is Burstable.
+    assert _qos_class_from_resources(
+        [{"resources": {"requests": {"cpu": "1", "memory": "1Gi"}}}]
+    ) == "Burstable"
+
+
+def test_k0s_overlay_requires_the_cgroup_and_keeps_the_same_qos() -> None:
+    """Pins 1+3: the k0s patch rewrites `resources` and turns the switch on.
+
+    The patch moves `requests: 500m/512Mi` under `limits: 4/4Gi` (still
+    Burstable) and overrides `E2B_SANDBOX_CGROUP` to `required`. The static
+    half reads the patch's own `resources`; the rendered half (below) proves
+    the merged object still carries the narrowed mount.
+    """
+    docs = [doc for doc in yaml.safe_load_all(WORKER_CAPACITY_PATCH.read_text("utf-8")) if doc]
+    assert len(docs) == 1
+    containers = _pod_spec_of(docs[0])["containers"]
+    assert _qos_class_from_resources(containers) == "Burstable"
+    patch_env = _k8s_container_env(containers[0])
+    assert patch_env["E2B_SANDBOX_CGROUP"] == {
+        "name": "E2B_SANDBOX_CGROUP",
+        "value": "required",
+    }
+    # Falsifiability: the patch's resources really differ from the baseline's,
+    # so "derived class is the same" is a comparison and not two copies of one
+    # manifest agreeing with themselves.
+    baseline = _only_doc(K8S_WORKER, "StatefulSet", "e2b-worker")
+    baseline_container = next(
+        c for c in _pod_spec_of(baseline)["containers"] if c["name"] == "worker"
+    )
+    assert (
+        baseline_container.get("resources")
+        != containers[0].get("resources")
+    )
+
+
+@pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
+def test_k0s_overlay_renders_the_narrowed_cgroup_view_with_the_switch_on() -> None:
+    """The cluster actually runs the overlay: mount + switch must survive it."""
+    rendered = subprocess.run(
+        [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    worker = _only_doc(rendered.stdout, "StatefulSet", "e2b-worker")
+    pod = _pod_spec_of(worker)
+    container = next(c for c in pod["containers"] if c["name"] == "worker")
+    mounts = {m["name"]: m for m in container["volumeMounts"]}
+    volumes = {v["name"]: v for v in pod["volumes"]}
+    assert mounts["cgpod"]["mountPath"] == "/pod-cgroup"
+    assert mounts["cgpod"]["subPathExpr"] == "pod$(POD_UID)"
+    assert volumes["cgpod"]["hostPath"] == {
+        "path": "/sys/fs/cgroup/kubepods/burstable",
+        "type": "Directory",
+    }
+    env = _k8s_container_env(container)
+    assert env["E2B_SANDBOX_CGROUP"]["value"] == "required"
+    assert env["E2B_CGROUP_MOUNT"]["value"] == "/pod-cgroup"
+    assert (
+        volumes["cgpod"]["hostPath"]["path"].rsplit("/", 1)[1].lower()
+        == _qos_class_from_resources(pod["containers"]).lower()
+    )
+
+
+def test_agent_face_b_carries_its_own_writable_cgroup_view() -> None:
+    """R-C (Task 2 preflight): the delegation needs a rw view too.
+
+    Shape W (plan §3.2) has the **worker** own `sbx_<id>` beside `worker/`, and
+    the agent's face B do the one-time *delegation* (chown of the worker's
+    container cgroup subtree) that makes those writes land on the worker's uid.
+    Delegation is an op on the real tree, so face B needs its own rw cgroupfs
+    view: the whole tree (`/sys/fs/cgroup`) at `/host-cgroup`, because the path
+    it resolves for the worker's container is QoS-agnostic (plan §3.2 step 1).
+    """
+    agent = _only_doc(K8S_AGENT, "DaemonSet", "e2b-c3-agent")
+    pod = _pod_spec_of(agent)
+    containers = {c["name"]: c for c in pod["containers"]}
+    maint = containers["maint"]
+    mounts = {m["name"]: m for m in maint["volumeMounts"]}
+    assert mounts["host-cgroup"]["mountPath"] == "/host-cgroup"
+    assert mounts["host-cgroup"].get("readOnly") is not True
+    volumes = {v["name"]: v for v in pod["volumes"]}
+    assert volumes["host-cgroup"]["hostPath"] == {
+        "path": "/sys/fs/cgroup",
+        "type": "Directory",
+    }
+    assert _k8s_container_env(maint)["E2B_CGROUP_MOUNT"] == {
+        "name": "E2B_CGROUP_MOUNT",
+        "value": "/host-cgroup",
+    }
+    # The narrow shape holds: exactly face B carries it (not face A, not the two
+    # owner inits), and *nobody* re-mounts the runtime's own `/sys/fs/cgroup`.
+    for container in [*(pod.get("initContainers") or []), *pod["containers"]]:
+        names = {m["name"] for m in container.get("volumeMounts") or []}
+        paths = {m["mountPath"] for m in container.get("volumeMounts") or []}
+        assert ("host-cgroup" in names) == (container["name"] == "maint"), (
+            container["name"],
+            names,
+        )
+        assert "/sys/fs/cgroup" not in paths, (container["name"], paths)
+
+
+def _compose_block(text: str, service: str) -> str:
+    """One compose service's block: its key line up to the next 2-space key."""
+    tail = text.split(f"\n  {service}:", 1)[1]
+    lines = tail.splitlines()
+    end = len(lines)
+    for index, line in enumerate(lines):
+        if re.match(r"^  [A-Za-z0-9_.-]+:", line) or line == "volumes:":
+            end = index
+            break
+    return "\n".join(lines[:end])
+
+
+def test_compose_lanes_declare_the_workers_narrowed_cgroup_view() -> None:
+    """§3.5: compose has no `subPathExpr`, so the worker sees the whole VM tree.
+
+    The narrowed shape is a k8s-only device; on the compose lane the worker
+    recognises its own subtree by the *delegated* directory (the local-lane
+    runtime check is Task 7's). What has to stay true in every lane is the
+    pair of knobs and the rw bind, so the code path is the same on both sides.
+    """
+    for path, text in (
+        ("deploy/compose/docker-compose.multinode.yml", COMPOSE_MULTINODE),
+        ("deploy/compose/docker-compose.prod.yml", COMPOSE_PROD),
+        ("deploy/stack/docker-compose.prod.yml", STACK_COMPOSE),
+    ):
+        if path.endswith("multinode.yml"):
+            # No anchor here: each of the three workers repeats its whole block.
+            blocks = [_multinode_worker_block(name) for name in MULTINODE_WORKERS]
+        else:
+            # worker-1 is the `&worker`/`&worker-env` anchor worker-2/3 inherit.
+            blocks = [_compose_block(text, "worker-1")]
+        for block in blocks:
+            assert "\n      E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}\n" in block, path
+            assert "\n      E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}\n" in block, path
+            assert "\n      - /sys/fs/cgroup:/pod-cgroup\n" in block, path
+
+
+def test_compose_agent_face_b_carries_the_host_cgroup_view() -> None:
+    """R-C: the compose half of face B's rw view, and nowhere else.
+
+    `/sys/fs/cgroup:/host-cgroup` is the compose spelling of the k8s
+    `host-cgroup` volume; it goes on face B only, and face A must stay as
+    mountless as the k8s one (plan §2.1).
+    """
+    for path, text in (
+        ("deploy/compose/docker-compose.multinode.yml", COMPOSE_MULTINODE),
+        ("deploy/compose/docker-compose.prod.yml", COMPOSE_PROD),
+        ("deploy/stack/docker-compose.prod.yml", STACK_COMPOSE),
+    ):
+        maint = _compose_block(text, "c3-agent-maint")
+        assert "\n      E2B_CGROUP_MOUNT: /host-cgroup\n" in maint, path
+        assert "\n      - /sys/fs/cgroup:/host-cgroup\n" in maint, path
+        assert "/sys/fs/cgroup" not in _compose_block(text, "c3-agent"), path

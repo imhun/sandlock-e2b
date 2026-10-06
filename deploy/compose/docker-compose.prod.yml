@@ -400,6 +400,11 @@ services:
       # default, 10000/1000).
       E2B_UID_POOL_START: ${E2B_UID_POOL_START:-10000}
       E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE:-1000}
+      # N83 phase 1 / Task 2：面 B 的 rw cgroupfs 视图（`/sys/fs/cgroup:/host-cgroup`
+      # 在下面的 volumes 里）。委派（把 worker 容器 cgroup 子树 chown 给它）是
+      # **这个**容器做的（形态 W，计划 §3.2），所以它要有一块真的 cgroupfs；
+      # 挂整棵树而非收窄视图 —— 它自己解析 worker 容器路径，那条路径与 QoS 无关。
+      E2B_CGROUP_MOUNT: /host-cgroup
       # C3 Task 6: the eyes. This is face B because it is the container that
       # mounts the workspaces; the report is `{"sandboxes": [ids]}` and the
       # control plane decides and instructs, exactly as in k8s. 30s + 120s ⇒ a
@@ -411,6 +416,9 @@ services:
       E2B_C3_AGENT_SCAN_BACKOFF_MAX_S: ${E2B_C3_AGENT_SCAN_BACKOFF_MAX_S:-600}
     volumes:
       - sandbox-shared:/var/lib/e2b-sandboxes
+      # N83 phase 1 / Task 2：面 B 的 rw cgroupfs 视图（见上面
+      # `E2B_CGROUP_MOUNT`）；只挂给面 B —— 面 A 不挂。
+      - /sys/fs/cgroup:/host-cgroup
     # `agent-plane` only: this is the other half of the same two-channel split.
     networks:
       - agent-plane
@@ -525,6 +533,13 @@ services:
       E2B_NODE_CPU_PERCENT: ${E2B_NODE_CPU_PERCENT:-200}
       E2B_NODE_DISK_MB: ${E2B_NODE_DISK_MB:-4096}
       E2B_NODE_PROCESSES: ${E2B_NODE_PROCESSES:-256}
+      # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
+      # default, inert) and where the rw cgroupfs view lands. This lane has no
+      # `subPathExpr`, so the view is the whole Docker VM tree
+      # (`/sys/fs/cgroup:/pod-cgroup` in `&worker-volumes` below) and the worker
+      # picks its own subtree by the directory face B delegated to it.
+      E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}
+      E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}
       # NFS form (E2.6): route quota operations to the server-side
       # quota-agent (docker-compose.quota-agent.yml). Default false = local
       # direct XFS; unreachable/rejecting agent degrades with warnings.
@@ -534,6 +549,11 @@ services:
       E2B_QUOTA_AGENT_TIMEOUT_S: ${E2B_QUOTA_AGENT_TIMEOUT_S:-5}
     volumes: &worker-volumes
       - sandbox-shared:/var/lib/e2b-sandboxes
+      # N83 phase 1 / Task 2: the worker's rw cgroupfs view (plan §3.5). No
+      # `subPathExpr` in compose, so this is the whole tree; the worker picks its
+      # own subtree by the **delegated** directory (`sbx_<id>` sits beside the
+      # `worker/` owning cgroup).
+      - /sys/fs/cgroup:/pod-cgroup
     # A6: the worker needs no SYS_ADMIN (shared-volume bind deleted in A4,
     # quota served by the quota-agent, and since 2026-09-26 no low-port window
     # either -- see the net-isolation pair above). Enabling the agent form is
