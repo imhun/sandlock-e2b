@@ -852,6 +852,66 @@ async def _never_ending(*_args, **_kwargs) -> None:
     await asyncio.sleep(3600)
 
 
+def _delegate_is_unreachable(**_kwargs) -> dict:
+    """The startup lane's retry path: the control plane is away for now."""
+    raise PrivHelperError("the control plane is unreachable")
+
+
+async def test_the_off_lane_starts_no_event_sweeper(monkeypatch) -> None:
+    """``off`` is byte-identical here too: no lane, so nothing samples.
+
+    N83 phase 2 (Task 5) puts the kernel's per-sandbox event counters on the
+    heartbeat. They live inside ``sbx_<id>``, which only exists on a lane that
+    built one -- so a worker with the switch off must not even start a task for
+    them, exactly like the startup lane above.
+    """
+    monkeypatch.setattr(node_agent.NodeAgent, "_loop", _never_ending)
+    agent = node_agent.NodeAgent(
+        settings=_settings(sandbox_cgroup="off"),
+        runtime_registry=SimpleNamespace(),
+        control_plane_url=CONTROL_PLANE_URL,
+        node_address="10.0.0.5",
+        node_id=NODE_ID,
+    )
+
+    agent.start()
+
+    assert agent._cgroup_task is None
+    assert agent._cgroup_events_task is None
+    await agent.stop()
+
+
+async def test_the_required_lane_sweeps_the_event_counters(monkeypatch) -> None:
+    """With the lane on, the counters are sampled on their own cadence and kept
+    for the heartbeat."""
+    monkeypatch.setattr(node_agent.NodeAgent, "_loop", _never_ending)
+    monkeypatch.setattr(
+        node_agent, "request_cgroup_delegate", _delegate_is_unreachable
+    )
+    monkeypatch.setattr(node_agent, "CGROUP_RETRY_INTERVAL_S", 0.01)
+    events = {"sbx_alpha": {"oom_kill": 1, "oom_group_kill": 0, "pids_max": 0}}
+    monkeypatch.setattr(
+        node_agent, "sample_sandbox_events", lambda _settings: dict(events)
+    )
+    agent = node_agent.NodeAgent(
+        settings=_settings(sandbox_cgroup="required"),
+        runtime_registry=SimpleNamespace(),
+        control_plane_url=CONTROL_PLANE_URL,
+        node_address="10.0.0.5",
+        node_id=NODE_ID,
+    )
+    agent._cgroup_events_interval_s = 0.01
+
+    agent.start()
+    sweeper = agent._cgroup_events_task
+    assert sweeper is not None
+    await asyncio.sleep(0.05)
+    assert agent._cgroup_events == events
+    await agent.stop()
+    assert sweeper.cancelled()
+    assert agent._cgroup_events_task is None
+
+
 # ------------------------------------------------- the factory's two local paths
 
 

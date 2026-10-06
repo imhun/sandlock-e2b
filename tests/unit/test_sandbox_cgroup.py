@@ -1167,3 +1167,202 @@ def test_a_ceiling_that_matches_the_kernel_is_silent(
         cpu_percent=400, memory_mb=4096, processes=None
     )
     assert caplog.records == []
+
+
+# ---------------------------------------------------------------------------
+# N83 phase 2 (Task 5): the kernel's own account of a sandbox hitting a wall
+#
+# ``sbx_<id>/memory.events`` counts the times a charge hit ``memory.max``
+# (``oom_kill``, and the whole-group variant ``oom_group_kill`` that stays 0
+# because D3 never writes ``memory.oom.group``); ``sbx_<id>/pids.events`` counts
+# the times a *task* creation hit ``pids.max`` (``max`` -- tasks, so threads
+# count, plan D4). The kernel removes both files with the directory, so the
+# worker reads them at teardown (``release``, *before* ``cgroup.kill``/``rmdir``)
+# and, for a live box, on the periodic sweep (``sample_events``). Either way the
+# numbers ride the heartbeat as ``sandboxEvents``, and the control plane turns
+# "the count grew" into one named WARN -- Review Focus §4: the user must not
+# just watch the process mysteriously disappear.
+
+#: What one box's account looks like on the wire: the kernel's own counter
+#: names, with ``pids.events``'s ``max`` prefixed by its file -- a bare ``max``
+#: would collide with ``memory.events``'s own line of that name.
+BOX_EVENTS = {"oom_kill": 2, "oom_group_kill": 1, "pids_max": 3}
+
+
+def _box_events(
+    box: Path, *, oom_kill: int, oom_group_kill: int, pids_max: int
+) -> None:
+    """The two kernfs event files a real cgroup directory carries."""
+    _write(
+        box / "memory.events",
+        "low 0\nhigh 0\nmax 0\noom 0\n"
+        f"oom_kill {oom_kill}\noom_group_kill {oom_group_kill}\n",
+    )
+    _write(box / "pids.events", f"max {pids_max}\n")
+
+
+def _live_cgroups(tmp_path: Path) -> tuple[SandboxCgroups, Path, Path]:
+    """A handle that has run ``setup``: ready for ``attach``/``sample_events``."""
+    mount = _pod_mount(tmp_path)
+    proc_root = tmp_path / "proc"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=proc_root,
+        policy_ceiling=POLICY_CEILING,
+    )
+    cg.setup(wait_s=0.2)
+    return cg, mount / "worker-container", proc_root
+
+
+def _attach_box(
+    cg: SandboxCgroups, proc_root: Path, sandbox_id: str, pid: int
+) -> Path:
+    _write(proc_root / str(pid) / "cgroup", f"0::/sbx_{sandbox_id}\n")
+    return Path(
+        cg.attach(
+            sandbox_id=sandbox_id,
+            pid=pid,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=64,
+        )
+    )
+
+
+def test_release_reads_the_counters_before_it_removes_the_box(tmp_path: Path) -> None:
+    """The teardown reading is the last chance: the files go with the directory."""
+    cg, _parent, proc_root = _live_cgroups(tmp_path)
+    box = _attach_box(cg, proc_root, "alpha", 4242)
+    _box_events(box, oom_kill=2, oom_group_kill=1, pids_max=3)
+
+    # A live box is read by the periodic sweep ...
+    assert cg.sample_events() == {"alpha": BOX_EVENTS}
+
+    # ... and the teardown's own reading survives it: after ``release`` the
+    # directory (and both files) are gone, and the numbers still travel.
+    assert cg.release(sandbox_id="alpha") is True
+    assert box.exists() is False
+    assert cg.sample_events() == {"alpha": BOX_EVENTS}
+
+
+def test_release_refuses_and_keeps_the_box_when_a_counter_cannot_be_read(
+    tmp_path: Path,
+) -> None:
+    """Strict where it matters: a box whose account cannot be read is not
+    destroyed with the numbers unread -- the refusal names the file, and the
+    box (and its account) stays for the next attempt or the node's GC."""
+    cg, _parent, proc_root = _live_cgroups(tmp_path)
+    box = _attach_box(cg, proc_root, "alpha", 4242)
+    _box_events(box, oom_kill=2, oom_group_kill=0, pids_max=0)
+    (box / "memory.events").unlink()
+    (box / "memory.events").mkdir()  # present, but not readable as a file
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.release(sandbox_id="alpha")
+
+    assert str(excinfo.value) == (
+        f"cgroup-refusal events-read: {box / 'memory.events'}"
+    )
+    assert box.exists() is True
+    # The heartbeat's sweep must never fail on the same file: it skips the box
+    # (an unreadable account is not "nothing happened").
+    assert cg.sample_events() == {}
+
+
+def test_the_sampler_reports_only_the_boxes_that_hit_a_wall(tmp_path: Path) -> None:
+    """A clean box carries no event, so it is not on the wire every 5 s."""
+    cg, _parent, proc_root = _live_cgroups(tmp_path)
+    alpha = _attach_box(cg, proc_root, "alpha", 4242)
+    _box_events(alpha, oom_kill=2, oom_group_kill=1, pids_max=3)
+    beta = _attach_box(cg, proc_root, "beta", 4243)
+    _box_events(beta, oom_kill=0, oom_group_kill=0, pids_max=0)
+    _attach_box(cg, proc_root, "gamma", 4244)  # no event files at all
+
+    assert cg.sample_events() == {"alpha": BOX_EVENTS}
+
+
+def test_the_sampler_skips_a_box_whose_account_cannot_be_read(
+    tmp_path: Path,
+) -> None:
+    """The sweep never raises -- a heartbeat must not be lost over a cgroup
+    file -- and it still reports the boxes it could read."""
+    cg, _parent, proc_root = _live_cgroups(tmp_path)
+    alpha = _attach_box(cg, proc_root, "alpha", 4242)
+    _box_events(alpha, oom_kill=2, oom_group_kill=1, pids_max=3)
+    beta = _attach_box(cg, proc_root, "beta", 4243)
+    _box_events(beta, oom_kill=9, oom_group_kill=0, pids_max=0)
+    (beta / "memory.events").unlink()
+    (beta / "memory.events").mkdir()
+
+    assert cg.sample_events() == {"alpha": BOX_EVENTS}
+
+
+def test_a_remembered_reading_is_never_lowered_by_a_later_box(
+    tmp_path: Path,
+) -> None:
+    """The counters are the kernel's and the growth is the event: a sandbox id
+    seen again with a fresh cgroup keeps the maximum this node ever saw."""
+    cg, _parent, proc_root = _live_cgroups(tmp_path)
+    first = _attach_box(cg, proc_root, "alpha", 4242)
+    _box_events(first, oom_kill=5, oom_group_kill=0, pids_max=0)
+    assert cg.release(sandbox_id="alpha") is True
+
+    second = _attach_box(cg, proc_root, "alpha", 4243)
+    _box_events(second, oom_kill=1, oom_group_kill=0, pids_max=0)
+
+    assert cg.sample_events() == {
+        "alpha": {"oom_kill": 5, "oom_group_kill": 0, "pids_max": 0}
+    }
+
+
+def test_the_heartbeat_carries_the_event_section_only_when_there_is_one() -> None:
+    """The wire field: ``sandboxEvents``, one entry per sandbox that hit a wall."""
+    payload = node_agent._heartbeat_usage_payload(
+        Settings(), sandbox_events={"alpha": BOX_EVENTS}
+    )
+
+    assert payload["sandboxEvents"] == {"alpha": BOX_EVENTS}
+    assert "sandboxEvents" not in node_agent._heartbeat_usage_payload(Settings())
+    assert "sandboxEvents" not in node_agent._heartbeat_usage_payload(
+        Settings(), sandbox_events={}
+    )
+
+
+def test_the_off_lane_samples_nothing_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``E2B_SANDBOX_CGROUP=off`` reaches no further than this: there is no
+    ``sbx_<id>`` to read, so no handle is built and no cgroup file is touched."""
+    from envd_service import route_b
+
+    monkeypatch.setenv("E2B_SANDBOX_CGROUP", "off")
+
+    def _forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the off lane must not build a cgroup handle")
+
+    monkeypatch.setattr(route_b, "SandboxCgroups", _forbidden)
+
+    assert node_agent.sample_sandbox_events(Settings()) == {}
+
+
+def test_the_sampler_goes_through_the_process_wide_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The heartbeat's sampler resolves the *one* handle ``setup`` established
+    and ``attach`` wrote through -- never a second object with its own view."""
+    from envd_service import route_b
+
+    monkeypatch.setenv("E2B_SANDBOX_CGROUP", "required")
+    monkeypatch.setenv("E2B_CGROUP_MOUNT", str(tmp_path / "pod"))
+    seen: list[dict] = []
+
+    class _Handle:
+        def __init__(self, **kwargs: object) -> None:
+            seen.append(kwargs)
+
+        def sample_events(self) -> dict[str, dict[str, int]]:
+            return {"alpha": dict(BOX_EVENTS)}
+
+    monkeypatch.setattr(route_b, "SandboxCgroups", _Handle)
+
+    assert node_agent.sample_sandbox_events(Settings()) == {"alpha": BOX_EVENTS}
+    assert len(seen) == 1

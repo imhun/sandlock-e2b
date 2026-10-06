@@ -230,6 +230,62 @@ def _sandbox_ceiling_fields(body: dict[str, Any]) -> dict[str, Any] | None:
     return ceiling
 
 
+def _sandbox_event_fields(body: dict[str, Any]) -> dict[str, dict[str, int]] | None:
+    """The worker's per-sandbox kernel event counters, or ``None`` (Task 5).
+
+    Shape: ``{"<sandbox id>": {"oom_kill": <int>, "oom_group_kill": <int>,
+    "pids_max": <int>}}`` -- the counters the kernel keeps inside each
+    ``sbx_<id>``: ``memory.events``'s ``oom_kill``/``oom_group_kill`` (an
+    over-budget sandbox was SIGKILLed) and ``pids.events``'s ``max`` (a *task*
+    creation hit ``pids.max`` and got ``EAGAIN``; tasks, so threads count).
+    Every counter only ever grows, and the *growth* is the event.
+
+    Absent is not an error -- an older worker during a rollout reports nothing,
+    and the record keeps what it already has, exactly like ``sandboxCeiling``
+    above. A section of the wrong shape is refused by name for the same reason
+    a malformed ceiling is: a typo must not read as "no sandbox hit a wall".
+
+    An *entry* that is not a mapping of non-negative integers is a different
+    case and is **dropped, with a warning**, rather than failing the heartbeat.
+    Unlike the ceiling, this section grants nothing -- it is the account of
+    something that already happened -- and a garbled counter must not cost the
+    node its liveness: a worker whose heartbeats are refused goes stale, and a
+    stale node's live sandboxes are orphaned. ``apply_cpu_report``'s per-entry
+    tolerance is the precedent for a per-sandbox map on the heartbeat.
+    """
+    value = body.get("sandboxEvents")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise OfficialError(400, "sandboxEvents must be a JSON object")
+    events: dict[str, dict[str, int]] = {}
+    for sandbox_id, counters in value.items():
+        if not isinstance(counters, dict):
+            logger.warning(
+                "internal API: sandboxEvents[%s] is not a JSON object (%r); "
+                "ignoring this counter report",
+                sandbox_id,
+                counters,
+            )
+            continue
+        clean: dict[str, int] = {}
+        for name, raw in counters.items():
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+                logger.warning(
+                    "internal API: sandboxEvents[%s].%s is not a non-negative "
+                    "integer (%r); ignoring this counter report",
+                    sandbox_id,
+                    name,
+                    raw,
+                )
+                clean = {}
+                break
+            clean[str(name)] = raw
+        if clean:
+            events[str(sandbox_id)] = clean
+    return events
+
+
 def _worker_identity_fields(body: dict[str, Any]) -> tuple[int | None, int | None]:
     """The worker's reported ``workerUID`` / ``workerGID``, or a named refusal.
 
@@ -725,6 +781,14 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
     sandbox_ceiling = _sandbox_ceiling_fields(body)
     if sandbox_ceiling is not None:
         record.apply_sandbox_ceiling(sandbox_ceiling)
+    # N83 phase 2 (Task 5): the kernel's per-sandbox count of what phase 2's two
+    # new endings did -- a SIGKILL past ``memory.max``, an ``EAGAIN`` past
+    # ``pids.max``. The record keeps the maximum per sandbox and counter and
+    # ``apply_sandbox_events`` logs one named WARN per growth (see there for why
+    # a smaller report is neither stored nor refused).
+    sandbox_events = _sandbox_event_fields(body)
+    if sandbox_events:
+        record.apply_sandbox_events(sandbox_events)
     record.update_usage(
         used_disk_mb=body.get("diskUsedMB"),
         disk_total_mb=body.get("diskTotalMB"),

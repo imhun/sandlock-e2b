@@ -58,6 +58,21 @@ over-budget sandbox from dragging its neighbours, or the parent container,
 down with it). The **policy** ceiling is injected into this class (R3), never
 read from the kernel: a declared size above it is refused by name, because
 "run smaller silently" is the one outcome the API promise must not have.
+
+N83 phase 2 (Task 5) adds the *reading* half of those two endings, and it has
+to happen inside this module for the same reason everything else does: the
+counters are kernfs files **inside** the box. ``memory.events`` counts the
+times a charge hit ``memory.max`` (``oom_kill``, plus the whole-group variant
+``oom_group_kill`` that stays 0 because D3 never writes ``memory.oom.group``);
+``pids.events``'s ``max`` counts the times a *task* creation hit ``pids.max``
+-- tasks, so threads count (D4). The kernel removes both files with the
+directory, so :meth:`SandboxCgroups.release` reads them **before**
+``cgroup.kill``/``rmdir`` (that is the last chance to see them, and the reason
+that read is strict) while :meth:`SandboxCgroups.sample_events` reads the live
+boxes for the heartbeat (that one is best effort: a heartbeat must never be
+lost over a cgroup file). Both feed the same per-sandbox map, which rides the
+heartbeat so a kill becomes a named event instead of a process that "just
+vanished".
 """
 
 from __future__ import annotations
@@ -80,6 +95,9 @@ logger = logging.getLogger(__name__)
 #: How deep the compose-lane search walks the mounted tree before giving up.
 _WALK_MAX_DEPTH = 6
 
+#: Every sandbox cgroup this module builds is named this plus the sandbox id.
+_SANDBOX_PREFIX = "sbx_"
+
 #: The kernfs files a cgroup directory exposes. On cgroupfs they are removed
 #: *with* the directory, so the first ``rmdir`` succeeds; a plain filesystem
 #: keeps them, so teardown falls back to unlinking precisely these names (they
@@ -90,11 +108,21 @@ _KERNFS_FILES = (
     "cpu.max",
     "memory.high",
     "memory.max",
+    "memory.events",
     "pids.max",
+    "pids.events",
     "cgroup.procs",
     "cgroup.kill",
     "cgroup.subtree_control",
 )
+
+#: The counters the kernel keeps for the two endings phase 2 introduced, under
+#: the names the heartbeat uses. ``oom_kill``/``oom_group_kill`` are
+#: ``memory.events``'s own lines; ``pids_max`` is ``pids.events``'s ``max``
+#: line, prefixed by its file because a bare ``max`` would collide with the
+#: memory file's line of that name (and with ``memory.max`` itself).
+MEMORY_EVENT_COUNTERS = ("oom_kill", "oom_group_kill")
+PIDS_EVENT_COUNTER = "max"
 
 #: The three controllers ``setup()`` enables on the delegated parent. One
 #: command, because they arrive through one delegation and one drain:
@@ -237,6 +265,71 @@ def read_kernel_ceiling(mount: Path) -> SandboxCeiling:
     )
 
 
+def _event_counters(path: Path, wanted: tuple[str, ...]) -> dict[str, int]:
+    """The named counters in one ``*.events`` file.
+
+    An **absent** file is not a failure: a box whose kernel does not keep the
+    account (the synthetic lane's tree, or a kernel without that line) has
+    nothing to count, and every wanted counter reads 0 -- "this kernel does not
+    track it" is the honest value for a counter, unlike the limit files above,
+    where "no number" must never read as "no limit".
+
+    A file that **is there** but cannot be read or parsed is a named refusal,
+    and that asymmetry is the whole point of this function: these numbers are
+    the only record of a sandbox that was killed, so "I could not read it" must
+    never be silently reported as "nothing happened" (plan Task 5 -- Review
+    Focus §4). Callers decide what to do with the refusal: ``release`` lets it
+    out (the box keeps its account), ``sample_events`` swallows it (a heartbeat
+    must not be lost over a cgroup file).
+    """
+    counters = {name: 0 for name in wanted}
+    if not path.exists():
+        return counters
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise CgroupRefusal(f"cgroup-refusal events-read: {path}") from exc
+    for line in text.splitlines():
+        name, _, raw = line.partition(" ")
+        if name not in counters:
+            # `memory.events` carries other lines (`low`, `high`, `max`,
+            # `oom`); a kernel that grows a new one is not this module's
+            # business.
+            continue
+        try:
+            counters[name] = int(raw.strip())
+        except ValueError as exc:
+            raise CgroupRefusal(
+                f"cgroup-refusal events-format: {path} reads {line!r} for "
+                f"{name}, expected '<name> <count>'"
+            ) from exc
+    return counters
+
+
+def read_sandbox_events(directory: Path) -> dict[str, int]:
+    """One box's kernel event counters, under the names the heartbeat uses.
+
+    ``directory`` is a live ``sbx_<id>``: ``oom_kill``/``oom_group_kill`` come
+    from its ``memory.events`` and ``pids_max`` from its ``pids.events``. All
+    three are monotonic kernel counters -- *the count grew* is the event, and
+    there is no "current" reading here on purpose: ``pids.current`` counts
+    **tasks, threads included**, so it is not a process count and does not
+    belong in a section whose every other number only ever moves forward.
+
+    Raises :class:`CgroupRefusal` for a file that exists but cannot be read or
+    parsed (see :func:`_event_counters`); the callers' two disciplines -- strict
+    in :meth:`SandboxCgroups.release`, best effort in
+    :meth:`SandboxCgroups.sample_events` -- are documented there.
+    """
+    memory = _event_counters(directory / "memory.events", MEMORY_EVENT_COUNTERS)
+    pids = _event_counters(directory / "pids.events", (PIDS_EVENT_COUNTER,))
+    return {
+        "oom_kill": memory["oom_kill"],
+        "oom_group_kill": memory["oom_group_kill"],
+        "pids_max": pids[PIDS_EVENT_COUNTER],
+    }
+
+
 def check_policy_ceiling(policy: SandboxCeiling, *, mount: Path) -> SandboxCeiling:
     """D5b: cross-check the configured per-sandbox ceiling against the kernel's.
 
@@ -348,6 +441,14 @@ def _remove_cgroup_dir(target: Path) -> None:
 class SandboxCgroups:
     """Build and tear down ``sbx_<id>`` cgroups under the delegated directory."""
 
+    #: How many retired boxes' last-chance readings are kept for the heartbeat.
+    #: Only boxes that hit a wall are kept and the numbers are a few bytes, so
+    #: this bounds a worker that lives for months rather than a busy one -- and
+    #: because it is only *evicted* (never lowered), losing an entry costs at
+    #: most a repeated WARN on the control plane, never a lost event within a
+    #: heartbeat's reach.
+    RETIRED_EVENT_KEEP = 256
+
     def __init__(
         self,
         *,
@@ -363,6 +464,10 @@ class SandboxCgroups:
         self._container_token = container_token
         self._policy_ceiling = policy_ceiling
         self._parent: Path | None = None
+        #: N83 phase 2 (Task 5): the counters of boxes that have already been
+        #: torn down, kept from ``release`` (they only exist while the
+        #: directory does) so the next ``sample_events`` can still report them.
+        self._retired_events: dict[str, dict[str, int]] = {}
 
     # -- startup -------------------------------------------------------
 
@@ -592,7 +697,7 @@ class SandboxCgroups:
             memory_mb=memory_mb,
             max_processes=max_processes,
         )
-        target = parent / f"sbx_{sandbox_id}"
+        target = parent / f"{_SANDBOX_PREFIX}{sandbox_id}"
         created = False
         try:
             if target.exists():
@@ -629,7 +734,7 @@ class SandboxCgroups:
                 raise CgroupRefusal(
                     f"cgroup-refusal procs: wrote {pid} to {procs}, read {placed!r}"
                 )
-            expected = f"0::/sbx_{sandbox_id}"
+            expected = f"0::/{_SANDBOX_PREFIX}{sandbox_id}"
             actual = self._pid_cgroup(pid)
             if actual != expected:
                 raise CgroupRefusal(
@@ -728,13 +833,31 @@ class SandboxCgroups:
             )
 
     def release(self, *, sandbox_id: str) -> bool:
-        """Kill and remove ``sbx_<id>``. Absent is ``False``, not an error."""
+        """Kill and remove ``sbx_<id>``. Absent is ``False``, not an error.
+
+        N83 phase 2 (Task 5) reads the box's kernel event counters here, first
+        and **before** ``cgroup.kill`` and the ``rmdir``: the kernel removes
+        ``memory.events``/``pids.events`` with the directory, so this is the
+        last chance to see them, and the reading is kept for the next heartbeat
+        (:meth:`sample_events`) -- which is what turns "the process just
+        vanished" into a named event on the control plane.
+
+        This read is **strict**, unlike the sampler's: a file that is there but
+        cannot be read or parsed raises the named refusal and the box is left
+        alone, because destroying the account you failed to read is the one
+        thing that would make the numbers unrecoverable. An *absent* file is
+        not an error (a lane whose kernel keeps no such account has nothing to
+        count), and a box that hit nothing keeps no entry -- "the count grew" is
+        the event, and this method is called for every sandbox that ever lived.
+        """
         self._validate_sandbox_id(sandbox_id)
         parent = self._require_parent()
-        target = parent / f"sbx_{sandbox_id}"
+        target = parent / f"{_SANDBOX_PREFIX}{sandbox_id}"
+        events: dict[str, int] = {}
         try:
             if not target.exists():
                 return False
+            events = read_sandbox_events(target)
             kill = target / "cgroup.kill"
             if kill.exists():
                 # Write-only (mode 0200) on a real cgroupfs: no readback is possible.
@@ -751,7 +874,80 @@ class SandboxCgroups:
             raise CgroupRefusal(
                 f"cgroup-refusal release-rmdir: could not rmdir {target}"
             ) from exc
+        self._remember_events(sandbox_id, events)
         return True
+
+    def sample_events(self) -> dict[str, dict[str, int]]:
+        """Every live box's kernel event counters, plus the retired readings.
+
+        This is the heartbeat's copy (N83 phase 2, Task 5), and it is **best
+        effort by construction**: it never raises, because a heartbeat must not
+        be lost over a cgroup file (the strict read of the same numbers is
+        :meth:`release`'s, where they are the last chance to see them). A box
+        whose account cannot be read is **skipped**, never reported as zeros:
+        "I could not read it" is not "nothing happened".
+
+        Boxes that have hit no wall are omitted too -- they carry no event, and
+        this rides a channel that speaks every few seconds. The retired
+        readings ``release`` kept are merged in and never lowered, so a box that
+        was killed *and* torn down between two samples still reaches the
+        control plane at least once.
+        """
+        merged: dict[str, dict[str, int]] = {
+            sandbox_id: dict(counters)
+            for sandbox_id, counters in self._retired_events.items()
+        }
+        parent = self._parent
+        if parent is not None:
+            for entry in self._live_box_dirs(parent):
+                sandbox_id = entry.name[len(_SANDBOX_PREFIX) :]
+                try:
+                    counters = read_sandbox_events(entry)
+                except (CgroupRefusal, OSError) as exc:
+                    logger.debug("cgroup events: cannot read %s (%s)", entry, exc)
+                    continue
+                seen = merged.get(sandbox_id)
+                merged[sandbox_id] = (
+                    counters
+                    if seen is None
+                    else {
+                        name: max(counters.get(name, 0), seen.get(name, 0))
+                        for name in counters.keys() | seen.keys()
+                    }
+                )
+        return {
+            sandbox_id: counters
+            for sandbox_id, counters in merged.items()
+            if any(counters.values())
+        }
+
+    def _live_box_dirs(self, parent: Path) -> list[Path]:
+        """The ``sbx_*`` directories under the delegated parent, best effort."""
+        try:
+            listing = list(parent.iterdir())
+        except OSError:
+            # A view that went away mid-read must not cost a heartbeat.
+            return []
+        return sorted(
+            path
+            for path in listing
+            if path.name.startswith(_SANDBOX_PREFIX) and path.is_dir()
+        )
+
+    def _remember_events(self, sandbox_id: str, counters: dict[str, int]) -> None:
+        """Keep one box's last-chance reading for the next heartbeat."""
+        if not any(counters.values()):
+            return
+        previous = self._retired_events.get(sandbox_id)
+        if previous is not None:
+            counters = {
+                name: max(value, previous.get(name, 0))
+                for name, value in counters.items()
+            }
+        self._retired_events.pop(sandbox_id, None)  # keep the eviction FIFO
+        self._retired_events[sandbox_id] = counters
+        while len(self._retired_events) > self.RETIRED_EVENT_KEEP:
+            self._retired_events.pop(next(iter(self._retired_events)))
 
     # -- helpers -------------------------------------------------------
 

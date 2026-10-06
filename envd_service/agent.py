@@ -470,6 +470,20 @@ def _cpu_activity_interval_s() -> float:
     return env_float("E2B_CPU_ACTIVITY_INTERVAL_S", 5.0)
 
 
+def _cgroup_events_interval_s() -> float:
+    """How often the worker samples the per-sandbox kernel event counters (Task 5).
+
+    ``E2B_CGROUP_EVENTS_INTERVAL_S`` (default 5 s = the heartbeat's own
+    cadence); ``0`` disables the sweep, which costs nothing but latency -- the
+    counters are still read at teardown (``SandboxCgroups.release``), so a
+    sandbox that is killed *and* removed is still reported; one that is killed
+    and left running only shows up when its box is read.
+    """
+    from gateway_common.env import env_float
+
+    return env_float("E2B_CGROUP_EVENTS_INTERVAL_S", 5.0)
+
+
 def _cpu_activity_percent() -> float:
     """Percent of one core that counts as "this sandbox is working".
 
@@ -526,12 +540,19 @@ def _heartbeat_usage_payload(
     container_id: str | None = None,
     cpu_provider: Callable[[], dict[str, float]] | None = None,
     ceiling: dict[str, Any] | None = None,
+    sandbox_events: dict[str, dict[str, int]] | None = None,
 ) -> dict[str, Any]:
     """Disk usage + quota alerts + MCP port band carried by each heartbeat.
 
     N83 phase 2 adds ``sandboxCeiling`` (the caller passes it in): the
     per-sandbox policy this worker resolved and the kernel's own read of its
     container cgroup.
+
+    ... and (Task 5) ``sandboxEvents``: the kernel's per-sandbox count of the
+    two endings phase 2 introduced -- an over-budget sandbox SIGKILLed, and a
+    task creation that hit ``pids.max`` and got ``EAGAIN``. Keyed by sandbox id
+    like ``sandboxCpu``, absent when nothing has hit a wall (and absent
+    entirely on the ``off`` lane, which has no ``sbx_<id>`` to read).
     """
     payload: dict[str, Any] = {}
     if pid_namespace:
@@ -559,6 +580,19 @@ def _heartbeat_usage_payload(
         # that lowers the policy ceiling must reach the control plane's node
         # record without waiting for a full re-registration.
         payload["sandboxCeiling"] = dict(ceiling)
+    if sandbox_events:
+        # N83 phase 2 (Task 5): the kernel's own count of this sandbox hitting
+        # its cgroup wall. The control plane keeps the maximum per sandbox and
+        # counter and logs one named WARN per growth -- the line that keeps a
+        # kernel kill from reading as "the process mysteriously disappeared"
+        # (the sandbox record still says `running`). Entries carry all three
+        # counters; a box that hit nothing is not sent at all.
+        payload["sandboxEvents"] = {
+            str(sandbox_id): {
+                str(name): int(count) for name, count in counters.items()
+            }
+            for sandbox_id, counters in sandbox_events.items()
+        }
     try:
         usage = shutil.disk_usage(settings.workspace_base)
         payload["diskUsedMB"] = usage.used // (1024 * 1024)
@@ -1904,6 +1938,44 @@ def _scan_workspace_runtimes(
 CGROUP_RETRY_INTERVAL_S = 5.0
 
 
+def sample_sandbox_events(settings: Settings) -> dict[str, dict[str, int]]:
+    """The per-sandbox kernel event counters to ship with the heartbeat (Task 5).
+
+    Resolved through the *same* process-wide handle the startup lane brought up
+    and the route-B pool attaches through (``sandbox_cgroups_for``), because the
+    ``sbx_<id>`` directories only exist under the parent ``setup`` established.
+    ``E2B_SANDBOX_CGROUP=off`` resolves to no handle at all and returns ``{}``
+    without touching a cgroup file -- the same "off is byte-identical" rule the
+    rest of phase 2 follows, and the reason this returns no ``sandboxEvents``
+    key on that lane.
+
+    Best effort by construction, exactly like the kernel-ceiling read above: a
+    heartbeat must never be lost because a cgroup file could not be read. The
+    strict read of the same numbers is ``SandboxCgroups.release``'s, where they
+    are the last chance to see them -- and those teardown readings are kept on
+    the handle, so a box that was killed *and* torn down between two sweeps
+    still reaches the control plane.
+    """
+    from envd_service.route_b import sandbox_cgroups_for
+
+    try:
+        handle = sandbox_cgroups_for(settings)
+    except Exception:  # noqa: BLE001 - a bad switch must not cost a heartbeat
+        logger.warning(
+            "cgroup events: cannot resolve the cgroup handle; reporting no "
+            "sandbox events this beat",
+            exc_info=True,
+        )
+        return {}
+    if handle is None:
+        return {}
+    try:
+        return handle.sample_events()
+    except Exception:  # noqa: BLE001 - the sampler is not allowed to raise
+        logger.warning("cgroup events: the sweep failed", exc_info=True)
+        return {}
+
+
 def start_cgroup_lane(
     settings: Settings, *, sandbox_cgroups=None
 ) -> "asyncio.Task | None":
@@ -2083,6 +2155,15 @@ class NodeAgent:
             "on",
         }
         self._cpu_loop_task: asyncio.Task | None = None
+        #: N83 phase 2 (Task 5): the kernel's per-sandbox event counters that
+        #: ride the heartbeat as ``sandboxEvents``. Sampled on their own
+        #: cadence (below) and carried by every beat in between -- the sweep is
+        #: a handful of file reads, but there is no reason to redo it five times
+        #: a minute, and a heartbeat that sampled nothing must not erase what
+        #: the control plane already saw (it keeps the maximum anyway).
+        self._cgroup_events: dict[str, dict[str, int]] = {}
+        self._cgroup_events_interval_s = _cgroup_events_interval_s()
+        self._cgroup_events_task: asyncio.Task | None = None
         self._disk_report_at = 0.0
         #: The scan round in flight, if any (single-flight, like the reconcile
         #: round): the heartbeat reads the last completed report and never
@@ -2122,6 +2203,14 @@ class NodeAgent:
         # failure -- it retries -- but an unknown switch value is refused by
         # name, here, at startup.
         self._cgroup_task = start_cgroup_lane(self._settings)
+        # N83 phase 2 (Task 5): the event counters live inside ``sbx_<id>``, so
+        # they are sampled on their own cadence and carried by every heartbeat.
+        # A lane with no cgroup lane has no boxes to read: off is off, and no
+        # sweep task is created at all.
+        if self._cgroup_task is not None and self._cgroup_events_interval_s > 0:
+            self._cgroup_events_task = asyncio.create_task(
+                self._cgroup_events_loop()
+            )
         if not self._control_url or not self._node_address:
             return
         self._task = asyncio.create_task(self._loop())
@@ -2240,6 +2329,7 @@ class NodeAgent:
                         reported_container_id(),
                         cpu_provider=self._cpu_provider,
                         ceiling=sandbox_ceiling_payload(self._settings),
+                        sandbox_events=self._cgroup_events,
                     ),
                     headers=headers,
                 )
@@ -2309,6 +2399,27 @@ class NodeAgent:
                 raise
             except Exception:  # pragma: no cover - defensive
                 logger.warning("cpu activity round failed", exc_info=True)
+
+    async def _cgroup_events_loop(self) -> None:
+        """Sample the kernel's per-sandbox event counters (N83 phase 2, Task 5).
+
+        Its own cadence for the same reason the CPU and disk rounds have one:
+        the pulse is every 5 s, and a sandbox can be killed inside that window
+        (the teardown reading catches that one; this catches the box that is
+        still alive). Sampling is best effort end to end -- a failed sweep
+        leaves the last completed one in place, and the heartbeat keeps
+        carrying it.
+        """
+        while True:
+            await asyncio.sleep(self._cgroup_events_interval_s)
+            try:
+                self._cgroup_events = await asyncio.to_thread(
+                    sample_sandbox_events, self._settings
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("cgroup event sweep failed", exc_info=True)
 
     async def _cpu_activity_round(self) -> dict[str, float]:
         """One CPU sample: mark the sandboxes that were actually working, and
@@ -3174,6 +3285,7 @@ class NodeAgent:
             "_disk_scan_task",
             "_disk_loop_task",
             "_cpu_loop_task",
+            "_cgroup_events_task",
             "_push_task",
             "_cgroup_task",
         ):

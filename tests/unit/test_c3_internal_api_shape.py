@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import httpx
@@ -1106,3 +1107,206 @@ def test_a_zero_sandbox_ceiling_in_a_heartbeat_is_refused_by_name(
     }
     record = app.state.nodes.get(NODE_ID)
     assert record.sandbox_cpu_percent_max == 0
+
+
+# ------------- N83 phase 2 (Task 5): the kernel's per-sandbox event counters
+#
+# ``sbx_<id>/memory.events`` counts the SIGKILLs (``oom_kill`` /
+# ``oom_group_kill``) and ``sbx_<id>/pids.events`` counts the ``EAGAIN``s
+# (``max`` -- tasks, threads included). The worker ships them per sandbox on
+# every heartbeat (``sandboxEvents``); the control plane stores the maximum it
+# has ever seen per sandbox and counter, and one WARN per growth names the
+# sandbox and the counter. Review Focus §4: the sandbox record still says
+# ``running`` after a kernel kill, so this line is the only thing standing
+# between the operator and "the process mysteriously disappeared".
+
+#: One worker's report: two kills in ``alpha`` and three task-creation
+#: refusals in a second box -- the kernel's own counter names, verbatim
+#: (``pids_max`` is ``pids.events``'s ``max`` line, prefixed by its file).
+SANDBOX_EVENTS = {"alpha": {"oom_kill": 2, "oom_group_kill": 1, "pids_max": 3}}
+
+
+def _warnings_from(caplog: pytest.LogCaptureFixture, logger_name: str) -> list[str]:
+    """The WARN lines one module emitted, in order (the app logs its own)."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == logger_name and record.levelno == logging.WARNING
+    ]
+
+
+def test_the_heartbeat_carries_the_event_counters_into_the_node_record(
+    workspace,
+) -> None:
+    """The counters land on the node record and are exposed by the node view."""
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+
+    resp = asyncio.run(_heartbeat_node(app, {"sandboxEvents": SANDBOX_EVENTS}))
+    assert resp.status_code == 204
+
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_events == SANDBOX_EVENTS
+
+    view = asyncio.run(_internal_node_view(app))
+    assert view.status_code == 200
+    (node,) = [n for n in view.json() if n["nodeID"] == NODE_ID]
+    assert node["sandboxEvents"] == SANDBOX_EVENTS
+
+
+def test_a_heartbeat_without_events_leaves_the_record_alone(workspace) -> None:
+    """An older worker during a rollout reports nothing -- never erase."""
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+    assert (
+        asyncio.run(_heartbeat_node(app, {"sandboxEvents": SANDBOX_EVENTS})).status_code
+        == 204
+    )
+
+    assert asyncio.run(_heartbeat_node(app, {"diskUsedMB": 4096})).status_code == 204
+
+    assert app.state.nodes.get(NODE_ID).sandbox_events == SANDBOX_EVENTS
+
+
+def test_a_growing_counter_logs_one_named_warn_per_growth(
+    workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The WARN names the sandbox *and* the counter, and only a growth warns."""
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+
+    def _warns() -> list[str]:
+        return _warnings_from(caplog, "control_plane.registry.nodes")
+
+    with caplog.at_level(logging.WARNING, logger="control_plane.registry.nodes"):
+        # 0 -> 1 is the event: the kernel killed a sandbox in this box.
+        assert (
+            asyncio.run(
+                _heartbeat_node(app, {"sandboxEvents": {"alpha": {"oom_kill": 1}}})
+            ).status_code
+            == 204
+        )
+        assert _warns() == [
+            "sandbox alpha on node node_a: oom_kill grew from 0 to 1 -- the "
+            "kernel's own account of this sandbox hitting its cgroup wall "
+            "(memory.events/pids.events; the sandbox record may still read "
+            "'running')"
+        ]
+
+        # The same number again is not a new event: no second line.
+        assert (
+            asyncio.run(
+                _heartbeat_node(app, {"sandboxEvents": {"alpha": {"oom_kill": 1}}})
+            ).status_code
+            == 204
+        )
+        assert len(_warns()) == 1
+
+        # ... and the pids wall is named the same way, by its own counter.
+        assert (
+            asyncio.run(
+                _heartbeat_node(
+                    app,
+                    {"sandboxEvents": {"beta": {"pids_max": 4}}},
+                )
+            ).status_code
+            == 204
+        )
+        assert _warns()[1:] == [
+            "sandbox beta on node node_a: pids_max grew from 0 to 4 -- the "
+            "kernel's own account of this sandbox hitting its cgroup wall "
+            "(memory.events/pids.events; the sandbox record may still read "
+            "'running')"
+        ]
+
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_events == {
+        "alpha": {"oom_kill": 1},
+        "beta": {"pids_max": 4},
+    }
+
+
+def test_a_smaller_counter_never_erases_what_was_seen(
+    workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The counters only ever move forward on the record.
+
+    A smaller report is not a refusal and not a new event: this record is
+    simply newer than the worker that reports it (a rollout, or a restarted
+    worker whose cgroup subtree is fresh). It cannot lower what the kernel
+    already said, and it must not fail the heartbeat -- a node that fails
+    heartbeats has its live sandboxes orphaned.
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+
+    with caplog.at_level(logging.WARNING, logger="control_plane.registry.nodes"):
+        assert (
+            asyncio.run(
+                _heartbeat_node(app, {"sandboxEvents": {"alpha": {"oom_kill": 5}}})
+            ).status_code
+            == 204
+        )
+        warns = len(_warnings_from(caplog, "control_plane.registry.nodes"))
+        assert (
+            asyncio.run(
+                _heartbeat_node(app, {"sandboxEvents": {"alpha": {"oom_kill": 2}}})
+            ).status_code
+            == 204
+        )
+        assert len(_warnings_from(caplog, "control_plane.registry.nodes")) == warns
+
+    assert app.state.nodes.get(NODE_ID).sandbox_events == {"alpha": {"oom_kill": 5}}
+
+
+def test_a_malformed_counter_entry_does_not_fail_the_heartbeat(
+    workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unlike the ceiling, this section grants nothing: a garbled entry is
+    dropped by name, and the entries beside it still land."""
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+
+    with caplog.at_level(logging.WARNING):
+        resp = asyncio.run(
+            _heartbeat_node(
+                app,
+                {
+                    "sandboxEvents": {
+                        "alpha": {"oom_kill": -1},
+                        "beta": {"oom_kill": "2"},
+                        "gamma": {"oom_kill": 7},
+                    }
+                },
+            )
+        )
+
+    assert resp.status_code == 204
+    assert _warnings_from(caplog, "control_plane.api.internal") == [
+        "internal API: sandboxEvents[alpha].oom_kill is not a non-negative "
+        "integer (-1); ignoring this counter report",
+        "internal API: sandboxEvents[beta].oom_kill is not a non-negative "
+        "integer ('2'); ignoring this counter report",
+    ]
+    assert app.state.nodes.get(NODE_ID).sandbox_events == {"gamma": {"oom_kill": 7}}
+
+
+def test_a_non_object_sandbox_events_section_is_refused_by_name(workspace) -> None:
+    """A section of the wrong *shape* is still refused by name, like
+    ``sandboxCeiling``: a typo must not read as "no sandbox hit a wall"."""
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+
+    resp = asyncio.run(_heartbeat_node(app, {"sandboxEvents": []}))
+
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "code": 400,
+        "message": "sandboxEvents must be a JSON object",
+    }

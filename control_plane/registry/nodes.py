@@ -37,6 +37,14 @@ class NodeRecord:
     #: not by a sentinel -- a reported ``max`` is a real answer.
     kernel_cpu_percent: int | None = None
     kernel_memory_mb: int | None = None
+    #: N83 phase 2 (Task 5): the kernel's own per-sandbox event counters, as
+    #: this node reported them -- ``{sandbox id: {counter: count}}`` from the
+    #: ``memory.events``/``pids.events`` inside that sandbox's cgroup. Only
+    #: sandboxes that hit a wall are listed, and every counter only ever moves
+    #: forward here (``apply_sandbox_events``), because "the count grew" *is*
+    #: the event: a sandbox that overran ``memory.max`` was SIGKILLed while its
+    #: record still read ``running``.
+    sandbox_events: dict[str, dict[str, int]] = field(default_factory=dict)
     used_disk_mb: int = 0
     quota_over_limit: list[int] = field(default_factory=list)
     quota_near_limit: list[int] = field(default_factory=list)
@@ -113,6 +121,10 @@ class NodeRecord:
             "sandbox_processes_max": self.sandbox_processes_max,
             "kernel_cpu_percent": self.kernel_cpu_percent,
             "kernel_memory_mb": self.kernel_memory_mb,
+            "sandbox_events": {
+                sandbox_id: dict(counters)
+                for sandbox_id, counters in self.sandbox_events.items()
+            },
             "used_disk_mb": self.used_disk_mb,
             "quota_over_limit": list(self.quota_over_limit),
             "quota_near_limit": list(self.quota_near_limit),
@@ -248,6 +260,78 @@ class NodeRecord:
         self.kernel_cpu_percent = None if kernel_cpu is None else int(kernel_cpu)
         self.kernel_memory_mb = None if kernel_memory is None else int(kernel_memory)
 
+    #: How many sandboxes' event counters one node record keeps. Only boxes that
+    #: hit a wall are stored at all, so this bounds a node that has lived for
+    #: months rather than a busy one; an evicted box that reports again is stored
+    #: from zero, which is why the warning below names the absolute count.
+    SANDBOX_EVENTS_MAX = 256
+
+    def apply_sandbox_events(self, events: Mapping[str, Mapping[str, int]]) -> None:
+        """Store the worker's kernel event counters, monotonic, and name them.
+
+        ``events`` is the heartbeat's ``sandboxEvents``: per sandbox, the
+        counters inside that sandbox's own cgroup -- ``memory.events``'s
+        ``oom_kill``/``oom_group_kill`` (an over-budget sandbox was SIGKILLed,
+        plan D3) and ``pids.events``'s ``max`` (a *task* creation hit
+        ``pids.max`` and got ``EAGAIN``; tasks, so threads count, plan D4).
+
+        **The count growing is the event**, and it gets exactly one WARN naming
+        the sandbox, the counter and both numbers. That line is the whole point
+        of the task (plan Review Focus §4): the sandbox's own record still says
+        ``running`` after a kernel kill, so without it the user's report is "the
+        process mysteriously disappeared".
+
+        A **smaller** report never lowers what is stored, and is not refused by
+        name either (the plan allowed both): this record may simply be newer
+        than the worker reporting to it -- a rollout, or a worker restart whose
+        cgroup subtree came up fresh -- and failing a heartbeat over a counter
+        would cost the node its liveness, which orphans its live sandboxes. It
+        is logged at debug rather than warned about, because a worker that keeps
+        reporting less would otherwise warn on every single heartbeat.
+        """
+        for sandbox_id, counters in events.items():
+            stored = dict(self.sandbox_events.get(sandbox_id, {}))
+            for name, value in counters.items():
+                previous = int(stored.get(name, 0))
+                if value < previous:
+                    logger.debug(
+                        "node %s: sandbox %s reported %s=%d, keeping the "
+                        "maximum %d already seen",
+                        self.node_id,
+                        sandbox_id,
+                        name,
+                        value,
+                        previous,
+                    )
+                    continue
+                if value > previous:
+                    logger.warning(
+                        "sandbox %s on node %s: %s grew from %d to %d -- the "
+                        "kernel's own account of this sandbox hitting its cgroup "
+                        "wall (memory.events/pids.events; the sandbox record may "
+                        "still read 'running')",
+                        sandbox_id,
+                        self.node_id,
+                        name,
+                        previous,
+                        value,
+                    )
+                    stored[name] = value
+            if stored:
+                # Re-insert so eviction below is least-recently-reported first.
+                self.sandbox_events.pop(sandbox_id, None)
+                self.sandbox_events[sandbox_id] = stored
+        while len(self.sandbox_events) > self.SANDBOX_EVENTS_MAX:
+            evicted = next(iter(self.sandbox_events))
+            del self.sandbox_events[evicted]
+            logger.debug(
+                "node %s: dropping the event counters of sandbox %s (keeping "
+                "the %d most recently reported)",
+                self.node_id,
+                evicted,
+                self.SANDBOX_EVENTS_MAX,
+            )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "nodeID": self.node_id,
@@ -280,6 +364,10 @@ class NodeRecord:
             "sandboxProcessesMax": self.sandbox_processes_max,
             "kernelCPUPercent": self.kernel_cpu_percent,
             "kernelMemoryMB": self.kernel_memory_mb,
+            "sandboxEvents": {
+                sandbox_id: dict(counters)
+                for sandbox_id, counters in self.sandbox_events.items()
+            },
             "draining": self.draining,
         }
 
