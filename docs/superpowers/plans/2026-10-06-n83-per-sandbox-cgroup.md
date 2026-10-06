@@ -90,6 +90,30 @@ arm 沙箱自己的 `max_cpu`**（今天 `cpu_percent=100` 时根本不 arm，�
 fork 内、纯代码，覆盖"supervisor 替它花的那半"与"沙箱自己烧的那半"；代价是没有内核级精确度，`memory.max`/
 `pids.max` 那两块仍走老路。**Phase 1 与它二选一，或先备选后 cgroup。**
 
+**worker 面与沙箱面（2026-10-06 实测；这两面才是用户实际担心的）**
+
+- **worker 面：今天对 cgroup 零写路。** `uid=65534 CapEff=0000000000000000`，`/sys/fs/cgroup` 是
+  `ro` 挂载 —— `echo $$ > cgroup.procs` 与 `mkdir` 都是 **`Read-only file system`**。Phase 1 必须
+  保持这一点：**写走 CP→agent**（与现成的 `POST /internal/nodes/{id}/file-op` 同一条：worker 只报
+  `{sandbox_id, op}`，CP 派生目标并做归属检查，agent 执行），worker 只保留**读**（Phase 0 的计量）。
+  ⚠ 要避免的形态：为了"让 worker 自己放 supervisor"而给它 rw cgroup 视图 —— 那等于把写权限放进沙箱相邻
+  组件；放置应交给 agent 在 spawn 时用 `clone3(CLONE_INTO_CGROUP)`。
+  **万一 worker 被攻破**：新增的是"对**本节点**同侪沙箱的**进程级**控制（节流/杀）"。**范围不变** ——
+  `file-op` 那条已经有对象检查（`record.node_id != node_id` → 403），也就是说它今天就能对本节点的沙箱
+  做数据级操作；新的是**种类**（进程 vs 数据），不是范围。缓解：cgroup op 复用同一条归属检查 + agent 的
+  解析后白名单 + 目标由 CP 派生（worker 不传路径、不传 uid —— 与 file-op 的硬规则 1/3 相同）。
+- **沙箱面：零可见、零可达（实测）。** 沙箱里 `cat /proc/self/cgroup` → **EACCES**（`/proc` 是中介
+  合成的，`self/cgroup` 不在白名单）；`ls /sys` → **EACCES**；`grep -c cgroup /proc/self/mountinfo`
+  → **0**；`ls /sys/fs/cgroup` → **ENOENT**。⇒ 每沙箱 cgroup **不给沙箱任何新信息、也拿不到任何句柄**，
+  "目录用 sandbox_id 还是池 uid 命名"这个问题**不存在**。
+  逃不出限额：它没有 cgroupfs 的任何 fd，写不了 `cgroup.procs`/`cpu.max`；它 spawn 的一切继承同一
+  cgroup；唯一能"逃"的是放置前的 TOCTOU（用 `clone3(CLONE_INTO_CGROUP)` 关掉）。
+  不削弱现有边界：每箱 cgroup **嵌套在 worker pod 之下** ⇒ pod 的 4 核/4 GiB 照旧（取二者较小）。
+  对沙箱的**收益**：每箱 `cpu.max` 把 N82 那类"邻居被吵"变成"花自己的额度" —— 这是沙箱面的安全**改善**
+  （跨租户公平/DoS），不是新增风险。
+  对沙箱的**功能**变化（非安全）：`pids.max` → fork `EAGAIN`；`memory.max` → OOM kill（今天 mmap 记账
+  回 ENOMEM）；`cpu.max` → CFS 100 ms 周期节流（比通知限流那 860 ms 的一秒悬崖平滑得多）。
+
 ## Tasks
 
 ### Phase 0 —— 计量（**✅ 已上线 2026-10-06**）
