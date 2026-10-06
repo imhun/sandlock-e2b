@@ -22,27 +22,33 @@ about a *reading*, never about "the call did not error":
    the declared quota, whereas the N82 baseline booked the same ~1.02 core to
    the *worker pod* (`docs/open-issues.md` N82).
 4. **The narrowing / view shape.** From every worker container: what it sees
-   under the mount, ``/proc/self/cgroup``, and which cgroups are writable:
-   its **own** container cgroup is the delegated one (owner 65534,
-   ``cgroup.procs``/``cgroup.subtree_control`` writable — and ``cpu.max`` is
-   not), while the **peer container cgroups next to it** are not. "Peer" means
-   an actual container directory beside ours under the same parent
-   (``/pod-cgroup/docker/<other-container-id>`` on compose, a sibling
+   under the mount, ``/proc/self/cgroup``, and which cgroups are writable.
+
+   **The rule, stated once**: a cgroup is writable by this worker exactly when
+   the one-shot delegation gave it to **this worker's uid** — its own
+   container cgroup (``cgroup.procs``/``cgroup.subtree_control``), and, on a
+   lane where every worker runs as the *same* host uid, the other workers'
+   container cgroups too (compose: all of them are 65534). ``cpu.max`` is
+   never writable — the delegation deliberately excludes it, for a peer
+   exactly as for ourselves. Every other cgroup in view (the root-owned
+   containers — control plane, redis, agents — and the mounted root itself) is
+   EACCES on every write.
+
+   "Peer" means an actual container directory beside ours under the same
+   parent (``/pod-cgroup/docker/<other-container-id>`` on compose, a sibling
    container directory under the pod directory on k8s) — **not** the mounted
    root, which is a cgroup of its own and is probed separately for exactly
    that reason (fix round 1, finding 1).
 
-   What can be asserted differs by lane, and both shapes are recorded: on a
-   whole-tree mount (compose) a *non-delegated* peer — root-owned, e.g. the
-   control plane or redis — must refuse ``cpu.max``, ``cgroup.procs`` and
-   ``mkdir`` with EACCES, and that is the primary evidence. A *delegated* peer
-   (another worker on the same host uid, which is every worker on compose)
-   keeps ``cpu.max`` root-owned but its ``cgroup.procs``/``mkdir`` are ours by
-   uid: uid-based DAC cannot separate two containers of the same uid. That is
-   reported per peer as ``delegated_peers`` rather than hidden, and the
-   k8s lane does not have the problem at all because its mount is narrowed to
-   the pod and peers are not reachable. On a narrowed mount with no peer
-   visible the evidence is the mount root itself, which must also be closed.
+   Check ④ therefore asserts: (a) our own delegated cgroup is writable on
+   ``cgroup.procs``/``cgroup.subtree_control`` and **not** on ``cpu.max``;
+   (b) **every** visible peer's ``cpu.max`` is EACCES; (c) every *non*-
+   delegated peer refuses all three writes (``cpu.max``, ``cgroup.procs``,
+   ``mkdir``); and (d) if no peer is visible at all (a narrowed mount), the
+   mount root refuses ``cpu.max``/``cgroup.procs``/``mkdir``. The delegated
+   peers that *are* writable — the same-uid case above — are reported per peer
+   as ``delegated_peers`` rather than hidden, and the k8s lane does not have
+   that shape at all because its mount is narrowed to the pod.
 5. **The negative (fail closed).** ``open(<own container cgroup>/cpu.max,
    O_WRONLY)`` must fail ``EACCES``: the delegation deliberately excludes
    ``cpu.max``, so a worker cannot lift its own ceiling.
@@ -480,11 +486,14 @@ for peer in peers:
 
 # The mounted root is *not* a peer container (on compose it is the Docker VM's
 # cgroup root, owner 0:0); it is probed on its own so the two are never
-# conflated again.
+# conflated again. The boolean below says only what it measures -- that this
+# directory carries the two kernfs files a container cgroup has -- because
+# "is_container_cgroup" claimed more than the probe can know (fix round 2,
+# residual 4: the VM's cgroup root carries them both and is not a container).
 mount_root_facts = {
     "path": str(mount),
     "owner": owner(mount),
-    "is_container_cgroup": (mount / "cpu.max").exists() and (mount / "cgroup.procs").exists(),
+    "has_cpu_max_and_procs": (mount / "cpu.max").exists() and (mount / "cgroup.procs").exists(),
     "cpu_max": write_probe(mount / "cpu.max"),
     "cgroup_procs": write_probe(mount / "cgroup.procs"),
     "mkdir": mkdir_probe(mount / "n83_acceptance_probe"),
@@ -1073,6 +1082,7 @@ def main() -> int:
             facts["mount_root_closed"] = (
                 root_probe["cpu_max"] != "WRITABLE"
                 and root_probe["cgroup_procs"] != "WRITABLE"
+                and root_probe["mkdir"] != "WRITABLE"
             )
             facts["evidence"] = (
                 facts["foreign_peers_closed"]

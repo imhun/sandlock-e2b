@@ -2848,7 +2848,7 @@ hardcode 的 `3100:3000`（compose 对 `ports` 是**追加**合并，只写新�
 | 检查 | RED（`off`，限流关） | GREEN（`required`，限流关） |
 |---|---|---|
 | ① 额度是真的 | 4 自旋 ⇒ CP 内部视图 `measuredCpuPercent = **399.92**`（声明 100）；沙箱**没有** cgroup 可读 | `measuredCpuPercent = **100.19**`（= 声明额度）；`cpu.max` 读回 `100000 100000`；同节点第二个沙箱往返 min **27.92 ms** vs 静默基线 **33.01 ms**（判据 = 3× 静默 min-of-5，本例上限 99.03 ms）。⚠ **这条子判据的能力边界要说清**：RED 档（4 自旋、无 cgroup）的邻居 min 是 **29.98 ms vs 静默 31.37 ms** —— 本车道这条负载下邻居**确实没有掉速**，所以它只能发现**粗粒度饿死**（N82 那种 860 ms 停顿），细微劣化它分辨不出来；"邻居不被吵"的正面证据以 ③ 的额度记账为准（CPU 记在沙箱自己的账上、超了被节流），不是这条 rtt |
-| ② 内核在强制 | 无 `sbx_<id>` ⇒ 具名失败（没有可节流的东西） | 3.12 s 自旋：`usage_usec +3,189,901`（1.021 核）、**`nr_throttled +31`**、`throttled_usec +9.30 s` |
+| ② 内核在强制 | 无 `sbx_<id>` ⇒ 具名失败（没有可节流的东西） | 3.12 s 自旋：`usage_usec +3,189,901`（1.021 核）、**`nr_throttled +31`**、`throttled_usec +9,301,843 µs` |
 | ③ 洪泛花自己的额度 | 探针 9118 op/s；**`sbx` cgroup 不存在**（这笔 CPU 记不到沙箱账上） | 探针单跑 **10,165 op/s / 0.840 核**（≤ 1 核额度）；**四路并发 12,071 op/s（3018×4）/ 0.994 核 ≤ 额度、`nr_throttled +8`** —— 额度真的 binding |
 | ④ 收窄/视图形状 | 无被委派目录（worker 的 cgroup 视图里没有 `worker/` 子树） | 三台 worker：自家容器 cgroup 属主 **65534**、`cgroup.procs`/`cgroup.subtree_control` **可写**、`cpu.max` **EACCES**、`/proc/self/cgroup = 0::/worker`；**同层的 15 个 peer 容器 cgroup** 逐个探：非被委派的（root 所有，控制面/redis/agent/另一套栈的容器）`cpu.max`/`cgroup.procs`/`mkdir` **全 EACCES**；被委派的那 2 个（同宿主的另两台 worker，uid 都是 65534）`cpu.max` 仍 **EACCES**，但 `cgroup.procs`/`subtree_control`/`mkdir` 按 uid 归我们 —— 如实记在 `delegated_peers` 里，见下面第 4 条坑；挂载根 `/pod-cgroup`（它不是容器、是 Docker VM 的 cgroup 根）单独探：三个写全 EACCES |
 | ⑤ 负例（fail closed） | — | 三台 worker 对**自家** `cpu.max` 的 `open(O_WRONLY)` 全 **EACCES**（委派故意不含它） |
@@ -2887,12 +2887,13 @@ op 在位但惰性）→ **第二次 apply** 把 `deploy/k8s-k0s/worker-capacity
    自己就是一个带 `cpu.max` 的 cgroup（**它不是容器**，owner 0:0），一版实现从根开始自上而下走、
    碰到第一个 `cpu.max` 就停 ⇒ 探到的是根，peer 容器一个都没访问到，而文档却写成"别的容器全 EACCES"
    （**文档与读数不符**，已修：现在 `_VIEW_SCRIPT` 只走 `own.parent` 下的同层目录，逐个探 peer，
-   根单独探）。顺带量到一条**真实现象**：本地车道三台 worker **共用同一个宿主 uid 65534**，
-   于是"被委派的 peer"（另两台 worker 的容器 cgroup，委派 chown 给了 65534）里
-   `cgroup.procs`/`subtree_control`/`mkdir` 对我们是**可写**的 —— 只有 `cpu.max` 保持 root 所有
-   （委派故意不含它，⑤ 也钉着这一条）。这是**uid 制 DAC 分不开同 uid 容器**的固有性质，
-   不是 N83 引入的回归；k8s 车道因为挂载被 `subPathExpr` 收窄到本 pod，peer 根本不可达，
-   所以那边不存在这个形状。验收脚本把这条**逐 peer 如实上报**（`delegated_peers`），不隐藏也不当作通过。
+   根单独探）。顺带量到一条**由这次委派自己带来的性质**：本地车道三台 worker **共用同一个宿主 uid
+   65534**，而 N83 的委派正是把 peer 容器 cgroup 的**目录** chown 给 65534 ⇒ 另两台 worker 的容器
+   cgroup 里 `cgroup.procs`/`subtree_control`/`mkdir` 对我们是**可写**的（只有 `cpu.max` 保持 root
+   所有 —— 委派故意不含它，⑤ 也钉着这一条）。**这条性质属于 compose 车道上的委派本身**，范围被两条
+   边界卡住：只有**跑在 worker uid（65534）下**的进程能用它，且只在**整棵 VM 树可见**的挂载上成立；
+   k8s 车道挂载被 `subPathExpr` 收窄到本 pod，peer 根本不可达，**不存在这个形状**。验收脚本把这条
+   **逐 peer 如实上报**（`delegated_peers`），不隐藏、也不当作通过；它是 Phase 1 接受的已知代价之一。
 
 **怎么再跑一遍**（本地车道；k0s 车道的完整五参数命令见脚本 docstring，不能只换 `--worker-exec-template`/`--nodes`）：`deploy/compose/.env` 从 `.env.example` 复制（`AGENT_IMAGE` 指向本 worktree 构建的
 agent 镜像）→ `docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f

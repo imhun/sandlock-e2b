@@ -2026,7 +2026,7 @@ worker-3: peak 0.872 cores, median 0.857 cores`（完整 JSON 见工作树 `tmp/
 | ① 额度是真的 | `measuredCpuPercent ∈ [50,150]`（声明 100）且同节点第二箱往返 min-of-5 ≤ 3× 静默 min-of-5（下限 50 ms） | `100.19`；`cpu_max=100000 100000`；第二箱 **27.92 ms** vs 静默 **33.01 ms**（上限 99.03 ms） | PASS |
 | ② 内核在强制 | 3 s 自旋窗口内 `nr_throttled_delta > 0` 且 `observed_cores ∈ [0.5,1.5]×quota` | `usage_usec +3,189,901`、`nr_throttled +31`、`throttled_usec +9,301,843`、`1.021 核` | PASS |
 | ③ 洪泛花自己的额度 | 探针单跑 `peak ≤ 1.15×quota` **且** 四路并发 `peak ≤ 1.15×quota` **且** `nr_throttled > 0` **且**两次都真拿到 `ops_per_s` | 单独 `10,165 op/s / 0.840 核 / nr_throttled 0`；四路 `12,071 op/s（3018×4）/ 0.994 核 / nr_throttled +8` | PASS |
-| ④ 收窄/视图形状 | 三台 worker：自家容器 cgroup 属主 65534 且 `cgroup.procs`/`subtree_control` 可写、`cpu.max` 不可写；**同层每个 peer 容器**的 `cpu.max` 不可写；非被委派的 peer 的 `cpu.max`/`cgroup.procs`/`mkdir` 全不可写；（peer 全不可见时）挂载根也不可写 | 三台全满足（`check4_mode = peer-container`，每台 **15 个 peer**）：外来 peer（root 所有）三写全 `EACCES`；被委派 peer（同 uid 的另两台 worker）只有 `cpu.max` 是 `EACCES`，`cgroup.procs`/`subtree_control`/`mkdir` 按 uid 可写（逐条记在 `delegated_peers`）；挂载根 `/pod-cgroup` 三写全 `EACCES` | PASS |
+| ④ 收窄/视图形状 | 三台 worker：自家容器 cgroup 属主 65534 且 `cgroup.procs`/`subtree_control` 可写、`cpu.max` 不可写；**同层每个 peer 容器**的 `cpu.max` 不可写；非被委派的 peer 的 `cpu.max`/`cgroup.procs`/`mkdir` 全不可写；（peer 全不可见时）挂载根的 `cpu.max`/`cgroup.procs`/`mkdir` 三条也都不可写 | 三台全满足（`check4_mode = peer-container`，每台 **15 个 peer**）：外来 peer（root 所有）三写全 `EACCES`；被委派 peer（同 uid 的另两台 worker）只有 `cpu.max` 是 `EACCES`，`cgroup.procs`/`subtree_control`/`mkdir` 按 uid 可写（逐条记在 `delegated_peers`）；挂载根 `/pod-cgroup` 三写全 `EACCES` | PASS |
 | ⑤ 负例 fail-closed | 三台 worker 自家 `cpu.max` 的 `open(O_WRONLY)` == `EACCES` | worker-1/2/3 全 `EACCES` | PASS |
 
 RED 档同一条脚本的判定（**这就是"不弱化"的证据**：RED 五条全 FAIL，且每条都给了具名理由）：
@@ -2081,7 +2081,7 @@ RED 档同一条脚本的判定（**这就是"不弱化"的证据**：RED 五条
    N83 行的那段标成"原始立项文本"。
 2. **check ③ 加了第二条读数**：计划只要求"洪泛仍落在额度内"（= 单独跑 ≤ 额度），照做是
    `0.84 核 ≤ 1 核`。但那条**没有**证明额度 binding（负载自限在 1 核以下）。所以我在**同一条检查里**
-   追加"四路并发"读数（用**探针自己的 INNER 程序**，import 而非抄写）—— 0.99 核 + `nr_throttled +11`
+   追加"四路并发"读数（用**探针自己的 INNER 程序**，import 而非抄写）—— `0.994 核` + `nr_throttled +8`
    才真正说明"沙箱自己的额度在 bound 它"。判据里两条都要过。
 3. **check ④ 的本地版判据**：计划的写法是"本地 lane = 只看得到自己容器那棵子树"，但 compose 没有
    `subPathExpr`、挂载的是**整棵 VM 树**（§1.4 的探针也这么量过）。所以本地版 ④ 判的是"**同层 peer
@@ -2106,7 +2106,10 @@ RED 档同一条脚本的判定（**这就是"不弱化"的证据**：RED 五条
   根，随后 `dirnames[:] = []` 剪枝 ⇒ **peer 容器一个都没访问到**（GREEN JSON 里 `foreign:[{path:"/pod-cgroup",
   owner:{uid:0}}]` 正是这个）。
 * 修法：peer 的定义改成**同层容器目录**（`own.parent` 下 != own、且 `cpu.max` + `cgroup.procs` 都在的
-  目录）；挂载根**单独探**，并在 JSON 里带 `is_container_cgroup` 标明它不是容器。
+  目录）；挂载根**单独探**。归档的那一版 JSON 里这个根探针带一个布尔字段（当时叫
+  `is_container_cgroup`，fix round 2 已改名为 `has_cpu_max_and_procs`）——它只说明"这个目录带
+  `cpu.max` + `cgroup.procs`"，Docker VM 的 cgroup 根两者都有，**它不是容器**；旧名字声称的比探针
+  能知道的更多，所以改了名。
 * 新读数（GREEN，三台一致）：`peer_containers_count = 15`；`check4_mode = "peer-container"`；
   `foreign_peers_closed = true`（root 所有的控制面/redis/agent/**另一套栈的**容器，三写全 EACCES）；
   `every_peer_cpu_max_closed = true`；`mount_root` 三写全 EACCES。
@@ -2138,7 +2141,7 @@ RED 档同一条脚本的判定（**这就是"不弱化"的证据**：RED 五条
 
 ## F3（Important）① 的邻居 rtt 上限是退化的
 
-**判定：成立。** 旧式 `max(2×quiet, 200ms)` 在 quiet≈31.5 ms 时等于 200 ms（≈6×），RED 的邻居
+**判定：成立。** 旧式 `max(2×quiet, 200ms)` 在本车道的 quiet（几十毫秒）下就等于 200 ms（≈6×），RED 的邻居
 （29.98 vs 31.37 ms）也能过 —— 这条子判据测不出它声称的东西。
 
 * 修法：上限改成 **`3.0 × 静默 min-of-5`，下限 50 ms**（常量 `_NEIGHBOUR_RTT_FACTOR` /
@@ -2164,11 +2167,13 @@ RED 档同一条脚本的判定（**这就是"不弱化"的证据**：RED 五条
 1. **`docs/env-vars.md` 的额度写法**：`cpu.max = cpu_count×1000 100000` → 改成
    `cpu_percent×1000 100000`，并写明 `cpu_percent` 是**一个核的百分比**、今天 `cpu_count` 恒为 1、
    默认 100% 就是 `100000 100000`（含 supervisor）。
-2. **数字与归档件不一致**（RED ③ 的 op/s、§10 的 `nr_throttled +11`）：两份归档 JSON 用**同一支
-   修好的脚本**重跑后全部重新取自 JSON —— GREEN `100.19 / +3,189,901 / nr_throttled +31 /
+2. **数字与归档件不一致**（RED ③ 的 op/s、§10 里那处四路并发的旧读数）：两份归档 JSON 用**同一支
+   修好的脚本**重跑后重新取自 JSON —— GREEN `100.19 / +3,189,901 / nr_throttled +31 /
    10,165 op/s / 0.840 核 / 12,071 op/s（3018×4）/ 0.994 核 / +8`；RED `399.92 / 9118 op/s`。
-   本节、§4/§5 的 JSON、§7/§8/§10 的正文，以及 `docs/deploy-clusters.md` §7.48 与
-   `docs/open-issues.md` 的 N83 行全部对齐到这两份 JSON（逐条 grep 核对过）。
+   `docs/deploy-clusters.md` §7.48、`docs/open-issues.md` 的 N83 行与引用这些读数的表全部取自这两份
+   JSON。**但 §10 第 2 条当时漏改了**，还带着 round 0 留下的核数与节流计数（这里不重复抄旧值）——
+   评审指出后已在 **fix round 2** 改成 `0.994 核` / `nr_throttled +8`；原先"全部对齐"的说法过强，
+   已收敛为上句那种逐处可核对的说法。
 3. **回退杆写死行号**：`docs/deploy-clusters.md` §7.48 与 `docs/open-issues.md` 都写明是
    `deploy/k8s-k0s/worker-capacity.patch.yaml:41`（`- name: E2B_SANDBOX_CGROUP`，第 42 行是 value）。
 
@@ -2197,3 +2202,77 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
 ```
 
 归档的原始读数就是 §4（GREEN）与 §5（RED）那两个 JSON 代码块（本轮重跑后已替换为最新一版）。
+
+---
+
+# 附：Fix round 2（2026-10-06，收尾轮）
+
+范围只有四条残留（数字一致性、两处措辞、一个新字段名/断言），**没有重跑验收**（评审也说不必）：
+§4/§5 那两份归档 JSON **一字未动**，本节说的每一处改动都不改读数、不改任何检查的判决。
+
+## R1（必须改）§10 那处四路并发读数与归档 JSON 对不上
+
+* **改了什么**：§10 第 2 条那处四路并发的读数还是 **round 0 留下的旧值**（旧的核数与节流计数），
+  已换成归档 GREEN JSON 里的 **`0.994 核` / `nr_throttled +8`**；§11 里"本节、§4/§5 的 JSON、
+  §7/§8/§10 的正文……全部对齐（逐条 grep 核对过）"这句**过强**的说法已删掉，改成逐处可核对的说法，
+  并**明写**"§10 第 2 条当时漏改了，fix round 2 才改过来"（旧值本身不再抄进文件 —— 抄一遍就等于把
+  错数字又留在 artifact 里）。
+* **全 artifact 扫了一遍**（脚本化，见下面"本轮的核对命令与结果"）：评审点名的四个旧数
+  （round 0 的 measuredCpuPercent、两次 RED 探针 op/s、round 1 的另一种写法）**均已 0 处命中**，
+  连同 round 0 那批时效性读数（旧的 usage/throttled 计数）一起确认清干净了；
+  这里只写"已 0 处命中"，不把旧值再抄一遍 —— 抄一遍就等于把错数字又留在文件里。
+* 现在引用本轮读数的段落只剩三处载体：本报告 §7 表、`docs/deploy-clusters.md` §7.48 的 RED→GREEN 表、
+  `docs/open-issues.md` 的 N83 行 —— 每个数字都来自归档的那两份 JSON（下面有核对脚本的输出）。
+
+## R2（措辞）docstring 里"peer 不可写"与"被委派的 peer 可写"两处打架
+
+* 修法：check ④ 的 docstring 现在**在一处**把规则讲完：**一个 cgroup 可写，当且仅当那次一次性委派把它
+  交给了本 worker 的 uid** —— 自己的容器 cgroup，以及"所有 worker 共用同一个宿主 uid"的车道上
+  **别人（另几台 worker）的容器 cgroup**；**`cpu.max` 永远不可写**（peer 与自己一视同仁，委派故意不含
+  它）；视野里其余每一个 cgroup（root 所有的容器、挂载根本身）**每一条写都是 EACCES**。
+  随后才分四小条列 check ④ 到底断言什么（own / 每个 peer 的 cpu.max / 非被委派 peer 的三条写 /
+  没有 peer 可见时挂载根的三条写），以及同 uid 那些 peer 用 `delegated_peers` 如实上报。
+
+## R3（措辞）"不是 N83 引入的回归"不准确
+
+* 修法：`docs/deploy-clusters.md` §7.48 坑 4 改成：这是**compose 车道上这次委派自己带来的性质** ——
+  委派把 peer 容器 cgroup 的**目录** chown 给 65534，**共享 uid 才使这条委托对别的 worker 可用**；
+  范围被两条边界卡住（只有跑在 worker uid 下的进程能用它、只在"整棵树可见"的挂载上成立），
+  k8s 车道挂载被 `subPathExpr` 收窄、peer 不可达，**没有这个形状**。不再出现"回归"这种把责任推给
+  别处的说法。
+
+## R4（新 Minor）字段名与断言同文档对不上
+
+* `mount_root.is_container_cgroup` → **`mount_root.has_cpu_max_and_procs`**（改名，说它真正量到什么：
+  该目录带 `cpu.max` + `cgroup.procs`；Docker VM 的 cgroup 根两者都有，但它**不是容器**）。
+* `mount_root_closed` 现在把 **`mkdir`** 也算进断言（`cpu.max` + `cgroup.procs` + `mkdir` 三条写都要
+  非 WRITABLE），与"挂载根三条写全 EACCES"的文档说法一致。
+* **归档漂移，明说**：§4/§5 的 JSON 是 round 1 那一版跑出来的，里面 `mount_root` 的布尔键还叫旧名。
+  这次两处代码改动只动**键名**与那条断言的一个项：不改任何读数、不改任何判决 ——
+  ① 归档 JSON 自己的 `mount_root` 块里 `cpu_max`/`cgroup_procs`/`mkdir` 三项**都是 `EACCES`**，
+  所以新断言在它的读数上同样成立；② `mount_root_closed` 只在 `narrowed-mount` 分支参与判决，而归档的
+  compose 运行是 `check4_mode = peer-container`、证据来自 `foreign_peers_closed`，**根本没走那条分支**。
+  本轮**没有重跑**、两份 JSON 未改；要消掉这处键名漂移只需要重跑一次 GREEN（代价 ~100 s，但会把所有
+  时效性读数换一批，评审明说不必，故不做）。
+
+## 没动（按评审的"do not change"清单）
+
+五条检查的 pass/fail 语义；邻居上限 `max(3×quiet_min, 50 ms)` 与它"只抓粗粒度饿死"的能力边界说明；
+`delegated_peers` 的披露；k0s 不在本轮范围（一个 pod 都没碰）；用户的 live `compose` 栈（3100）——
+本轮**没有起任何栈**（纯 artifact/文案修改），自然也没碰它。
+
+## 本轮的核对命令与结果（数字与归档 JSON 的一致性）
+
+```text
+# 把「引用读数的三段文字」里的每个数字 token 与两份归档 JSON 的数值集合逐一比对
+# （允许值 = JSON 里的数、其保留两位小数的形式，或显式列出的结构性常数）
+# scoped = 报告 §7 表 + 本附节 + §7.48 的 RED→GREEN 表 + N83 行 + env-vars 的三行
+python3 <上面那个 scoped 脚本>
+```
+
+第一遍扫出来的 unmatched 只剩**结构性/历史项**：节号（7.46 / 7.48 / 11 / 06 / 82）、端口
+（3000 / 3100 / 3200）、判据区间常数（50,150）、以及 N83 行里 **Phase 0 的历史读数**
+（0444 / 1046 / 110307 / 375.5 / 382 / 669 —— 那是 `0.1.0-1046-gd2d669b…` 那一版上线时的现场数，
+不是本轮读数）；另有两个与归档 JSON 对不上的值在同一轮改掉：一处的秒级换算改成精确的
+`+9,301,843 µs`，另一处旧 quiet 值改成"几十毫秒"这种不带具体数字的说法。改完再跑同一脚本，
+**引用的读数一个不差地来自归档 JSON**。全部改动都在 worktree 的同一分支上提交（见下）。
