@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Callable
 
 from envd_service.priv_helpers import PrivHelperError
-from envd_service.runtime.sandbox_cgroup import SandboxCgroups
+from envd_service.runtime.sandbox_cgroup import SandboxCeiling, SandboxCgroups
 from envd_service.worker_identity import reported_container_id
 from gateway_common.worker_identity import container_cgroup_token
 
@@ -495,6 +495,12 @@ def sandbox_cgroups_for(settings) -> SandboxCgroups | None:
 
     An unknown switch value is refused by name (see
     :func:`sandbox_cgroup_mode`) rather than read as "off".
+
+    N83 phase 2 (R3) also hands the handle the worker's **policy** ceiling
+    (:func:`policy_ceiling_for`), which is the number ``attach`` checks a
+    declared sandbox size against. It is resolved here, beside the handle,
+    because both are one process-wide fact -- and because resolving it *after*
+    the ``off`` early return is what keeps that lane byte-for-byte unchanged.
     """
     mode = sandbox_cgroup_mode(settings)
     if mode == "off":
@@ -506,10 +512,31 @@ def sandbox_cgroups_for(settings) -> SandboxCgroups | None:
     handle = _CGROUP_HANDLES.get(key)
     if handle is None:
         handle = SandboxCgroups(
-            mount=mount, worker_uid=worker_uid, container_token=token
+            mount=mount,
+            worker_uid=worker_uid,
+            container_token=token,
+            policy_ceiling=policy_ceiling_for(settings),
         )
         _CGROUP_HANDLES[key] = handle
     return handle
+
+
+def policy_ceiling_for(settings) -> SandboxCeiling:
+    """The worker's per-sandbox **policy** ceiling (N83 phase 2, R3).
+
+    One rule, one reader: :func:`envd_service.agent.sandbox_ceiling_for`
+    resolves ``E2B_MAX_SANDBOX_*`` (falling back to this node's own total) and
+    the heartbeat reports exactly the same numbers to the control plane, so the
+    first gate (the control plane's 400) and this second one (``attach``'s
+    named refusal) can never disagree about what one sandbox may be.
+
+    Imported lazily because :mod:`envd_service.agent` is a much heavier module
+    (FastAPI routes, the executor factory) and it reaches back here for the
+    startup lane; the function is the seam tests stand in for.
+    """
+    from envd_service.agent import sandbox_ceiling_for
+
+    return sandbox_ceiling_for(settings)
 
 
 def reset_sandbox_cgroups() -> None:
@@ -682,6 +709,8 @@ class W1SlotPool:
         uid: int | None = None,
         name: str | None = None,
         cpu_percent: int | None = None,
+        memory_mb: int | None = None,
+        max_processes: int | None = None,
     ) -> SlotHandle:
         """Lease a uid (``uid`` when given, else the least-recently-freed) and
         start its slot.
@@ -696,6 +725,12 @@ class W1SlotPool:
         per-sandbox cgroup's ``cpu.max`` carries; ``None`` means the caller does
         not know, and the pool falls back to
         :data:`DEFAULT_CGROUP_PERCENT`.
+
+        N83 phase 2 (Task 3) adds ``memory_mb``/``max_processes``, the same two
+        declared sizes off the worker's record: they become the box's
+        ``memory.high``/``memory.max`` and ``pids.max``. Nothing is invented
+        here either -- ``None`` travels through as an honest "nobody declared
+        it", and the cgroup module resolves that against the worker's ceiling.
         """
         with self._ledger:
             uid = self._take_uid_locked(sandbox_id, uid)
@@ -796,7 +831,14 @@ class W1SlotPool:
             # identity report below -- see :meth:`_attach_cgroup`. A refusal
             # here is the end of this create: no identity is reported, so the
             # child cannot exec, and it is killed on the way out.
-            self._attach_cgroup(sandbox_id, process, cpu_percent, slot_name)
+            self._attach_cgroup(
+                sandbox_id,
+                process,
+                cpu_percent,
+                slot_name,
+                memory_mb=memory_mb,
+                max_processes=max_processes,
+            )
             if self._identity_reporter is not None:
                 # C3 Task 3 (ruling D9.1): report the child, then keep going --
                 # nothing "releases" it, it polls setresuid itself. The report
@@ -864,6 +906,9 @@ class W1SlotPool:
         process,
         cpu_percent: int | None,
         slot_name: str,
+        *,
+        memory_mb: int | None = None,
+        max_processes: int | None = None,
     ) -> None:
         """Place ``process`` in ``sbx_<sandbox_id>``, or refuse the create.
 
@@ -878,6 +923,10 @@ class W1SlotPool:
         Fail closed: a refusal kills the child and re-raises, so the caller
         never sees a live slot for a sandbox that has no quota (the module has
         already removed whatever cgroup it had created).
+
+        N83 phase 2: the declared memory/task budgets ride the same call, so the
+        child's first millisecond inside the cgroup is already limited on all
+        three dimensions -- not just CPU.
         """
         cgroups = self._sandbox_cgroups
         if cgroups is None:
@@ -887,17 +936,24 @@ class W1SlotPool:
         )
         try:
             cgroups.attach(
-                sandbox_id=sandbox_id, pid=process.pid, cpu_percent=percent
+                sandbox_id=sandbox_id,
+                pid=process.pid,
+                cpu_percent=percent,
+                memory_mb=memory_mb,
+                max_processes=max_processes,
             )
         except BaseException:
             logger.error(
-                "route-B slot %s: the sandbox cgroup for %s (pid %s, %d%%) "
-                "could not be attached; killing the child -- this create fails "
-                "rather than run without a quota (N83 phase 1)",
+                "route-B slot %s: the sandbox cgroup for %s (pid %s, %d%%, "
+                "memory_mb=%s, max_processes=%s) could not be attached; killing "
+                "the child -- this create fails rather than run without a quota "
+                "(N83 phase 1/2)",
                 slot_name,
                 sandbox_id,
                 process.pid,
                 percent,
+                memory_mb,
+                max_processes,
                 exc_info=True,
             )
             try:
@@ -1110,6 +1166,8 @@ class W1SlotPool:
         *,
         uid: int | None = None,
         name: str | None = None,
+        memory_mb: int | None = None,
+        max_processes: int | None = None,
     ) -> SlotHandle:
         return await asyncio.to_thread(
             self.acquire_sync,
@@ -1118,6 +1176,8 @@ class W1SlotPool:
             program_json,
             uid=uid,
             name=name,
+            memory_mb=memory_mb,
+            max_processes=max_processes,
         )
 
     def release_sync(self, sandbox_id: str) -> None:

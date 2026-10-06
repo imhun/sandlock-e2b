@@ -1753,6 +1753,13 @@ class SandlockExecutor(Executor):
                 # throttle; the cgroup is what actually enforces the declared
                 # number, so it must travel unclamped.
                 cpu_percent=self._cpu_percent,
+                # N83 phase 2 (Task 3): the same two numbers the record
+                # carries become the box's ``memory.high``/``memory.max`` and
+                # ``pids.max``. The slot policy above still declares the
+                # mediator's own soft ceiling; the cgroup is what makes the
+                # budget a kernel fact.
+                memory_mb=self._memory_mb,
+                max_processes=self._max_processes,
             )
 
         try:

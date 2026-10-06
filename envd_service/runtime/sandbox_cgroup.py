@@ -46,6 +46,18 @@ name**, and a kernel that sets no ceiling at all -- the compose lanes' measured
 shape, where nothing sets ``cpus``/``mem_limit`` -- starts normally with one
 explicit WARN, because there the policy and the platform's ledger are the only
 bounds left.
+
+N83 phase 2 (Task 3) adds the *writing* half: ``setup()`` enables ``memory``
+and ``pids`` beside phase 1's ``cpu`` (one command, the same drain -- a write
+while the cgroup still holds tasks is ``EBUSY``), and ``attach()`` writes
+``memory.high``/``memory.max``/``pids.max`` beside ``cpu.max``, each one read
+back verbatim. ``memory.high`` and ``memory.max`` carry the same value (D2:
+reclaim first, kill only if the process really cannot come down) and
+``memory.oom.group`` is deliberately never written (D3: the default 0 keeps an
+over-budget sandbox from dragging its neighbours, or the parent container,
+down with it). The **policy** ceiling is injected into this class (R3), never
+read from the kernel: a declared size above it is refused by name, because
+"run smaller silently" is the one outcome the API promise must not have.
 """
 
 from __future__ import annotations
@@ -56,7 +68,12 @@ import time
 from pathlib import Path
 
 from gateway_common.paths import validate_sandbox_id
-from gateway_common.sandbox_ceiling import SandboxCeiling
+from gateway_common.sandbox_ceiling import (
+    MAX_SANDBOX_CPU_PERCENT_ENV,
+    MAX_SANDBOX_MEMORY_MB_ENV,
+    MAX_SANDBOX_PROCESSES_ENV,
+    SandboxCeiling,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +86,23 @@ _WALK_MAX_DEPTH = 6
 #: are unremovable on a real cgroupfs, where that fallback is never reached)
 #: before trying ``rmdir`` again. A file that is not one of these still blocks
 #: the second ``rmdir``, which is the failure the unit lane pins.
-_KERNFS_FILES = ("cpu.max", "cgroup.procs", "cgroup.kill", "cgroup.subtree_control")
+_KERNFS_FILES = (
+    "cpu.max",
+    "memory.high",
+    "memory.max",
+    "pids.max",
+    "cgroup.procs",
+    "cgroup.kill",
+    "cgroup.subtree_control",
+)
+
+#: The three controllers ``setup()`` enables on the delegated parent. One
+#: command, because they arrive through one delegation and one drain:
+#: ``cgroup.subtree_control`` is already writable by the worker, so phase 1's
+#: word and phase 2's two are the same write with two more words in it, and the
+#: same "no internal process" rule applies to the whole command (measured: the
+#: write is ``EBUSY`` while the parent still holds tasks).
+CGROUP_CONTROLLERS = ("cpu", "memory", "pids")
 
 
 class CgroupRefusal(Exception):
@@ -87,6 +120,21 @@ class CgroupRefusal(Exception):
 def cpu_max_for(cpu_percent: int) -> str:
     """The ``cpu.max`` quota string for a percentage of one core, 100 ms period."""
     return f"{cpu_percent * 1000} 100000"
+
+
+def memory_max_for(memory_mb: int) -> str:
+    """The ``memory.high``/``memory.max`` byte count for a declared MiB budget."""
+    return f"{memory_mb * 1024 * 1024}"
+
+
+def pids_max_for(max_processes: int) -> str:
+    """The ``pids.max`` task count for a declared process budget.
+
+    Tasks, not processes: threads share this one budget, so the number is the
+    declared budget verbatim -- exactly the semantics the mediator's own
+    ``EAGAIN`` count has today (plan D4).
+    """
+    return str(max_processes)
 
 
 def _read_limit_file(path: Path) -> str:
@@ -307,22 +355,29 @@ class SandboxCgroups:
         worker_uid: int,
         proc_root: Path = Path("/proc"),
         container_token: str | None = None,
+        policy_ceiling: SandboxCeiling | None = None,
     ) -> None:
         self._mount = mount
         self._worker_uid = worker_uid
         self._proc_root = proc_root
         self._container_token = container_token
+        self._policy_ceiling = policy_ceiling
         self._parent: Path | None = None
 
     # -- startup -------------------------------------------------------
 
     def setup(self, *, wait_s: float) -> str:
-        """Run the two-stage self-check, drain the worker, and enable ``+cpu``.
+        """Run the two-stage self-check, drain the worker, enable the controllers.
 
         Returns the evidence line the caller logs: which directory was taken as
         the parent, how many pids were drained, and the enabled controller set.
         On any failure the ``worker/`` cgroup this call created is removed and
         its pids are moved back before a :class:`CgroupRefusal` is raised.
+
+        The drain is what makes the enable legal: ``cgroup.subtree_control``
+        refuses a controller while the cgroup still holds tasks (``EBUSY``),
+        and a cgroup with tasks *and* an enabled domain controller is "domain
+        invalid", so the order below is not a preference.
         """
         parent: Path | None = None
         worker: Path | None = None
@@ -334,7 +389,7 @@ class SandboxCgroups:
             worker = parent / "worker"
             created = self._prepare_worker_dir(worker)
             drained = self._drain_into(parent, worker)
-            enabled = self._enable_cpu(parent)
+            enabled = self._enable_controllers(parent)
         except CgroupRefusal:
             if parent is not None and worker is not None:
                 self._discard_worker(parent, worker, created)
@@ -459,22 +514,31 @@ class SandboxCgroups:
             )
         return pids
 
-    def _enable_cpu(self, parent: Path) -> str:
-        """Enable the cpu controller on the (now empty) parent, then verify it."""
+    def _enable_controllers(self, parent: Path) -> str:
+        """Enable ``cpu``/``memory``/``pids`` on the (now empty) parent, and verify it.
+
+        One write of three words, then a readback of the *enabled set* the
+        kernel echoes: the enabled set is a fact the module must see for every
+        controller it asked for, because a silently absent ``memory`` would
+        leave the files ``attach`` is about to write non-existent (or, worse,
+        the write landing nowhere).
+        """
         control = parent / "cgroup.subtree_control"
+        command = " ".join(f"+{name}" for name in CGROUP_CONTROLLERS)
         try:
-            control.write_text("+cpu")
+            control.write_text(command)
         except OSError as exc:
             raise CgroupRefusal(
                 f"cgroup-refusal subtree-control-write: {control}"
             ) from exc
         read_back = control.read_text().strip()
-        # The kernel echoes the *enabled set* ("cpu"), not the "+cpu" command.
+        # The kernel echoes the *enabled set* ("cpu memory pids"), not the command.
         enabled = {token.lstrip("+-") for token in read_back.split()}
-        if "cpu" not in enabled:
+        missing = [name for name in CGROUP_CONTROLLERS if name not in enabled]
+        if missing:
             raise CgroupRefusal(
-                f"cgroup-refusal subtree-control: wrote '+cpu' to {control}, "
-                f"read {read_back!r}"
+                f"cgroup-refusal subtree-control: wrote {command!r} to {control}, "
+                f"read {read_back!r} (missing: {', '.join(missing)})"
             )
         return " ".join(sorted(enabled))
 
@@ -492,14 +556,42 @@ class SandboxCgroups:
         """
         return read_kernel_ceiling(self._parent or self._mount)
 
-    def attach(self, *, sandbox_id: str, pid: int, cpu_percent: int) -> str:
-        """Create ``sbx_<id>``, set its quota, and place ``pid`` in it.
+    def attach(
+        self,
+        *,
+        sandbox_id: str,
+        pid: int,
+        cpu_percent: int,
+        memory_mb: int | None,
+        max_processes: int | None,
+    ) -> str:
+        """Create ``sbx_<id>``, write its three limits, and place ``pid`` in it.
 
         Returns the cgroup directory. Reuse-or-refuse: an existing directory
         that already holds pids is refused, never silently shared.
+
+        ``cpu_percent``, ``memory_mb`` and ``max_processes`` are the sandbox's
+        **declared** sizes -- the control plane's ``cpuPercent``/``memoryMB``/
+        ``maxProcesses``, travelling unchanged from the worker's own record.
+        ``None`` for either of the last two is "the caller did not declare this
+        dimension": the worker's per-sandbox ceiling is then written, which is
+        a bound and the only value in sight that nobody had to invent.
+
+        Before anything is created, all three are checked against the policy
+        ceiling injected into this handle (R3, the worker's second gate -- the
+        control plane ran the first one): a declared size above it is a named
+        refusal, never a clamp and never a silent smaller run. Every limit that
+        is written is then read back **verbatim**; a disagreement is a refusal,
+        and the directory this call created is removed with it.
         """
         self._validate_sandbox_id(sandbox_id)
         parent = self._require_parent()
+        memory, pids = self._checked_declared_sizes(
+            sandbox_id=sandbox_id,
+            cpu_percent=cpu_percent,
+            memory_mb=memory_mb,
+            max_processes=max_processes,
+        )
         target = parent / f"sbx_{sandbox_id}"
         created = False
         try:
@@ -517,15 +609,19 @@ class SandboxCgroups:
                         f"cgroup-refusal sbx-mkdir: {target}"
                     ) from exc
                 created = True
-            quota = cpu_max_for(cpu_percent)
-            cpu_max = target / "cpu.max"
-            cpu_max.write_text(quota)
-            read_quota = cpu_max.read_text().strip()
-            if read_quota != quota:
-                raise CgroupRefusal(
-                    f"cgroup-refusal cpu-max: wrote {quota!r} to {cpu_max}, "
-                    f"read {read_quota!r}"
-                )
+            self._write_limit(
+                target / "cpu.max", cpu_max_for(cpu_percent), "cpu-max"
+            )
+            # D2: the same line for both memory files -- `memory.high` reclaims
+            # (throttles) first and `memory.max` is the wall behind it, so an
+            # allocation is only killed when the process really cannot come
+            # down. D3: `memory.oom.group` is never written; the default 0
+            # keeps the kill on the allocating task instead of the whole box.
+            self._write_limit(target / "memory.high", memory, "memory-high")
+            self._write_limit(target / "memory.max", memory, "memory-max")
+            # D4: tasks, not processes -- threads share this one budget, which
+            # is exactly what today's mediator-side count enforces (EAGAIN).
+            self._write_limit(target / "pids.max", pids, "pids-max")
             procs = target / "cgroup.procs"
             procs.write_text(f"{pid}\n")
             placed = procs.read_text().split()
@@ -547,6 +643,89 @@ class SandboxCgroups:
             self._discard(target, created)
             raise CgroupRefusal(f"cgroup-refusal attach-io: {target}") from exc
         return str(target)
+
+    def _checked_declared_sizes(
+        self,
+        *,
+        sandbox_id: str,
+        cpu_percent: int,
+        memory_mb: int | None,
+        max_processes: int | None,
+    ) -> tuple[str, str]:
+        """R3's second gate: the declared sizes vs this worker's own ceiling.
+
+        The ceiling is the one injected at construction (the worker's
+        ``E2B_MAX_SANDBOX_*`` policy, resolved by
+        ``envd_service.route_b.policy_ceiling_for``) -- explicitly **not** the
+        kernel read: the kernel's half is the startup cross-check's business,
+        and a kernel that sets no limit is a legal lane where the policy is the
+        only bound left.
+
+        Three outcomes, none of them silent:
+
+        * a declared dimension is above the ceiling -- one named refusal naming
+          every offending dimension, its value and the env that carries the
+          limit (no clamp: the API promise and the kernel have to agree);
+        * a dimension nobody declared -- the ceiling is written, so the sandbox
+          is still bounded by the deployment's own number;
+        * no ceiling on this handle at all -- refused by name, because "checked
+          against nothing" is the fail-open direction this whole module exists
+          to close.
+        """
+        ceiling = self._policy_ceiling
+        if ceiling is None:
+            raise CgroupRefusal(
+                "cgroup-refusal ceiling-unavailable: this handle carries no "
+                f"per-sandbox ceiling, so sandbox {sandbox_id}'s declared size "
+                "cannot be checked against anything (N83 phase 2 R3) -- build "
+                "it through sandbox_cgroups_for(settings), or set "
+                "E2B_SANDBOX_CGROUP=off"
+            )
+        memory = ceiling.memory_mb if memory_mb is None else int(memory_mb)
+        processes = ceiling.processes if max_processes is None else int(max_processes)
+        above: list[str] = []
+        if ceiling.cpu_percent is not None and int(cpu_percent) > ceiling.cpu_percent:
+            above.append(
+                f"cpuPercent {cpu_percent} > {ceiling.cpu_percent} "
+                f"({MAX_SANDBOX_CPU_PERCENT_ENV})"
+            )
+        if ceiling.memory_mb is not None and memory > ceiling.memory_mb:
+            above.append(
+                f"memoryMB {memory} > {ceiling.memory_mb} "
+                f"({MAX_SANDBOX_MEMORY_MB_ENV})"
+            )
+        if ceiling.processes is not None and processes > ceiling.processes:
+            above.append(
+                f"maxProcesses {processes} > {ceiling.processes} "
+                f"({MAX_SANDBOX_PROCESSES_ENV})"
+            )
+        if above:
+            raise CgroupRefusal(
+                f"cgroup-refusal size-exceeds-ceiling: sandbox {sandbox_id} "
+                "declares more than this worker's per-sandbox ceiling "
+                f"({'; '.join(above)}) -- refusing the create rather than "
+                "running a smaller sandbox silently; lower the request or "
+                "raise E2B_MAX_SANDBOX_*"
+            )
+        return memory_max_for(memory), pids_max_for(processes)
+
+    def _write_limit(self, path: Path, value: str, reason: str) -> None:
+        """Write one kernfs limit and read it back **verbatim**.
+
+        The readback is the only proof there is: kernfs is where the kernel's
+        answer lives, and a value it rounded (or a parent layer that applied
+        "the smaller one") must be a refusal naming the file, never a shrug.
+        """
+        try:
+            path.write_text(value)
+        except OSError as exc:
+            raise CgroupRefusal(f"cgroup-refusal {reason}-write: {path}") from exc
+        read_back = path.read_text().strip()
+        if read_back != value:
+            raise CgroupRefusal(
+                f"cgroup-refusal {reason}: wrote {value!r} to {path}, "
+                f"read {read_back!r}"
+            )
 
     def release(self, *, sandbox_id: str) -> bool:
         """Kill and remove ``sbx_<id>``. Absent is ``False``, not an error."""

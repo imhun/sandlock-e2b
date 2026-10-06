@@ -46,13 +46,25 @@ from envd_service.config import Settings
 from envd_service.executors.local import LocalExecutor
 from envd_service.priv_helpers import PrivHelperError
 from envd_service.route_b import RouteBConfig, W1SlotPool
-from envd_service.runtime.sandbox_cgroup import CgroupRefusal, SandboxCgroups
+from envd_service.runtime.sandbox_cgroup import (
+    CgroupRefusal,
+    SandboxCeiling,
+    SandboxCgroups,
+)
 
 SANDBOX_ID = "sbx_cgroup"
 CHILD_PID = 4242
 #: The declared (unclamped) share this sandbox asked for: two cores. The pool
 #: must hand *this* to ``attach``, not the fork policy's ``min(100, ...)``.
 DECLARED_PERCENT = 200
+#: N83 phase 2 (Task 3): the other two declared sizes on the same record. They
+#: are what ``attach`` writes as ``memory.high``/``memory.max`` and ``pids.max``
+#: -- the record is where they come from, so the pool carries them verbatim.
+DECLARED_MEMORY_MB = 2048
+DECLARED_MAX_PROCESSES = 512
+#: The worker's own per-sandbox ceiling (``E2B_MAX_SANDBOX_*``, N83 phase 2
+#: R3): the number the module's second gate compares a declared size against.
+POLICY_CEILING = SandboxCeiling(cpu_percent=400, memory_mb=4096, processes=1024)
 CONTROL_PLANE_URL = "http://control-plane:3000"
 NODE_ID = "worker-1"
 
@@ -130,9 +142,23 @@ class FakeCgroups:
         self.attached: list[dict] = []
         self.released: list[str] = []
 
-    def attach(self, *, sandbox_id: str, pid: int, cpu_percent: int) -> str:
+    def attach(
+        self,
+        *,
+        sandbox_id: str,
+        pid: int,
+        cpu_percent: int,
+        memory_mb: int | None,
+        max_processes: int | None,
+    ) -> str:
         self.attached.append(
-            {"sandbox_id": sandbox_id, "pid": pid, "cpu_percent": cpu_percent}
+            {
+                "sandbox_id": sandbox_id,
+                "pid": pid,
+                "cpu_percent": cpu_percent,
+                "memory_mb": memory_mb,
+                "max_processes": max_processes,
+            }
         )
         self._order.append("attach")
         if self._attach_error is not None:
@@ -163,6 +189,14 @@ def _settings(**overrides) -> SimpleNamespace:
         sandbox_cgroup="off",
         cgroup_mount="/pod-cgroup",
         cgroup_delegate_wait_s=30.0,
+        # N83 phase 2: the per-sandbox policy ceiling (R3). Explicit here, so
+        # the resolved ceiling does not follow this test host's CPU/memory.
+        max_sandbox_cpu_percent=400,
+        max_sandbox_memory_mb=4096,
+        max_sandbox_processes=1024,
+        default_cpu_percent=100,
+        default_memory_mb=512,
+        default_max_processes=64,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -317,6 +351,11 @@ def test_the_required_switch_builds_one_handle_for_the_whole_process(
             "mount": Path("/pod-cgroup"),
             "worker_uid": os.geteuid(),
             "container_token": None,
+            # N83 phase 2 (R3): the handle is built with the worker's own
+            # per-sandbox ceiling, so ``attach`` can refuse a declared size
+            # above it *by name*. It is resolved next to the handle because
+            # both are one process-wide fact.
+            "policy_ceiling": POLICY_CEILING,
         }
     ]
 
@@ -402,7 +441,13 @@ def test_the_child_is_placed_before_its_identity_is_reported(tmp_path) -> None:
 
     assert order == ["attach", "report", "stats"]
     assert fake.attached == [
-        {"sandbox_id": SANDBOX_ID, "pid": CHILD_PID, "cpu_percent": DECLARED_PERCENT}
+        {
+            "sandbox_id": SANDBOX_ID,
+            "pid": CHILD_PID,
+            "cpu_percent": DECLARED_PERCENT,
+            "memory_mb": None,
+            "max_processes": None,
+        }
     ]
     assert reports == [(SANDBOX_ID, CHILD_PID)]
     assert spawned[0].killed == 0
@@ -414,7 +459,14 @@ def test_the_declared_percent_reaches_attach_unchanged(tmp_path) -> None:
     order: list = []
     fake = FakeCgroups(order)
     pool, _spawned, _reports = _pool(tmp_path, order, sandbox_cgroups=fake)
-    pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001, cpu_percent=400)
+    pool.acquire_sync(
+        SANDBOX_ID,
+        {"ceiling": {}},
+        uid=20001,
+        cpu_percent=400,
+        memory_mb=2048,
+        max_processes=256,
+    )
     pool.acquire_sync(
         "sbx_two", {"ceiling": {}}, uid=20000, cpu_percent=DECLARED_PERCENT
     )
@@ -422,13 +474,73 @@ def test_the_declared_percent_reaches_attach_unchanged(tmp_path) -> None:
     assert [call["cpu_percent"] for call in fake.attached] == [400, DECLARED_PERCENT]
 
 
-def test_a_caller_with_no_declared_percent_gets_the_plan_default(tmp_path) -> None:
-    """``None`` is "the caller does not know", and 100% is the documented floor."""
+def test_the_declared_memory_and_pids_reach_attach_unchanged(tmp_path) -> None:
+    """N83 phase 2 (Task 3): the record's sizes are what the box is capped at.
+
+    ``memory.high``/``memory.max`` get the declared MiB and ``pids.max`` the
+    declared task budget, verbatim -- no clamping here, and no default invented
+    by the pool.
+    """
+    order: list = []
+    fake = FakeCgroups(order)
+    pool, _spawned, _reports = _pool(tmp_path, order, sandbox_cgroups=fake)
+    pool.acquire_sync(
+        SANDBOX_ID,
+        {"ceiling": {}},
+        uid=20001,
+        cpu_percent=DECLARED_PERCENT,
+        memory_mb=DECLARED_MEMORY_MB,
+        max_processes=DECLARED_MAX_PROCESSES,
+    )
+
+    assert fake.attached == [
+        {
+            "sandbox_id": SANDBOX_ID,
+            "pid": CHILD_PID,
+            "cpu_percent": DECLARED_PERCENT,
+            "memory_mb": DECLARED_MEMORY_MB,
+            "max_processes": DECLARED_MAX_PROCESSES,
+        }
+    ]
+
+
+def test_a_caller_that_declares_nothing_hands_attach_a_none(tmp_path) -> None:
+    """``None`` is "the caller does not know", and the pool invents nothing.
+
+    ``cpu_percent`` has a documented floor (100 %, pinned since phase 1); the
+    two phase-2 dimensions have none, so the pool passes the honest ``None``
+    through and the module resolves it against the worker's ceiling -- never
+    against a number this layer made up.
+    """
     order: list = []
     fake = FakeCgroups(order)
     pool, _spawned, _reports = _pool(tmp_path, order, sandbox_cgroups=fake)
     pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
+
     assert fake.attached[0]["cpu_percent"] == 100
+    assert fake.attached[0]["memory_mb"] is None
+    assert fake.attached[0]["max_processes"] is None
+
+
+def test_the_handle_is_built_with_the_workers_policy_ceiling(
+    monkeypatch, tmp_path
+) -> None:
+    """R3: the second gate compares against ``sandbox_ceiling_for(settings)``.
+
+    Not the kernel read (``kernel_ceiling`` is only the startup cross-check):
+    the policy is a deployment decision, and the process-wide handle is built
+    with it, so every ``attach`` through that handle sees the same number.
+    """
+    built: list[dict] = []
+
+    class Recording:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+    monkeypatch.setattr(rb, "SandboxCgroups", Recording)
+    rb.sandbox_cgroups_for(_settings(sandbox_cgroup="required"))
+
+    assert built[0]["policy_ceiling"] == POLICY_CEILING
 
 
 # ------------------------------------------------------- the fail-closed half

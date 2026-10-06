@@ -28,6 +28,12 @@ never infinity) and the kernel read of the worker's own container cgroup
 at the bottom of this file pin the three mistakes Review Focus §1 names: an
 unset ceiling read as "unlimited", a policy ceiling above the kernel's, and a
 kernel that sets no ceiling at all (the compose lane's measured shape).
+
+N83 phase 2 (Task 3) adds the *writing* half: ``setup()`` enables ``memory`` and
+``pids`` beside ``cpu`` (same drain, same EBUSY rule), and ``attach()`` writes
+``memory.high``/``memory.max``/``pids.max`` beside ``cpu.max`` -- each one read
+back **verbatim** -- with a second, worker-side defense gate (R3) that refuses a
+declared size above the worker's own ``E2B_MAX_SANDBOX_*`` ceiling by name.
 """
 
 from __future__ import annotations
@@ -49,12 +55,20 @@ from envd_service.runtime.sandbox_cgroup import (
     SandboxCgroups,
     check_policy_ceiling,
     cpu_max_for,
+    memory_max_for,
+    pids_max_for,
 )
 from envd_service.agent import start_cgroup_lane
 
 #: The pid the synthetic cgroup.procs files carry. The module must see its own
 #: pid there (``self-placement``), so the tests use the process's real pid.
 SELF_PID = os.getpid()
+
+#: The worker's own per-sandbox ceiling (``E2B_MAX_SANDBOX_*``) for the cases
+#: that build a handle by hand: generous enough that a declared size below it is
+#: the interesting shape. The R3 defense gate compares against *this*, never
+#: against the kernel (plan ruling R3).
+POLICY_CEILING = SandboxCeiling(cpu_percent=400, memory_mb=4096, processes=1024)
 
 
 def _write(path: Path, text: str) -> None:
@@ -104,6 +118,28 @@ def kernel_placement(monkeypatch: pytest.MonkeyPatch) -> None:
         return [pid for pid in here if pid not in moved]
 
     monkeypatch.setattr(sandbox_cgroup, "_cgroup_pids", placed)
+
+
+@pytest.fixture()
+def kernel_ebusy_while_occupied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The kernel's no-internal-process rule, faked like ``kernel_placement``.
+
+    Enabling a domain controller on a cgroup that still holds tasks is
+    ``EBUSY``; after the drain it is accepted. Measured on the local Docker VM
+    (plan 现场事实): ``+memory`` with the parent still populated gives errno 16,
+    and the same write is ``ok`` once the worker has been moved into
+    ``worker/``. Only that one rule is faked -- the module's write, the module's
+    readback and the module's refusal translation are the real code path.
+    """
+    real_write = Path.write_text
+
+    def guarded(self: Path, text: str, *args: object, **kwargs: object) -> int:
+        if self.name == "cgroup.subtree_control" and str(text).startswith("+"):
+            if sandbox_cgroup._cgroup_pids(self.parent):
+                raise OSError(16, "Device or resource busy")
+        return real_write(self, text, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", guarded)
 
 
 def test_setup_refuses_when_mount_root_has_no_cpu_max(tmp_path: Path) -> None:
@@ -161,7 +197,9 @@ def test_setup_refuses_when_two_dirs_are_owned_by_the_worker(tmp_path: Path) -> 
     )
 
 
-def test_setup_drains_the_parent_and_enables_cpu(tmp_path: Path) -> None:
+def test_setup_drains_the_parent_and_enables_every_controller(
+    tmp_path: Path, kernel_ebusy_while_occupied: None
+) -> None:
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
 
@@ -170,13 +208,18 @@ def test_setup_drains_the_parent_and_enables_cpu(tmp_path: Path) -> None:
     line = cg.setup(wait_s=0.2)
 
     # Drained: the parent no longer holds the worker, and the worker/ dir does.
+    # The faked kernel rule above is what makes that ordering load-bearing: the
+    # enable below is EBUSY while the parent still holds tasks (plan 现场事实,
+    # measured for +cpu in phase 1 and re-measured for +memory/+pids), so a
+    # ``setup`` that did not drain first could not reach this assertion.
     assert sandbox_cgroup._cgroup_pids(parent) == []
     assert (parent / "worker" / "cgroup.procs").read_text() == f"{SELF_PID}\n"
-    # +cpu written literally, then verified by readback (kernel echoes "cpu").
-    assert (parent / "cgroup.subtree_control").read_text() == "+cpu"
+    # All three controllers in one command, then verified by readback (the
+    # kernel echoes the enabled set, "cpu memory pids").
+    assert (parent / "cgroup.subtree_control").read_text() == "+cpu +memory +pids"
     assert line == (
         f"cgroup ready parent={parent} worker_uid={os.getuid()} "
-        f"drained=1 subtree_control=cpu"
+        f"drained=1 subtree_control=cpu memory pids"
     )
 
 
@@ -196,7 +239,7 @@ def test_setup_with_container_token_narrows_to_the_container_id(tmp_path: Path) 
     line = cg.setup(wait_s=0.2)
     assert line == (
         f"cgroup ready parent={delegated} worker_uid={os.getuid()} "
-        f"drained=1 subtree_control=cpu"
+        f"drained=1 subtree_control=cpu memory pids"
     )
 
 
@@ -204,12 +247,23 @@ def test_attach_writes_cpu_max_and_places_the_pid(tmp_path: Path) -> None:
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
     proc_root = tmp_path / "proc"
-    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=proc_root)
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=proc_root,
+        policy_ceiling=POLICY_CEILING,
+    )
     cg.setup(wait_s=0.2)
     pid = 4242
     _write(proc_root / str(pid) / "cgroup", "0::/sbx_alpha\n")
 
-    target = cg.attach(sandbox_id="alpha", pid=pid, cpu_percent=100)
+    target = cg.attach(
+        sandbox_id="alpha",
+        pid=pid,
+        cpu_percent=100,
+        memory_mb=512,
+        max_processes=64,
+    )
 
     assert target == str(parent / "sbx_alpha")
     assert (parent / "sbx_alpha" / "cpu.max").read_text() == "100000 100000"
@@ -219,14 +273,25 @@ def test_attach_writes_cpu_max_and_places_the_pid(tmp_path: Path) -> None:
 def test_attach_refuses_a_target_that_already_holds_pids(tmp_path: Path) -> None:
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
-    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
     cg.setup(wait_s=0.2)
     target = parent / "sbx_busy"
     target.mkdir()
     _write(target / "cgroup.procs", "999\n")
 
     with pytest.raises(CgroupRefusal) as excinfo:
-        cg.attach(sandbox_id="busy", pid=4242, cpu_percent=50)
+        cg.attach(
+            sandbox_id="busy",
+            pid=4242,
+            cpu_percent=50,
+            memory_mb=512,
+            max_processes=64,
+        )
     assert str(excinfo.value) == (
         f"cgroup-refusal sbx-in-use: {target} already holds pids [999]"
     )
@@ -238,13 +303,24 @@ def test_attach_removes_what_it_created_when_placement_check_fails(tmp_path: Pat
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
     proc_root = tmp_path / "proc"
-    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=proc_root)
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=proc_root,
+        policy_ceiling=POLICY_CEILING,
+    )
     cg.setup(wait_s=0.2)
     pid = 4242
     _write(proc_root / str(pid) / "cgroup", "0::/elsewhere\n")
 
     with pytest.raises(CgroupRefusal) as excinfo:
-        cg.attach(sandbox_id="alpha", pid=pid, cpu_percent=100)
+        cg.attach(
+            sandbox_id="alpha",
+            pid=pid,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=64,
+        )
     assert str(excinfo.value) == (
         f"cgroup-refusal placement: pid {pid} is in '0::/elsewhere', "
         f"expected '0::/sbx_alpha'"
@@ -255,7 +331,12 @@ def test_attach_removes_what_it_created_when_placement_check_fails(tmp_path: Pat
 def test_release_is_idempotent(tmp_path: Path) -> None:
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
-    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
     cg.setup(wait_s=0.2)
 
     assert cg.release(sandbox_id="gone") is False
@@ -272,7 +353,12 @@ def test_release_is_idempotent(tmp_path: Path) -> None:
 def test_release_refuses_when_rmdir_fails(tmp_path: Path) -> None:
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
-    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
     cg.setup(wait_s=0.2)
     target = parent / "sbx_alpha"
     target.mkdir()
@@ -342,7 +428,12 @@ def test_attach_refuses_when_the_sandbox_cgroup_cannot_be_created(
 ) -> None:
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
-    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
     cg.setup(wait_s=0.2)
     target = parent / "sbx_alpha"
     real_mkdir = Path.mkdir
@@ -355,7 +446,13 @@ def test_attach_refuses_when_the_sandbox_cgroup_cannot_be_created(
     monkeypatch.setattr(Path, "mkdir", deny)
 
     with pytest.raises(CgroupRefusal) as excinfo:
-        cg.attach(sandbox_id="alpha", pid=4242, cpu_percent=100)
+        cg.attach(
+            sandbox_id="alpha",
+            pid=4242,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=64,
+        )
     assert str(excinfo.value) == f"cgroup-refusal sbx-mkdir: {target}"
     assert target.exists() is False
 
@@ -363,7 +460,12 @@ def test_attach_refuses_when_the_sandbox_cgroup_cannot_be_created(
 def test_attach_refuses_when_an_existing_target_cannot_be_read(tmp_path: Path) -> None:
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
-    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
     cg.setup(wait_s=0.2)
     # Exists, but has no cgroup.procs to read: the reuse probe fails, and that
     # must be a named refusal, not a bare OSError.
@@ -371,7 +473,13 @@ def test_attach_refuses_when_an_existing_target_cannot_be_read(tmp_path: Path) -
     target.mkdir()
 
     with pytest.raises(CgroupRefusal) as excinfo:
-        cg.attach(sandbox_id="alpha", pid=4242, cpu_percent=100)
+        cg.attach(
+            sandbox_id="alpha",
+            pid=4242,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=64,
+        )
     assert str(excinfo.value) == f"cgroup-refusal attach-io: {target}"
     assert target.exists() is True
 
@@ -381,7 +489,12 @@ def test_release_refuses_when_cgroup_kill_cannot_be_written(
 ) -> None:
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
-    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
     cg.setup(wait_s=0.2)
     target = parent / "sbx_alpha"
     target.mkdir()
@@ -406,12 +519,23 @@ def test_release_refuses_when_cgroup_kill_cannot_be_written(
 def test_attach_refuses_a_path_escaping_sandbox_id(tmp_path: Path, bad_id: str) -> None:
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
-    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
     cg.setup(wait_s=0.2)
     before = sorted(child.name for child in parent.iterdir())
 
     with pytest.raises(CgroupRefusal) as excinfo:
-        cg.attach(sandbox_id=bad_id, pid=4242, cpu_percent=100)
+        cg.attach(
+            sandbox_id=bad_id,
+            pid=4242,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=64,
+        )
 
     assert str(excinfo.value) == (
         f"cgroup-refusal sandbox-id: {bad_id!r} is not a valid sandbox id"
@@ -424,7 +548,12 @@ def test_attach_refuses_a_path_escaping_sandbox_id(tmp_path: Path, bad_id: str) 
 def test_release_refuses_a_path_escaping_sandbox_id(tmp_path: Path) -> None:
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
-    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
     cg.setup(wait_s=0.2)
     before = sorted(child.name for child in parent.iterdir())
 
@@ -435,6 +564,352 @@ def test_release_refuses_a_path_escaping_sandbox_id(tmp_path: Path) -> None:
         "cgroup-refusal sandbox-id: 'a/b' is not a valid sandbox id"
     )
     assert sorted(child.name for child in parent.iterdir()) == before
+
+
+# ------------------------------ the box's three limits (N83 phase 2, Task 3)
+#
+# D1: one ``sbx_<id>`` carries ``cpu.max`` *and* ``memory.high``/``memory.max``
+# *and* ``pids.max``; D2: the two memory files get the same value (reclaim
+# first, kill only if the process cannot come down); D3: ``memory.oom.group``
+# is deliberately left alone, so an over-budget sandbox does not take its
+# neighbours in the same box (or the parent container) with it. Every write is
+# read back verbatim, and the second gate (R3) compares a *declared* size
+# against the worker's ``E2B_MAX_SANDBOX_*`` ceiling -- never against a kernel
+# read: no clamping, no silently running smaller.
+
+
+def test_the_limit_helpers_spell_the_kernel_files() -> None:
+    assert memory_max_for(512) == "536870912"
+    assert memory_max_for(4096) == "4294967296"
+    assert pids_max_for(64) == "64"
+    assert pids_max_for(1024) == "1024"
+
+
+def test_attach_writes_all_three_limits_and_reads_them_back_verbatim(
+    tmp_path: Path,
+) -> None:
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    proc_root = tmp_path / "proc"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=proc_root,
+        policy_ceiling=POLICY_CEILING,
+    )
+    cg.setup(wait_s=0.2)
+    pid = 4242
+    _write(proc_root / str(pid) / "cgroup", "0::/sbx_alpha\n")
+
+    target = Path(
+        cg.attach(
+            sandbox_id="alpha",
+            pid=pid,
+            cpu_percent=200,
+            memory_mb=512,
+            max_processes=64,
+        )
+    )
+
+    assert target == parent / "sbx_alpha"
+    assert (target / "cpu.max").read_text() == "200000 100000"
+    # D2: the same line for both -- `memory.high` reclaims (throttles) first,
+    # and an allocation that still cannot come down hits `memory.max`.
+    assert (target / "memory.high").read_text() == "536870912"
+    assert (target / "memory.max").read_text() == "536870912"
+    assert (target / "pids.max").read_text() == "64"
+    # D3: `memory.oom.group` is not written at all -- the default 0 kills only
+    # the allocating task, so a neighbour in the same box (and the parent
+    # container) is not dragged down with it.
+    assert (target / "memory.oom.group").exists() is False
+
+
+def test_attach_takes_the_ceiling_for_a_dimension_nobody_declared(
+    tmp_path: Path,
+) -> None:
+    """``None`` is "the caller did not say", and the ceiling is the only number
+    that is not invented here: writing what one sandbox may have is a bound,
+    while any other value would be a silent policy change."""
+    mount = _pod_mount(tmp_path)
+    proc_root = tmp_path / "proc"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=proc_root,
+        policy_ceiling=POLICY_CEILING,
+    )
+    cg.setup(wait_s=0.2)
+    pid = 4242
+    _write(proc_root / str(pid) / "cgroup", "0::/sbx_alpha\n")
+
+    target = Path(
+        cg.attach(
+            sandbox_id="alpha",
+            pid=pid,
+            cpu_percent=100,
+            memory_mb=None,
+            max_processes=None,
+        )
+    )
+
+    assert (target / "memory.high").read_text() == memory_max_for(4096)
+    assert (target / "memory.max").read_text() == memory_max_for(4096)
+    assert (target / "pids.max").read_text() == pids_max_for(1024)
+
+
+def test_release_removes_a_box_that_carried_all_three_limits(tmp_path: Path) -> None:
+    """The synthetic-tree teardown has to drop the new kernfs files too.
+
+    A real cgroupfs removes them with the directory; the unit lane keeps them,
+    so ``_KERNFS_FILES`` is the only reason the second ``rmdir`` succeeds here.
+    """
+    mount = _pod_mount(tmp_path)
+    proc_root = tmp_path / "proc"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=proc_root,
+        policy_ceiling=POLICY_CEILING,
+    )
+    cg.setup(wait_s=0.2)
+    pid = 4242
+    _write(proc_root / str(pid) / "cgroup", "0::/sbx_alpha\n")
+    box = Path(
+        cg.attach(
+            sandbox_id="alpha",
+            pid=pid,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=64,
+        )
+    )
+    assert sorted(child.name for child in box.iterdir()) == [
+        "cgroup.procs",
+        "cpu.max",
+        "memory.high",
+        "memory.max",
+        "pids.max",
+    ]
+
+    assert cg.release(sandbox_id="alpha") is True
+    assert box.exists() is False
+
+
+def test_attach_refuses_a_declared_size_above_the_worker_ceiling(
+    tmp_path: Path,
+) -> None:
+    """R3's second gate compares the declared size with ``E2B_MAX_SANDBOX_*``.
+
+    The control plane already refused an oversized request (Task 2); this is
+    the worker's own defense -- no clamp, no "run smaller silently", and
+    nothing half-built is left behind for a size this worker will not promise.
+    """
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
+    cg.setup(wait_s=0.2)
+    before = sorted(child.name for child in parent.iterdir())
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(
+            sandbox_id="alpha",
+            pid=4242,
+            cpu_percent=800,
+            memory_mb=8192,
+            max_processes=2048,
+        )
+
+    assert str(excinfo.value) == (
+        "cgroup-refusal size-exceeds-ceiling: sandbox alpha declares more than "
+        "this worker's per-sandbox ceiling "
+        "(cpuPercent 800 > 400 (E2B_MAX_SANDBOX_CPU_PERCENT); "
+        "memoryMB 8192 > 4096 (E2B_MAX_SANDBOX_MEMORY_MB); "
+        "maxProcesses 2048 > 1024 (E2B_MAX_SANDBOX_PROCESSES)) -- refusing the "
+        "create rather than running a smaller sandbox silently; lower the "
+        "request or raise E2B_MAX_SANDBOX_*"
+    )
+    # No half-built box, and nothing else in the delegated subtree moved.
+    assert sorted(child.name for child in parent.iterdir()) == before
+    assert (parent / "sbx_alpha").exists() is False
+
+
+def test_attach_refuses_when_the_handle_carries_no_ceiling(tmp_path: Path) -> None:
+    """Fail closed: with nothing to compare against, nothing is written.
+
+    A handle built by hand (or by an embedder) without the worker's ceiling
+    cannot answer "is this request inside what this node may promise?", so the
+    create is refused by name -- the same direction as
+    ``E2B_SANDBOX_CGROUP=required`` without a handle.
+    """
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(
+        mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc"
+    )
+    cg.setup(wait_s=0.2)
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(
+            sandbox_id="alpha",
+            pid=4242,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=64,
+        )
+
+    assert str(excinfo.value) == (
+        "cgroup-refusal ceiling-unavailable: this handle carries no per-sandbox "
+        "ceiling, so sandbox alpha's declared size cannot be checked against "
+        "anything (N83 phase 2 R3) -- build it through "
+        "sandbox_cgroups_for(settings), or set E2B_SANDBOX_CGROUP=off"
+    )
+    assert (parent / "sbx_alpha").exists() is False
+
+
+def test_attach_refuses_and_removes_the_box_when_a_limit_cannot_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused write is a named refusal, and the box it made is gone."""
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
+    cg.setup(wait_s=0.2)
+    memory_high = parent / "sbx_alpha" / "memory.high"
+    real_write = Path.write_text
+
+    def deny(self: Path, *args: object, **kwargs: object) -> int:
+        if self == memory_high:
+            raise PermissionError(13, "Permission denied")
+        return real_write(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", deny)
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(
+            sandbox_id="alpha",
+            pid=4242,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=64,
+        )
+
+    assert str(excinfo.value) == f"cgroup-refusal memory-high-write: {memory_high}"
+    assert (parent / "sbx_alpha").exists() is False
+
+
+def test_attach_refuses_and_removes_the_box_when_a_limit_reads_back_wrong(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that does not read back verbatim is a refusal, not a shrug.
+
+    A parent layer is allowed to round a value it cannot represent; this module
+    is not allowed to leave a sandbox running with a limit nobody checked. Each
+    file gets its own named refusal, so a log names *which* limit disagreed.
+    """
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
+    cg.setup(wait_s=0.2)
+    memory_max = parent / "sbx_alpha" / "memory.max"
+    real_write = Path.write_text
+
+    def tamper(self: Path, *args: object, **kwargs: object) -> int:
+        if self == memory_max:
+            # Something between us and the kernel stored a different number:
+            # the shape the plan's Review Focus 2 names (a parent layer that
+            # silently applies "the smaller one").
+            return real_write(self, "1073741824")  # type: ignore[arg-type]
+        return real_write(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", tamper)
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(
+            sandbox_id="alpha",
+            pid=4242,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=64,
+        )
+
+    assert str(excinfo.value) == (
+        f"cgroup-refusal memory-max: wrote '536870912' to {memory_max}, "
+        f"read '1073741824'"
+    )
+    assert (parent / "sbx_alpha").exists() is False
+
+
+def test_the_controllers_are_refused_while_the_parent_still_holds_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kernel_ebusy_while_occupied: None,
+) -> None:
+    """``+memory``/``+pids`` need the same drain ``+cpu`` needs.
+
+    The fake above is the kernel's own rule; skipping the drain is the shortest
+    way to show the rule applies to the *whole* command, not only to phase 1's
+    word.
+    """
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    control = parent / "cgroup.subtree_control"
+    monkeypatch.setattr(
+        sandbox_cgroup.SandboxCgroups,
+        "_drain_into",
+        lambda self, parent_dir, worker_dir: [],
+    )
+    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid())
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.setup(wait_s=0.2)
+
+    assert str(excinfo.value) == f"cgroup-refusal subtree-control-write: {control}"
+    # Nothing half-built: the worker/ cgroup this attempt created is gone.
+    assert (parent / "worker").exists() is False
+
+
+def test_setup_refuses_when_the_kernel_does_not_echo_every_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The readback is the proof: one missing word is a named refusal."""
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    control = parent / "cgroup.subtree_control"
+    real_write = Path.write_text
+
+    def partial(self: Path, text: str, *args: object, **kwargs: object) -> int:
+        if self == control and str(text).startswith("+"):
+            # A parent layer (or an older kernel) that accepted only phase 1's
+            # word: what it echoes is the enabled set it really has.
+            return real_write(self, "cpu")  # type: ignore[arg-type]
+        return real_write(self, text, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", partial)
+    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid())
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.setup(wait_s=0.2)
+
+    assert str(excinfo.value) == (
+        f"cgroup-refusal subtree-control: wrote '+cpu +memory +pids' to "
+        f"{control}, read 'cpu' (missing: memory, pids)"
+    )
+    assert (parent / "worker").exists() is False
 
 
 # --------------------------- the per-sandbox ceiling (N83 phase 2, Task 1)

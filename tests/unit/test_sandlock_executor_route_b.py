@@ -125,6 +125,8 @@ class FakePool:
         uid=None,
         name=None,
         cpu_percent=None,
+        memory_mb=None,
+        max_processes=None,
     ):
         self.acquire_calls.append(
             {
@@ -135,6 +137,10 @@ class FakePool:
                 "name": name,
                 # N83 phase 1: the sandbox's declared share, unclamped.
                 "cpu_percent": cpu_percent,
+                # N83 phase 2 (Task 3): the declared memory/task budget, which
+                # the pool writes as ``memory.high``/``memory.max``/``pids.max``.
+                "memory_mb": memory_mb,
+                "max_processes": max_processes,
             }
         )
         handle = SlotHandle(
@@ -443,6 +449,11 @@ async def test_first_exec_leases_this_sandbox_uid_with_the_full_ceiling(
             # N83 phase 1: the sandbox's declared share rides the lease, so the
             # pool can write it into ``sbx_<id>``'s ``cpu.max``.
             "cpu_percent": 100,
+            # N83 phase 2 (Task 3): the other two declared sizes ride the same
+            # lease, so the box's ``memory.high``/``memory.max``/``pids.max``
+            # are the record's numbers and nothing else.
+            "memory_mb": 1024,
+            "max_processes": 128,
         }
     ]
     policy = pool.acquire_calls[0]["policy"]
@@ -593,6 +604,8 @@ async def test_slot_that_never_starts_is_restarted_once_then_reported(
         uid=None,
         name=None,
         cpu_percent=None,
+        memory_mb=None,
+        max_processes=None,
     ):
         attempts.append(uid)
         if len(attempts) == 1:
@@ -606,6 +619,8 @@ async def test_slot_that_never_starts_is_restarted_once_then_reported(
             uid=uid,
             name=name,
             cpu_percent=cpu_percent,
+            memory_mb=memory_mb,
+            max_processes=max_processes,
         )
 
     pool.acquire_sync = _dead_on_first
