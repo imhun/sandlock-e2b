@@ -26,7 +26,7 @@ Rust（fork 的通知表）、k8s 1.36 / k0s、compose（本地车道）。
 |---|---|---|
 | **P1** | **pids 与内存一起做** | 一个 Phase，不拆两次上线 |
 | **P2** | **`memory.max` 接 SIGKILL 语义** | 超预算 = 内核 OOM 杀进程（不是今天记账回的 `ENOMEM`）；这条**写进对外文档**，并接受它是产品语义变化 |
-| **P3** | **集群上配的 CPU/内存上限 = 单沙箱最大可配置值** | 单箱可配到节点给 worker 的那份（今天 k8s 上 = **4 核 / 4 GiB**），但**不能超过**；超了**具名拒绝**，不静默夹取 |
+| **P3** | **集群上配的 CPU/内存上限 = 单沙箱最大可配置值**（**2026-10-06 更正：这个"上限"要来自显式配置的环境变量，不是从内核读**） | 单箱可配到部署声明的那份（k8s 今天 = **4 核 / 4 GiB**），但**不能超过**；超了**具名拒绝**，不静默夹取。**为什么必须显式配**：compose 三条车道**根本没给 worker 设 limits**（实测 `cpus`/`mem_limit` 零命中）⇒ 内核那层是 `max`，任何"从内核推断上限"的做法在本地车道上会**静默退化成无上限** |
 
 ## 现场事实（2026-10-06 实测，都是本次做的）
 
@@ -40,7 +40,12 @@ Rust（fork 的通知表）、k8s 1.36 / k0s、compose（本地车道）。
 | `cgroup.subtree_control` | `[cpu]`（Phase 1 写的） |
 | `cgroup.controllers` | 含 `memory`、`pids`（pod 层已委派） |
 
-⇒ **上限不用新加配置项**：读 worker 容器 cgroup 的这三个文件就是"集群配的那份"。
+⇒ 这三个文件是**内核那份（物理）上限**，但它**不是**"单箱最大可配置值"的来源 —— **策略上限要显式配**
+（D5/D5b）。它在这里的用途是两条：① worker 启动时拿它与 env 交叉校验（env 更大 ⇒ 拒绝启动）；
+② 记进节点记录，作为"这个节点物理上最多能给多少"的对照。理由见下面 compose 那行。
+
+**反例（决定了 D5 的形状）**：compose 三条车道**没有** `cpus`/`mem_limit`（实测零命中）⇒ 本地车道的
+内核那份是 `max`，任何"从内核推导上限"的做法在那里都会**静默等于无上限**。
 
 ### 能不能加（本地一次性容器实测）
 
@@ -74,7 +79,8 @@ Phase 1 的 `setup()` **已经在做**这个腾空 + 使能（今天只写 `+cpu
 | D2 | `memory.high = 声明额度`、`memory.max = 声明额度`（同一根线） | 先走 reclaim（节流），撑不住才杀 —— 与今天 `ENOMEM` 的**可观察差别最小**，同时满足 P2 的"超了就死" |
 | D3 | 箱内 **`memory.oom.group` 保持默认 `0`**（只杀分配者），并把 `memory.events` 的 `oom_kill` 上报成具名告警 | 最小爆炸半径；"整箱一起死"作为一行可配置备选留档（改 `1` 即可），但默认不这么做 |
 | D4 | `pids.max = max_processes`（整箱语义，M4 D6），**语义与今天完全一致**（EAGAIN） | 今天的强制者也是 EAGAIN（fork 的 `proc_count` 注释原话）⇒ 只换"谁数"，用户可见行为不变 |
-| D5 | **单箱上限 = 读 worker 容器 cgroup**，控制面按它**校验**客户端请求（超了具名 400），不静默夹取 | P3；上限是集群事实，不该在代码里复制一份 |
+| D5 | **单箱上限来自三个显式 env**：`E2B_MAX_SANDBOX_CPU_PERCENT` / `E2B_MAX_SANDBOX_MEMORY_MB` / `E2B_MAX_SANDBOX_PROCESSES`（清单里声明，与 `E2B_NODE_*` 并列）；**默认值 = 对应的 `E2B_NODE_*`**（`0`/缺省 = 跟随节点总量，绝不默认成"无上限"） | P3；单箱不可能比整个节点还大，所以"跟节点总量"是个安全默认；但**必须能被显式调小**（节点给 4 核，不代表业务上愿意让一个沙箱吃满 4 核） |
+| D5b | **启动时拿内核那份交叉校验**：worker 读自己容器 cgroup 的 `cpu.max`/`memory.max`，与 env 上限比 —— **env > 内核 ⇒ 具名拒绝启动**（会把"API 答应 8 GiB、内核只给 2 GiB"变成"上线当天整容器 OOM"）；**内核 = `max` ⇒ 只打 WARN**（compose 车道就是这样，那时 env 是唯一的上限） | 内核那份是**物理**上限、env 那份是**策略**上限；策略超过物理是配置错误，必须响亮。反过来物理没设（compose）是合法的，只是"聚合"只剩台账管 |
 | D6 | 真的解析创建请求里的 `cpuCount` / `memoryMB`（默认取 settings），并把 `record.cpu_count` 与 `record.memory_mb` 变成**唯一真相** | 顺手结掉 **N84**（今天 `cpu_count` 恒 1、客户端字段被静默忽略） |
 | D7 | 通知表的 mmap 族与 clone 族**只在 `E2B_SANDBOX_CGROUP=required` 时**退掉 | `off` 的部署仍靠中介记账（逐字节回到今天），不退表 |
 | D8 | 虚拟化数字（`/proc/meminfo`、`sysinfo`）**继续报声明额度** | 沙箱内 `free` 看到的应是"我这一箱有多少"，不是节点的 |
@@ -86,14 +92,17 @@ Phase 1 的 `setup()` **已经在做**这个腾空 + 使能（今天只写 `+cpu
 - **嵌套且取小**：每箱 cgroup 仍在 worker 容器 cgroup 之下（k8s 收窄、compose 静态父切片），
   容器/pod 的限额照旧生效。
 - **fail 方向 closed**：写不上限额 / 回读不一致 / 拿不到上限 ⇒ 具名拒绝，**绝不无额度放行**。
-- **上限只读**：从内核读（`cpu.max`/`memory.max`/`pids.max`），不从 env 复制；读不到就拒绝。
+- **上限不读内核、只做交叉校验**：策略上限来自**显式配置的 env**（`E2B_MAX_SANDBOX_*`，缺省跟随
+  `E2B_NODE_*`）；内核那份（容器 cgroup 的 `cpu.max`/`memory.max`）只用来**校验**（env > 内核 ⇒ 拒绝启动），
+  不用来推导上限 —— 因为 compose 车道没有内核限额（实测），推导会静默变成"无上限"。
 - **`E2B_SANDBOX_CGROUP=off` 逐字节回到今天**（不退通知表、不写 memory/pids 限额）。
 - 断言精确（`==`），禁止部分匹配；每个写入后回读比对。
 
 ## Review Focus
 
-1. **上限读错**（把 `max` 当成一个数、把 `pids.max=max` 当 0、把 pod 层的值当容器的值）⇒ 必须
-   解析成"无上限"或具名拒绝，不能当成 `0`/`1` 写进限额。
+1. **上限的三种错配**：env 缺省被当成 `0`/无穷；**env > 内核**（API 答应 8 GiB、内核只给 2 GiB ⇒ 上线当天
+   整容器 OOM）；**内核 = `max`**（compose：物理层没有上限，只有 env 与台账兜着）⇒ 前两种必须具名拒绝、
+   第三种必须有一行 WARN，都不能静默。
 2. **层级取小的直觉被破坏**（例如把 `memory.max` 设得比容器层还大）⇒ 内核会拒绝或静默按小的来，
    两种都要被回读抓到。
 3. **`pids` 数的是任务**：默认 256 对多线程程序可能不够 ⇒ 验收里要有"线程也算"的读数，
@@ -107,27 +116,37 @@ Phase 1 的 `setup()` **已经在做**这个腾空 + 使能（今天只写 `+cpu
 
 ## Tasks
 
-### Task 1：worker 读「每箱上限」并上报
-
+### Task 1：配置「每箱上限」并做内核交叉校验
 **Files:**
-- Modify: `envd_service/runtime/sandbox_cgroup.py`（`setup()` 顺手读三个上限并挂在实例上）
-- Modify: `envd_service/agent.py`（心跳 payload 加 `sandboxCeiling`）
-- Modify: `control_plane/registry/nodes.py`（节点记录加三个字段 + `to_dict`/`from_dict`）
-- Modify: `control_plane/api/internal.py`（`apply_*_report` 落库；节点内部视图并列暴露）
+- Modify: `control_plane/config.py`（三个新 env：`E2B_MAX_SANDBOX_CPU_PERCENT` / `E2B_MAX_SANDBOX_MEMORY_MB` /
+  `E2B_MAX_SANDBOX_PROCESSES`；**缺省或 `<=0` ⇒ 跟随对应的 `E2B_NODE_*`**，绝不默认成无穷）
+- Modify: `envd_service/runtime/sandbox_cgroup.py`（读自己容器 cgroup 的 `cpu.max`/`memory.max` 作为**内核那份**，
+  与 env 做 D5b 的交叉校验）
+- Modify: `envd_service/agent.py`（心跳带 `sandboxCeiling`）
+- Modify: `control_plane/registry/nodes.py` + `control_plane/api/internal.py`（节点记录落**两份**，
+  内部视图并列暴露）
 - Test: `tests/unit/test_sandbox_cgroup.py`、`tests/unit/test_c3_internal_api_shape.py`
 
 **Interfaces:**
-- Produces: `SandboxCgroups.ceiling -> SandboxCeiling(cpu_percent: int | None, memory_mb: int | None, processes: int | None)`
-  （`None` = 内核说 `max`＝无上限）；心跳字段 `sandboxCeiling`；节点记录
-  `sandbox_cpu_percent_max` / `sandbox_memory_mb_max` / `sandbox_processes_max`。
+- Produces（名字按这里写）：
+  - CP 侧 `Settings.max_sandbox_cpu_percent` / `max_sandbox_memory_mb` / `max_sandbox_processes`
+    （`<=0` 或缺省 ⇒ 跟随 `node_cpu_percent` / `node_memory_mb` / `node_processes`）
+  - worker 侧内核读数：`SandboxCgroups.kernel_ceiling -> SandboxCeiling(cpu_percent|None, memory_mb|None, processes|None)`
+    （`None` = 内核说 `max`＝无物理上限）
+  - 心跳 `sandboxCeiling = {"cpuPercent": <env>, "memoryMB": <env>, "processes": <env>,
+    "kernelCpuPercent": <int|None>, "kernelMemoryMB": <int|None>}`
+  - 节点记录：`sandbox_cpu_percent_max` / `sandbox_memory_mb_max` / `sandbox_processes_max`（**策略**那份）
+    + `kernel_cpu_percent` / `kernel_memory_mb`（**物理**那份，`None` = 内核没设）
 
-- [ ] **Step 1: 写失败测试**：① `cpu.max = "400000 100000"` ⇒ `cpu_percent == 400`；
-  ② `memory.max = "4294967296"` ⇒ `memory_mb == 4096`；③ 两个字面 `max` ⇒ 字段为 `None`
-  （**不是 0**）；④ 文件缺失 ⇒ 具名拒绝；⑤ 心跳带上 `sandboxCeiling` 且节点记录回读一致
+- [ ] **Step 1: 写失败测试**：① env 缺省 ⇒ 上限 == **节点总量**（不是 0、不是无穷）；
+  ② env 显式设 200 ⇒ 上限 200、且**与节点总量无关**；③ **env > 内核**（`cpu.max` 说 2 核而 env 说 4 核）
+  ⇒ **启动具名拒绝**（不是夹取、不是 WARN）；④ **内核 = `max`**（compose 车道，实测就是这样）⇒ 启动成功、
+  日志有一行 WARN 说明"物理层没设上限、聚合只剩台账管"；⑤ 心跳带两份读数且节点记录回读一致
 - [ ] **Step 2: 跑测试确认失败**：`pytest tests/unit/test_sandbox_cgroup.py tests/unit/test_c3_internal_api_shape.py -q` ⇒ FAIL
 - [ ] **Step 3: 实现**
 - [ ] **Step 4: 跑测试确认通过**
-- [ ] **Step 5: 提交**
+- [ ] **Step 5: 清单里显式写上三个 env**（k8s 基线 + k0s 覆盖层 + 三条 compose），值 = 各车道愿意给**单箱**的上限
+- [ ] **Step 6: 提交**
 
 ### Task 2：控制面校验单箱请求（含 N84 收口）
 
@@ -236,6 +255,9 @@ Phase 1 的 `setup()` **已经在做**这个腾空 + 使能（今天只写 `+cpu
 2. **`pids` 数任务**：默认 256 对 JVM/Node 可能偏紧；要不要按语言给建议值，留到文档里给
    "怎么调"的指引，不在这版自动调。
 3. **聚合 vs pod 限额**：Σ 各箱 ≤ 节点台账（`E2B_NODE_MEMORY_MB`）与 pod 的 4 GiB 是两套账；
-   P3 只钉了"单箱不超过集群那份"，**聚合那一层**仍是既有准入的职责（今天两者也没对齐，见 N84 的邻居问题）。
+   P3 只钉了"单箱不超过**策略上限**（env）"，而 env 上限又只与**内核**那份做了交叉校验（D5b），
+   所以"多箱之和把 pod 顶掉"这条仍然只有台账管 —— 而且 compose 车道的内核那层**根本没设**
+   （实测 `cpus`/`mem_limit` 零命中），那里连 pod 兜底都没有，**只有 env + 台账**。这是本阶段
+   最需要写清楚的边界（也是 N84 邻居问题的一半）。
 4. **退表后的 argv-safety**：clone 族能否退要看 argv-safety 的前置（Phase 1 文档 §4 已记）；退不掉就
    只退 mmap 族，并在任务里写明哪一半没退、为什么。
