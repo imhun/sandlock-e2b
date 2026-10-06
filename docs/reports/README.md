@@ -65,9 +65,9 @@ sha256 对照见 `.superpowers/sdd/artifact-promotion-report.md`）。原件目�
 `098ba10`）的实施记录：默认值、成对耦合的 `E2B_REAL_ROOT`、配置守卫、逐处影响面与两档 lane；
 正文引用在 `docs/production-deployment-requirements.md` §2.4.11 与 `docs/pure-shape-decision.md` §7。
 
-`n83-task-7-cgroup-acceptance.md` 是 **N83 Phase 1 的本地车道验收**（2026-10-06）：五条检查的
-RED→GREEN 全文、脚本 `deploy/scripts/acceptance/cgroup_acceptance.py` 的两次原始输出（JSON）、
-车库（本地 compose 多节点栈）与"邻居付账"的补充读数；**这一份不是上线记录**（k0s 还没滚），
+`n83-task-7-cgroup-acceptance.md` 是 **N83 Phase 1 的本地车道验收**（2026-10-06，含评审后的 fix
+round 1 附节）：五条检查的 RED→GREEN 全文、脚本 `deploy/scripts/acceptance/cgroup_acceptance.py`
+的两次原始输出（JSON）、车道（本地 compose 多节点栈）与"邻居付账"的补充读数；**这一份不是上线记录**（k0s 还没滚），
 所以正文引用是 `docs/open-issues.md` 的 N83 行与 `docs/deploy-clusters.md` §7.48（后者写明两次
 apply 的剧本与回退杆），而不是 §7 的当前部署状态索引。
 

@@ -22,17 +22,47 @@ about a *reading*, never about "the call did not error":
    the declared quota, whereas the N82 baseline booked the same ~1.02 core to
    the *worker pod* (`docs/open-issues.md` N82).
 4. **The narrowing / view shape.** From every worker container: what it sees
-   under the mount, ``/proc/self/cgroup``, that its **own** container cgroup is
-   the delegated one (owner 65534, ``cgroup.procs``/``cgroup.subtree_control``
-   writable), and that a *different* container's cgroup is not writable.
+   under the mount, ``/proc/self/cgroup``, and which cgroups are writable:
+   its **own** container cgroup is the delegated one (owner 65534,
+   ``cgroup.procs``/``cgroup.subtree_control`` writable — and ``cpu.max`` is
+   not), while the **peer container cgroups next to it** are not. "Peer" means
+   an actual container directory beside ours under the same parent
+   (``/pod-cgroup/docker/<other-container-id>`` on compose, a sibling
+   container directory under the pod directory on k8s) — **not** the mounted
+   root, which is a cgroup of its own and is probed separately for exactly
+   that reason (fix round 1, finding 1).
+
+   What can be asserted differs by lane, and both shapes are recorded: on a
+   whole-tree mount (compose) a *non-delegated* peer — root-owned, e.g. the
+   control plane or redis — must refuse ``cpu.max``, ``cgroup.procs`` and
+   ``mkdir`` with EACCES, and that is the primary evidence. A *delegated* peer
+   (another worker on the same host uid, which is every worker on compose)
+   keeps ``cpu.max`` root-owned but its ``cgroup.procs``/``mkdir`` are ours by
+   uid: uid-based DAC cannot separate two containers of the same uid. That is
+   reported per peer as ``delegated_peers`` rather than hidden, and the
+   k8s lane does not have the problem at all because its mount is narrowed to
+   the pod and peers are not reachable. On a narrowed mount with no peer
+   visible the evidence is the mount root itself, which must also be closed.
 5. **The negative (fail closed).** ``open(<own container cgroup>/cpu.max,
    O_WRONLY)`` must fail ``EACCES``: the delegation deliberately excludes
    ``cpu.max``, so a worker cannot lift its own ceiling.
 
-The script drives **any** E2B endpoint (the same file is meant to be pointed at
-the k0s lane later), so the two lane-specific things are parameters:
+The script drives **any** E2B endpoint, so everything lane-specific is a
+parameter — and a real cluster run needs **all five** of them (fix round 1,
+finding 4: the earlier "just swap two flags" recipe could not work, because
+three of the defaults are compose-only):
 
 * ``--api-url`` / ``--api-key``: the E2B API (and gateway) endpoint + key.
+* ``--internal-url``: the control plane's **internal** API as reachable *from
+  inside a worker container* (compose: ``http://control-plane:3000``; k8s: the
+  control-plane Service, e.g. ``http://e2b-control-plane.sandlock.svc:3000``).
+  It is only ever called from inside a worker (node-scoped endpoint + source-IP
+  second factor), so a host-side value would be wrong even if it resolved.
+* ``--internal-key``: the ``X-Internal-Key`` the worker holds
+  (``E2B_INTERNAL_API_KEY`` / the per-node ``E2B_INTERNAL_NODE_KEYS``).
+* ``--nodes``: the node ids the control plane knows (compose: ``worker-1``…;
+  k8s: ``e2b-worker-0``…), used both for the internal per-node record read and
+  as the ``{node}`` substitution in ``--worker-exec-template``.
 * ``--worker-exec-template``: how to run a shell command *inside a worker
   container* for a given node. ``{node}`` is substituted with the node id. The
   local compose lane is
@@ -47,6 +77,12 @@ the k0s lane later), so the two lane-specific things are parameters:
   control plane's per-node measurement is a **node-scoped** internal endpoint
   (source-IP second factor, N49), so the only place that can read it is the
   worker itself -- exactly the same reason checks 4/5 run there.
+
+  The lane's own switches (``E2B_SANDBOX_CGROUP``, ``E2B_CGROUP_MOUNT``,
+  ``E2B_SANDBOX_NOTIFY_RATE_LIMIT``) are read **out of the worker containers**
+  at run time and reported per node — never taken from the caller's shell and
+  never hard-coded, so the archived artifact cannot claim a lane it did not
+  observe.
 
 What a sandbox cgroup's path is differs by lane and is therefore discovered, not
 assumed: the k8s mount is narrowed to the pod (``/pod-cgroup/sbx_<id>``), the
@@ -67,6 +103,17 @@ rate limit):
 
 It prints one JSON object (every reading, plus ``ok``) and exits non-zero when
 any check fails.
+
+A full k0s run -- all five lane flags, with the internal URL and both keys
+taken from that cluster (never from this lane's defaults):
+
+    python3 deploy/scripts/acceptance/cgroup_acceptance.py \\
+        --api-url "$E2B_API_URL" \\
+        --api-key "$E2B_API_KEY" \\
+        --internal-url http://e2b-control-plane.sandlock.svc.cluster.local:3000 \\
+        --internal-key "$E2B_INTERNAL_API_KEY" \\
+        --nodes e2b-worker-0,e2b-worker-1 \\
+        --worker-exec-template 'kubectl -n sandlock exec {node} -c worker -- bash -lc'
 """
 
 from __future__ import annotations
@@ -97,6 +144,16 @@ _SPIN_CMD = "sh -c 'for i in 1 2 3 4; do python3 -c \"while True: pass\" & done;
 #: limiter off, **no** per-sandbox cgroup -> ~18149 op/s, and the *worker pod*
 #: booked ~1.02 core with the sandbox's own cgroup nowhere in the accounting.
 _N82_BASELINE = {"ops_per_s": 18149, "cores_on_worker_pod": 1.02}
+
+#: The neighbour round trip's allowance: a small multiple of the quiet
+#: baseline (min of five, which already drops the cold connect). Fix round 1,
+#: finding 3: the old bound was ``max(2 * quiet, 200ms)`` -- with a ~30 ms
+#: baseline that is ~6x, wide enough that a starved neighbour still "passed".
+#: 3x with a 50 ms floor is: > 10x below the N82 stall signature (860 ms), and
+#: several times the observed jitter (a few ms). What it can detect is gross
+#: starvation, not a subtle one -- the report says so in as many words.
+_NEIGHBOUR_RTT_FACTOR = 3.0
+_NEIGHBOUR_RTT_FLOOR_MS = 50.0
 
 
 class Refusal(RuntimeError):
@@ -241,6 +298,50 @@ def sandboxes_on_node(
     return {row.get("sandboxID") for row in payload.get("sandboxes", [])}
 
 
+#: The three switches this acceptance's verdict depends on. Read from *inside
+#: the worker container* -- never from the caller's shell and never hard-coded:
+#: a run must not be able to print a value it did not observe (fix round 1,
+#: finding 2: the archived RED artifact, which ran with the lane off, printed
+#: "required" because the report field was a canned string).
+_LANE_ENV_SCRIPT = r"""
+import json, os, pathlib, sys
+
+WANTED = ("E2B_SANDBOX_CGROUP", "E2B_CGROUP_MOUNT", "E2B_SANDBOX_NOTIFY_RATE_LIMIT")
+
+
+def from_proc1():
+    try:
+        raw = pathlib.Path("/proc/1/environ").read_bytes()
+    except OSError:
+        return {}
+    out = {}
+    for entry in raw.split(b"\0"):
+        key, _, value = entry.partition(b"=")
+        name = key.decode("utf-8", "replace")
+        if name in WANTED:
+            out[name] = value.decode("utf-8", "replace")
+    return out
+
+
+proc1 = from_proc1()
+observed = {}
+for name in WANTED:
+    if name in proc1:
+        observed[name] = {"value": proc1[name], "source": "/proc/1/environ"}
+    elif name in os.environ:
+        observed[name] = {"value": os.environ[name], "source": "exec env"}
+    else:
+        observed[name] = {"value": None, "source": "unset"}
+print(json.dumps({"pid1": pathlib.Path("/proc/1/cmdline").read_bytes().split(b"\0")[0].decode("utf-8", "replace"),
+                  "observed": observed}))
+"""
+
+
+def lane_env(shell: WorkerShell, node: str) -> dict:
+    """The three switches as this *worker container* actually sees them."""
+    return shell.json(node, "python3 - <<'PY'\n%s\nPY" % _LANE_ENV_SCRIPT)
+
+
 #: The lane-neutral identity of "this worker's own container cgroup": the unique
 #: directory this worker drained itself into and enabled cpu on -- holder of a
 #: ``worker/`` child and of ``cpu`` in ``cgroup.subtree_control`` (plan §3.5 /
@@ -336,24 +437,18 @@ def mkdir_probe(path):
     return "WRITABLE"
 
 
-# A *different* container's cgroup: anything under the mount that looks like a
-# real container (has a cpu.max) and is **not** inside our own subtree. On the
-# compose lane (whole VM tree) there are several; on the k8s lane the mount is
-# narrowed to this pod, so there is deliberately none -- which is itself the
-# narrowing, reported as `foreign_visible: false` plus the mount listing.
-own_prefix = str(own) + "/"
-foreign = []
-for dirpath, dirnames, _files in os.walk(mount):
-    here = pathlib.Path(dirpath)
-    if len(here.relative_to(mount).parts) > 6:
-        dirnames[:] = []
+# *Peer containers*: the other entries next to our own container cgroup under
+# the same parent (compose: `/pod-cgroup/docker/<other-container-id>`; k8s: a
+# sibling container directory under the pod directory, when the pod has any).
+# Deliberately **not** a top-down walk of the mount: the mounted root itself is
+# a cgroup with a `cpu.max`, so a walk that stops at the first hit stops at the
+# root and never reaches a peer (that was fix round 1's Spec finding).
+peers = []
+for sibling in sorted(own.parent.iterdir()):
+    if sibling == own or not sibling.is_dir():
         continue
-    if str(here) == str(own) or str(here).startswith(own_prefix):
-        dirnames[:] = []      # never descend into our own subtree
-        continue
-    if (here / "cpu.max").exists():
-        foreign.append(here)
-        dirnames[:] = []      # one entry per container is enough
+    if (sibling / "cpu.max").exists() and (sibling / "cgroup.procs").exists():
+        peers.append(sibling)
 
 own_facts = {
     "path": str(own),
@@ -365,17 +460,35 @@ own_facts = {
     "subtree_control_value": (own / "cgroup.subtree_control").read_text().strip(),
     "worker_dir_owner": owner(own / "worker") if (own / "worker").exists() else None,
 }
-foreign_facts = []
-for sibling in foreign:
-    foreign_facts.append(
+peer_facts = []
+for peer in peers:
+    peer_facts.append(
         {
-            "path": str(sibling),
-            "owner": owner(sibling),
-            "cpu_max": write_probe(sibling / "cpu.max"),
-            "cgroup_procs": write_probe(sibling / "cgroup.procs"),
-            "mkdir": mkdir_probe(sibling / "n83_acceptance_probe"),
+            "path": str(peer),
+            "owner": owner(peer),
+            # True when this peer's *directory* was chowned to our own uid --
+            # i.e. it is another worker's delegated cgroup on a lane where
+            # every worker runs as the same host uid. Reported, never hidden:
+            # uid-based DAC cannot tell those apart (see the docstring).
+            "delegated_to_our_uid": peer.stat().st_uid == os.geteuid(),
+            "cpu_max": write_probe(peer / "cpu.max"),
+            "cgroup_procs": write_probe(peer / "cgroup.procs"),
+            "subtree_control": write_probe(peer / "cgroup.subtree_control"),
+            "mkdir": mkdir_probe(peer / "n83_acceptance_probe"),
         }
     )
+
+# The mounted root is *not* a peer container (on compose it is the Docker VM's
+# cgroup root, owner 0:0); it is probed on its own so the two are never
+# conflated again.
+mount_root_facts = {
+    "path": str(mount),
+    "owner": owner(mount),
+    "is_container_cgroup": (mount / "cpu.max").exists() and (mount / "cgroup.procs").exists(),
+    "cpu_max": write_probe(mount / "cpu.max"),
+    "cgroup_procs": write_probe(mount / "cgroup.procs"),
+    "mkdir": mkdir_probe(mount / "n83_acceptance_probe"),
+}
 
 top = sorted(p.name for p in mount.iterdir())
 print(json.dumps({
@@ -385,7 +498,8 @@ print(json.dumps({
     "proc_self_cgroup": pathlib.Path("/proc/self/cgroup").read_text().strip(),
     "hostname": hostname,
     "own": own_facts,
-    "foreign": foreign_facts,
+    "peer_containers": peer_facts,
+    "mount_root": mount_root_facts,
 }))
 """
 
@@ -455,8 +569,8 @@ def main() -> int:
             "cgroup_mount": args.cgroup_mount,
             "template": args.template,
             "flood_seconds": args.flood_seconds,
-            "sandbox_cgroup_env": "required (the caller's override; see the report)",
-            "sandbox_notify_rate_limit_env": "0 (the caller's override; only this acceptance)",
+            # Filled in below from inside the workers -- see lane_env().
+            "worker_env": {},
         },
         "n82_baseline": _N82_BASELINE,
         "checks": {},
@@ -465,6 +579,14 @@ def main() -> int:
     }
     started = time.monotonic()
     boxes: list[tuple[object, dict]] = []
+
+    # The lane's own switches, read out of the worker containers (finding 2):
+    # a value the run could not observe is never printed.
+    for node in nodes:
+        try:
+            report["lane"]["worker_env"][node] = lane_env(shell, node)
+        except Refusal as exc:
+            report["lane"]["worker_env"][node] = {"error": str(exc)}
 
     def record(key: str, passed: bool, **readings) -> None:
         existing = report["checks"].get(key, {})
@@ -598,11 +720,14 @@ def main() -> int:
                 measured is not None
                 and 50.0 <= float(measured) <= 150.0
                 and first_cgroup is not None
-                # "Does not degrade": min of five round trips within 2x of the
+                # "Does not degrade": min of five round trips within 3x of the
                 # quiet baseline *on the same node*. The min is the signal --
                 # each batch's first sample is a cold connect and would other-
                 # wise dominate both numbers (and hide a real regression).
-                and busy_rtt["min_ms"] <= max(2 * quiet_rtt["min_ms"], 200.0),
+                and busy_rtt["min_ms"]
+                <= max(
+                    _NEIGHBOUR_RTT_FACTOR * quiet_rtt["min_ms"], _NEIGHBOUR_RTT_FLOOR_MS
+                ),
                 declared_cpu_percent=declared,
                 measured_cpu_percent=measured,
                 cpu_max_readback=quota_readback["cpu_max"] if quota_readback else None,
@@ -610,7 +735,18 @@ def main() -> int:
                 spinner_node=first_node,
                 first_sandbox_rtt_quiet=quiet_rtt,
                 second_sandbox_rtt=busy_rtt,
-                round_trip_criterion="min-of-5, within 2x of the quiet baseline (>=200ms floor)",
+                round_trip_criterion=(
+                    f"min-of-5 neighbour <= {_NEIGHBOUR_RTT_FACTOR:g}x the quiet min-of-5 "
+                    f"(floor {_NEIGHBOUR_RTT_FLOOR_MS:g} ms) -- detects gross starvation "
+                    "(the N82 shape stalled 860 ms); a subtle slowdown is below its "
+                    "resolution and is caught by check 3's cgroup accounting instead"
+                ),
+                round_trip_bound_ms=round(
+                    max(
+                        _NEIGHBOUR_RTT_FACTOR * quiet_rtt["min_ms"], _NEIGHBOUR_RTT_FLOOR_MS
+                    ),
+                    2,
+                ),
                 second_sandbox_node=second_node,
                 second_sandbox_same_node=True,
             )
@@ -883,24 +1019,75 @@ def main() -> int:
                 and facts["own"]["cgroup_procs"] == "WRITABLE"
                 and facts["own"]["subtree_control"] == "WRITABLE"
             )
-            facts["foreign_closed"] = all(
-                sibling["cpu_max"] != "WRITABLE"
-                and sibling["cgroup_procs"] != "WRITABLE"
-                and sibling["mkdir"] != "WRITABLE"
-                for sibling in facts["foreign"]
+            peers = facts["peer_containers"]
+            # A peer we were *not* given: its directory is still root-owned, so
+            # every write (its cpu.max, its cgroup.procs, mkdir in it) must be
+            # EACCES. This is the assertion the ruling names.
+            foreign_peers = [peer for peer in peers if not peer["delegated_to_our_uid"]]
+            # A peer whose directory *was* delegated -- i.e. another worker on
+            # a lane where every worker runs as the same host uid. Its
+            # `cpu.max` is still root-owned (the delegation excludes it), but
+            # `cgroup.procs`/`mkdir` are ours by uid. Reported as a reading,
+            # not hidden and not asserted away: uid-based DAC cannot separate
+            # two containers of the same uid (see the module docstring and
+            # `docs/deploy-clusters.md` §7.48).
+            delegated_peers = [peer for peer in peers if peer["delegated_to_our_uid"]]
+            facts["peer_containers_count"] = len(peers)
+            facts["foreign_peers"] = [peer["path"] for peer in foreign_peers]
+            facts["foreign_peers_closed"] = bool(foreign_peers) and all(
+                peer["cpu_max"] != "WRITABLE"
+                and peer["cgroup_procs"] != "WRITABLE"
+                and peer["mkdir"] != "WRITABLE"
+                for peer in foreign_peers
             )
-            # A different container's cgroup is either *visible and closed*
-            # (compose: the whole VM tree is mounted, so this is a real
-            # negative) or *not visible at all* because the mount root is not
-            # the node's cgroup tree (k8s: subPathExpr narrowed it to this
-            # pod). Any other combination -- a whole-tree mount that shows no
-            # foreign cgroup -- is not evidence, so it fails.
-            facts["foreign_visible"] = bool(facts["foreign"])
+            facts["every_peer_cpu_max_closed"] = all(
+                peer["cpu_max"] != "WRITABLE" for peer in peers
+            )
+            facts["delegated_peers"] = [
+                {
+                    "path": peer["path"],
+                    "cgroup_procs": peer["cgroup_procs"],
+                    "subtree_control": peer["subtree_control"],
+                    "mkdir": peer["mkdir"],
+                    "cpu_max": peer["cpu_max"],
+                }
+                for peer in delegated_peers
+            ]
+            # Which shape of evidence this lane can produce: peers visible and
+            # closed (compose), or no peer visible at all because the mount root
+            # is not the node's cgroup tree (k8s, subPathExpr-narrowed). A
+            # whole-tree mount that shows no peer is *not* evidence.
+            facts["peer_visible"] = bool(peers)
             facts["mount_looks_narrowed"] = not any(
                 name == "docker"
                 or name.startswith("kubepods")
                 or name.endswith(".slice")
                 for name in facts["ls_mount"]
+            )
+            facts["check4_mode"] = (
+                "peer-container"
+                if foreign_peers
+                else ("delegated-peer-only" if delegated_peers else ("narrowed-mount" if facts["mount_looks_narrowed"] else "no-evidence"))
+            )
+            root_probe = facts["mount_root"]
+            facts["mount_root_closed"] = (
+                root_probe["cpu_max"] != "WRITABLE"
+                and root_probe["cgroup_procs"] != "WRITABLE"
+            )
+            facts["evidence"] = (
+                facts["foreign_peers_closed"]
+                if foreign_peers
+                else (
+                    # Another worker's delegated cgroup is visible (same host
+                    # uid): its `cpu.max` is still the invariant -- the
+                    # delegation never hands it over.
+                    facts["every_peer_cpu_max_closed"]
+                    if delegated_peers
+                    # Nothing peer-shaped is visible because the mount is this
+                    # pod only: the root is then the authority, and it is not
+                    # ours to write.
+                    else facts["mount_looks_narrowed"] and facts["mount_root_closed"]
+                )
             )
             facts["cpu_max_closed"] = facts["own"]["cpu_max"] != "WRITABLE"
             view_facts[node] = facts
@@ -909,9 +1096,14 @@ def main() -> int:
             bool(view_facts)
             and all(
                 facts.get("own_delegated")
-                and facts.get("foreign_closed")
-                and (facts.get("foreign_visible") or facts.get("mount_looks_narrowed"))
+                and facts.get("every_peer_cpu_max_closed")
+                and facts.get("evidence")
                 for facts in view_facts.values()
+            ),
+            criterion=(
+                "own delegated cgroup writable (cgroup.procs/subtree_control, NOT cpu.max); "
+                "every visible peer container's cpu.max still EACCES; every non-delegated peer's "
+                "cpu.max/cgroup.procs/mkdir EACCES"
             ),
             workers=view_facts,
         )

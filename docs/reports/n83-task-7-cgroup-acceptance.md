@@ -9,7 +9,7 @@
   （`"ok": true`，退出码 0）。
 * 验收在**本地 compose 多节点栈**（自己的项目名 `n83acc`、宿主端口 3200）上跑；**k0s 集群一个 pod
   都没碰**（这是 `AGENTS.md` 的顺序：本地 lane 绿了才发线上）。
-* 同一条车道、同一支脚本做了 **RED 档**（`E2B_SANDBOX_CGROUP=off`）：`measuredCpuPercent=400.47`、
+* 同一条车道、同一支脚本做了 **RED 档**（`E2B_SANDBOX_CGROUP=off`）：`measuredCpuPercent=399.92`、
   沙箱没有 cgroup、洪泛的 0.86 核记在 **worker 自己容器的 cgroup** 上 —— N82 的症状在本地复现。
 * 文档四处更新完（env-vars 三个新变量、open-issues N83 行、deploy-clusters §7.48、resource-contention §6），
   回退杆写死在文档里（k8s = `worker-capacity.patch.yaml` 那行翻回 `off`）。
@@ -120,8 +120,59 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
     "cgroup_mount": "/pod-cgroup",
     "template": "base",
     "flood_seconds": 40.0,
-    "sandbox_cgroup_env": "required (the caller's override; see the report)",
-    "sandbox_notify_rate_limit_env": "0 (the caller's override; only this acceptance)"
+    "worker_env": {
+      "worker-1": {
+        "pid1": "python",
+        "observed": {
+          "E2B_SANDBOX_CGROUP": {
+            "value": "required",
+            "source": "/proc/1/environ"
+          },
+          "E2B_CGROUP_MOUNT": {
+            "value": "/pod-cgroup",
+            "source": "/proc/1/environ"
+          },
+          "E2B_SANDBOX_NOTIFY_RATE_LIMIT": {
+            "value": "0",
+            "source": "/proc/1/environ"
+          }
+        }
+      },
+      "worker-2": {
+        "pid1": "python",
+        "observed": {
+          "E2B_SANDBOX_CGROUP": {
+            "value": "required",
+            "source": "/proc/1/environ"
+          },
+          "E2B_CGROUP_MOUNT": {
+            "value": "/pod-cgroup",
+            "source": "/proc/1/environ"
+          },
+          "E2B_SANDBOX_NOTIFY_RATE_LIMIT": {
+            "value": "0",
+            "source": "/proc/1/environ"
+          }
+        }
+      },
+      "worker-3": {
+        "pid1": "python",
+        "observed": {
+          "E2B_SANDBOX_CGROUP": {
+            "value": "required",
+            "source": "/proc/1/environ"
+          },
+          "E2B_CGROUP_MOUNT": {
+            "value": "/pod-cgroup",
+            "source": "/proc/1/environ"
+          },
+          "E2B_SANDBOX_NOTIFY_RATE_LIMIT": {
+            "value": "0",
+            "source": "/proc/1/environ"
+          }
+        }
+      }
+    }
   },
   "n82_baseline": {
     "ops_per_s": 18149,
@@ -131,45 +182,46 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
     "1_quota_is_real": {
       "pass": true,
       "declared_cpu_percent": 100.0,
-      "measured_cpu_percent": 99.97929048357675,
+      "measured_cpu_percent": 100.18654721656027,
       "cpu_max_readback": "100000 100000",
-      "sandbox_cgroup": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_fc73ff9407750d0a",
-      "spinner_node": "worker-3",
+      "sandbox_cgroup": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_d1ee6480246461cb",
+      "spinner_node": "worker-1",
       "first_sandbox_rtt_quiet": {
         "samples_ms": [
-          361.81,
-          32.39,
-          33.64,
-          31.48,
-          31.93
+          390.63,
+          33.68,
+          33.01,
+          36.75,
+          36.37
         ],
-        "min_ms": 31.48,
-        "median_ms": 32.39
+        "min_ms": 33.01,
+        "median_ms": 36.37
       },
       "second_sandbox_rtt": {
         "samples_ms": [
-          183.57,
-          37.38,
-          32.02,
-          32.94,
-          42.83
+          196.91,
+          27.92,
+          40.67,
+          38.51,
+          29.51
         ],
-        "min_ms": 32.02,
-        "median_ms": 37.38
+        "min_ms": 27.92,
+        "median_ms": 38.51
       },
-      "round_trip_criterion": "min-of-5, within 2x of the quiet baseline (>=200ms floor)",
-      "second_sandbox_node": "worker-3",
+      "round_trip_criterion": "min-of-5 neighbour <= 3x the quiet min-of-5 (floor 50 ms) -- detects gross starvation (the N82 shape stalled 860 ms); a subtle slowdown is below its resolution and is caught by check 3's cgroup accounting instead",
+      "round_trip_bound_ms": 99.03,
+      "second_sandbox_node": "worker-1",
       "second_sandbox_same_node": true
     },
     "2_kernel_enforces": {
       "pass": true,
-      "cgroup": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_fc73ff9407750d0a",
+      "cgroup": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_d1ee6480246461cb",
       "cpu_max": "100000 100000",
-      "window_s": 3.124,
-      "usage_usec_delta": 3107035,
-      "nr_throttled_delta": 32,
-      "throttled_usec_delta": 9612556,
-      "observed_cores": 0.995,
+      "window_s": 3.123,
+      "usage_usec_delta": 3189901,
+      "nr_throttled_delta": 31,
+      "throttled_usec_delta": 9301843,
+      "observed_cores": 1.021,
       "quota_cores": 1.0
     },
     "3_flood_spends_own_quota": {
@@ -182,20 +234,20 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
       "quota_cores": 1.0,
       "flood_alone": {
         "label": "the N82 probe (openclose) alone in its own sandbox",
-        "probe_output": "DONE op=openclose stalls=0 rounds=195 elapsed_s=40.1 ops_per_s=9737",
-        "ops_per_s": 9737,
-        "elapsed_s": 43.3,
-        "sandbox_id": "sbx_56dcecb92abfe77b",
-        "node_id": "worker-3",
-        "cgroup": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+        "probe_output": "DONE op=openclose stalls=0 rounds=204 elapsed_s=40.1 ops_per_s=10165",
+        "ops_per_s": 10165,
+        "elapsed_s": 43.0,
+        "sandbox_id": "sbx_a8b02908f995b658",
+        "node_id": "worker-1",
+        "cgroup": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
         "cgroup_samples": [
           {
-            "at_s": 2.77,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 2.7,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 1596250,
-              "user_usec": 591420,
-              "system_usec": 1004830,
+              "usage_usec": 1595468,
+              "user_usec": 489072,
+              "system_usec": 1106395,
               "nice_usec": 0,
               "nr_periods": 20,
               "nr_throttled": 0,
@@ -206,12 +258,12 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 4.9,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 4.82,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 3358351,
-              "user_usec": 1171767,
-              "system_usec": 2186584,
+              "usage_usec": 3376194,
+              "user_usec": 1052209,
+              "system_usec": 2323985,
               "nice_usec": 0,
               "nr_periods": 41,
               "nr_throttled": 0,
@@ -222,12 +274,12 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 7.03,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 6.94,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 5118884,
-              "user_usec": 1684757,
-              "system_usec": 3434127,
+              "usage_usec": 5136991,
+              "user_usec": 1563763,
+              "system_usec": 3573227,
               "nice_usec": 0,
               "nr_periods": 62,
               "nr_throttled": 0,
@@ -238,14 +290,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 9.16,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 9.06,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 6892710,
-              "user_usec": 2215959,
-              "system_usec": 4676750,
+              "usage_usec": 6882769,
+              "user_usec": 2114562,
+              "system_usec": 4768206,
               "nice_usec": 0,
-              "nr_periods": 84,
+              "nr_periods": 83,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -254,12 +306,12 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 11.31,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 11.18,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 8659095,
-              "user_usec": 2755383,
-              "system_usec": 5903712,
+              "usage_usec": 8636335,
+              "user_usec": 2578661,
+              "system_usec": 6057673,
               "nice_usec": 0,
               "nr_periods": 105,
               "nr_throttled": 0,
@@ -270,12 +322,12 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 13.44,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 13.3,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 10421453,
-              "user_usec": 3288484,
-              "system_usec": 7132969,
+              "usage_usec": 10388155,
+              "user_usec": 3050002,
+              "system_usec": 7338153,
               "nice_usec": 0,
               "nr_periods": 126,
               "nr_throttled": 0,
@@ -286,14 +338,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 15.56,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 15.42,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 12159922,
-              "user_usec": 3786771,
-              "system_usec": 8373151,
+              "usage_usec": 12162004,
+              "user_usec": 3610609,
+              "system_usec": 8551394,
               "nice_usec": 0,
-              "nr_periods": 148,
+              "nr_periods": 147,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -302,14 +354,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 17.69,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 17.54,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 13908186,
-              "user_usec": 4275661,
-              "system_usec": 9632525,
+              "usage_usec": 13936589,
+              "user_usec": 4152427,
+              "system_usec": 9784162,
               "nice_usec": 0,
-              "nr_periods": 169,
+              "nr_periods": 168,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -318,14 +370,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 19.82,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 19.66,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 15666163,
-              "user_usec": 4801773,
-              "system_usec": 10864390,
+              "usage_usec": 15668343,
+              "user_usec": 4648259,
+              "system_usec": 11020084,
               "nice_usec": 0,
-              "nr_periods": 190,
+              "nr_periods": 189,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -334,14 +386,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 21.94,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 21.78,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 17429964,
-              "user_usec": 5321767,
-              "system_usec": 12108197,
+              "usage_usec": 17413391,
+              "user_usec": 5166414,
+              "system_usec": 12246977,
               "nice_usec": 0,
-              "nr_periods": 211,
+              "nr_periods": 210,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -350,14 +402,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 24.07,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 23.91,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 19195084,
-              "user_usec": 5889122,
-              "system_usec": 13305962,
+              "usage_usec": 19166851,
+              "user_usec": 5664020,
+              "system_usec": 13502830,
               "nice_usec": 0,
-              "nr_periods": 233,
+              "nr_periods": 232,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -366,14 +418,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 26.2,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 26.03,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 20950737,
-              "user_usec": 6407328,
-              "system_usec": 14543409,
+              "usage_usec": 20928377,
+              "user_usec": 6175217,
+              "system_usec": 14753159,
               "nice_usec": 0,
-              "nr_periods": 254,
+              "nr_periods": 253,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -382,14 +434,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 28.33,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 28.14,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 22710123,
-              "user_usec": 6904398,
-              "system_usec": 15805725,
+              "usage_usec": 22678422,
+              "user_usec": 6690917,
+              "system_usec": 15987505,
               "nice_usec": 0,
-              "nr_periods": 275,
+              "nr_periods": 274,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -398,14 +450,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 30.45,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 30.27,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 24454478,
-              "user_usec": 7426169,
-              "system_usec": 17028308,
+              "usage_usec": 24426690,
+              "user_usec": 7208029,
+              "system_usec": 17218660,
               "nice_usec": 0,
-              "nr_periods": 296,
+              "nr_periods": 295,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -414,14 +466,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 32.58,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 32.39,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 26200696,
-              "user_usec": 7915303,
-              "system_usec": 18285393,
+              "usage_usec": 26185505,
+              "user_usec": 7728406,
+              "system_usec": 18457098,
               "nice_usec": 0,
-              "nr_periods": 318,
+              "nr_periods": 317,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -430,14 +482,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 34.71,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 34.52,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 27981457,
-              "user_usec": 8468813,
-              "system_usec": 19512643,
+              "usage_usec": 27942203,
+              "user_usec": 8266403,
+              "system_usec": 19675800,
               "nice_usec": 0,
-              "nr_periods": 339,
+              "nr_periods": 338,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -446,14 +498,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 36.84,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 36.63,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 29727906,
-              "user_usec": 8972320,
-              "system_usec": 20755585,
+              "usage_usec": 29683493,
+              "user_usec": 8754362,
+              "system_usec": 20929130,
               "nice_usec": 0,
-              "nr_periods": 360,
+              "nr_periods": 359,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -462,14 +514,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 38.96,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 38.75,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 31486556,
-              "user_usec": 9529579,
-              "system_usec": 21956976,
+              "usage_usec": 31438577,
+              "user_usec": 9241850,
+              "system_usec": 22196727,
               "nice_usec": 0,
-              "nr_periods": 381,
+              "nr_periods": 380,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -478,14 +530,14 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 41.08,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_56dcecb92abfe77b",
+            "at_s": 40.88,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_a8b02908f995b658",
             "cpu_stat": {
-              "usage_usec": 33171557,
-              "user_usec": 10024268,
-              "system_usec": 23147288,
+              "usage_usec": 33186327,
+              "user_usec": 9727817,
+              "system_usec": 23458510,
               "nice_usec": 0,
-              "nr_periods": 403,
+              "nr_periods": 401,
               "nr_throttled": 0,
               "throttled_usec": 0,
               "nr_bursts": 0,
@@ -495,54 +547,54 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
           }
         ],
         "interval_cores": [
-          0.827,
-          0.827,
-          0.833,
-          0.822,
-          0.827,
-          0.82,
-          0.821,
-          0.825,
-          0.832,
-          0.829,
-          0.824,
-          0.826,
+          0.84,
+          0.831,
           0.823,
-          0.82,
-          0.836,
-          0.82,
+          0.827,
+          0.826,
+          0.837,
+          0.837,
+          0.817,
+          0.823,
+          0.823,
+          0.831,
+          0.829,
+          0.821,
           0.83,
-          0.795
+          0.825,
+          0.825,
+          0.828,
+          0.821
         ],
-        "peak_cores": 0.836,
+        "peak_cores": 0.84,
         "nr_throttled_delta": 0
       },
       "flood_under_own_spinners": {
         "label": "4 concurrent copies of the probe's openclose program, one sandbox",
         "harness": "probe_n82_traced_syscall_costs.INNER imported verbatim, run in a sandbox we own",
-        "sandbox_id": "sbx_c2da98f31f321d54",
-        "node_id": "worker-3",
-        "cgroup": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
-        "ops_per_s": 11887,
+        "sandbox_id": "sbx_30bf9d716723beb9",
+        "node_id": "worker-1",
+        "cgroup": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
+        "ops_per_s": 12071,
         "per_client_ops_per_s": [
-          2971,
-          2973,
-          2972,
-          2971
+          3018,
+          3017,
+          3018,
+          3018
         ],
-        "output": "STALL wall=1791275867.472 op_us=22047 mean_us=360.5 round=0\nDONE op=openclose stalls=1 rounds=30 elapsed_s=20.2 ops_per_s=2971\nSTALL wall=1791275867.472 op_us=22082 mean_us=360.4 round=0\nDONE op=openclose stalls=1 rounds=30 elapsed_s=20.2 ops_per_s=2973\nSTALL wall=1791275867.472 op_us=22037 mean_us=359.8 round=0\nDONE op=openclose stalls=1 rounds=30 elapsed_s=20.2 ops_per_s=2972\nSTALL wall=1791275867.472 op_us=22085 mean_us=359.8 round=0\nDONE op=openclose stalls=1 rounds=30 elapsed_s=20.2 ops_per_s=2971",
+        "output": "DONE op=openclose stalls=0 rounds=31 elapsed_s=20.5 ops_per_s=3018\nDONE op=openclose stalls=0 rounds=31 elapsed_s=20.5 ops_per_s=3017\nDONE op=openclose stalls=0 rounds=31 elapsed_s=20.5 ops_per_s=3018\nDONE op=openclose stalls=0 rounds=31 elapsed_s=20.5 ops_per_s=3018",
         "cgroup_samples": [
           {
-            "at_s": 2.01,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
+            "at_s": 2.0,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
             "cpu_stat": {
-              "usage_usec": 2102727,
-              "user_usec": 813586,
-              "system_usec": 1289141,
+              "usage_usec": 2075973,
+              "user_usec": 904486,
+              "system_usec": 1171486,
               "nice_usec": 0,
               "nr_periods": 26,
-              "nr_throttled": 3,
-              "throttled_usec": 22038,
+              "nr_throttled": 2,
+              "throttled_usec": 18723,
               "nr_bursts": 0,
               "burst_usec": 0
             },
@@ -550,143 +602,143 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
           },
           {
             "at_s": 4.13,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
             "cpu_stat": {
-              "usage_usec": 4191601,
-              "user_usec": 1704208,
-              "system_usec": 2487393,
+              "usage_usec": 4150008,
+              "user_usec": 1800471,
+              "system_usec": 2349536,
               "nice_usec": 0,
               "nr_periods": 47,
-              "nr_throttled": 5,
-              "throttled_usec": 22188,
+              "nr_throttled": 3,
+              "throttled_usec": 19436,
               "nr_bursts": 0,
               "burst_usec": 0
             },
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 6.26,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
+            "at_s": 6.25,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
             "cpu_stat": {
-              "usage_usec": 6281167,
-              "user_usec": 2523320,
-              "system_usec": 3757847,
+              "usage_usec": 6220458,
+              "user_usec": 2631972,
+              "system_usec": 3588485,
               "nice_usec": 0,
-              "nr_periods": 68,
-              "nr_throttled": 5,
-              "throttled_usec": 22188,
+              "nr_periods": 69,
+              "nr_throttled": 4,
+              "throttled_usec": 22788,
               "nr_bursts": 0,
               "burst_usec": 0
             },
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 8.39,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
+            "at_s": 8.37,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
             "cpu_stat": {
-              "usage_usec": 8374297,
-              "user_usec": 3411288,
-              "system_usec": 4963008,
+              "usage_usec": 8302025,
+              "user_usec": 3475678,
+              "system_usec": 4826346,
               "nice_usec": 0,
-              "nr_periods": 89,
-              "nr_throttled": 5,
-              "throttled_usec": 22188,
+              "nr_periods": 90,
+              "nr_throttled": 4,
+              "throttled_usec": 22788,
               "nr_bursts": 0,
               "burst_usec": 0
             },
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 10.52,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
+            "at_s": 10.5,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
             "cpu_stat": {
-              "usage_usec": 10468534,
-              "user_usec": 4322176,
-              "system_usec": 6146357,
+              "usage_usec": 10362795,
+              "user_usec": 4348403,
+              "system_usec": 6014391,
               "nice_usec": 0,
               "nr_periods": 111,
-              "nr_throttled": 8,
-              "throttled_usec": 23359,
+              "nr_throttled": 4,
+              "throttled_usec": 22788,
               "nr_bursts": 0,
               "burst_usec": 0
             },
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 12.65,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
+            "at_s": 12.62,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
             "cpu_stat": {
-              "usage_usec": 12571001,
-              "user_usec": 5120518,
-              "system_usec": 7450483,
+              "usage_usec": 12444858,
+              "user_usec": 5223176,
+              "system_usec": 7221682,
               "nice_usec": 0,
               "nr_periods": 132,
-              "nr_throttled": 9,
-              "throttled_usec": 23563,
+              "nr_throttled": 5,
+              "throttled_usec": 23167,
               "nr_bursts": 0,
               "burst_usec": 0
             },
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 14.79,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
+            "at_s": 14.74,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
             "cpu_stat": {
-              "usage_usec": 14657097,
-              "user_usec": 5909784,
-              "system_usec": 8747312,
+              "usage_usec": 14553142,
+              "user_usec": 6121485,
+              "system_usec": 8431656,
               "nice_usec": 0,
-              "nr_periods": 153,
-              "nr_throttled": 9,
-              "throttled_usec": 23563,
+              "nr_periods": 154,
+              "nr_throttled": 5,
+              "throttled_usec": 23167,
               "nr_bursts": 0,
               "burst_usec": 0
             },
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 16.91,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
+            "at_s": 16.88,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
             "cpu_stat": {
-              "usage_usec": 16759066,
-              "user_usec": 6794749,
-              "system_usec": 9964317,
+              "usage_usec": 16628015,
+              "user_usec": 6960613,
+              "system_usec": 9667402,
               "nice_usec": 0,
               "nr_periods": 175,
-              "nr_throttled": 10,
-              "throttled_usec": 23563,
+              "nr_throttled": 7,
+              "throttled_usec": 24587,
               "nr_bursts": 0,
               "burst_usec": 0
             },
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 19.04,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
+            "at_s": 19.01,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
             "cpu_stat": {
-              "usage_usec": 18846888,
-              "user_usec": 7611443,
-              "system_usec": 11235445,
+              "usage_usec": 18714746,
+              "user_usec": 7885643,
+              "system_usec": 10829103,
               "nice_usec": 0,
               "nr_periods": 196,
-              "nr_throttled": 10,
-              "throttled_usec": 23563,
+              "nr_throttled": 8,
+              "throttled_usec": 24620,
               "nr_bursts": 0,
               "burst_usec": 0
             },
             "cpu_max": "100000 100000"
           },
           {
-            "at_s": 21.17,
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_c2da98f31f321d54",
+            "at_s": 21.14,
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_30bf9d716723beb9",
             "cpu_stat": {
-              "usage_usec": 19973094,
-              "user_usec": 8080019,
-              "system_usec": 11893074,
+              "usage_usec": 20207700,
+              "user_usec": 8512836,
+              "system_usec": 11694864,
               "nice_usec": 0,
-              "nr_periods": 211,
-              "nr_throttled": 11,
-              "throttled_usec": 26146,
+              "nr_periods": 214,
+              "nr_throttled": 10,
+              "throttled_usec": 32131,
               "nr_bursts": 0,
               "burst_usec": 0
             },
@@ -694,22 +746,23 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
           }
         ],
         "interval_cores": [
-          0.985,
-          0.981,
-          0.983,
-          0.983,
-          0.987,
-          0.975,
-          0.991,
+          0.974,
+          0.977,
+          0.982,
+          0.967,
+          0.982,
+          0.994,
+          0.97,
           0.98,
-          0.529
+          0.701
         ],
-        "peak_cores": 0.991,
+        "peak_cores": 0.994,
         "nr_throttled_delta": 8
       }
     },
     "4_narrowing_view_shape": {
       "pass": true,
+      "criterion": "own delegated cgroup writable (cgroup.procs/subtree_control, NOT cpu.max); every visible peer container's cpu.max still EACCES; every non-delegated peer's cpu.max/cgroup.procs/mkdir EACCES",
       "workers": {
         "worker-1": {
           "mount": "/pod-cgroup",
@@ -769,9 +822,9 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
           ],
           "ls_mount_count": 52,
           "proc_self_cgroup": "0::/worker",
-          "hostname": "fefc14f5a4ca",
+          "hostname": "cc222bec0b23",
           "own": {
-            "path": "/pod-cgroup/docker/fefc14f5a4cae814f94e01f804912980a75ffc6c41081318059f5e509e85d877",
+            "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651",
             "owner": {
               "uid": 65534,
               "gid": 65534,
@@ -788,30 +841,263 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
               "mode": "0o755"
             }
           },
-          "foreign": [
+          "peer_containers": [
             {
-              "path": "/pod-cgroup",
+              "path": "/pod-cgroup/docker/03490090c59108c472e0312dab400c7a528fd0b1f4991feca0b247d3f51ab267",
               "owner": {
                 "uid": 0,
                 "gid": 0,
                 "mode": "0o755"
               },
+              "delegated_to_our_uid": false,
               "cpu_max": "EACCES",
               "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
               "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/0671d24c070f4ca6e8311a177d1a579c9bf4137f14e8654d5640b8e09b58c359",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/2668a85ac283c423b406054f3a64f5588a822bcca716dec3517bccf13be9927e",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/31bf2ab1609c4510882b920115f9e360eec53681d25962e535527b2a93f71cd6",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/46f90707b973f95660fbb6cfb10aa9680200a5e7c81177e60531f7b14e2dd229",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/55da732083d6c8b949367222b98e580dbef63d654d9e062f7af1229bfed6bef0",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/652abcef44b8e6e492179ac636d2233429d1582879110d668d700cee458336c0",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/9f6ba4a0c1a9b29c6555120bac22fbbe2938cb12e13581aa6dff07b89ac8410b",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/a15140b3183d03d77d052213179f8e2b47ce9c1f98ff0dbeeccc2d8ee4451413",
+              "owner": {
+                "uid": 65534,
+                "gid": 65534,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": true,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE"
+            },
+            {
+              "path": "/pod-cgroup/docker/b8e70c8de35d6097a8290b29256f0ce2836dc18f984a6e05106dfdbc06457d08",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/buildkit",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/buildx",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/df12053355f0d6fda015353119a675cb7044819ab010c93b551293d1e28d3398",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/e59263904a7de1565d3399fe12df2aa48780a4ecabec9fddad8ec90c2cccc8df",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/ed81365ce9713957b97d6a999e0331a7ab28423699913e3265773622cf9af138",
+              "owner": {
+                "uid": 65534,
+                "gid": 65534,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": true,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE"
             }
           ],
+          "mount_root": {
+            "path": "/pod-cgroup",
+            "owner": {
+              "uid": 0,
+              "gid": 0,
+              "mode": "0o755"
+            },
+            "is_container_cgroup": true,
+            "cpu_max": "EACCES",
+            "cgroup_procs": "EACCES",
+            "mkdir": "EACCES"
+          },
           "own_subtree": {
-            "own": "/pod-cgroup/docker/fefc14f5a4cae814f94e01f804912980a75ffc6c41081318059f5e509e85d877",
+            "own": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651",
             "children": [
+              "sbx_sbx_30bf9d716723beb9",
               "worker"
             ],
             "proc_self_cgroup": "0::/worker"
           },
           "own_delegated": true,
-          "foreign_closed": true,
-          "foreign_visible": true,
+          "peer_containers_count": 15,
+          "foreign_peers": [
+            "/pod-cgroup/docker/03490090c59108c472e0312dab400c7a528fd0b1f4991feca0b247d3f51ab267",
+            "/pod-cgroup/docker/0671d24c070f4ca6e8311a177d1a579c9bf4137f14e8654d5640b8e09b58c359",
+            "/pod-cgroup/docker/2668a85ac283c423b406054f3a64f5588a822bcca716dec3517bccf13be9927e",
+            "/pod-cgroup/docker/31bf2ab1609c4510882b920115f9e360eec53681d25962e535527b2a93f71cd6",
+            "/pod-cgroup/docker/46f90707b973f95660fbb6cfb10aa9680200a5e7c81177e60531f7b14e2dd229",
+            "/pod-cgroup/docker/55da732083d6c8b949367222b98e580dbef63d654d9e062f7af1229bfed6bef0",
+            "/pod-cgroup/docker/652abcef44b8e6e492179ac636d2233429d1582879110d668d700cee458336c0",
+            "/pod-cgroup/docker/9f6ba4a0c1a9b29c6555120bac22fbbe2938cb12e13581aa6dff07b89ac8410b",
+            "/pod-cgroup/docker/b8e70c8de35d6097a8290b29256f0ce2836dc18f984a6e05106dfdbc06457d08",
+            "/pod-cgroup/docker/buildkit",
+            "/pod-cgroup/docker/buildx",
+            "/pod-cgroup/docker/df12053355f0d6fda015353119a675cb7044819ab010c93b551293d1e28d3398",
+            "/pod-cgroup/docker/e59263904a7de1565d3399fe12df2aa48780a4ecabec9fddad8ec90c2cccc8df"
+          ],
+          "foreign_peers_closed": true,
+          "every_peer_cpu_max_closed": true,
+          "delegated_peers": [
+            {
+              "path": "/pod-cgroup/docker/a15140b3183d03d77d052213179f8e2b47ce9c1f98ff0dbeeccc2d8ee4451413",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE",
+              "cpu_max": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/ed81365ce9713957b97d6a999e0331a7ab28423699913e3265773622cf9af138",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE",
+              "cpu_max": "EACCES"
+            }
+          ],
+          "peer_visible": true,
           "mount_looks_narrowed": false,
+          "check4_mode": "peer-container",
+          "mount_root_closed": true,
+          "evidence": true,
           "cpu_max_closed": true
         },
         "worker-2": {
@@ -872,9 +1158,9 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
           ],
           "ls_mount_count": 52,
           "proc_self_cgroup": "0::/worker",
-          "hostname": "0ab62dc79c05",
+          "hostname": "ed81365ce971",
           "own": {
-            "path": "/pod-cgroup/docker/0ab62dc79c055514df4538ef3a51d0f57c1bb7065e893e3ca0b8d7956d0331a0",
+            "path": "/pod-cgroup/docker/ed81365ce9713957b97d6a999e0331a7ab28423699913e3265773622cf9af138",
             "owner": {
               "uid": 65534,
               "gid": 65534,
@@ -891,30 +1177,262 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
               "mode": "0o755"
             }
           },
-          "foreign": [
+          "peer_containers": [
             {
-              "path": "/pod-cgroup",
+              "path": "/pod-cgroup/docker/03490090c59108c472e0312dab400c7a528fd0b1f4991feca0b247d3f51ab267",
               "owner": {
                 "uid": 0,
                 "gid": 0,
                 "mode": "0o755"
               },
+              "delegated_to_our_uid": false,
               "cpu_max": "EACCES",
               "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/0671d24c070f4ca6e8311a177d1a579c9bf4137f14e8654d5640b8e09b58c359",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/2668a85ac283c423b406054f3a64f5588a822bcca716dec3517bccf13be9927e",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/31bf2ab1609c4510882b920115f9e360eec53681d25962e535527b2a93f71cd6",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/46f90707b973f95660fbb6cfb10aa9680200a5e7c81177e60531f7b14e2dd229",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/55da732083d6c8b949367222b98e580dbef63d654d9e062f7af1229bfed6bef0",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/652abcef44b8e6e492179ac636d2233429d1582879110d668d700cee458336c0",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/9f6ba4a0c1a9b29c6555120bac22fbbe2938cb12e13581aa6dff07b89ac8410b",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/a15140b3183d03d77d052213179f8e2b47ce9c1f98ff0dbeeccc2d8ee4451413",
+              "owner": {
+                "uid": 65534,
+                "gid": 65534,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": true,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE"
+            },
+            {
+              "path": "/pod-cgroup/docker/b8e70c8de35d6097a8290b29256f0ce2836dc18f984a6e05106dfdbc06457d08",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/buildkit",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/buildx",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651",
+              "owner": {
+                "uid": 65534,
+                "gid": 65534,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": true,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE"
+            },
+            {
+              "path": "/pod-cgroup/docker/df12053355f0d6fda015353119a675cb7044819ab010c93b551293d1e28d3398",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/e59263904a7de1565d3399fe12df2aa48780a4ecabec9fddad8ec90c2cccc8df",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
               "mkdir": "EACCES"
             }
           ],
+          "mount_root": {
+            "path": "/pod-cgroup",
+            "owner": {
+              "uid": 0,
+              "gid": 0,
+              "mode": "0o755"
+            },
+            "is_container_cgroup": true,
+            "cpu_max": "EACCES",
+            "cgroup_procs": "EACCES",
+            "mkdir": "EACCES"
+          },
           "own_subtree": {
-            "own": "/pod-cgroup/docker/0ab62dc79c055514df4538ef3a51d0f57c1bb7065e893e3ca0b8d7956d0331a0",
+            "own": "/pod-cgroup/docker/ed81365ce9713957b97d6a999e0331a7ab28423699913e3265773622cf9af138",
             "children": [
               "worker"
             ],
             "proc_self_cgroup": "0::/worker"
           },
           "own_delegated": true,
-          "foreign_closed": true,
-          "foreign_visible": true,
+          "peer_containers_count": 15,
+          "foreign_peers": [
+            "/pod-cgroup/docker/03490090c59108c472e0312dab400c7a528fd0b1f4991feca0b247d3f51ab267",
+            "/pod-cgroup/docker/0671d24c070f4ca6e8311a177d1a579c9bf4137f14e8654d5640b8e09b58c359",
+            "/pod-cgroup/docker/2668a85ac283c423b406054f3a64f5588a822bcca716dec3517bccf13be9927e",
+            "/pod-cgroup/docker/31bf2ab1609c4510882b920115f9e360eec53681d25962e535527b2a93f71cd6",
+            "/pod-cgroup/docker/46f90707b973f95660fbb6cfb10aa9680200a5e7c81177e60531f7b14e2dd229",
+            "/pod-cgroup/docker/55da732083d6c8b949367222b98e580dbef63d654d9e062f7af1229bfed6bef0",
+            "/pod-cgroup/docker/652abcef44b8e6e492179ac636d2233429d1582879110d668d700cee458336c0",
+            "/pod-cgroup/docker/9f6ba4a0c1a9b29c6555120bac22fbbe2938cb12e13581aa6dff07b89ac8410b",
+            "/pod-cgroup/docker/b8e70c8de35d6097a8290b29256f0ce2836dc18f984a6e05106dfdbc06457d08",
+            "/pod-cgroup/docker/buildkit",
+            "/pod-cgroup/docker/buildx",
+            "/pod-cgroup/docker/df12053355f0d6fda015353119a675cb7044819ab010c93b551293d1e28d3398",
+            "/pod-cgroup/docker/e59263904a7de1565d3399fe12df2aa48780a4ecabec9fddad8ec90c2cccc8df"
+          ],
+          "foreign_peers_closed": true,
+          "every_peer_cpu_max_closed": true,
+          "delegated_peers": [
+            {
+              "path": "/pod-cgroup/docker/a15140b3183d03d77d052213179f8e2b47ce9c1f98ff0dbeeccc2d8ee4451413",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE",
+              "cpu_max": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE",
+              "cpu_max": "EACCES"
+            }
+          ],
+          "peer_visible": true,
           "mount_looks_narrowed": false,
+          "check4_mode": "peer-container",
+          "mount_root_closed": true,
+          "evidence": true,
           "cpu_max_closed": true
         },
         "worker-3": {
@@ -975,9 +1493,9 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
           ],
           "ls_mount_count": 52,
           "proc_self_cgroup": "0::/worker",
-          "hostname": "6d71515dfeec",
+          "hostname": "a15140b3183d",
           "own": {
-            "path": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721",
+            "path": "/pod-cgroup/docker/a15140b3183d03d77d052213179f8e2b47ce9c1f98ff0dbeeccc2d8ee4451413",
             "owner": {
               "uid": 65534,
               "gid": 65534,
@@ -994,31 +1512,262 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
               "mode": "0o755"
             }
           },
-          "foreign": [
+          "peer_containers": [
             {
-              "path": "/pod-cgroup",
+              "path": "/pod-cgroup/docker/03490090c59108c472e0312dab400c7a528fd0b1f4991feca0b247d3f51ab267",
               "owner": {
                 "uid": 0,
                 "gid": 0,
                 "mode": "0o755"
               },
+              "delegated_to_our_uid": false,
               "cpu_max": "EACCES",
               "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
               "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/0671d24c070f4ca6e8311a177d1a579c9bf4137f14e8654d5640b8e09b58c359",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/2668a85ac283c423b406054f3a64f5588a822bcca716dec3517bccf13be9927e",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/31bf2ab1609c4510882b920115f9e360eec53681d25962e535527b2a93f71cd6",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/46f90707b973f95660fbb6cfb10aa9680200a5e7c81177e60531f7b14e2dd229",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/55da732083d6c8b949367222b98e580dbef63d654d9e062f7af1229bfed6bef0",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/652abcef44b8e6e492179ac636d2233429d1582879110d668d700cee458336c0",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/9f6ba4a0c1a9b29c6555120bac22fbbe2938cb12e13581aa6dff07b89ac8410b",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/b8e70c8de35d6097a8290b29256f0ce2836dc18f984a6e05106dfdbc06457d08",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/buildkit",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/buildx",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651",
+              "owner": {
+                "uid": 65534,
+                "gid": 65534,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": true,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE"
+            },
+            {
+              "path": "/pod-cgroup/docker/df12053355f0d6fda015353119a675cb7044819ab010c93b551293d1e28d3398",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/e59263904a7de1565d3399fe12df2aa48780a4ecabec9fddad8ec90c2cccc8df",
+              "owner": {
+                "uid": 0,
+                "gid": 0,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": false,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "EACCES",
+              "subtree_control": "EACCES",
+              "mkdir": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/ed81365ce9713957b97d6a999e0331a7ab28423699913e3265773622cf9af138",
+              "owner": {
+                "uid": 65534,
+                "gid": 65534,
+                "mode": "0o755"
+              },
+              "delegated_to_our_uid": true,
+              "cpu_max": "EACCES",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE"
             }
           ],
+          "mount_root": {
+            "path": "/pod-cgroup",
+            "owner": {
+              "uid": 0,
+              "gid": 0,
+              "mode": "0o755"
+            },
+            "is_container_cgroup": true,
+            "cpu_max": "EACCES",
+            "cgroup_procs": "EACCES",
+            "mkdir": "EACCES"
+          },
           "own_subtree": {
-            "own": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721",
+            "own": "/pod-cgroup/docker/a15140b3183d03d77d052213179f8e2b47ce9c1f98ff0dbeeccc2d8ee4451413",
             "children": [
-              "sbx_sbx_c2da98f31f321d54",
               "worker"
             ],
             "proc_self_cgroup": "0::/worker"
           },
           "own_delegated": true,
-          "foreign_closed": true,
-          "foreign_visible": true,
+          "peer_containers_count": 15,
+          "foreign_peers": [
+            "/pod-cgroup/docker/03490090c59108c472e0312dab400c7a528fd0b1f4991feca0b247d3f51ab267",
+            "/pod-cgroup/docker/0671d24c070f4ca6e8311a177d1a579c9bf4137f14e8654d5640b8e09b58c359",
+            "/pod-cgroup/docker/2668a85ac283c423b406054f3a64f5588a822bcca716dec3517bccf13be9927e",
+            "/pod-cgroup/docker/31bf2ab1609c4510882b920115f9e360eec53681d25962e535527b2a93f71cd6",
+            "/pod-cgroup/docker/46f90707b973f95660fbb6cfb10aa9680200a5e7c81177e60531f7b14e2dd229",
+            "/pod-cgroup/docker/55da732083d6c8b949367222b98e580dbef63d654d9e062f7af1229bfed6bef0",
+            "/pod-cgroup/docker/652abcef44b8e6e492179ac636d2233429d1582879110d668d700cee458336c0",
+            "/pod-cgroup/docker/9f6ba4a0c1a9b29c6555120bac22fbbe2938cb12e13581aa6dff07b89ac8410b",
+            "/pod-cgroup/docker/b8e70c8de35d6097a8290b29256f0ce2836dc18f984a6e05106dfdbc06457d08",
+            "/pod-cgroup/docker/buildkit",
+            "/pod-cgroup/docker/buildx",
+            "/pod-cgroup/docker/df12053355f0d6fda015353119a675cb7044819ab010c93b551293d1e28d3398",
+            "/pod-cgroup/docker/e59263904a7de1565d3399fe12df2aa48780a4ecabec9fddad8ec90c2cccc8df"
+          ],
+          "foreign_peers_closed": true,
+          "every_peer_cpu_max_closed": true,
+          "delegated_peers": [
+            {
+              "path": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE",
+              "cpu_max": "EACCES"
+            },
+            {
+              "path": "/pod-cgroup/docker/ed81365ce9713957b97d6a999e0331a7ab28423699913e3265773622cf9af138",
+              "cgroup_procs": "WRITABLE",
+              "subtree_control": "WRITABLE",
+              "mkdir": "WRITABLE",
+              "cpu_max": "EACCES"
+            }
+          ],
+          "peer_visible": true,
           "mount_looks_narrowed": false,
+          "check4_mode": "peer-container",
+          "mount_root_closed": true,
+          "evidence": true,
           "cpu_max_closed": true
         }
       }
@@ -1034,28 +1783,28 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
   },
   "sandboxes": [
     {
-      "sandbox_id": "sbx_fc73ff9407750d0a",
-      "node_id": "worker-3",
-      "cgroup": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_fc73ff9407750d0a"
-    },
-    {
-      "sandbox_id": "sbx_c123b23c280442d2",
-      "node_id": "worker-2",
-      "cgroup": "/pod-cgroup/docker/0ab62dc79c055514df4538ef3a51d0f57c1bb7065e893e3ca0b8d7956d0331a0/sbx_sbx_c123b23c280442d2"
-    },
-    {
-      "sandbox_id": "sbx_4cd0a38095989050",
+      "sandbox_id": "sbx_d1ee6480246461cb",
       "node_id": "worker-1",
-      "cgroup": "/pod-cgroup/docker/fefc14f5a4cae814f94e01f804912980a75ffc6c41081318059f5e509e85d877/sbx_sbx_4cd0a38095989050"
+      "cgroup": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_d1ee6480246461cb"
     },
     {
-      "sandbox_id": "sbx_2eeb1b95284940da",
+      "sandbox_id": "sbx_417743d04060fd0d",
       "node_id": "worker-3",
-      "cgroup": "/pod-cgroup/docker/6d71515dfeecb9ae17b81802edd1fdfbfff8d0bcf6fed10d07951d46465b0721/sbx_sbx_2eeb1b95284940da"
+      "cgroup": "/pod-cgroup/docker/a15140b3183d03d77d052213179f8e2b47ce9c1f98ff0dbeeccc2d8ee4451413/sbx_sbx_417743d04060fd0d"
+    },
+    {
+      "sandbox_id": "sbx_1a6b0a6e69e0e153",
+      "node_id": "worker-2",
+      "cgroup": "/pod-cgroup/docker/ed81365ce9713957b97d6a999e0331a7ab28423699913e3265773622cf9af138/sbx_sbx_1a6b0a6e69e0e153"
+    },
+    {
+      "sandbox_id": "sbx_366a0274eb6b92b5",
+      "node_id": "worker-1",
+      "cgroup": "/pod-cgroup/docker/cc222bec0b23005e6aeb749d831a6b7ca0fd1f77aee75a3313cfda7f630af651/sbx_sbx_366a0274eb6b92b5"
     }
   ],
-  "started_at": "2026-10-06T16:36:28+0800",
-  "elapsed_s": 101.3,
+  "started_at": "2026-10-06T16:51:02+0800",
+  "elapsed_s": 101.4,
   "ok": true
 }
 ```
@@ -1076,8 +1825,59 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
     "cgroup_mount": "/pod-cgroup",
     "template": "base",
     "flood_seconds": 40.0,
-    "sandbox_cgroup_env": "required (the caller's override; see the report)",
-    "sandbox_notify_rate_limit_env": "0 (the caller's override; only this acceptance)"
+    "worker_env": {
+      "worker-1": {
+        "pid1": "python",
+        "observed": {
+          "E2B_SANDBOX_CGROUP": {
+            "value": "off",
+            "source": "/proc/1/environ"
+          },
+          "E2B_CGROUP_MOUNT": {
+            "value": "/pod-cgroup",
+            "source": "/proc/1/environ"
+          },
+          "E2B_SANDBOX_NOTIFY_RATE_LIMIT": {
+            "value": "0",
+            "source": "/proc/1/environ"
+          }
+        }
+      },
+      "worker-2": {
+        "pid1": "python",
+        "observed": {
+          "E2B_SANDBOX_CGROUP": {
+            "value": "off",
+            "source": "/proc/1/environ"
+          },
+          "E2B_CGROUP_MOUNT": {
+            "value": "/pod-cgroup",
+            "source": "/proc/1/environ"
+          },
+          "E2B_SANDBOX_NOTIFY_RATE_LIMIT": {
+            "value": "0",
+            "source": "/proc/1/environ"
+          }
+        }
+      },
+      "worker-3": {
+        "pid1": "python",
+        "observed": {
+          "E2B_SANDBOX_CGROUP": {
+            "value": "off",
+            "source": "/proc/1/environ"
+          },
+          "E2B_CGROUP_MOUNT": {
+            "value": "/pod-cgroup",
+            "source": "/proc/1/environ"
+          },
+          "E2B_SANDBOX_NOTIFY_RATE_LIMIT": {
+            "value": "0",
+            "source": "/proc/1/environ"
+          }
+        }
+      }
+    }
   },
   "n82_baseline": {
     "ops_per_s": 18149,
@@ -1087,34 +1887,35 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
     "1_quota_is_real": {
       "pass": false,
       "declared_cpu_percent": 100.0,
-      "measured_cpu_percent": 400.46644447743057,
+      "measured_cpu_percent": 399.9151028615027,
       "cpu_max_readback": null,
       "sandbox_cgroup": null,
-      "spinner_node": "worker-3",
+      "spinner_node": "worker-1",
       "first_sandbox_rtt_quiet": {
         "samples_ms": [
-          322.98,
-          44.56,
-          31.53,
-          34.37,
-          42.92
+          463.05,
+          35.24,
+          31.37,
+          34.44,
+          34.11
         ],
-        "min_ms": 31.53,
-        "median_ms": 42.92
+        "min_ms": 31.37,
+        "median_ms": 34.44
       },
       "second_sandbox_rtt": {
         "samples_ms": [
-          249.74,
-          35.69,
-          47.7,
-          49.86,
-          27.39
+          226.65,
+          31.2,
+          29.98,
+          38.81,
+          49.96
         ],
-        "min_ms": 27.39,
-        "median_ms": 47.7
+        "min_ms": 29.98,
+        "median_ms": 38.81
       },
-      "round_trip_criterion": "min-of-5, within 2x of the quiet baseline (>=200ms floor)",
-      "second_sandbox_node": "worker-3",
+      "round_trip_criterion": "min-of-5 neighbour <= 3x the quiet min-of-5 (floor 50 ms) -- detects gross starvation (the N82 shape stalled 860 ms); a subtle slowdown is below its resolution and is caught by check 3's cgroup accounting instead",
+      "round_trip_bound_ms": 94.11,
+      "second_sandbox_node": "worker-1",
       "second_sandbox_same_node": true
     },
     "2_kernel_enforces": {
@@ -1133,11 +1934,11 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
       "quota_cores": 1.0,
       "flood_alone": {
         "label": "the N82 probe (openclose) alone in its own sandbox",
-        "probe_output": "DONE op=openclose stalls=0 rounds=179 elapsed_s=40.1 ops_per_s=8937",
-        "ops_per_s": 8937,
-        "elapsed_s": 42.8,
-        "sandbox_id": "sbx_2f716edfc5f5db3d",
-        "node_id": "worker-3",
+        "probe_output": "DONE op=openclose stalls=0 rounds=183 elapsed_s=40.1 ops_per_s=9118",
+        "ops_per_s": 9118,
+        "elapsed_s": 42.7,
+        "sandbox_id": "sbx_de866926e8461f2f",
+        "node_id": "worker-1",
         "cgroup": null,
         "cgroup_samples": [],
         "interval_cores": [],
@@ -1150,15 +1951,16 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
     },
     "4_narrowing_view_shape": {
       "pass": false,
+      "criterion": "own delegated cgroup writable (cgroup.procs/subtree_control, NOT cpu.max); every visible peer container's cpu.max still EACCES; every non-delegated peer's cpu.max/cgroup.procs/mkdir EACCES",
       "workers": {
         "worker-1": {
-          "error": "worker command on worker-1 exited 1: cannot pick this worker's delegated container cgroup under /pod-cgroup: 0 candidates, 0 matching hostname be668b6091cb: []"
+          "error": "worker command on worker-1 exited 1: cannot pick this worker's delegated container cgroup under /pod-cgroup: 0 candidates, 0 matching hostname 199ce7e14732: []"
         },
         "worker-2": {
-          "error": "worker command on worker-2 exited 1: cannot pick this worker's delegated container cgroup under /pod-cgroup: 0 candidates, 0 matching hostname a5660a4fe746: []"
+          "error": "worker command on worker-2 exited 1: cannot pick this worker's delegated container cgroup under /pod-cgroup: 0 candidates, 0 matching hostname 306efbfe60d1: []"
         },
         "worker-3": {
-          "error": "worker command on worker-3 exited 1: cannot pick this worker's delegated container cgroup under /pod-cgroup: 0 candidates, 0 matching hostname 07712507c33e: []"
+          "error": "worker command on worker-3 exited 1: cannot pick this worker's delegated container cgroup under /pod-cgroup: 0 candidates, 0 matching hostname 366f81558365: []"
         }
       }
     },
@@ -1173,28 +1975,28 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
   },
   "sandboxes": [
     {
-      "sandbox_id": "sbx_ce11b9bab69dead2",
-      "node_id": "worker-3",
-      "cgroup": null
-    },
-    {
-      "sandbox_id": "sbx_90b789bf14f23cd6",
-      "node_id": "worker-2",
-      "cgroup": null
-    },
-    {
-      "sandbox_id": "sbx_423b430431d3a8b4",
+      "sandbox_id": "sbx_0ad37a8d9a58ba45",
       "node_id": "worker-1",
       "cgroup": null
     },
     {
-      "sandbox_id": "sbx_89c4146a1834f916",
+      "sandbox_id": "sbx_f11457eedfb15a03",
       "node_id": "worker-3",
+      "cgroup": null
+    },
+    {
+      "sandbox_id": "sbx_2b6a83231e904e54",
+      "node_id": "worker-2",
+      "cgroup": null
+    },
+    {
+      "sandbox_id": "sbx_7f09fd5862280532",
+      "node_id": "worker-1",
       "cgroup": null
     }
   ],
-  "started_at": "2026-10-06T16:38:44+0800",
-  "elapsed_s": 74.5,
+  "started_at": "2026-10-06T16:53:19+0800",
+  "elapsed_s": 75.7,
   "ok": false
 }
 ```
@@ -1221,19 +2023,19 @@ worker-3: peak 0.872 cores, median 0.857 cores`（完整 JSON 见工作树 `tmp/
 
 | # | 判据（脚本里的实际条件） | GREEN 读数 | 判定 |
 |---|---|---|---|
-| ① 额度是真的 | `measuredCpuPercent ∈ [50,150]`（声明 100）且同节点第二箱往返 min-of-5 ≤ 2× 静默基线 | `99.98`；`cpu_max=100000 100000`；第二箱 32.0 ms vs 静默 31.5 ms | PASS |
-| ② 内核在强制 | 3 s 自旋窗口内 `nr_throttled_delta > 0` 且 `observed_cores ∈ [0.5,1.5]×quota` | `usage_usec +3,107,035`、`nr_throttled +32`、`throttled_usec +9,612,556`、`0.995 核` | PASS |
-| ③ 洪泛花自己的额度 | 探针单跑 `peak ≤ 1.15×quota` **且** 四路并发 `peak ≤ 1.15×quota` **且** `nr_throttled > 0` **且**两次都真拿到 `ops_per_s` | 单独 `9737 op/s / 0.836 核 / nr_throttled 0`；四路 `11,887 op/s（2971×4）/ 0.991 核 / nr_throttled +8` | PASS |
-| ④ 收窄/视图形状 | 三台 worker：自家容器 cgroup 属主 65534 且 `cgroup.procs`/`subtree_control` 可写；**别的容器** cgroup 的 `cpu.max`/`cgroup.procs` 不可写 | 三台全满足；`/proc/self/cgroup = 0::/worker`；视野内的**别的容器** cgroup `cpu.max`/`cgroup.procs`/`mkdir` 全 `EACCES`（GREEN JSON 里 `foreign_visible: true`） | PASS |
+| ① 额度是真的 | `measuredCpuPercent ∈ [50,150]`（声明 100）且同节点第二箱往返 min-of-5 ≤ 3× 静默 min-of-5（下限 50 ms） | `100.19`；`cpu_max=100000 100000`；第二箱 **27.92 ms** vs 静默 **33.01 ms**（上限 99.03 ms） | PASS |
+| ② 内核在强制 | 3 s 自旋窗口内 `nr_throttled_delta > 0` 且 `observed_cores ∈ [0.5,1.5]×quota` | `usage_usec +3,189,901`、`nr_throttled +31`、`throttled_usec +9,301,843`、`1.021 核` | PASS |
+| ③ 洪泛花自己的额度 | 探针单跑 `peak ≤ 1.15×quota` **且** 四路并发 `peak ≤ 1.15×quota` **且** `nr_throttled > 0` **且**两次都真拿到 `ops_per_s` | 单独 `10,165 op/s / 0.840 核 / nr_throttled 0`；四路 `12,071 op/s（3018×4）/ 0.994 核 / nr_throttled +8` | PASS |
+| ④ 收窄/视图形状 | 三台 worker：自家容器 cgroup 属主 65534 且 `cgroup.procs`/`subtree_control` 可写、`cpu.max` 不可写；**同层每个 peer 容器**的 `cpu.max` 不可写；非被委派的 peer 的 `cpu.max`/`cgroup.procs`/`mkdir` 全不可写；（peer 全不可见时）挂载根也不可写 | 三台全满足（`check4_mode = peer-container`，每台 **15 个 peer**）：外来 peer（root 所有）三写全 `EACCES`；被委派 peer（同 uid 的另两台 worker）只有 `cpu.max` 是 `EACCES`，`cgroup.procs`/`subtree_control`/`mkdir` 按 uid 可写（逐条记在 `delegated_peers`）；挂载根 `/pod-cgroup` 三写全 `EACCES` | PASS |
 | ⑤ 负例 fail-closed | 三台 worker 自家 `cpu.max` 的 `open(O_WRONLY)` == `EACCES` | worker-1/2/3 全 `EACCES` | PASS |
 
 RED 档同一条脚本的判定（**这就是"不弱化"的证据**：RED 五条全 FAIL，且每条都给了具名理由）：
 
 | # | RED 读数 | 判定 |
 |---|---|---|
-| ① | `measuredCpuPercent = 400.47`、`sandbox_cgroup = null` | FAIL |
+| ① | `measuredCpuPercent = 399.92`、`sandbox_cgroup = null`（邻居 min 29.98 ms vs 静默 31.37 ms —— 见 §11 的说明） | FAIL |
 | ② | `reason: there is no sbx_<id> cgroup … (E2B_SANDBOX_CGROUP off?)` | FAIL |
-| ③ | 探针 `8935 op/s`（RED 档位那一次），`peak_cores = null`；binding harness 具名拒绝（找不到 `sbx_<id>`） | FAIL |
+| ③ | 探针 `9118 op/s`，`peak_cores = null`；binding harness 具名拒绝（找不到 `sbx_<id>`） | FAIL |
 | ④ | 没有"自家被委派目录"（视图里没有 `worker/` 子树） | FAIL |
 | ⑤ | 没有被委派的容器目录 ⇒ 三台都判不出"自家 cgroup" | FAIL |
 
@@ -1243,8 +2045,10 @@ RED 档同一条脚本的判定（**这就是"不弱化"的证据**：RED 五条
   **没做**，因为这个任务的范围到"本地 lane 全绿 + 文档 + 回退杆"。上线剧本写在
   `docs/deploy-clusters.md` §7.48，回退杆也在那里。
 * **内存/进程数**（`memory.max` / `pids.max`）是 Phase 2，本任务不涉及（计划 D6）。
-* **多节点跨 worker 的邻居保护**（同一节点上另一个沙箱被别箱拖慢）只量了"第二箱往返不掉速"
-  这一条；节点级公平（CFS 层次带宽）没有单独测量。
+* **多节点跨 worker 的邻居保护**：只量了"同节点第二箱的往返不掉速"这一条，节点级公平（CFS 层次带宽）
+  没有单独测量；而且这条 rtt 判据**只能发现粗粒度饿死** —— RED 档（4 自旋、无 cgroup）量到邻居
+  29.98 ms vs 静默 31.37 ms，**确实没掉速**，所以它在这条车道上证明不了"邻居没被吵"；那件事的正面
+  证据是 ③ 的额度记账。详见 §11。
 * **`E2B_SANDBOX_NOTIFY_RATE_LIMIT=0` 只在这次验收的栈里**：生产清单没改，N83 Phase 1 的
   Task 8（限流器降级）还没有做。
 * 本机 Docker VM 是 **cgroup v2 / x86_64**（`docker info`：`CgroupVersion 2`、`Architecture x86_64`、
@@ -1280,6 +2084,116 @@ RED 档同一条脚本的判定（**这就是"不弱化"的证据**：RED 五条
    追加"四路并发"读数（用**探针自己的 INNER 程序**，import 而非抄写）—— 0.99 核 + `nr_throttled +11`
    才真正说明"沙箱自己的额度在 bound 它"。判据里两条都要过。
 3. **check ④ 的本地版判据**：计划的写法是"本地 lane = 只看得到自己容器那棵子树"，但 compose 没有
-   `subPathExpr`、挂载的是**整棵 VM 树**（§1.4 的探针也这么量过）。所以本地版 ④ 判的是
-   "**可写/被委派**的范围只有自家容器 cgroup"（自家可写、兄弟容器全 EACCES），这与 §3.5
-   的收窄意图一致；k8s 那版（挂载本身收窄、`ls /pod-cgroup` 看不到 `kubepods/`）留给 Step 3 复验。
+   `subPathExpr`、挂载的是**整棵 VM 树**（§1.4 的探针也这么量过）。所以本地版 ④ 判的是"**同层 peer
+   容器**里，我们没被给的那些（root 所有）三写全 EACCES；每个 peer 的 `cpu.max` 一律 EACCES；
+   被委派的那两个同 uid peer 如实上报"。k8s 那版（挂载本身收窄、`ls /pod-cgroup` 看不到 `kubepods/`、
+   根探针为据）留给 Step 3 复验。fix round 1 之前这里探的其实是**挂载根**、根本没到 peer —— 见 §11。
+
+---
+
+# 附：Fix round 1（2026-10-06，评审回修）
+
+评审结果：**Spec ❌（check ④）+ 4 条 Important + 3 条 minor**。逐条处置如下，全部在同一个 worktree
+（`/Users/polus/project/ai/sandlock-e2b.wt/task7`，branch `n83/task7`）里改、**GREEN 与 RED 都重跑**过。
+本节引用的每个数字都取自本节归档的那两份 JSON（`tmp/n83-acceptance-green.json` /
+`tmp/n83-acceptance-red.json`，与 §4/§5 的代码块逐字一致）。
+
+## F1（Spec ❌ + Important）check ④ 探的不是 peer 容器
+
+**判定：成立，且比评审说的更值得记一笔。**
+
+* 原实现 `_VIEW_SCRIPT` 从**挂载根** `os.walk` 下去，`/pod-cgroup` 自己就有 `cpu.max` ⇒ 第一个命中就是
+  根，随后 `dirnames[:] = []` 剪枝 ⇒ **peer 容器一个都没访问到**（GREEN JSON 里 `foreign:[{path:"/pod-cgroup",
+  owner:{uid:0}}]` 正是这个）。
+* 修法：peer 的定义改成**同层容器目录**（`own.parent` 下 != own、且 `cpu.max` + `cgroup.procs` 都在的
+  目录）；挂载根**单独探**，并在 JSON 里带 `is_container_cgroup` 标明它不是容器。
+* 新读数（GREEN，三台一致）：`peer_containers_count = 15`；`check4_mode = "peer-container"`；
+  `foreign_peers_closed = true`（root 所有的控制面/redis/agent/**另一套栈的**容器，三写全 EACCES）；
+  `every_peer_cpu_max_closed = true`；`mount_root` 三写全 EACCES。
+* **顺带量到、必须写下来的真实现象**：peer 里有 **2 个是"被委派"的**（同宿主的另两台 worker，
+  委派把它们的容器 cgroup chown 给了 65534）。对这 2 个 peer：
+  `cpu.max = EACCES`（委派故意不含它，⑤ 钉的正是这条），但
+  `cgroup.procs` / `subtree_control` / `mkdir = WRITABLE`——**同一个宿主 uid 的 DAC 分不开两个容器**。
+  这是 compose 车道的固有形状（三台 worker 都是 65534），不是 N83 引入的回归；k8s 车道因为
+  `subPathExpr` 把挂载收窄到本 pod，peer 根本不可达，不存在这个形状。脚本把它**逐 peer 上报**
+  （`delegated_peers`），不隐藏、也不当作"通过"。
+* 因此 ④ 的通过条件（脚本里逐字）：
+  `own_delegated AND every_peer_cpu_max_closed AND evidence`，其中 `evidence` =
+  有非被委派 peer 时要求它们三写全闭；peer 全不可见时（k8s 收窄形状）退化为"挂载根必须不可写**且**
+  挂载看起来是收窄的"。两种形状都写进 JSON（`check4_mode` / `evidence` / `mount_root_closed`）。
+* 文档同步：`docs/deploy-clusters.md` §7.48 的 ④ 行、坑 4、以及本报告 §7/§10 已按上面的**实际读数**重写。
+
+## F2（Important）车道元信息是写死的字符串
+
+**判定：成立。** 原 `report["lane"]["sandbox_cgroup_env"]` 是常量 `"required (…)"`，RED 档（`off`）
+也照印 `required`。
+
+* 修法：新增 `lane_env()` —— 在**每个 worker 容器内部**读 `E2B_SANDBOX_CGROUP` / `E2B_CGROUP_MOUNT` /
+  `E2B_SANDBOX_NOTIFY_RATE_LIMIT`，来源是 **`/proc/1/environ`**（worker 进程自己的环境），读不到才退到
+  exec 的环境，两者都没有就记 `null` + `source: "unset"`；连同 PID 1 的 cmdline 一起按 worker 上报
+  （`lane.worker_env`）。写死的两个字段已从脚本里删除。
+* 重跑后的读数（归档 JSON 里可直接核对）：
+  * GREEN：三台都 `{"E2B_SANDBOX_CGROUP": {"value": "required", "source": "/proc/1/environ"}, …}`
+  * RED：三台都 `{"value": "off", …}` —— 归档件与那一趟实际开关**一致**了。
+
+## F3（Important）① 的邻居 rtt 上限是退化的
+
+**判定：成立。** 旧式 `max(2×quiet, 200ms)` 在 quiet≈31.5 ms 时等于 200 ms（≈6×），RED 的邻居
+（29.98 vs 31.37 ms）也能过 —— 这条子判据测不出它声称的东西。
+
+* 修法：上限改成 **`3.0 × 静默 min-of-5`，下限 50 ms**（常量 `_NEIGHBOUR_RTT_FACTOR` /
+  `_NEIGHBOUR_RTT_FLOOR_MS`），并把判据字符串与 `round_trip_bound_ms` 一起写进 JSON。
+  50 ms 的理由：观测到的抖动只有几 ms，而 N82 那种一秒悬崖是 860 ms ⇒ 3× 能抓住粗粒度饿死、
+  又留了 >10× 的余量。
+* **RED 档的实话**：`31.37 ms（静默）→ 29.98 ms（邻居，同节点、另一箱在跑 4 自旋时）` ——
+  这条车道上**邻居确实没有掉速**，所以这条子判据在本车道**无法**证明"邻居没被吵"，它只能发现
+  粗粒度饿死（860 ms 级）。这一点已写进 ① 的判据字符串、`docs/deploy-clusters.md` §7.48 的 ① 行
+  与 §8；"邻居不被吵"的正面证据是 ③ 的额度记账（CPU 落在沙箱自己的 cgroup 上、超了被节流），
+  不是这条 rtt。**没有把上限放宽来换取通过。**
+
+## F4（Important）文档里的 k0s"只换两个参数"是错的
+
+**判定：成立。** `--internal-url`（默认 `http://control-plane:3000`）、`--api-key`（默认 `local-key`）、
+`--internal-key`（默认 `internal-key`）都是 compose 专用值。
+
+* 修法：脚本 docstring 列全**五个**参数并给了 k0s 的取值来源；`docs/deploy-clusters.md` §7.48 的
+  开头段与"怎么再跑一遍"都改成"车道相关的一共五个、都得给"，并指向 docstring 里的完整命令。
+
+## Minors
+
+1. **`docs/env-vars.md` 的额度写法**：`cpu.max = cpu_count×1000 100000` → 改成
+   `cpu_percent×1000 100000`，并写明 `cpu_percent` 是**一个核的百分比**、今天 `cpu_count` 恒为 1、
+   默认 100% 就是 `100000 100000`（含 supervisor）。
+2. **数字与归档件不一致**（RED ③ 的 op/s、§10 的 `nr_throttled +11`）：两份归档 JSON 用**同一支
+   修好的脚本**重跑后全部重新取自 JSON —— GREEN `100.19 / +3,189,901 / nr_throttled +31 /
+   10,165 op/s / 0.840 核 / 12,071 op/s（3018×4）/ 0.994 核 / +8`；RED `399.92 / 9118 op/s`。
+   本节、§4/§5 的 JSON、§7/§8/§10 的正文，以及 `docs/deploy-clusters.md` §7.48 与
+   `docs/open-issues.md` 的 N83 行全部对齐到这两份 JSON（逐条 grep 核对过）。
+3. **回退杆写死行号**：`docs/deploy-clusters.md` §7.48 与 `docs/open-issues.md` 都写明是
+   `deploy/k8s-k0s/worker-capacity.patch.yaml:41`（`- name: E2B_SANDBOX_CGROUP`，第 42 行是 value）。
+
+## 没动的裁定
+
+* k0s 车道仍然**不在本轮范围**（一个 pod 都没碰）；脚本仍然是对任意 endpoint 可跑（只是参数变多）；
+  ③ 的四路并发读数保留（它是"额度真的 binding"的证据）；用户的 live 栈（project `compose`、3100）
+  本轮同样全程未动 —— 用的是我自己的 `-p n83acc` 栈，验收完已拆。
+
+## 本轮的执行与复验（命令与结果）
+
+```bash
+# 1) 起 GREEN 档（我自己的栈，端口 3200）
+docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n83-acc-override.yml up -d
+# 2) GREEN 验收（exit 0，五条全 PASS）
+E2B_API_KEY=local-key tmp/venv/bin/python deploy/scripts/acceptance/cgroup_acceptance.py \
+    --api-url http://127.0.0.1:3200 --api-key local-key --internal-key internal-key \
+    --internal-url http://control-plane:3000 --nodes worker-1,worker-2,worker-3 \
+    --worker-exec-template 'docker exec -i n83acc-{node}-1 bash -lc' \
+    --out tmp/n83-acceptance-green.json
+# 3) 切 RED 档并跑同一条命令（exit 1，五条全 FAIL，① 的 measuredCpuPercent = 399.92）
+docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n83-acc-override-off.yml up -d
+#    → tmp/n83-acceptance-red.json
+# 4) 复位 GREEN 档
+docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n83-acc-override.yml up -d
+```
+
+归档的原始读数就是 §4（GREEN）与 §5（RED）那两个 JSON 代码块（本轮重跑后已替换为最新一版）。
