@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,20 @@ class NodeRecord:
     total_cpu_percent: int = 0
     total_disk_mb: int = 0
     total_processes: int = 0
+    #: N83 phase 2 (D5/D5b): the *promise* side of this node's sandbox sizing --
+    #: the largest values a single sandbox may be configured to here, resolved
+    #: by the worker from ``E2B_MAX_SANDBOX_*`` (``0`` = an older worker that
+    #: never reported one; the worker's own resolution is never 0).
+    sandbox_cpu_percent_max: int = 0
+    sandbox_memory_mb_max: int = 0
+    sandbox_processes_max: int = 0
+    #: ...and the *physical* side: the kernel's own read of this worker's
+    #: container cgroup (``cpu.max``/``memory.max``). ``None`` = the kernel sets
+    #: no limit on that dimension (the compose lanes' measured shape) *or* the
+    #: worker has not reported it; the two are kept apart by ``heartbeat_at``,
+    #: not by a sentinel -- a reported ``max`` is a real answer.
+    kernel_cpu_percent: int | None = None
+    kernel_memory_mb: int | None = None
     used_disk_mb: int = 0
     quota_over_limit: list[int] = field(default_factory=list)
     quota_near_limit: list[int] = field(default_factory=list)
@@ -93,6 +108,11 @@ class NodeRecord:
             "total_cpu_percent": self.total_cpu_percent,
             "total_disk_mb": self.total_disk_mb,
             "total_processes": self.total_processes,
+            "sandbox_cpu_percent_max": self.sandbox_cpu_percent_max,
+            "sandbox_memory_mb_max": self.sandbox_memory_mb_max,
+            "sandbox_processes_max": self.sandbox_processes_max,
+            "kernel_cpu_percent": self.kernel_cpu_percent,
+            "kernel_memory_mb": self.kernel_memory_mb,
             "used_disk_mb": self.used_disk_mb,
             "quota_over_limit": list(self.quota_over_limit),
             "quota_near_limit": list(self.quota_near_limit),
@@ -208,6 +228,26 @@ class NodeRecord:
         if platform_disk_budget_mb is not None:
             self.platform_disk_budget_mb = int(platform_disk_budget_mb)
 
+    def apply_sandbox_ceiling(self, ceiling: Mapping[str, Any]) -> None:
+        """Store one worker's reported per-sandbox ceiling -- both copies.
+
+        ``ceiling`` is the heartbeat's ``sandboxCeiling``, already shape-checked
+        by the internal API: the three policy values the worker resolved
+        (``cpuPercent``/``memoryMB``/``processes``) and the kernel's own read of
+        its container cgroup (``kernelCpuPercent``/``kernelMemoryMB``; ``None``
+        = the kernel sets no limit there). They are stored side by side on
+        purpose: the policy is what a create is checked against, the kernel's is
+        what the physical layer actually allows, and an operator comparing the
+        two can see a node whose policy is only bounded by its ledger.
+        """
+        self.sandbox_cpu_percent_max = int(ceiling["cpuPercent"])
+        self.sandbox_memory_mb_max = int(ceiling["memoryMB"])
+        self.sandbox_processes_max = int(ceiling["processes"])
+        kernel_cpu = ceiling.get("kernelCpuPercent")
+        kernel_memory = ceiling.get("kernelMemoryMB")
+        self.kernel_cpu_percent = None if kernel_cpu is None else int(kernel_cpu)
+        self.kernel_memory_mb = None if kernel_memory is None else int(kernel_memory)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "nodeID": self.node_id,
@@ -235,6 +275,11 @@ class NodeRecord:
             "platformDiskBudgetMB": self.platform_disk_budget_mb,
             "totalProcesses": self.total_processes,
             "reservedProcesses": self.reserved_processes,
+            "sandboxCPUPercentMax": self.sandbox_cpu_percent_max,
+            "sandboxMemoryMBMax": self.sandbox_memory_mb_max,
+            "sandboxProcessesMax": self.sandbox_processes_max,
+            "kernelCPUPercent": self.kernel_cpu_percent,
+            "kernelMemoryMB": self.kernel_memory_mb,
             "draining": self.draining,
         }
 
@@ -397,6 +442,7 @@ class NodeRegistry:
         container_id: str | None = None,
         worker_uid: int | None = None,
         worker_gid: int | None = None,
+        sandbox_ceiling: Mapping[str, Any] | None = None,
     ) -> NodeRecord:
         with self._lock:
             record = self._load_locked(node_id) if node_id else None
@@ -422,6 +468,8 @@ class NodeRegistry:
                     reserved_processes=reserved.get("processes", 0),
                 )
                 self._nodes[node_id] = record
+                if sandbox_ceiling is not None:
+                    record.apply_sandbox_ceiling(sandbox_ceiling)
             else:
                 record.address = address
                 record.total_memory_mb = total_memory_mb
@@ -447,6 +495,12 @@ class NodeRegistry:
                 if worker_uid is not None and worker_gid is not None:
                     record.worker_uid = worker_uid
                     record.worker_gid = worker_gid
+                # N83 phase 2: same "only ever set" rule as the identities
+                # above -- an older worker during a rollout reports no ceiling,
+                # and erasing the one the record holds would make this node look
+                # like an unlimited one.
+                if sandbox_ceiling is not None:
+                    record.apply_sandbox_ceiling(sandbox_ceiling)
                 record.draining = False
             record.heartbeat_at = time.time()
             record.status = "healthy"
@@ -802,7 +856,19 @@ class NodeRegistry:
         total_cpu_percent: int,
         total_disk_mb: int,
         total_processes: int,
+        sandbox_cpu_percent_max: int = 0,
+        sandbox_memory_mb_max: int = 0,
+        sandbox_processes_max: int = 0,
     ) -> NodeRecord:
+        """The in-process worker's own node row.
+
+        N83 phase 2: the per-sandbox ceilings ride along from the control
+        plane's ``Settings`` (its ``local://`` node has no heartbeat to carry
+        them, and no kernel of its own to read), so a reader of this row sees
+        the same "what may one sandbox ask for" answer a remote node's row
+        carries. The kernel half stays ``None``: this process is not a worker
+        container.
+        """
         with self._lock:
             record = NodeRecord(
                 node_id=node_id,
@@ -811,6 +877,9 @@ class NodeRegistry:
                 total_cpu_percent=total_cpu_percent,
                 total_disk_mb=total_disk_mb,
                 total_processes=total_processes,
+                sandbox_cpu_percent_max=sandbox_cpu_percent_max,
+                sandbox_memory_mb_max=sandbox_memory_mb_max,
+                sandbox_processes_max=sandbox_processes_max,
                 labels={"node-type": "local"},
             )
             self._nodes[node_id] = record

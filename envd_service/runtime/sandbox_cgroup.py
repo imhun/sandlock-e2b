@@ -34,6 +34,18 @@ The only injected state is the two facts a unit lane cannot observe:
 ``proc_root`` for ``/proc/<pid>/cgroup`` placement, and (for the compose lane)
 ``container_token`` to narrow the search to our container's cgroup among the
 whole mounted VM tree.
+
+N83 phase 2 (Task 1) adds the *ceiling* half here too, and for the same reason
+this module exists: both ceilings are cgroup facts. The **policy** ceiling (what
+one sandbox may be configured to) comes from the environment, never from a
+kernel read -- see :mod:`gateway_common.sandbox_ceiling`. The **kernel** ceiling
+(``cpu.max``/``memory.max``/``pids.max`` on the worker's own cgroup) is read by
+:func:`read_kernel_ceiling`, and :func:`check_policy_ceiling` cross-checks the
+two at worker startup (plan D5b): a policy above the kernel is refused **by
+name**, and a kernel that sets no ceiling at all -- the compose lanes' measured
+shape, where nothing sets ``cpus``/``mem_limit`` -- starts normally with one
+explicit WARN, because there the policy and the platform's ledger are the only
+bounds left.
 """
 
 from __future__ import annotations
@@ -44,6 +56,7 @@ import time
 from pathlib import Path
 
 from gateway_common.paths import validate_sandbox_id
+from gateway_common.sandbox_ceiling import SandboxCeiling
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +87,175 @@ class CgroupRefusal(Exception):
 def cpu_max_for(cpu_percent: int) -> str:
     """The ``cpu.max`` quota string for a percentage of one core, 100 ms period."""
     return f"{cpu_percent * 1000} 100000"
+
+
+def _read_limit_file(path: Path) -> str:
+    """One line of a kernfs limit file, or a named refusal.
+
+    A limit this module cannot read is never silently absent: the whole point
+    of the cross-check is that "no number" must not read as "no limit".
+    """
+    try:
+        return path.read_text().strip()
+    except OSError as exc:
+        raise CgroupRefusal(f"cgroup-refusal kernel-ceiling-read: {path}") from exc
+
+
+def _cpu_percent_limit(text: str, path: Path) -> int | None:
+    """``cpu.max`` as a percentage of one core; ``max <period>`` is ``None``.
+
+    The division **floors** on purpose: the kernel's capacity is never
+    overstated, so the comparison below can only refuse more, never let a
+    sandbox past what the container layer would actually give it.
+    """
+    if text.split(" ", 1)[0] == "max":
+        return None
+    quota, _, period = text.partition(" ")
+    try:
+        quota_us, period_us = int(quota), int(period)
+    except ValueError as exc:
+        raise CgroupRefusal(
+            f"cgroup-refusal kernel-ceiling-format: {path} reads {text!r}, "
+            "expected '<quota> <period>' in microseconds or 'max <period>'"
+        ) from exc
+    if period_us <= 0:
+        raise CgroupRefusal(
+            f"cgroup-refusal kernel-ceiling-format: {path} reads {text!r} "
+            "(a non-positive period is not a cpu.max)"
+        )
+    return quota_us * 100 // period_us
+
+
+def _memory_mb_limit(text: str, path: Path) -> int | None:
+    """``memory.max`` in MiB (floored, for the same reason as cpu above)."""
+    if text == "max":
+        return None
+    try:
+        limit_bytes = int(text)
+    except ValueError as exc:
+        raise CgroupRefusal(
+            f"cgroup-refusal kernel-ceiling-format: {path} reads {text!r}, "
+            "expected a byte count or 'max'"
+        ) from exc
+    if limit_bytes < 0:
+        raise CgroupRefusal(
+            f"cgroup-refusal kernel-ceiling-format: {path} reads {text!r}"
+        )
+    return limit_bytes // (1024 * 1024)
+
+
+def _processes_limit(path: Path) -> int | None:
+    """``pids.max`` (tasks, threads included) -- informational, so optional.
+
+    Both shipped lanes delegate the ``pids`` controller, so the file is
+    normally there; a mount that does not expose it reads as "no limit known"
+    rather than refusing, because the plan's startup cross-check (D5b) is about
+    ``cpu.max``/``memory.max``: a ``pids.max`` of ``max`` is the *measured* k8s
+    shape, not a policy/physical mismatch, and warning about it on every k8s
+    start would train operators to ignore the warning that matters.
+    """
+    if not path.is_file():
+        return None
+    text = _read_limit_file(path)
+    if text == "max":
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise CgroupRefusal(
+            f"cgroup-refusal kernel-ceiling-format: {path} reads {text!r}, "
+            "expected a task count or 'max'"
+        ) from exc
+
+
+def read_kernel_ceiling(mount: Path) -> SandboxCeiling:
+    """The kernel's own ceilings on the cgroup at ``mount`` (the *physical* half).
+
+    ``mount`` is the worker's own cgroup view (``E2B_CGROUP_MOUNT``). On k8s
+    that view is already narrowed by ``subPathExpr`` to this pod's cgroup -- the
+    directory the plan's measurement table reads, whose ``cpu.max`` is the same
+    ``400000 100000`` the container carries (one container per pod); on compose
+    it is the whole VM tree, where the measured answer is ``max`` for every
+    dimension because those stacks set no ``cpus``/``mem_limit``.
+
+    ``None`` in a field is the kernel's ``max``: no limit on this dimension.
+    """
+    cpu_path = mount / "cpu.max"
+    memory_path = mount / "memory.max"
+    return SandboxCeiling(
+        cpu_percent=_cpu_percent_limit(_read_limit_file(cpu_path), cpu_path),
+        memory_mb=_memory_mb_limit(_read_limit_file(memory_path), memory_path),
+        processes=_processes_limit(mount / "pids.max"),
+    )
+
+
+def check_policy_ceiling(policy: SandboxCeiling, *, mount: Path) -> SandboxCeiling:
+    """D5b: cross-check the configured per-sandbox ceiling against the kernel's.
+
+    The policy comes from ``E2B_MAX_SANDBOX_*`` (never from this read); the
+    kernel's comes from the worker's own cgroup. Two outcomes, both loud:
+
+    * **policy above the kernel** -- a named ``cgroup-refusal
+      ceiling-exceeds-kernel`` that the worker's startup path turns into a
+      refusal to run. Not a clamp and not a warning: the API would otherwise
+      promise a sandbox 8 GiB while the container layer OOM-kills it at 2.
+    * **the kernel sets no ceiling** (``max``) -- one WARN naming the
+      dimensions, then normal startup. This is the compose lane's measured
+      shape, and it is legal: the policy and the platform's ledger are then the
+      only bounds, which is exactly what an operator has to know.
+
+    Only ``cpu.max``/``memory.max`` are compared (D5b). ``pids.max`` is read
+    into the returned ceiling for callers, but its ``max`` is the *measured*
+    k8s shape, not a mismatch.
+
+    Returns the kernel ceiling it read, so a caller can log or report it.
+    """
+    kernel = read_kernel_ceiling(mount)
+    above: list[str] = []
+    if (
+        policy.cpu_percent is not None
+        and kernel.cpu_percent is not None
+        and policy.cpu_percent > kernel.cpu_percent
+    ):
+        above.append(
+            f"E2B_MAX_SANDBOX_CPU_PERCENT={policy.cpu_percent} > "
+            f"{kernel.cpu_percent}% (cpu.max)"
+        )
+    if (
+        policy.memory_mb is not None
+        and kernel.memory_mb is not None
+        and policy.memory_mb > kernel.memory_mb
+    ):
+        above.append(
+            f"E2B_MAX_SANDBOX_MEMORY_MB={policy.memory_mb} > "
+            f"{kernel.memory_mb} MiB (memory.max)"
+        )
+    if above:
+        raise CgroupRefusal(
+            "cgroup-refusal ceiling-exceeds-kernel: this worker's cgroup allows "
+            f"less than the configured per-sandbox ceiling ({'; '.join(above)}) "
+            "-- lower the env or raise the worker container's limits; refusing "
+            "to start rather than accepting sandboxes the container layer would "
+            "throttle or OOM-kill"
+        )
+    unbounded = [
+        name
+        for name, value in (
+            ("cpu.max", kernel.cpu_percent),
+            ("memory.max", kernel.memory_mb),
+        )
+        if value is None
+    ]
+    if unbounded:
+        logger.warning(
+            "cgroup ceiling: %s sets no kernel limit for %s (read 'max'): the "
+            "physical layer caps nothing, so the configured per-sandbox ceiling "
+            "is the only bound and aggregate admission rests on the platform's "
+            "ledger alone",
+            mount,
+            ", ".join(unbounded),
+        )
+    return kernel
 
 
 def _cgroup_pids(cgroup_dir: Path) -> list[int]:
@@ -297,6 +479,18 @@ class SandboxCgroups:
         return " ".join(sorted(enabled))
 
     # -- per-sandbox ---------------------------------------------------
+
+    @property
+    def kernel_ceiling(self) -> SandboxCeiling:
+        """The kernel's ceilings on this worker's own container cgroup.
+
+        Read at the delegated container cgroup once :meth:`setup` has settled on
+        one (that is the directory ``sbx_<id>`` is built under, and the one
+        whose ``cpu.max`` the deployment actually configured), and at the mount
+        root before that -- which on k8s *is* this pod's cgroup, narrowed by the
+        manifest's ``subPathExpr``.
+        """
+        return read_kernel_ceiling(self._parent or self._mount)
 
     def attach(self, *, sandbox_id: str, pid: int, cpu_percent: int) -> str:
         """Create ``sbx_<id>``, set its quota, and place ``pid`` in it.

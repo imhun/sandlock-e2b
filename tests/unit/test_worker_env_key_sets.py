@@ -264,7 +264,22 @@ KEY_CLASSES: dict[str, set[str]] = {
     # (`docker-compose.yml`) and the SDK test runner build no per-sandbox cgroup
     # at all, so both carry neither key -- their `.env` classes below name that
     # absence rather than letting a missing switch look like an oversight.
-    "sandbox_cgroup": {"E2B_SANDBOX_CGROUP", "E2B_CGROUP_MOUNT"},
+    #
+    # N83 phase 2 / Task 1 (2026-10-06) adds the ceiling trio to the same
+    # class, for the same reason: what a *single* sandbox may be configured to
+    # (`E2B_MAX_SANDBOX_*`, D5) only means anything where a per-sandbox cgroup
+    # is built. The fleet names all three next to its `E2B_NODE_*` totals (the
+    # k0s overlay raises them with the pod's limits, because the worker's
+    # startup cross-check refuses a policy above the kernel's read), the three
+    # C3 compose stacks name them at the node totals their kernel layer does
+    # not set, and the two stacks that build no per-sandbox cgroup name none.
+    "sandbox_cgroup": {
+        "E2B_SANDBOX_CGROUP",
+        "E2B_CGROUP_MOUNT",
+        "E2B_MAX_SANDBOX_CPU_PERCENT",
+        "E2B_MAX_SANDBOX_MEMORY_MB",
+        "E2B_MAX_SANDBOX_PROCESSES",
+    },
 }
 
 #: Keys a *stack* declares that the k8s manifest does not, in exactly one named

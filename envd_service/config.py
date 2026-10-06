@@ -547,6 +547,24 @@ class Settings:
             os.getenv("E2B_SANDBOX_CGROUP") or "off"
         ).strip().lower()
     )
+    # N83 phase 2 (D5): what ONE sandbox may be configured to on this node --
+    # the per-sandbox **policy** ceiling, read here (worker side) as well as on
+    # the control plane, because the heartbeat is emitted by *this* process: the
+    # three values ride `sandboxCeiling` so the control plane's node record
+    # carries what this worker actually resolved rather than a second guess.
+    # `0`/unset follows the corresponding `E2B_NODE_*` total (never "unlimited"
+    # -- see `gateway_common.sandbox_ceiling.resolve_sandbox_ceiling`), and the
+    # cross-check against the kernel's own read of this container's cgroup
+    # happens at startup (`agent.start_cgroup_lane`, D5b).
+    max_sandbox_cpu_percent: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_SANDBOX_CPU_PERCENT", 0)
+    )
+    max_sandbox_memory_mb: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_SANDBOX_MEMORY_MB", 0)
+    )
+    max_sandbox_processes: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_SANDBOX_PROCESSES", 0)
+    )
     #: Where the worker's read-write cgroupfs view is mounted. k8s narrows it
     #: with ``subPathExpr`` to this pod's own cgroup; the compose lane mounts
     #: the whole VM tree there and the handle narrows by container id.

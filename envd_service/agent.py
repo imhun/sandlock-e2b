@@ -40,6 +40,12 @@ from envd_service.runtime.checkpoint_store import (
 )
 from envd_service.runtime.cpu_activity import CpuActivityTracker, sample_cpu_ticks
 from envd_service.runtime.context import mcp_port_stats as _mcp_port_stats
+from envd_service.runtime.sandbox_cgroup import (
+    CgroupRefusal,
+    SandboxCeiling,
+    check_policy_ceiling,
+    read_kernel_ceiling,
+)
 from envd_service.uid_pool import (
     align_shared_uid_workspace,
     apply_sandbox_ownership,
@@ -65,6 +71,7 @@ from envd_service.xfs_quota import (
 )
 from envd_service.volumes import build_volume_mounts, cleanup_volume_projects
 from gateway_common import create_trace
+from gateway_common.sandbox_ceiling import resolve_sandbox_ceiling
 from gateway_common.archive import (
     ArchiveRefusal,
     BoundedTreeWriter,
@@ -229,31 +236,51 @@ def _require_internal_key(request: Request, settings: Settings) -> None:
         raise PermissionError("Unauthorized")
 
 
-def _node_resources(settings: Settings) -> dict[str, int]:
-    """Report node capacity: explicit env overrides, else host probing."""
+def _node_memory_mb(settings: Settings) -> int:
+    """``E2B_NODE_MEMORY_MB``, else this host's physical memory."""
     memory_mb = int(os.getenv("E2B_NODE_MEMORY_MB", "0"))
     if memory_mb <= 0:
         try:
             memory_mb = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
         except (ValueError, OSError):
             memory_mb = settings.default_memory_mb * 100
+    return memory_mb
+
+
+def _node_cpu_percent() -> int:
+    """``E2B_NODE_CPU_PERCENT``, else every core this host reports."""
     cpu = int(os.getenv("E2B_NODE_CPU_PERCENT", "0"))
     if cpu <= 0:
         cpu = os.cpu_count() * 100 or 100
+    return cpu
+
+
+def _node_disk_mb(settings: Settings) -> int:
+    """``E2B_NODE_DISK_MB``, else the workspace base's filesystem."""
     disk = int(os.getenv("E2B_NODE_DISK_MB", "0"))
     if disk <= 0:
         try:
             disk = shutil.disk_usage(settings.workspace_base).total // (1024 * 1024)
         except OSError:
             disk = settings.default_disk_mb * 100
+    return disk
+
+
+def _node_processes(settings: Settings) -> int:
+    """``E2B_NODE_PROCESSES``, else 100x one sandbox's default task budget."""
     processes = int(os.getenv("E2B_NODE_PROCESSES", "0"))
     if processes <= 0:
         processes = settings.default_max_processes * 100
+    return processes
+
+
+def _node_resources(settings: Settings) -> dict[str, int]:
+    """Report node capacity: explicit env overrides, else host probing."""
     return {
-        "totalMemoryMB": memory_mb,
-        "totalCPUPercent": cpu,
-        "totalDiskMB": disk,
-        "totalProcesses": processes,
+        "totalMemoryMB": _node_memory_mb(settings),
+        "totalCPUPercent": _node_cpu_percent(),
+        "totalDiskMB": _node_disk_mb(settings),
+        "totalProcesses": _node_processes(settings),
     }
 
 
@@ -261,6 +288,81 @@ def _node_type() -> str:
     if os.path.exists("/.dockerenv"):
         return "container"
     return "physical"
+
+
+def sandbox_ceiling_for(settings: Settings) -> SandboxCeiling:
+    """The per-sandbox **policy** ceiling this worker resolves (N83 D5).
+
+    Three explicit envs, each one falling back to the same dimension of the
+    node's own total (``_node_resources``) and then to the per-sandbox create
+    default -- so the answer is never ``0`` ("unlimited") and never the whole
+    machine by accident. The rule itself lives in
+    :func:`gateway_common.sandbox_ceiling.resolve_sandbox_ceiling` because the
+    control plane resolves the *same* three names for its in-process node, and
+    the two sides have to agree: what this worker reports in its heartbeat's
+    ``sandboxCeiling`` is the number the control plane stores.
+
+    ``getattr`` with a zero default, like the rest of the optional settings:
+    an embedder's settings double that predates these fields keeps today's
+    behaviour (the ceiling follows the node total) instead of crashing.
+    """
+    return SandboxCeiling(
+        cpu_percent=resolve_sandbox_ceiling(
+            configured=int(getattr(settings, "max_sandbox_cpu_percent", 0) or 0),
+            node_total=_node_cpu_percent(),
+            create_default=settings.default_cpu_percent,
+        ),
+        memory_mb=resolve_sandbox_ceiling(
+            configured=int(getattr(settings, "max_sandbox_memory_mb", 0) or 0),
+            node_total=_node_memory_mb(settings),
+            create_default=settings.default_memory_mb,
+        ),
+        processes=resolve_sandbox_ceiling(
+            configured=int(getattr(settings, "max_sandbox_processes", 0) or 0),
+            node_total=_node_processes(settings),
+            create_default=settings.default_max_processes,
+        ),
+    )
+
+
+def sandbox_ceiling_payload(settings: Settings) -> dict[str, Any]:
+    """The heartbeat's ``sandboxCeiling``: the policy plus the kernel's read.
+
+    Both halves travel, side by side, because the control plane stores both:
+    the policy is what a create is checked against (Task 2/3), the kernel's is
+    what the physical layer actually allows. ``None`` in a kernel field is the
+    kernel's ``max`` -- no physical limit, which is the compose lanes' real
+    shape.
+
+    The kernel read is best-effort *here*: a heartbeat must never be lost
+    because this node's cgroup view cannot be read (on a macOS dev box it does
+    not exist at all, and on a lane with ``E2B_SANDBOX_CGROUP=off`` there is no
+    cgroup business of ours to read). The cross-check that *has* to be strict
+    is the startup one (:func:`start_cgroup_lane`), where a missing read is a
+    named refusal.
+    """
+    policy = sandbox_ceiling_for(settings)
+    kernel_cpu: int | None = None
+    kernel_memory: int | None = None
+    mount = Path(getattr(settings, "cgroup_mount", "/pod-cgroup"))
+    try:
+        kernel = read_kernel_ceiling(mount)
+    except (CgroupRefusal, OSError):
+        logger.debug(
+            "cgroup ceiling: cannot read the kernel ceiling at %s; reporting "
+            "the policy half only",
+            mount,
+        )
+    else:
+        kernel_cpu = kernel.cpu_percent
+        kernel_memory = kernel.memory_mb
+    return {
+        "cpuPercent": policy.cpu_percent,
+        "memoryMB": policy.memory_mb,
+        "processes": policy.processes,
+        "kernelCpuPercent": kernel_cpu,
+        "kernelMemoryMB": kernel_memory,
+    }
 
 
 def _register_payload(
@@ -280,6 +382,11 @@ def _register_payload(
             "node-type": os.getenv("E2B_NODE_TYPE") or _node_type(),
         },
         **_node_resources(settings),
+        # N83 phase 2 (D5/D5b): what ONE sandbox may be configured to on this
+        # node, plus the kernel's own read of this container's cgroup. It rides
+        # the registration as well as every heartbeat -- register *is* the first
+        # heartbeat, and the control plane creates the node record from it.
+        "sandboxCeiling": sandbox_ceiling_payload(settings),
     }
     # C3 Task 3 (ruling D9.3): the worker's own pid namespace identity. The
     # control plane stores it and hands it to the agent, which is what makes the
@@ -418,8 +525,14 @@ def _heartbeat_usage_payload(
     worker_identity: dict[str, int] | None = None,
     container_id: str | None = None,
     cpu_provider: Callable[[], dict[str, float]] | None = None,
+    ceiling: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Disk usage + quota alerts + MCP port band carried by each heartbeat."""
+    """Disk usage + quota alerts + MCP port band carried by each heartbeat.
+
+    N83 phase 2 adds ``sandboxCeiling`` (the caller passes it in): the
+    per-sandbox policy this worker resolved and the kernel's own read of its
+    container cgroup.
+    """
     payload: dict[str, Any] = {}
     if pid_namespace:
         # C3 Task 3: refreshed with every heartbeat, because a restarted worker
@@ -440,6 +553,12 @@ def _heartbeat_usage_payload(
         # under the same node id, and a stale one would make the agent match a
         # cgroup that no longer exists (every file operation refused by name).
         payload["containerID"] = container_id
+    if ceiling is not None:
+        # N83 phase 2 (Task 1): the per-sandbox ceiling, both halves. Refreshed
+        # with every heartbeat like the identity fields above -- a re-deploy
+        # that lowers the policy ceiling must reach the control plane's node
+        # record without waiting for a full re-registration.
+        payload["sandboxCeiling"] = dict(ceiling)
     try:
         usage = shutil.disk_usage(settings.workspace_base)
         payload["diskUsedMB"] = usage.used // (1024 * 1024)
@@ -1808,6 +1927,17 @@ def start_cgroup_lane(
     must not read as "off" (that is a whole fleet without a quota while looking
     configured). See :func:`envd_service.route_b.sandbox_cgroup_mode`.
 
+    N83 phase 2 / D5b adds the second startup refusal, and it is the same
+    *kind* of fact as the typo above: a configured per-sandbox ceiling that is
+    **above** what this worker's own cgroup allows is a launch-time
+    configuration error, so it is refused here -- by name, synchronously, before
+    any create can be accepted -- instead of being clamped or retried (a
+    retry loop would turn a permanent misconfiguration into a heartbeat-spaced
+    warning). The kernel's half is read from ``E2B_CGROUP_MOUNT``; a mount that
+    does not exist is not a cross-check we can make (and cannot build a sandbox
+    cgroup either -- ``setup`` refuses that by name below), while a mount that
+    exists but cannot produce the numbers is refused.
+
     ``sandbox_cgroups`` is the handle to bring up; the production path leaves it
     unset and resolves the process-wide one from ``settings``, and tests inject
     a double.
@@ -1817,6 +1947,9 @@ def start_cgroup_lane(
     mode = sandbox_cgroup_mode(settings)
     if mode == "off":
         return None
+    mount = Path(getattr(settings, "cgroup_mount", "/pod-cgroup"))
+    if mount.is_dir():
+        check_policy_ceiling(sandbox_ceiling_for(settings), mount=mount)
     handle = (
         sandbox_cgroups
         if sandbox_cgroups is not None
@@ -2106,6 +2239,7 @@ class NodeAgent:
                         worker_identity_fields(),
                         reported_container_id(),
                         cpu_provider=self._cpu_provider,
+                        ceiling=sandbox_ceiling_payload(self._settings),
                     ),
                     headers=headers,
                 )

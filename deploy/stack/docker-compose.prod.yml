@@ -574,6 +574,18 @@ services:
       E2B_NODE_CPU_PERCENT: ${E2B_NODE_CPU_PERCENT:-200}
       E2B_NODE_DISK_MB: ${E2B_NODE_DISK_MB:-4096}
       E2B_NODE_PROCESSES: ${E2B_NODE_PROCESSES:-256}
+      # N83 phase 2 / Task 1 (D5): the per-sandbox ceiling -- the largest a
+      # *single* sandbox may be configured to here. Equal to this lane's
+      # `E2B_NODE_*` totals on purpose (one sandbox may take the worker's whole
+      # declared budget), but written out because they are a decision: the
+      # production `.env` raises the node to 4096MB/400%/1024, and these follow
+      # (or come down) on their own. The compose lanes set no `cpus`/`mem_limit`
+      # (measured), so the kernel layer reads `max` and the worker's startup
+      # cross-check can only warn there -- these three numbers plus the control
+      # plane's ledger are then the entire bound.
+      E2B_MAX_SANDBOX_CPU_PERCENT: ${E2B_MAX_SANDBOX_CPU_PERCENT:-200}
+      E2B_MAX_SANDBOX_MEMORY_MB: ${E2B_MAX_SANDBOX_MEMORY_MB:-2048}
+      E2B_MAX_SANDBOX_PROCESSES: ${E2B_MAX_SANDBOX_PROCESSES:-256}
       # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
       # default, inert) and where the rw cgroupfs view lands. This lane gets the
       # same *narrowed* view k8s gets, by a different device: compose **has**

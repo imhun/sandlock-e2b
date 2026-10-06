@@ -18,6 +18,7 @@ from gateway_common.env import (
     _env_json,
     _env_list,
 )
+from gateway_common.sandbox_ceiling import resolve_sandbox_ceiling
 
 #: Default per-key budget for the *resource-creating* control-plane endpoints
 #: (sandbox create, snapshot create, volume create). One constant so the three
@@ -203,6 +204,25 @@ class Settings:
     )
     max_total_processes: int = field(
         default_factory=lambda: _env_int("E2B_MAX_TOTAL_PROCESSES", 2048)
+    )
+    #: N83 phase 2 (D5): what ONE sandbox may be configured to -- the
+    #: per-sandbox **policy** ceiling, never the node. `0`/unset follows the
+    #: node's own total for the same dimension (``max_total_*`` above), and a
+    #: node that declared no total at all falls back to the per-sandbox create
+    #: default, so the resolved value is never 0: 0 would read downstream as
+    #: "one sandbox may take everything", the fail-open the plan's Review Focus
+    #: §1 names. The rule is shared with the worker
+    #: (`gateway_common.sandbox_ceiling.resolve_sandbox_ceiling`), because the
+    #: worker reports its own resolution in every heartbeat and the two numbers
+    #: describe the same node.
+    max_sandbox_cpu_percent: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_SANDBOX_CPU_PERCENT", 0)
+    )
+    max_sandbox_memory_mb: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_SANDBOX_MEMORY_MB", 0)
+    )
+    max_sandbox_processes: int = field(
+        default_factory=lambda: _env_int("E2B_MAX_SANDBOX_PROCESSES", 0)
     )
     create_rate_limit_per_min: int = field(
         default_factory=lambda: _env_int(
@@ -661,6 +681,27 @@ class Settings:
         """
         if self.state_base is None:
             self.state_base = self.workspace_base
+        # N83 phase 2 (D5): the per-sandbox ceiling is resolved **here**, once,
+        # so every reader (the in-process ``local://`` node's record, a default
+        # view, a test) sees the same positive number instead of a raw env
+        # value that somebody else still has to interpret. An explicit value
+        # wins; `0`/unset follows the node's own total; a node that declared no
+        # total follows the per-sandbox create default -- never 0 (unlimited).
+        self.max_sandbox_cpu_percent = resolve_sandbox_ceiling(
+            configured=self.max_sandbox_cpu_percent,
+            node_total=self.max_total_cpu_percent,
+            create_default=self.default_cpu_percent,
+        )
+        self.max_sandbox_memory_mb = resolve_sandbox_ceiling(
+            configured=self.max_sandbox_memory_mb,
+            node_total=self.max_total_memory_mb,
+            create_default=self.default_memory_mb,
+        )
+        self.max_sandbox_processes = resolve_sandbox_ceiling(
+            configured=self.max_sandbox_processes,
+            node_total=self.max_total_processes,
+            create_default=self.default_max_processes,
+        )
         # N57: the trees' shared/not question, settled once. ``None`` means the
         # deployment did not name it, so it keeps the old answer -- which is
         # what makes the reslice a no-op for every deployment that has not been

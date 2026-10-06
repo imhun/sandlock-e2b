@@ -796,6 +796,13 @@ def create_app(
             total_cpu_percent=settings.max_total_cpu_percent,
             total_disk_mb=settings.max_total_disk_mb,
             total_processes=settings.max_total_processes,
+            # N83 phase 2 (D5): the local node has no heartbeat to carry a
+            # per-sandbox ceiling, so its row carries the control plane's own
+            # resolution -- the same three fields a remote node's row gets from
+            # the worker's ``sandboxCeiling``.
+            sandbox_cpu_percent_max=settings.max_sandbox_cpu_percent,
+            sandbox_memory_mb_max=settings.max_sandbox_memory_mb,
+            sandbox_processes_max=settings.max_sandbox_processes,
         )
     app.state.select_node = app.state.nodes.select_and_reserve
     # The autoscaler, when this deployment hosts it (the k8s shape): built

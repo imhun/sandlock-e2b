@@ -482,7 +482,9 @@ def _delegation_client(app, *, source_ip: str = "10.0.0.1") -> httpx.AsyncClient
     )
 
 
-async def _enroll_node(app, *, key: str = KEY_NODE, container_id=None) -> None:
+async def _enroll_node(
+    app, *, key: str = KEY_NODE, container_id=None, sandbox_ceiling=None
+) -> None:
     """Register node A -- the node-scoped identity every delegation needs."""
     body = {
         "nodeID": NODE_ID,
@@ -494,6 +496,8 @@ async def _enroll_node(app, *, key: str = KEY_NODE, container_id=None) -> None:
     }
     if container_id is not None:
         body["containerID"] = container_id
+    if sandbox_ceiling is not None:
+        body["sandboxCeiling"] = sandbox_ceiling
     body["workerUID"] = WORKER_UID
     body["workerGID"] = WORKER_GID
     async with _delegation_client(app) as client:
@@ -872,3 +876,233 @@ def test_no_agent_client_refuses_the_delegation_by_name(workspace) -> None:
             "delegate the worker's cgroup"
         ),
     }
+
+
+# ------------------------------- N83 phase 2: the per-sandbox ceiling
+#
+# D5: the ceiling a *single* sandbox may be configured to is a configured
+# policy (``E2B_MAX_SANDBOX_*``) that defaults to the corresponding node total
+# -- never 0 and never infinity. The control plane's ``Settings`` fields are
+# the in-process ``local://`` node's copy of that rule; a *worker* node gets
+# both copies from the worker's own heartbeat (``sandboxCeiling``): the policy
+# it resolved and the kernel's read of its own container cgroup (``None`` =
+# the kernel sets no limit). They are stored side by side so a reader can see
+# both the promise and the physical ceiling it was checked against.
+
+#: One worker's report: a 4-core/4 GiB container with a 2-core/2 GiB policy.
+SANDBOX_CEILING = {
+    "cpuPercent": 200,
+    "memoryMB": 2048,
+    "processes": 256,
+    "kernelCpuPercent": 400,
+    "kernelMemoryMB": 4096,
+}
+
+_CEILING_ENVS = (
+    "E2B_MAX_SANDBOX_CPU_PERCENT",
+    "E2B_MAX_SANDBOX_MEMORY_MB",
+    "E2B_MAX_SANDBOX_PROCESSES",
+)
+
+
+async def _heartbeat_node(app, body: dict, *, key: str = KEY_NODE):
+    async with _delegation_client(app) as client:
+        return await client.post(
+            f"/internal/nodes/{NODE_ID}/heartbeat",
+            headers={"X-Internal-Key": key},
+            json=body,
+        )
+
+
+async def _internal_node_view(app, *, key: str = FLEET):
+    async with _delegation_client(app) as client:
+        return await client.get("/internal/nodes", headers={"X-Internal-Key": key})
+
+
+def test_the_control_plane_ceiling_defaults_to_the_node_total(
+    monkeypatch,
+) -> None:
+    """① unset ⇒ the node's own total. Never 0 ("unlimited"), never infinity."""
+    for name in _CEILING_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    settings = ControlSettings(
+        api_keys=("local-key",),
+        internal_api_key=FLEET,
+        max_total_memory_mb=8192,
+        max_total_cpu_percent=400,
+        max_total_processes=2048,
+    )
+
+    assert settings.max_sandbox_cpu_percent == 400
+    assert settings.max_sandbox_memory_mb == 8192
+    assert settings.max_sandbox_processes == 2048
+
+
+def test_a_non_positive_control_plane_ceiling_follows_the_node_total(
+    monkeypatch,
+) -> None:
+    """``0``/negative is not "unlimited" here: it follows the node total."""
+    monkeypatch.setenv("E2B_MAX_SANDBOX_CPU_PERCENT", "0")
+    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "-1")
+    monkeypatch.setenv("E2B_MAX_SANDBOX_PROCESSES", "0")
+    settings = ControlSettings(
+        api_keys=("local-key",),
+        internal_api_key=FLEET,
+        max_total_memory_mb=8192,
+        max_total_cpu_percent=400,
+        max_total_processes=2048,
+    )
+
+    assert settings.max_sandbox_cpu_percent == 400
+    assert settings.max_sandbox_memory_mb == 8192
+    assert settings.max_sandbox_processes == 2048
+
+
+def test_the_control_plane_ceiling_is_never_zero(monkeypatch) -> None:
+    """Even a node that declared no total gets a positive per-sandbox ceiling.
+
+    ``0`` on this field would read downstream as "one sandbox may take
+    everything" -- the fail-open the plan's Review Focus §1 names. With no
+    declared node total the create default is the only positive signal left.
+    """
+    for name in _CEILING_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    settings = ControlSettings(
+        api_keys=("local-key",),
+        internal_api_key=FLEET,
+        max_total_memory_mb=0,
+        max_total_cpu_percent=0,
+        max_total_processes=0,
+        default_cpu_percent=100,
+        default_memory_mb=1024,
+        default_max_processes=256,
+    )
+
+    assert settings.max_sandbox_cpu_percent == 100
+    assert settings.max_sandbox_memory_mb == 1024
+    assert settings.max_sandbox_processes == 256
+
+
+def test_an_explicit_control_plane_ceiling_is_independent_of_the_node_total(
+    monkeypatch,
+) -> None:
+    """② an explicit ceiling wins, however big the node is."""
+    monkeypatch.setenv("E2B_MAX_SANDBOX_CPU_PERCENT", "200")
+    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "1024")
+    monkeypatch.setenv("E2B_MAX_SANDBOX_PROCESSES", "64")
+    settings = ControlSettings(
+        api_keys=("local-key",),
+        internal_api_key=FLEET,
+        max_total_memory_mb=65536,
+        max_total_cpu_percent=1600,
+        max_total_processes=8192,
+    )
+
+    assert settings.max_sandbox_cpu_percent == 200
+    assert settings.max_sandbox_memory_mb == 1024
+    assert settings.max_sandbox_processes == 64
+
+
+def test_the_heartbeat_carries_both_ceilings_into_the_node_record(
+    workspace,
+) -> None:
+    """⑤ the record keeps the policy copy *and* the kernel copy, side by side.
+
+    Registration carries it too (it is the first heartbeat), and a heartbeat
+    that reports nothing leaves what the record already holds alone -- that is
+    what keeps a mixed-version rollout from erasing the ceilings.
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app, sandbox_ceiling=SANDBOX_CEILING))
+
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_cpu_percent_max == 200
+    assert record.sandbox_memory_mb_max == 2048
+    assert record.sandbox_processes_max == 256
+    assert record.kernel_cpu_percent == 400
+    assert record.kernel_memory_mb == 4096
+
+    # A later beat refreshes both copies (a lower policy ceiling is a normal
+    # re-deploy, not an error) ...
+    resp = asyncio.run(
+        _heartbeat_node(
+            app,
+            {
+                "sandboxCeiling": {
+                    "cpuPercent": 100,
+                    "memoryMB": 1024,
+                    "processes": 128,
+                    "kernelCpuPercent": None,
+                    "kernelMemoryMB": None,
+                }
+            },
+        )
+    )
+    assert resp.status_code == 204
+    assert record.sandbox_cpu_percent_max == 100
+    assert record.sandbox_memory_mb_max == 1024
+    assert record.sandbox_processes_max == 128
+    assert record.kernel_cpu_percent is None
+    assert record.kernel_memory_mb is None
+
+    # ... and the internal view exposes both copies under their own names.
+    view = asyncio.run(_internal_node_view(app))
+    assert view.status_code == 200
+    (node,) = [n for n in view.json() if n["nodeID"] == NODE_ID]
+    assert node["sandboxCPUPercentMax"] == 100
+    assert node["sandboxMemoryMBMax"] == 1024
+    assert node["sandboxProcessesMax"] == 128
+    assert node["kernelCPUPercent"] is None
+    assert node["kernelMemoryMB"] is None
+
+
+def test_a_heartbeat_without_a_ceiling_leaves_the_record_alone(workspace) -> None:
+    """An older worker during a rollout reports nothing -- never erase."""
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app, sandbox_ceiling=SANDBOX_CEILING))
+
+    assert asyncio.run(_heartbeat_node(app, {"diskUsedMB": 4096})).status_code == 204
+
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_cpu_percent_max == 200
+    assert record.sandbox_memory_mb_max == 2048
+    assert record.sandbox_processes_max == 256
+    assert record.kernel_cpu_percent == 400
+    assert record.kernel_memory_mb == 4096
+
+
+def test_a_zero_sandbox_ceiling_in_a_heartbeat_is_refused_by_name(
+    workspace,
+) -> None:
+    """A 0 is refused rather than stored: downstream it would mean "unlimited"."""
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+
+    resp = asyncio.run(
+        _heartbeat_node(
+            app,
+            {
+                "sandboxCeiling": {
+                    "cpuPercent": 0,
+                    "memoryMB": 2048,
+                    "processes": 256,
+                }
+            },
+        )
+    )
+
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "code": 400,
+        "message": (
+            "sandboxCeiling.cpuPercent must be a positive integer: the "
+            "per-sandbox ceiling is never 0 (which would read as unlimited) "
+            "or negative -- the worker resolves an unset E2B_MAX_SANDBOX_* "
+            "to its node total"
+        ),
+    }
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_cpu_percent_max == 0

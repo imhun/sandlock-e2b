@@ -33,6 +33,20 @@ spec:
               value: "8192"
             - name: E2B_NODE_PROCESSES
               value: "1024"
+            # N83 phase 2 / Task 1 (D5): the per-sandbox ceiling, raised with
+            # the pod's own limits below (4 cores / 4 GiB). It has to be
+            # raised *with* them, not after: the worker's startup cross-check
+            # refuses a policy above the kernel's read, so leaving the baseline
+            # 200%/2048 MiB here would cap this lane at half of what the node
+            # is actually given -- a silent under-sell rather than an error.
+            # Processes stays at the node's declared count (the kernel sets no
+            # `pids.max` on this lane).
+            - name: E2B_MAX_SANDBOX_CPU_PERCENT
+              value: "400"
+            - name: E2B_MAX_SANDBOX_MEMORY_MB
+              value: "4096"
+            - name: E2B_MAX_SANDBOX_PROCESSES
+              value: "1024"
             # N83 phase 1 / Task 2: the per-sandbox cgroup switch, flipped on
             # the cluster. The code default is `off` (inert); this overlay is the
             # only place the value moves -- same discipline as the four numbers

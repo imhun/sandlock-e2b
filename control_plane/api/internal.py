@@ -180,6 +180,56 @@ def _worker_container_id(body: dict[str, Any]) -> str | None:
     return value
 
 
+def _sandbox_ceiling_fields(body: dict[str, Any]) -> dict[str, Any] | None:
+    """The worker's reported per-sandbox ceiling, or a named refusal (D5/D5b).
+
+    Shape: ``{"cpuPercent": <int>, "memoryMB": <int>, "processes": <int>,
+    "kernelCpuPercent": <int|null>, "kernelMemoryMB": <int|null>}`` -- the three
+    policy values the worker resolved and the kernel's read of its own container
+    cgroup (``null`` = the kernel sets no limit there, which is the compose
+    lanes' measured shape).
+
+    Absent is **not** an error: an older worker during a rollout reports
+    nothing, and the record keeps what it already has (the same rule the
+    identity fields above follow). Present but malformed is refused by name --
+    and a ``0`` policy value is refused rather than stored, because downstream
+    a 0 would read as "one sandbox may take everything": the worker resolves an
+    unset ``E2B_MAX_SANDBOX_*`` to its node total precisely so that this field
+    is a real, positive ceiling.
+    """
+    value = body.get("sandboxCeiling")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise OfficialError(400, "sandboxCeiling must be a JSON object")
+    ceiling: dict[str, Any] = {}
+    for name in ("cpuPercent", "memoryMB", "processes"):
+        raw = value.get(name)
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+            raise OfficialError(
+                400,
+                f"sandboxCeiling.{name} must be a positive integer: the "
+                "per-sandbox ceiling is never 0 (which would read as "
+                "unlimited) or negative -- the worker resolves an unset "
+                "E2B_MAX_SANDBOX_* to its node total",
+            )
+        ceiling[name] = raw
+    for name in ("kernelCpuPercent", "kernelMemoryMB"):
+        raw = value.get(name)
+        if raw is None:
+            ceiling[name] = None
+            continue
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+            raise OfficialError(
+                400,
+                f"sandboxCeiling.{name} must be a positive integer or null: "
+                "null is the kernel's own 'max' (this worker's container cgroup "
+                "sets no limit on that dimension)",
+            )
+        ceiling[name] = raw
+    return ceiling
+
+
 def _worker_identity_fields(body: dict[str, Any]) -> tuple[int | None, int | None]:
     """The worker's reported ``workerUID`` / ``workerGID``, or a named refusal.
 
@@ -550,6 +600,7 @@ async def register_node(request: Request) -> dict[str, Any]:
     worker_uid, worker_gid = _verified_worker_identity(
         request, node_id, _worker_identity_fields(body)
     )
+    sandbox_ceiling = _sandbox_ceiling_fields(body)
     record = request.app.state.nodes.register(
         node_id=node_id,
         address=address,
@@ -563,6 +614,7 @@ async def register_node(request: Request) -> dict[str, Any]:
         container_id=container_id,
         worker_uid=worker_uid,
         worker_gid=worker_gid,
+        sandbox_ceiling=sandbox_ceiling,
     )
     _rebuild_node_reservations(request, record)
     return {"nodeID": record.node_id}
@@ -666,6 +718,13 @@ async def node_heartbeat(node_id: str, request: Request) -> Response:
     if verified_uid is not None and verified_gid is not None:
         record.worker_uid = verified_uid
         record.worker_gid = verified_gid
+    # N83 phase 2: the per-sandbox ceiling rides every heartbeat, so a
+    # re-deploy that lowers the policy reaches the node record without a full
+    # re-registration -- and an older worker that reports none leaves the
+    # stored pair alone (see ``_sandbox_ceiling_fields``).
+    sandbox_ceiling = _sandbox_ceiling_fields(body)
+    if sandbox_ceiling is not None:
+        record.apply_sandbox_ceiling(sandbox_ceiling)
     record.update_usage(
         used_disk_mb=body.get("diskUsedMB"),
         disk_total_mb=body.get("diskTotalMB"),
