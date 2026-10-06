@@ -2575,23 +2575,32 @@ def test_qos_derivation_defaults_a_missing_request_to_its_limit() -> None:
     ) == "Burstable"
 
 
-def test_k0s_overlay_requires_the_cgroup_and_keeps_the_same_qos() -> None:
-    """Pins 1+3: the k0s patch rewrites `resources` and turns the switch on.
+def test_k0s_overlay_keeps_the_same_qos_and_a_legal_cgroup_switch() -> None:
+    """Pins 1+3: the k0s patch rewrites `resources` and names the cgroup switch.
 
     The patch moves `requests: 500m/512Mi` under `limits: 4/4Gi` (still
-    Burstable) and overrides `E2B_SANDBOX_CGROUP` to `required`. The static
-    half reads the patch's own `resources`; the rendered half (below) proves
-    the merged object still carries the narrowed mount.
+    Burstable) and sets `E2B_SANDBOX_CGROUP`. The static half reads the patch's
+    own `resources`; the rendered half (below) proves the merged object still
+    carries the narrowed mount.
+
+    **The switch's value is asserted as a pairing, not as one constant**
+    (2026-10-06, `docs/deploy-clusters.md` §7.49): it must be a legal value, and
+    the *narrowed view* it needs is asserted in the render test below. The
+    reason is that the value is a deployment decision -- the rollout's second
+    stage was rolled back to `off` because the delegation's lookup was
+    ambiguous on a k8s pod (pause container vs worker) -- while "switch on ⇒
+    narrowed mount ⇒ matching QoS segment" is the invariant that protects
+    production. Pinning the constant too would make the repo red for the whole
+    duration of a deliberate rollback, which is what trains people to edit
+    pins instead of reading them.
     """
     docs = [doc for doc in yaml.safe_load_all(WORKER_CAPACITY_PATCH.read_text("utf-8")) if doc]
     assert len(docs) == 1
     containers = _pod_spec_of(docs[0])["containers"]
     assert _qos_class_from_resources(containers) == "Burstable"
     patch_env = _k8s_container_env(containers[0])
-    assert patch_env["E2B_SANDBOX_CGROUP"] == {
-        "name": "E2B_SANDBOX_CGROUP",
-        "value": "required",
-    }
+    assert patch_env["E2B_SANDBOX_CGROUP"]["name"] == "E2B_SANDBOX_CGROUP"
+    assert patch_env["E2B_SANDBOX_CGROUP"]["value"] in ("off", "required")
     # Falsifiability: the patch's resources really differ from the baseline's,
     # so "derived class is the same" is a comparison and not two copies of one
     # manifest agreeing with themselves.
@@ -2606,8 +2615,14 @@ def test_k0s_overlay_requires_the_cgroup_and_keeps_the_same_qos() -> None:
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
-def test_k0s_overlay_renders_the_narrowed_cgroup_view_with_the_switch_on() -> None:
-    """The cluster actually runs the overlay: mount + switch must survive it."""
+def test_k0s_overlay_renders_the_narrowed_cgroup_view() -> None:
+    """The cluster actually runs the overlay: mount + switch must survive it.
+
+    The switch's value is read as a **pairing**: whatever the deployment says,
+    a `required` lane must have the narrowed view (that is the invariant
+    §7.49's incident turned on). The value itself is pinned as legal, not as a
+    constant, for the reason in the test above.
+    """
     rendered = subprocess.run(
         [KUBECTL, "kustomize", str(REPO / "deploy" / "k8s-k0s")],
         capture_output=True,
@@ -2627,7 +2642,8 @@ def test_k0s_overlay_renders_the_narrowed_cgroup_view_with_the_switch_on() -> No
         "type": "Directory",
     }
     env = _k8s_container_env(container)
-    assert env["E2B_SANDBOX_CGROUP"]["value"] == "required"
+    switch = env["E2B_SANDBOX_CGROUP"]["value"]
+    assert switch in ("off", "required")
     assert env["E2B_CGROUP_MOUNT"]["value"] == "/pod-cgroup"
     assert (
         volumes["cgpod"]["hostPath"]["path"].rsplit("/", 1)[1].lower()
