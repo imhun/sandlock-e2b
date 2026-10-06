@@ -430,7 +430,7 @@ e2b-sandlock-gateway/
 | `fs_writable` | 仅沙箱工作目录 |
 | `fs_denied` | `/proc/kcore`、`/sys` |
 | `max_memory` | `max_memory="1024M"`，seccomp user notification 内存跟踪（updated 2026-09-06: per-sandbox default 1024, FUP3） |
-| `max_cpu` | `max_cpu=100`，SIGSTOP/SIGCONT 按单核百分比限流 |
+| `max_cpu` | `max_cpu=100`。**强制者是每沙箱 cgroup 的 `cpu.max`（内核 CFS，100 ms 周期）**，额度**含 supervisor**（它与载荷同一个 cgroup）；`E2B_SANDBOX_CGROUP=off` 时退回老的 SIGSTOP/SIGCONT 占空比节流器，而它只在 `max_cpu < 100` 时才 arm ⇒ 默认 100 时**没有强制者**（N82 实测：4 个自旋能吃到 3.83 核）。详见 §6.6 的「谁在强制」与 `docs/deploy-clusters.md` §7.49 |
 | `max_processes` | `max_processes=256`，seccomp user notification 并发进程计数（M4 D6 whole-box semantics, 2026-09-06） |
 | `max_open_files` | `max_open_files`，RLIMIT_NOFILE |
 | `max_disk` | `max_disk`，仅作用于 COW storage 配额 |
@@ -570,7 +570,7 @@ Control Plane 必须同时限制沙箱数量和宿主总资源，避免 `E2B_MAX
 | 资源 | 默认值 |
 |------|--------|
 | 内存 | `E2B_DEFAULT_MEMORY_MB=1024`（updated 2026-09-06: per-sandbox default 1024, FUP3） |
-| CPU | `E2B_DEFAULT_CPU_PERCENT=100`，映射 `max_cpu=100` |
+| CPU | `E2B_DEFAULT_CPU_PERCENT=100`，映射 `max_cpu=100` ⇒ 每沙箱 cgroup `cpu.max`（内核强制，含 supervisor；今天恒为 `100000 100000`）。⚠ 这个 env 只决定**准入预留的维度**，**不决定沙箱自己的额度** —— 送到沙箱的是 `record.cpu_count × 100`，而 `cpu_count` 在创建路径上从不被赋值（恒 1）⇒ 把它调大只会让**节点少放几个沙箱**，不会给单个沙箱更多核 |
 | 磁盘 | `E2B_DEFAULT_DISK_MB=1024`，非 COW 时为准入预留 |
 | 并发进程 | `E2B_DEFAULT_MAX_PROCESSES=256`，映射 `max_processes=256`（M4 D6 whole-box semantics, 2026-09-06） |
 
@@ -582,6 +582,16 @@ Control Plane 必须同时限制沙箱数量和宿主总资源，避免 `E2B_MAX
 | 总 CPU | `E2B_MAX_TOTAL_CPU_PERCENT=400` |
 | 总磁盘 | `E2B_MAX_TOTAL_DISK_MB=10240` |
 | 总进程 | `E2B_MAX_TOTAL_PROCESSES=2048` |
+
+**谁在强制每个维度**（2026-10-06，N83 Phase 1 之后）：
+
+| 资源 | 强制者 | 备注 |
+|------|--------|------|
+| CPU | **每沙箱 cgroup `cpu.max`**（内核 CFS，100 ms 周期） | 额度含 supervisor（同一 cgroup）；`E2B_SANDBOX_CGROUP=off` 时没有强制者（老的占空比节流器只在 `max_cpu < 100` 时 arm） |
+| 内存 | fork 的 seccomp user-notification 记账（mmap 族） | 超限回 `ENOMEM`；**不含** supervisor 自身的占用；cgroup 的 `memory.max`/`memory.high` 是 Phase 2（尚未接） |
+| 并发进程 | 同上（clone 族记账） | 整箱语义（M4 D6）；`pids.max` 是 Phase 2（尚未接） |
+| 磁盘 | XFS project quota（经 quota-agent）+ 活账本 | worker 只发 HTTP；见 `docs/sandbox-disk-quota.md` |
+| 节点聚合 | 控制面的**预留**配额（准入时预留、kill/TTL 时归还） | 预留制，不是等实际用量超限；见下面的准入算法 |
 
 准入算法使用预留配额，而不是等待实际用量超限：
 

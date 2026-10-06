@@ -31,6 +31,11 @@ E2B_TENANT_LIMITS={"t1": {"max_sandboxes": 20, "max_total_memory_mb": 4096,
 E2B_TENANT_RATE_LIMITS={"t1": 60, "t2": 300}
 ```
 
+> **口径**：上面这些租户限额是**准入预留**（建箱时预留、kill/TTL 时归还），不是"用到超了才拦"；
+> 单个沙箱自己那一层的强制在沙箱内部（CPU = 每沙箱 cgroup `cpu.max`，内存/进程 = fork 的 syscall
+> 记账，磁盘 = XFS project quota），逐维度的"谁在强制"见 `spec.md` §6.6 的表。两层的取舍是
+> **取二者较小**：租户限额决定"这个租户能占多少"，沙箱配额决定"单个沙箱能占多少"。
+
 - **未配置 `E2B_TENANTS` = 单租户兼容模式**：所有 key 共享，无过滤
   （现状不变，存量部署零影响）；
 - 配置后：请求 key 解析出 tenant，资源按 tenant 隔离。
