@@ -2892,8 +2892,9 @@ op 在位但惰性）→ **第二次 apply** 把 `deploy/k8s-k0s/worker-capacity
 `cpu.procs`/`subtree_control` 可写）+ 一条端到端冒烟（② 的 3 s 自旋读数）。任何一条红 ⇒ 立刻用
 下面的回退杆。
 
-**回退杆（停一次就够）**：把 `deploy/k8s-k0s/worker-capacity.patch.yaml`**第 41 行**那一条
-（`- name: E2B_SANDBOX_CGROUP`，第 42 行是它的 `value: "required"`）的 value 翻回 **`"off"`** 并 apply（compose 车道同理：
+**回退杆（停一次就够）**：把 `deploy/k8s-k0s/worker-capacity.patch.yaml`**第 55 行**那一条
+（`- name: E2B_SANDBOX_CGROUP`，第 56 行是它的 `value: "required"`；Task 1 在它上面插了单箱上限块，
+所以是 55/56 而不是当初的 41/42）的 value 翻回 **`"off"`** 并 apply（compose 车道同理：
 `deploy/compose/docker-compose.multinode.yml` 的 `${E2B_SANDBOX_CGROUP:-off}`）。`off` 是代码默认，
 于是行为逐字节回到 Phase 1 之前；**已经在跑的沙箱 cgroup 会在它被拆除时照常 `cgroup.kill` + `rmdir`
 释放**，不需要额外清理（worker 重建时 `worker/` 目录由自检复用/拒绝，见 `sandbox_cgroup.py`）。
@@ -3008,7 +3009,7 @@ pause 容器 —— 这是"本地全绿 ≠ 线上成立"的一个具体案例�
 所以它绿着也没发现这件事；④ 按 `AGENTS.md`，修完先在**本地 compose 车道**复跑五条验收，再重新构建、
 再走两段式上线。
 
-**回退杆复核（本次实际用过，有效）**：`deploy/k8s-k0s/worker-capacity.patch.yaml:41-42` 的
+**回退杆复核（本次实际用过，有效）**：`deploy/k8s-k0s/worker-capacity.patch.yaml:55-56` 的
 `E2B_SANDBOX_CGROUP` 翻回 `"off"` + `apply.sh` ⇒ 行为逐字节回到 Phase 1 之前；**没有**需要额外清理的
 cgroup（这一版从未建过 `sbx_*`）。集群与用户的本地 `compose` 栈都没有别的改动。
 
