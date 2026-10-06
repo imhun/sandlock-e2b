@@ -39,7 +39,7 @@ spec:
             # above. `required` means the worker's startup self-check is
             # fail-closed (plan §3.5 insurance 2), never "best effort".
             - name: E2B_SANDBOX_CGROUP
-              value: "off"   # 回退：k8s 上委派被具名拒绝（anchor 命中多个容器 init），见 §7.49
+              value: "required"
           resources:
             requests:
               cpu: 500m
