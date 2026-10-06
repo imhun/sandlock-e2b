@@ -219,6 +219,45 @@ async def test_an_unknown_op_is_refused_named() -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_delegate_cgroup_op_is_routed_and_its_lookup_refusal_is_named(
+    tmp_path: Path,
+) -> None:
+    """N83 Phase 1 · Task 3: the delegating op rides the same authenticated table.
+
+    It is the same surface as ``grant-slot``/``chown``/``rm``/``walk`` (one op
+    table, one token, one refusal shape), so what this lane pins is that the new
+    op is *in* that table -- a 404 would mean a name that drifted -- and that a
+    lookup that finds nothing is a named 502, never a silent skip. The synthetic
+    ``/proc`` in ``tests/unit/test_c3_delegate_cgroup.py`` drives the real
+    delegation; here the shape rule and the op's routing are the subject.
+    """
+    app = create_app(
+        settings=_settings(),
+        runner=_StubRunner(),
+        lookup=ProcLookup(tmp_path / "proc"),
+    )
+    async with _client(app) as client:
+        resp = await client.post(
+            f"/internal/nodes/{HOST}/agent/delegate-cgroup",
+            headers=_headers(),
+            json={
+                "worker": {
+                    "node_id": WORKER,
+                    "pod_uid": "6d3cdd7b-3a5e-4a1f-9a6b-0c1d2e3f4a5b",
+                }
+            },
+        )
+        assert resp.status_code == 502
+        assert resp.json() == {
+            "error": (
+                "worker e2b-worker-0's container holds no process this agent can "
+                "identify as the container's init: refusing to locate its "
+                "container cgroup"
+            )
+        }
+
+
+@pytest.mark.asyncio
 async def test_a_refused_grant_is_fail_closed_and_named() -> None:
     runner = _StubRunner(
         refuse="as_uid refused: uid 999 is outside the privileged helper uid pool"
