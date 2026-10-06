@@ -2824,37 +2824,42 @@ worker 启动自检 `seccomp self-check: filter mode active, user namespaces all
 `unknown: blob upload unknown to registry`，构建本身两平台都已成功），**原样重跑一次即成功**；
 下次遇到这个报错直接重试，不要当成配置问题。
 
-### 7.48 本地车道验收：N83 Phase 1 每沙箱 cgroup —— **local compose lane 全绿，k0s 还没滚**（2026-10-06）
+### 7.48 本地车道验收：N83 Phase 1 每沙箱 cgroup —— **local compose lane 全绿，k0s 还没滚**（2026-10-06；2026-10-06 在 `d600b7e` 上复跑）
 
 **先说这一节是什么、不是什么**：这是"**本地 lane 先绿**"的读数（`AGENTS.md` 的顺序），**不是上线记录**
 —— 自建 k0s（`172.18.80.94` / `.80.140`）这次**一个 pod 都没碰**。验收脚本、RED→GREEN 全文、
 每一条原始读数在 `docs/reports/n83-task-7-cgroup-acceptance.md`，脚本本体是
 `deploy/scripts/acceptance/cgroup_acceptance.py`（对任何 E2B endpoint 都跑得动，但**车道相关的东西一共五个，都得给**：`--api-url` / `--api-key`、`--internal-url`（控制面**内部** API，从 worker 容器里可达的那个地址）、`--internal-key`、`--nodes`（CP 认识的那些 node id，同时进 `{node}` 替换）、`--worker-exec-template`。k0s 上不能只换后两个 —— `--internal-url` 与两个 key 的默认值是 compose 专用的，照默认值跑会直接失败；脚本的 docstring 里有一条完整的 k0s 命令）。
 
+> **本节读数取自 `d600b7e`（`n83/acceptance-final`，含 final-review 修复 `d8be58a`）上的复跑** ——
+> 同一支脚本、同一份配方；车道 `-p n83acc2`、宿主端口 **3250**。原始 JSON、重跑命令与"读数移动"
+> （相对 `164c987` 那一版）在 `docs/reports/n83-task-7-cgroup-acceptance.md`（§3.1 / §4 / §5 / §0）。
+
 **车道**：本机 compose 多节点栈 `deploy/compose/docker-compose.multinode.yml`（3 worker + 控制面 +
-redis + agent 两面），**项目名 `n83acc`、宿主端口 `3200`** —— 用户那套 live 栈（project `compose`、
-3100）全程没动，也**没有**对它跑过 `up/down/build`；验收完 `docker compose -p n83acc … down` 拆掉
+redis + agent 两面），**项目名 `n83acc2`、宿主端口 `3250`**（Task 7 那一趟是 `n83acc` / `3200`；
+复跑换名换端口，避开用户栈与旧趟残留）—— 用户那套 live 栈（project `compose`、
+3100）全程没动，也**没有**对它跑过 `up/down/build`；验收完 `docker compose -p n83acc2 … down` 拆掉
 （镜像留着）。三处 override 的来历（都在 `tmp/`，gitignored）：① 端口用 `ports: !override` 覆盖
 hardcode 的 `3100:3000`（compose 对 `ports` 是**追加**合并，只写新端口会同时绑 3100 ⇒ 撞车）；
 ② 盘/进程两维照抄用户 `tmp/n80/compose-override.yml`（Docker VM 整盘已用 ~111 GB，而清单里
 `E2B_NODE_DISK_MB: 4096` 是准入配额 ⇒ 不覆盖就是 `503 No resources available`）；③ 本次自己的
 `E2B_SANDBOX_CGROUP=required` 与 `E2B_SANDBOX_NOTIFY_RATE_LIMIT=0`（后者**只在这次验收里**关掉
 通知限流，用来量"洪泛花自己的额度"，量完随栈拆掉 = 撤回）。agent 两面用 **本 worktree 现构建的
-镜像**（`docker build -f deploy/docker/Dockerfile.agent -t e2b-sandlock-agent:n83acc .` 后由
+镜像**（`docker build -f deploy/docker/Dockerfile.agent -t e2b-sandlock-agent:n83acc2 .` 后由
 `AGENT_IMAGE` 指过去），否则跑的是旧 registry 镜像、委派 op 根本不存在。
 
 **RED → GREEN（同一条车道、同一支脚本，只翻 `E2B_SANDBOX_CGROUP`）**：
 
 | 检查 | RED（`off`，限流关） | GREEN（`required`，限流关） |
 |---|---|---|
-| ① 额度是真的 | 4 自旋 ⇒ CP 内部视图 `measuredCpuPercent = **399.92**`（声明 100）；沙箱**没有** cgroup 可读 | `measuredCpuPercent = **100.19**`（= 声明额度）；`cpu.max` 读回 `100000 100000`；同节点第二个沙箱往返 min **27.92 ms** vs 静默基线 **33.01 ms**（判据 = 3× 静默 min-of-5，本例上限 99.03 ms）。⚠ **这条子判据的能力边界要说清**：RED 档（4 自旋、无 cgroup）的邻居 min 是 **29.98 ms vs 静默 31.37 ms** —— 本车道这条负载下邻居**确实没有掉速**，所以它只能发现**粗粒度饿死**（N82 那种 860 ms 停顿），细微劣化它分辨不出来；"邻居不被吵"的正面证据以 ③ 的额度记账为准（CPU 记在沙箱自己的账上、超了被节流），不是这条 rtt |
-| ② 内核在强制 | 无 `sbx_<id>` ⇒ 具名失败（没有可节流的东西） | 3.12 s 自旋：`usage_usec +3,189,901`（1.021 核）、**`nr_throttled +31`**、`throttled_usec +9,301,843 µs` |
-| ③ 洪泛花自己的额度 | 探针 9118 op/s；**`sbx` cgroup 不存在**（这笔 CPU 记不到沙箱账上） | 探针单跑 **10,165 op/s / 0.840 核**（≤ 1 核额度）；**四路并发 12,071 op/s（3018×4）/ 0.994 核 ≤ 额度、`nr_throttled +8`** —— 额度真的 binding |
+| ① 额度是真的 | 4 自旋 ⇒ CP 内部视图 `measuredCpuPercent = **400.52**`（声明 100）；沙箱**没有** cgroup 可读 | `measuredCpuPercent = **100.16**`（= 声明额度）；`cpu.max` 读回 `100000 100000`；同节点第二个沙箱往返 min **31.15 ms** vs 静默基线 **39.65 ms**（判据 = 3× 静默 min-of-5，本例上限 118.95 ms）。⚠ **这条子判据的能力边界要说清**：RED 档（4 自旋、无 cgroup）的邻居 min 是 **26.84 ms vs 静默 27.45 ms** —— 本车道这条负载下邻居**确实没有掉速**，所以它只能发现**粗粒度饿死**（N82 那种 860 ms 停顿），细微劣化它分辨不出来；"邻居不被吵"的正面证据以 ③ 的额度记账为准（CPU 记在沙箱自己的账上、超了被节流），不是这条 rtt |
+| ② 内核在强制 | 无 `sbx_<id>` ⇒ 具名失败（没有可节流的东西） | 3.13 s 自旋：`usage_usec +3,201,252`（1.022 核）、**`nr_throttled +32`**、`throttled_usec +9,588,263 µs` |
+| ③ 洪泛花自己的额度 | 探针 9185 op/s；**`sbx` cgroup 不存在**（这笔 CPU 记不到沙箱账上） | 探针单跑 **9,794 op/s / 0.840 核**（≤ 1 核额度）；**四路并发 11,945 op/s（2986×4）/ 0.994 核 ≤ 额度、`nr_throttled +12`** —— 额度真的 binding |
 | ④ 收窄/视图形状 | 无被委派目录（worker 的 cgroup 视图里没有 `worker/` 子树） | 三台 worker：自家容器 cgroup 属主 **65534**、`cgroup.procs`/`cgroup.subtree_control` **可写**、`cpu.max` **EACCES**、`/proc/self/cgroup = 0::/worker`；**同层的 15 个 peer 容器 cgroup** 逐个探：非被委派的（root 所有，控制面/redis/agent/另一套栈的容器）`cpu.max`/`cgroup.procs`/`mkdir` **全 EACCES**；被委派的那 2 个（同宿主的另两台 worker，uid 都是 65534）`cpu.max` 仍 **EACCES**，但 `cgroup.procs`/`subtree_control`/`mkdir` 按 uid 归我们 —— 如实记在 `delegated_peers` 里，见下面第 4 条坑；挂载根 `/pod-cgroup`（它不是容器、是 Docker VM 的 cgroup 根）单独探：三个写全 EACCES |
 | ⑤ 负例（fail closed） | — | 三台 worker 对**自家** `cpu.max` 的 `open(O_WRONLY)` 全 **EACCES**（委派故意不含它） |
 
 **"邻居付账"这条症状的直接读数（RED 的补充，一次性探针）**：同一条 `openclose` 洪泛（限流关、无
-每沙箱 cgroup）期间，`worker-3` **自己容器 cgroup** 的 `cpu.stat` 涨 **0.857 核（中位）/ 0.872 核（峰）**，
+每沙箱 cgroup）期间，`worker-1`（本轮 hosting 节点）**自己容器 cgroup** 的 `cpu.stat` 涨 **0.860 核（中位）/ 0.869 核（峰）**，
 另两台 0.03 核 —— 也就是 N82 量到的"CPU 记在 worker pod 上、租户账上是 0"。GREEN 里同一笔 CPU
 落在 `sbx_<id>` 子树里（0.84 核），租户账与归属第一次合一。
 
@@ -2896,13 +2901,14 @@ op 在位但惰性）→ **第二次 apply** 把 `deploy/k8s-k0s/worker-capacity
    **逐 peer 如实上报**（`delegated_peers`），不隐藏、也不当作通过；它是 Phase 1 接受的已知代价之一。
 
 **怎么再跑一遍**（本地车道；k0s 车道的完整五参数命令见脚本 docstring，不能只换 `--worker-exec-template`/`--nodes`）：`deploy/compose/.env` 从 `.env.example` 复制（`AGENT_IMAGE` 指向本 worktree 构建的
-agent 镜像）→ `docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f
-tmp/n83-acc-override.yml up -d` → 等三台 worker 日志出现 `cgroup lane ready (attempt N): cgroup ready
-parent=…` → 跑
-`python deploy/scripts/acceptance/cgroup_acceptance.py --api-url http://127.0.0.1:3200 --api-key
+agent 镜像，`d600b7e` 那趟用的是 `e2b-sandlock-agent:n83acc2`）→ `docker compose -p n83acc2 -f
+deploy/compose/docker-compose.multinode.yml -f tmp/n83acc2-override.yml up -d` → 等三台 worker 日志
+出现 `cgroup lane ready (attempt N): cgroup ready parent=…` → 跑
+`python deploy/scripts/acceptance/cgroup_acceptance.py --api-url http://127.0.0.1:3250 --api-key
 "$E2B_API_KEY" --internal-key internal-key --internal-url http://control-plane:3000 --nodes
-worker-1,worker-2,worker-3 --worker-exec-template 'docker exec -i n83acc-{node}-1 bash -lc'`（~100 s，
-末尾一行 `"ok": true`）→ `docker compose -p n83acc … down`。
+worker-1,worker-2,worker-3 --worker-exec-template 'docker exec -i n83acc2-{node}-1 bash -lc'`（~100 s，
+末尾一行 `"ok": true`）。**首次 create 可能撞 `428: warm_required`**（base 镜像正在目标节点上预热）——
+稍等片刻用同一条命令重跑即绿。→ `docker compose -p n83acc2 … down`。
 
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
