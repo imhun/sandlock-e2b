@@ -1246,28 +1246,88 @@ def test_release_reads_the_counters_before_it_removes_the_box(tmp_path: Path) ->
     assert cg.sample_events() == {"alpha": BOX_EVENTS}
 
 
-def test_release_refuses_and_keeps_the_box_when_a_counter_cannot_be_read(
-    tmp_path: Path,
+def test_release_still_tears_the_box_down_when_a_counter_cannot_be_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Strict where it matters: a box whose account cannot be read is not
-    destroyed with the numbers unread -- the refusal names the file, and the
-    box (and its account) stays for the next attempt or the node's GC."""
+    """Fix 1 (review): **teardown completes.**
+
+    Nothing in this worker reclaims a leftover ``sbx_*`` directory, so a reading
+    that cannot be taken has to cost the reading, not the teardown: one named
+    WARNING carrying the sandbox id, the path and the underlying error, and then
+    ``cgroup.kill`` + ``rmdir`` proceed. What is lost is exactly that reading --
+    the last chance to see these numbers, in the window where the periodic sweep
+    had not already cached them.
+    """
     cg, _parent, proc_root = _live_cgroups(tmp_path)
     box = _attach_box(cg, proc_root, "alpha", 4242)
-    _box_events(box, oom_kill=2, oom_group_kill=0, pids_max=0)
-    (box / "memory.events").unlink()
-    (box / "memory.events").mkdir()  # present, but not readable as a file
+    _box_events(box, oom_kill=2, oom_group_kill=0, pids_max=3)
+    # A counter file that is there but does not parse: the same class of
+    # "cannot take the reading", and (unlike a permission error) reproducible in
+    # a plain tree without pretending to be unprivileged.
+    _write(box / "memory.events", "oom_kill not-a-number\n")
 
-    with pytest.raises(CgroupRefusal) as excinfo:
-        cg.release(sandbox_id="alpha")
+    with caplog.at_level(logging.WARNING):
+        assert cg.release(sandbox_id="alpha") is True
 
-    assert str(excinfo.value) == (
-        f"cgroup-refusal events-read: {box / 'memory.events'}"
-    )
-    assert box.exists() is True
-    # The heartbeat's sweep must never fail on the same file: it skips the box
-    # (an unreadable account is not "nothing happened").
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == sandbox_cgroup.__name__
+    ] == [
+        f"cgroup events: sandbox alpha: the last-chance reading of {box} "
+        f"failed: cgroup-refusal events-format: {box / 'memory.events'} reads "
+        "'oom_kill not-a-number' for oom_kill, expected '<name> <count>'; "
+        "tearing the box down anyway -- this reading is lost, because the kernel "
+        "removes the counters with the directory (the values the sweep already "
+        "cached still reach the control plane)"
+    ]
+    assert box.exists() is False
+    # The honest cost: nothing is remembered for a box whose account was not read.
     assert cg.sample_events() == {}
+
+
+def test_a_permission_error_is_named_by_the_read_not_by_the_rmdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Review Minor #3: the diagnostic names the step that actually failed.
+
+    A permission problem on a counter file is reported as
+    ``events-read: <file> (Operation not permitted)`` -- not as a
+    ``release-rmdir`` that hides its cause, and not as "this box has no
+    account". The read is the only thing faked here (macOS and Linux both let
+    the *file* be removed but not read, and a plain tree cannot express that
+    without privileges), and the teardown still completes.
+    """
+    cg, _parent, proc_root = _live_cgroups(tmp_path)
+    box = _attach_box(cg, proc_root, "alpha", 4242)
+    _box_events(box, oom_kill=2, oom_group_kill=0, pids_max=3)
+    real_read_text = Path.read_text
+    blocked = box / "memory.events"
+
+    def refusing(self: Path, *args: object, **kwargs: object) -> str:
+        if self == blocked:
+            raise PermissionError(13, "Operation not permitted")
+        return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", refusing)
+
+    with caplog.at_level(logging.WARNING):
+        assert cg.release(sandbox_id="alpha") is True
+
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == sandbox_cgroup.__name__
+    ] == [
+        f"cgroup events: sandbox alpha: the last-chance reading of {box} "
+        f"failed: cgroup-refusal events-read: {blocked} (Operation not "
+        "permitted); tearing the box down anyway -- this reading is lost, "
+        "because the kernel removes the counters with the directory (the values "
+        "the sweep already cached still reach the control plane)"
+    ]
+    assert box.exists() is False
 
 
 def test_the_sampler_reports_only_the_boxes_that_hit_a_wall(tmp_path: Path) -> None:
@@ -1298,22 +1358,110 @@ def test_the_sampler_skips_a_box_whose_account_cannot_be_read(
     assert cg.sample_events() == {"alpha": BOX_EVENTS}
 
 
-def test_a_remembered_reading_is_never_lowered_by_a_later_box(
+def test_a_leftover_box_that_still_carries_an_account_is_refused_by_name(
     tmp_path: Path,
 ) -> None:
-    """The counters are the kernel's and the growth is the event: a sandbox id
-    seen again with a fresh cgroup keeps the maximum this node ever saw."""
+    """Fix 2 (review): **reuse must never inherit an account.**
+
+    The previous occupant's tasks are gone, so the box looks reusable -- but its
+    ``*.events`` are still there, and a kernfs counter cannot be cleared in
+    place (measured on a real cgroup v2 mount: ``unlink`` is ``EPERM`` and a
+    write back to zero is ``EINVAL``). Refusing by name is therefore the only
+    answer that neither misattributes the previous occupant's wall to the new
+    sandbox nor silently runs it in a directory that carries a history.
+    """
+    cg, _parent, proc_root = _live_cgroups(tmp_path)
+    box = _attach_box(cg, proc_root, "alpha", 4242)
+    _box_events(box, oom_kill=1, oom_group_kill=0, pids_max=0)
+    _write(box / "cgroup.procs", "")  # the previous occupant's tasks are gone
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        _attach_box(cg, proc_root, "alpha", 4243)
+
+    assert str(excinfo.value) == (
+        f"cgroup-refusal sbx-stale-account: sandbox alpha's cgroup directory "
+        f"{box} still carries a previous generation's kernel event counters "
+        "(oom_kill=1), and a kernfs counter cannot be cleared in place -- "
+        "refusing to place a new sandbox in it rather than report the previous "
+        "occupant's wall as its own"
+    )
+    assert box.exists() is True
+    assert (box / "cgroup.procs").read_text() == ""
+
+
+def test_a_leftover_box_whose_account_cannot_be_read_is_refused_by_name(
+    tmp_path: Path,
+) -> None:
+    """The same gate, for the case where "clean" cannot be established: an
+    unreadable account is refused by name, never read as "no previous events"."""
+    cg, _parent, proc_root = _live_cgroups(tmp_path)
+    box = _attach_box(cg, proc_root, "alpha", 4242)
+    _box_events(box, oom_kill=0, oom_group_kill=0, pids_max=0)
+    _write(box / "cgroup.procs", "")
+    (box / "pids.events").unlink()
+    (box / "pids.events").mkdir()  # present, but not readable as a file
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        _attach_box(cg, proc_root, "alpha", 4243)
+
+    assert str(excinfo.value) == (
+        f"cgroup-refusal events-read: {box / 'pids.events'} (Is a directory)"
+    )
+
+
+def test_a_later_box_under_the_same_id_starts_with_a_clean_account(
+    tmp_path: Path,
+) -> None:
+    """Fix 2 (review), sampler half: the last-chance reading of a *previous*
+    generation must not be reported as the new occupant's own."""
     cg, _parent, proc_root = _live_cgroups(tmp_path)
     first = _attach_box(cg, proc_root, "alpha", 4242)
     _box_events(first, oom_kill=5, oom_group_kill=0, pids_max=0)
     assert cg.release(sandbox_id="alpha") is True
-
-    second = _attach_box(cg, proc_root, "alpha", 4243)
-    _box_events(second, oom_kill=1, oom_group_kill=0, pids_max=0)
-
+    # The teardown reading still travels while this id has no occupant ...
     assert cg.sample_events() == {
         "alpha": {"oom_kill": 5, "oom_group_kill": 0, "pids_max": 0}
     }
+
+    # ... and it does not follow the next occupant of that id.
+    second = _attach_box(cg, proc_root, "alpha", 4243)
+    _box_events(second, oom_kill=0, oom_group_kill=0, pids_max=0)
+    assert cg.sample_events() == {}
+
+
+def test_a_counter_that_cannot_be_unlinked_is_named_in_the_rmdir_refusal(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fix 4 (review): the refusal names the step that actually blocked the
+    removal. A `pids.events` that cannot be unlinked (a real cgroupfs refuses
+    that with `EPERM`; a directory in its place refuses it here) is what stops
+    the second `rmdir` -- reporting only "could not rmdir" hides the cause.
+
+    The errno *text* is the platform's (macOS says "Operation not permitted" for
+    unlinking a directory, Linux says "Is a directory"), so this case measures it
+    here and pins the full message with it: what is being pinned is that the
+    message names the file and its error, not the wording of one libc.
+    """
+    cg, _parent, proc_root = _live_cgroups(tmp_path)
+    box = _attach_box(cg, proc_root, "alpha", 4242)
+    _box_events(box, oom_kill=0, oom_group_kill=0, pids_max=0)
+    probe = tmp_path / "unlink-probe"
+    probe.mkdir()
+    with pytest.raises(OSError) as probe_error:
+        probe.unlink()
+    probe.rmdir()
+    (box / "pids.events").unlink()
+    (box / "pids.events").mkdir()
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(CgroupRefusal) as excinfo:
+            cg.release(sandbox_id="alpha")
+
+    assert str(excinfo.value) == (
+        f"cgroup-refusal release-rmdir: could not rmdir {box}"
+        f"; could not unlink pids.events ({probe_error.value.strerror})"
+    )
+    assert box.exists() is True
 
 
 def test_the_heartbeat_carries_the_event_section_only_when_there_is_one() -> None:
@@ -1331,17 +1479,30 @@ def test_the_heartbeat_carries_the_event_section_only_when_there_is_one() -> Non
 
 def test_the_off_lane_samples_nothing_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
     """``E2B_SANDBOX_CGROUP=off`` reaches no further than this: there is no
-    ``sbx_<id>`` to read, so no handle is built and no cgroup file is touched."""
+    ``sbx_<id>`` to read, so no handle is built and no cgroup file is touched.
+
+    The construction is *recorded* rather than raised on (review Minor #2):
+    ``sample_sandbox_events`` swallows every exception by design -- a heartbeat
+    must never fail -- so a stub that raised would be swallowed too and this
+    test would pass even if the off lane did build a handle. The list is what
+    makes the assertion able to fail.
+    """
     from envd_service import route_b
 
     monkeypatch.setenv("E2B_SANDBOX_CGROUP", "off")
+    built: list[dict] = []
 
-    def _forbidden(*args: object, **kwargs: object) -> None:
-        raise AssertionError("the off lane must not build a cgroup handle")
+    class _Handle:
+        def __init__(self, **kwargs: object) -> None:
+            built.append(kwargs)
 
-    monkeypatch.setattr(route_b, "SandboxCgroups", _forbidden)
+        def sample_events(self) -> dict[str, dict[str, int]]:
+            return {"alpha": dict(BOX_EVENTS)}
+
+    monkeypatch.setattr(route_b, "SandboxCgroups", _Handle)
 
     assert node_agent.sample_sandbox_events(Settings()) == {}
+    assert built == []
 
 
 def test_the_sampler_goes_through_the_process_wide_handle(

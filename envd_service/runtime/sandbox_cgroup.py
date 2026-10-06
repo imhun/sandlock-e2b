@@ -67,12 +67,13 @@ times a charge hit ``memory.max`` (``oom_kill``, plus the whole-group variant
 ``pids.events``'s ``max`` counts the times a *task* creation hit ``pids.max``
 -- tasks, so threads count (D4). The kernel removes both files with the
 directory, so :meth:`SandboxCgroups.release` reads them **before**
-``cgroup.kill``/``rmdir`` (that is the last chance to see them, and the reason
-that read is strict) while :meth:`SandboxCgroups.sample_events` reads the live
-boxes for the heartbeat (that one is best effort: a heartbeat must never be
-lost over a cgroup file). Both feed the same per-sandbox map, which rides the
-heartbeat so a kill becomes a named event instead of a process that "just
-vanished".
+``cgroup.kill``/``rmdir`` (that is the last chance to see them; a reading that
+cannot be taken is logged by name and the teardown proceeds, because nothing
+reclaims a leftover ``sbx_*`` directory) while
+:meth:`SandboxCgroups.sample_events` reads the live boxes for the heartbeat
+(best effort: a heartbeat must never be lost over a cgroup file). Both feed the
+same per-sandbox map, which rides the heartbeat so a kill becomes a named event
+instead of a process that "just vanished".
 """
 
 from __future__ import annotations
@@ -278,17 +279,30 @@ def _event_counters(path: Path, wanted: tuple[str, ...]) -> dict[str, int]:
     and that asymmetry is the whole point of this function: these numbers are
     the only record of a sandbox that was killed, so "I could not read it" must
     never be silently reported as "nothing happened" (plan Task 5 -- Review
-    Focus §4). Callers decide what to do with the refusal: ``release`` lets it
-    out (the box keeps its account), ``sample_events`` swallows it (a heartbeat
-    must not be lost over a cgroup file).
+    Focus §4). The refusal carries the underlying error (``(Is a directory)``,
+    ``(Operation not permitted)``), because a *permission* problem is a
+    different fact from a malformed file and the caller's log has to say which
+    one it hit (review Minor #3).
+
+    The *absent* case is decided by the read itself and not by ``exists()``:
+    ``exists()`` swallows a permission error and answers "False", which would
+    turn "I am not allowed to look" into "this kernel keeps no account here".
+
+    Callers decide what to do with the refusal: :meth:`SandboxCgroups.release`
+    logs it by name and tears the box down anyway (nothing reclaims a leftover
+    ``sbx_*``), :meth:`SandboxCgroups.sample_events` skips the box, and
+    :meth:`SandboxCgroups.attach` refuses to reuse the directory.
     """
     counters = {name: 0 for name in wanted}
-    if not path.exists():
-        return counters
     try:
         text = path.read_text()
+    except FileNotFoundError:
+        # Genuinely absent (or a dangling link): nothing to count.
+        return counters
     except OSError as exc:
-        raise CgroupRefusal(f"cgroup-refusal events-read: {path}") from exc
+        raise CgroupRefusal(
+            f"cgroup-refusal events-read: {path} ({exc.strerror or exc})"
+        ) from exc
     for line in text.splitlines():
         name, _, raw = line.partition(" ")
         if name not in counters:
@@ -317,9 +331,10 @@ def read_sandbox_events(directory: Path) -> dict[str, int]:
     belong in a section whose every other number only ever moves forward.
 
     Raises :class:`CgroupRefusal` for a file that exists but cannot be read or
-    parsed (see :func:`_event_counters`); the callers' two disciplines -- strict
-    in :meth:`SandboxCgroups.release`, best effort in
-    :meth:`SandboxCgroups.sample_events` -- are documented there.
+    parsed (see :func:`_event_counters`); what each caller does with that refusal
+    differs and is documented there -- :meth:`SandboxCgroups.release` logs it and
+    tears the box down anyway, :meth:`SandboxCgroups.sample_events` skips the
+    box, and :meth:`SandboxCgroups._refuse_a_leftover_account` refuses the reuse.
     """
     memory = _event_counters(directory / "memory.events", MEMORY_EVENT_COUNTERS)
     pids = _event_counters(directory / "pids.events", (PIDS_EVENT_COUNTER,))
@@ -422,20 +437,35 @@ def _remove_cgroup_dir(target: Path) -> None:
 
     On a real cgroupfs the first ``rmdir`` removes the directory *and* its
     kernfs files; a plain filesystem refuses while they are present, so we drop
-    exactly those names and try again. Raises ``OSError`` when something else
-    still blocks the removal.
+    exactly those names and try again.
+
+    Raises a named :class:`CgroupRefusal` when the directory is still there, and
+    it **names the step that actually blocked it**: a kernfs file that could not
+    be unlinked (a permission problem -- measured on a real cgroupfs: ``unlink``
+    of ``memory.events`` is ``EPERM``) is reported as such instead of as a bare
+    "could not rmdir", which would name a step that ran and failed while hiding
+    its cause (review Minor #3).
     """
     try:
         target.rmdir()
         return
     except OSError:
         pass
+    blocked: list[str] = []
     for name in _KERNFS_FILES:
         try:
             (target / name).unlink()
-        except OSError:
-            pass
-    target.rmdir()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            blocked.append(f"{name} ({exc.strerror or exc})")
+    try:
+        target.rmdir()
+    except OSError as exc:
+        detail = f"; could not unlink {', '.join(blocked)}" if blocked else ""
+        raise CgroupRefusal(
+            f"cgroup-refusal release-rmdir: could not rmdir {target}{detail}"
+        ) from exc
 
 
 class SandboxCgroups:
@@ -467,6 +497,8 @@ class SandboxCgroups:
         #: N83 phase 2 (Task 5): the counters of boxes that have already been
         #: torn down, kept from ``release`` (they only exist while the
         #: directory does) so the next ``sample_events`` can still report them.
+        #: A successful ``attach`` for the same id drops its entry -- a new
+        #: occupant's account starts at zero (Task 5 review, fix 2).
         self._retired_events: dict[str, dict[str, int]] = {}
 
     # -- startup -------------------------------------------------------
@@ -706,6 +738,7 @@ class SandboxCgroups:
                     raise CgroupRefusal(
                         f"cgroup-refusal sbx-in-use: {target} already holds pids {held!r}"
                     )
+                self._refuse_a_leftover_account(target, sandbox_id)
             else:
                 try:
                     target.mkdir()
@@ -747,7 +780,43 @@ class SandboxCgroups:
         except OSError as exc:
             self._discard(target, created)
             raise CgroupRefusal(f"cgroup-refusal attach-io: {target}") from exc
+        # Task 5 review, fix 2 (sampler half): a new occupant starts a clean
+        # account, so whatever the sweep remembered for this id -- the previous
+        # generation's last-chance reading -- must not be merged into its
+        # report and read as a wall the new sandbox hit.
+        self._retired_events.pop(sandbox_id, None)
         return str(target)
+
+    def _refuse_a_leftover_account(self, target: Path, sandbox_id: str) -> None:
+        """Task 5 review, fix 2: a leftover box must never hand over its account.
+
+        The directory is there and holds no pids, so it looks reusable -- but
+        ``memory.events``/``pids.events`` are **cumulative per cgroup** and
+        nothing resets them: writing ``memory.max``/``pids.max`` again does not,
+        and a real cgroupfs refuses to let them be cleared at all (measured
+        2026-10-07 on the local cgroup v2 lane: ``unlink(memory.events)`` is
+        ``EPERM`` and writing it back to zero is ``EINVAL``). Reusing such a
+        directory would report the *previous* occupant's kill as the new
+        sandbox's -- a stored record and a named WARN for a sandbox that never
+        hit a wall -- so the reuse is refused by name instead.
+
+        A directory whose account reads all zeros is reused as before: the
+        previous occupant hit nothing there, so there is nothing to inherit. An
+        account that *cannot* be read is refused by the read's own name
+        (``events-read``): "cannot prove it is clean" is not "clean".
+        """
+        counters = read_sandbox_events(target)
+        nonzero = ", ".join(
+            f"{name}={count}" for name, count in sorted(counters.items()) if count
+        )
+        if nonzero:
+            raise CgroupRefusal(
+                f"cgroup-refusal sbx-stale-account: sandbox {sandbox_id}'s cgroup "
+                f"directory {target} still carries a previous generation's kernel "
+                f"event counters ({nonzero}), and a kernfs counter cannot be "
+                "cleared in place -- refusing to place a new sandbox in it rather "
+                "than report the previous occupant's wall as its own"
+            )
 
     def _checked_declared_sizes(
         self,
@@ -842,13 +911,21 @@ class SandboxCgroups:
         (:meth:`sample_events`) -- which is what turns "the process just
         vanished" into a named event on the control plane.
 
-        This read is **strict**, unlike the sampler's: a file that is there but
-        cannot be read or parsed raises the named refusal and the box is left
-        alone, because destroying the account you failed to read is the one
-        thing that would make the numbers unrecoverable. An *absent* file is
-        not an error (a lane whose kernel keeps no such account has nothing to
-        count), and a box that hit nothing keeps no entry -- "the count grew" is
-        the event, and this method is called for every sandbox that ever lived.
+        **A reading that cannot be taken costs the reading, not the teardown**
+        (Task 5 review, fix 1). Nothing in this worker reclaims a leftover
+        ``sbx_*`` directory, so keeping a box alive "until the account can be
+        read" is a permanent leak: the caller (route-B's retire) logs one
+        warning and returns the uid, and there is no retry. A failed read is
+        therefore logged as one named WARNING -- sandbox id, path, and the
+        refusal that carries the underlying error -- and ``cgroup.kill`` +
+        ``rmdir`` proceed. What is lost is exactly this reading: the counters a
+        sweep had already cached still reach the control plane, and one that was
+        never swept does not.
+
+        An *absent* file is not a failure (a lane whose kernel keeps no such
+        account has nothing to count), and a box that hit nothing keeps no entry
+        -- "the count grew" is the event, and this method is called for every
+        sandbox that ever lived.
         """
         self._validate_sandbox_id(sandbox_id)
         parent = self._require_parent()
@@ -857,7 +934,19 @@ class SandboxCgroups:
         try:
             if not target.exists():
                 return False
-            events = read_sandbox_events(target)
+            try:
+                events = read_sandbox_events(target)
+            except CgroupRefusal as exc:
+                logger.warning(
+                    "cgroup events: sandbox %s: the last-chance reading of %s "
+                    "failed: %s; tearing the box down anyway -- this reading is "
+                    "lost, because the kernel removes the counters with the "
+                    "directory (the values the sweep already cached still reach "
+                    "the control plane)",
+                    sandbox_id,
+                    target,
+                    exc,
+                )
             kill = target / "cgroup.kill"
             if kill.exists():
                 # Write-only (mode 0200) on a real cgroupfs: no readback is possible.
@@ -882,16 +971,19 @@ class SandboxCgroups:
 
         This is the heartbeat's copy (N83 phase 2, Task 5), and it is **best
         effort by construction**: it never raises, because a heartbeat must not
-        be lost over a cgroup file (the strict read of the same numbers is
-        :meth:`release`'s, where they are the last chance to see them). A box
-        whose account cannot be read is **skipped**, never reported as zeros:
-        "I could not read it" is not "nothing happened".
+        be lost over a cgroup file (the last-chance read of the same numbers is
+        :meth:`release`'s). A box whose account cannot be read is **skipped**,
+        never reported as zeros: "I could not read it" is not "nothing
+        happened".
 
         Boxes that have hit no wall are omitted too -- they carry no event, and
         this rides a channel that speaks every few seconds. The retired
         readings ``release`` kept are merged in and never lowered, so a box that
-        was killed *and* torn down between two samples still reaches the
-        control plane at least once.
+        was killed *and* torn down between two samples still reaches the control
+        plane at least once; an ``attach`` for that id drops its entry (Task 5
+        review, fix 2), so a retired reading is never reported as a later
+        occupant's own -- the merge keeps the *maximum* as belt and braces, not
+        as the guarantee.
         """
         merged: dict[str, dict[str, int]] = {
             sandbox_id: dict(counters)
@@ -994,7 +1086,7 @@ class SandboxCgroups:
             pass
         try:
             _remove_cgroup_dir(worker)
-        except OSError:
+        except (CgroupRefusal, OSError):
             logger.warning("cgroup-refusal cleanup: could not rmdir %s", worker)
 
     def _discard(self, target: Path, created: bool) -> None:
@@ -1009,5 +1101,5 @@ class SandboxCgroups:
             pass
         try:
             _remove_cgroup_dir(target)
-        except OSError:
+        except (CgroupRefusal, OSError):
             logger.warning("cgroup-refusal cleanup: could not rmdir %s", target)

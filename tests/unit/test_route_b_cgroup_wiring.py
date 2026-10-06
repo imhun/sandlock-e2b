@@ -616,7 +616,13 @@ def test_retire_releases_the_sandbox_cgroup_exactly_once(tmp_path) -> None:
 def test_a_refused_release_is_a_named_warning_and_teardown_still_ends(
     tmp_path, caplog
 ) -> None:
-    """Teardown never fails because the cgroup is already gone (or wedged)."""
+    """Teardown never fails because the cgroup is already gone (or wedged).
+
+    ... and the warning says what actually happens to the leftover (Task 5
+    review, fix 3): nothing in this worker sweeps ``sbx_*`` directories, so the
+    old "the node's GC to reclaim" was a promise with no implementation behind
+    it.
+    """
     order: list = []
     fake = FakeCgroups(
         order, release_error=CgroupRefusal("cgroup-refusal release-rmdir: busy")
@@ -639,8 +645,9 @@ def test_a_refused_release_is_a_named_warning_and_teardown_still_ends(
         if record.name == rb.__name__
     ] == [
         "route-B slot rb-sbx_cgroup: the cgroup for sandbox sbx_cgroup was "
-        "not released (cgroup-refusal release-rmdir: busy); the subtree stays "
-        "for the next create to refuse or the node's GC to reclaim"
+        "not released (cgroup-refusal release-rmdir: busy); the subtree is left "
+        "behind -- nothing in this worker reclaims a sbx_* directory, so a "
+        "later create under the same id is the only thing that would touch it"
     ]
     # ...and the uid is immediately leasable again: teardown completed.
     assert pool.acquire_sync("sbx_next", {"ceiling": {}}, uid=20001).uid == 20001

@@ -966,11 +966,17 @@ class W1SlotPool:
         """Best-effort teardown of ``handle``'s cgroup; never fails the retire.
 
         ``release`` is idempotent and treats an absent cgroup as success
-        (``False``), which is the "the GC or a previous retire already removed
-        it" case. A real refusal (a directory that is there but cannot be
-        removed) is a named ``cgroup-refusal`` -- it is logged here and does not
-        stop the slot teardown, because the uid and the process have to come
-        back regardless.
+        (``False``), which is the "a previous retire already removed it" case. A
+        real refusal (a directory that is there but cannot be removed) is a named
+        ``cgroup-refusal`` -- it is logged here and does not stop the slot
+        teardown, because the uid and the process have to come back regardless.
+
+        **The leftover is not reclaimed for you** (Task 5 review, fix 3): nothing
+        in this worker sweeps ``sbx_*`` directories, so a box this call could not
+        remove simply stays on the node. A later ``attach`` under the same id is
+        the only thing that touches it, and it now refuses that id by name when
+        the box still carries a kernel event account rather than run a sandbox in
+        a directory with a history.
         """
         cgroups = self._sandbox_cgroups
         if cgroups is None:
@@ -980,8 +986,9 @@ class W1SlotPool:
         except Exception as exc:  # noqa: BLE001 - teardown must not fail here
             logger.warning(
                 "route-B slot %s: the cgroup for sandbox %s was not released "
-                "(%s); the subtree stays for the next create to refuse or the "
-                "node's GC to reclaim",
+                "(%s); the subtree is left behind -- nothing in this worker "
+                "reclaims a sbx_* directory, so a later create under the same "
+                "id is the only thing that would touch it",
                 handle.name,
                 handle.sandbox_id,
                 exc,
