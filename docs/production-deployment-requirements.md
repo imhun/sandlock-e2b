@@ -890,7 +890,7 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
 ### 2.4.9 为什么 MCP 箱里"只剩 110 MiB"：记账按预留，不按实际触碰
 
 > **车道说明（N83 Phase 2 起）**：这一节量的是 `E2B_SANDBOX_CGROUP=off` 车道的账本语义
-> （`max_memory` 由 supervisor 在 seccomp 通知里按**预留**记账，箱内 `MemFree = 上限 − 已记账`）。
+> （`max_memory` 由 supervisor 在 seccomp 通知里按**预留**记账，箱内 `MemFree = 上限 − 已记账`；超预算时它同样**杀掉分配者并答 `ENOMEM`** —— 这条车道的差别是"账只覆盖载荷"，不是"不杀"）。
 > 出厂清单跑的是 `required`：内存改由沙箱自己 cgroup 的 `memory.high`/`memory.max` 强制 —— 先
 > 回收/节流，撑不住就把**分配者 SIGKILL**（D2/P2），`memory.oom.group` 保持 `0` ⇒ 同箱旁观者存活
 > （D3）；**中介账本随之退役**，于是箱内 `MemFree` 不再跟已用量走（恒等于全额），`MemTotal` 与

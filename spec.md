@@ -432,7 +432,7 @@ e2b-sandlock-gateway/
 | `fs_readable` | `/usr`、`/lib`、`/bin` |
 | `fs_writable` | 仅沙箱工作目录 |
 | `fs_denied` | `/proc/kcore`、`/sys` |
-| `max_memory` | `max_memory="1024M"`（updated 2026-09-06: per-sandbox default 1024, FUP3）。**强制者是每沙箱 cgroup 的 `memory.high`/`memory.max`**（同一根线，D2）：内核先回收/节流，撑不住就把**分配者 SIGKILL**（不是回 `ENOMEM`），`memory.oom.group` 保持 `0` ⇒ 同箱旁观者存活（D3）。`E2B_SANDBOX_CGROUP=off` 时才退回 fork 的 seccomp user notification 记账（mmap 族），也才回到"超限回 `ENOMEM`、不含 supervisor"的旧语义。真 cgroup v2 实测（`.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-3-report.md`）：两个限额逐字回读、超 `memory.max` 的分配 `SIGKILL(9)`、`memory.events.oom_kill=1`、邻居箱存活 |
+| `max_memory` | `max_memory="1024M"`（updated 2026-09-06: per-sandbox default 1024, FUP3）。**两条车道都杀分配者，区别在"谁在强制"与"这本账覆盖什么"**：`E2B_SANDBOX_CGROUP=required`（出厂）由每沙箱 cgroup 的 `memory.high`/`memory.max` 强制（同一根线，D2；先回收/节流，撑不住再 SIGKILL），账是**整个箱**（supervise 树与载荷同一个 cgroup）；`E2B_SANDBOX_CGROUP=off` 由 fork 的中介在 seccomp 通知里记账（mmap/brk/mremap 族），超预算同样先 `kill(pid, SIGKILL)` 再 `respond_errno(ENOMEM)`（`third_party/sandlock/crates/sandlock-core/src/resource.rs:853` 的 `NotifAction::KillTask` → `.../seccomp/notif.rs:1755-1757`），但账**只覆盖载荷**、不含 supervisor。两条车道的 `memory.oom.group` 都保持 `0` ⇒ 同箱旁观者存活（D3）。真 cgroup v2 实测（`.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-3-report.md`）：两个限额逐字回读、超 `memory.max` 的分配 `SIGKILL(9)`、`memory.events.oom_kill=1`、邻居箱存活 |
 | `max_cpu` | `max_cpu=100`。**强制者是每沙箱 cgroup 的 `cpu.max`（内核 CFS，100 ms 周期）**，额度**含 supervisor**（它与载荷同一个 cgroup）；`E2B_SANDBOX_CGROUP=off` 时退回老的 SIGSTOP/SIGCONT 占空比节流器，而它只在 `max_cpu < 100` 时才 arm ⇒ 默认 100 时**没有强制者**（N82 实测：4 个自旋能吃到 3.83 核）。详见 §6.6 的「谁在强制」与 `docs/deploy-clusters.md` §7.49 |
 | `max_processes` | `max_processes=256`，整箱预算（M4 D6 whole-box semantics, 2026-09-06）。**强制者是每沙箱 cgroup 的 `pids.max`**（= `max_processes`，D4），数的是**任务数（含线程）**，超了 `fork`/`clone` 拿 `EAGAIN`（与今天同一种错误）；**平台自己的进程也占这个预算**（supervise 树与载荷同一个 cgroup）。`E2B_SANDBOX_CGROUP=off` 时退回 fork 的 clone 族计数（语义不变）。真 cgroup v2 实测（`.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-3-report.md` / `task-5-report.md`）：8 条任务预算 ⇒ 第 8 条 `EAGAIN(11)`、`pids.current=3`（2 线程 + 1 进程）、`pids.events.max=1` |
 | `max_open_files` | `max_open_files`，RLIMIT_NOFILE |
@@ -591,17 +591,19 @@ Control Plane 必须同时限制沙箱数量和宿主总资源，避免 `E2B_MAX
 | 资源 | 强制者 | 备注 |
 |------|--------|------|
 | CPU | **每沙箱 cgroup `cpu.max`**（内核 CFS，100 ms 周期） | 额度含 supervisor（同一 cgroup）；`E2B_SANDBOX_CGROUP=off` 时没有强制者（老的占空比节流器只在 `max_cpu < 100` 时 arm） |
-| 内存 | **每沙箱 cgroup `memory.high`/`memory.max`**（内核，D2：两根线同值） | 先回收/节流，撑不住就把**分配者 SIGKILL**；`memory.oom.group=0` ⇒ 同箱旁观者存活（D3）。supervise 树与载荷同一个 cgroup ⇒ 它的内存也计入（与 CPU 一致）。副作用：`required` 车道上箱内 `MemFree` 不再跟中介账本（账本已退役）|
+| 内存 | **每沙箱 cgroup `memory.high`/`memory.max`**（内核，D2：两根线同值） | 先回收/节流，撑不住就把**分配者 SIGKILL**；`memory.oom.group=0` ⇒ 同箱旁观者存活（D3）。supervise 树与载荷同一个 cgroup ⇒ 它的内存也计入（与 CPU 一致）。`off` 车道退回 fork 的中介记账：**同样杀分配者 + 答 `ENOMEM`**（`resource.rs:853`/`notif.rs:1755-1757`），只是账只覆盖载荷。副作用：`required` 车道上箱内 `MemFree` 不再跟中介账本（账本已退役）|
 | 并发进程 | **每沙箱 cgroup `pids.max`**（内核，= `max_processes`，D4） | 数的是**任务数（含线程）**，超了 `EAGAIN`（与今天同一种错误）；**平台自己的进程也占这个预算**。`E2B_SANDBOX_CGROUP=off` 时退回 fork 的 clone 族计数（语义不变） |
 | 磁盘 | XFS project quota（经 quota-agent）+ 活账本 | worker 只发 HTTP；见 `docs/sandbox-disk-quota.md` |
 | 节点聚合 | 控制面的**预留**配额（准入时预留、kill/TTL 时归还） | 预留制，不是等实际用量超限；见下面的准入算法 |
 
 **单箱上限（策略，不是内核读数）**：`E2B_MAX_SANDBOX_CPU_PERCENT` / `E2B_MAX_SANDBOX_MEMORY_MB` /
 `E2B_MAX_SANDBOX_PROCESSES` 是一箱最多能配到多少；**未设或 `<=0` ⇒ 跟随本节点总量**（worker 读
-`E2B_NODE_*`，控制面读 `E2B_MAX_TOTAL_*`），**绝不默认成"无上限"**（两侧共读
-`gateway_common/sandbox_ceiling.py` 里那一条规则）。worker 启动时拿它与自己容器 cgroup 的内核限额
+`E2B_NODE_*`，控制面读 `E2B_MAX_TOTAL_*`），**节点总量也没声明（`0`）时再退到创建时的每箱默认**
+（`E2B_DEFAULT_*`；三档全 `0` 是控制面按名拒绝的配置，不会静默变成 0），**绝不默认成"无上限"**
+（两侧共读 `gateway_common/sandbox_ceiling.py` 里那一条规则）。worker 启动时拿它与自己容器 cgroup 的内核限额
 交叉校验：**策略 > 内核 ⇒ 具名拒绝启动**（不夹取、不 WARN），**内核 = `max` ⇒ 启动成功 + 一行 WARN**
-（compose 三条车道实测就是 `max`）。请求超过**落点节点**的上限 ⇒ 具名 `400`；节点还没上报上限 ⇒
+（只比 `cpu.max`/`memory.max` 两维；`pids.max` 的 `max` 是 k8s 实测形状、故意不比 ——
+`envd_service/runtime/sandbox_cgroup.py::check_policy_ceiling`；compose 三条车道实测就是这两维都 `max`）。请求超过**落点节点**的上限 ⇒ 具名 `400`；节点还没上报上限 ⇒
 具名 `503`。四条真 cgroup v2 形状（基线 2 核/2 GiB + 策略 200/2048/256 ⇒ 通过；策略 400 ⇒
 `cgroup-refusal ceiling-exceeds-kernel`；compose 无 limits ⇒ 通过 + WARN；k0s 覆盖层 4 核/4 GiB +
 策略 400/4096/1024 ⇒ 通过）与五份清单的取值见 `.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/`
