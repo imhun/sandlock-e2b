@@ -2767,6 +2767,63 @@ worker + control-plane（本意是避开并发会话还没上线的 seccomp prof
 实测以沙箱自己的宿主 uid 在跑。**"镜像与 seccomp 档同批"仍然是该守的纪律**（旧镜像 + 新档会把
 route B 的 unshare 直接拒掉），但它不是这次故障的原因。
 
+### 7.47 发版：N80 收口 —— slot 握手改 clone3、`unshare` 退出 seccomp 档（2026-10-06，版本 `0.1.0-1057-gb98f5aa-20261006-123055`）
+
+§7.46.2 那条根因修复的上线记录。这一版把 N80 从"落地一半 + 回滚"推到**全部落地并现场验收**：
+route B 的 slot 子进程由 worker 的 `clone3(CLONE_NEWUSER)` 直接生进新 userns（它自己不再
+`unshare`），worker 的 seccomp 档里**最后一条 `unshare` 规则随之删掉**。
+
+**镜像**（`HEAD=b98f5aa`，四镜像同 tag，ACR OCI index 双平台）：
+
+| 镜像 | manifest list digest |
+|---|---|
+| `e2b-sandlock-worker` | `sha256:3dda11d8f56ab843c4065ebf0e9be4c53c187966535400e4405a3b76b4c3a0a4` |
+| `e2b-sandlock-agent` | `sha256:2620974eeb4c47ec73d38fcc26715ea9a460243d143fbcc96f90aeb0ef56caca` |
+| `e2b-sandlock-quota-agent` | `sha256:c043138f74fd2d177dad33d2539e3832a2c99fefe6240ecb0ea7033a7e0db8bb` |
+| `e2b-sandlock-control-plane-gateway` | `sha256:86f36832c90f204ee9d739baaec17bcc3be7d3bb536cf0bef7300245d35cae23` |
+| `python-mcp:3.14`（基础镜像镜像） | `sha256:11d6c23af304d95168a1fc31d473b673ca2cf41a5d51881372a9a15ff8782365` |
+
+**镜像内容核验**（从镜像里读，不看 tag）：worker 的 `slot_identity.py` —— `identity_wait_timeout_s`、
+`_keep_inheritable` 各在、旧的遮蔽调用 `limit = timeout_s()` **0 处**、`clone3` 17 处；
+`sandlock-supervise` 在、`import sandlock` 成功；agent 的 `/var/lib/e2b-priv/as_uid` =
+`cap_setgid,cap_setuid=ep`、`e2b-maint` = `cap_chown,cap_dac_override=ep`。
+
+**apply 前的 `kubectl diff`**（6 个对象，无意外项）：四个 workload 的镜像 tag +
+`ConfigMap/sandlock-worker-seccomp`（`checksum/profile` **`7447ec09` → `d39657fd`**，即去掉那条
+`unshare` 掩码规则）+ 已知的 `NetworkPolicy/sandlock-default-deny` generation 噪声。
+
+**上线动作**：`deploy/k8s-k0s/apply.sh`（**镜像与档同一批**，这正是 §7.46.1 的纪律）；
+它自带顺序 agent DaemonSet → worker StatefulSet；seccomp-installer DaemonSet 随后自行滚完
+（脚本不等它，我另行等到收敛）。两节点 installer 均报
+`installed /var/lib/k0s/kubelet/seccomp/sandlock-worker.json (15158 bytes)`（旧档 15595 字节），
+worker 启动自检 `seccomp self-check: filter mode active, user namespaces allowed`。
+`deploy/stack/.version` 由 `build-and-push.sh` 写成新 tag。
+
+**四条收尾读数**
+
+| # | 读数 | 结果 |
+|---|---|---|
+| 1 | 三处镜像 tag ≡ `deploy/stack/.version` | ✅ `worker` / `agent` / `control-plane-gateway` 全是 `0.1.0-1057-gb98f5aa-20261006-123055` |
+| 2 | `kubectl -n sandlock get pods` | ✅ **9/9 Running**（control-plane ×2 2/2、`e2b-c3-agent` ×2 2/2、`e2b-worker-0/1` 1/1、redis 1/1、seccomp-installer ×2 1/1），**0 重启** |
+| 3 | `GET /sandboxes` | ✅ **`[]`** |
+| 4 | `DRY_RUN=1 apply.sh \| kubectl diff -f - \| wc -l` | ✅ **12 行**，全部是 `sandlock-default-deny` 的 generation（与 §7.45 同一处噪声） |
+
+**两条冒烟**（本地 `port-forward`/`172.18.78.49:3000`，`env -u http_proxy…`，凭据只从 Secret 取）：
+
+- `multinode_smoke.py` → **`MULTI-NODE SMOKE OK`**：4 个沙箱按 **2+2** 落在两个 worker
+  （`10.244.140.54` / `10.244.192.241`），commands / files / health / stdin 全过，
+  kill 后 `e2b-worker-0: 0`、`e2b-worker-1: 0`（**无负账本**）。
+- `deployment_smoke.py` → **`DEPLOYMENT SMOKE OK`**：命令+文件、**跨节点迁移保文件**
+  （worker-0 → worker-1）、网络配置回显与原子更新、远端卷 + 兄弟卷隔离、
+  **模板构建 → registry push → worker pull → image rootfs**、MCP gateway 全过，kill 后预约 0/0。
+
+**这一次是 arm64 上的端到端**（此前该修复的本地验证只能在本机 x86_64 上做）—— 两节点全 arm64，
+上面两条冒烟就在这套硬件上过的。
+
+**操作记录**：`build-and-push.sh` 第一次在 push 阶段失败（ACR 返回
+`unknown: blob upload unknown to registry`，构建本身两平台都已成功），**原样重跑一次即成功**；
+下次遇到这个报错直接重试，不要当成配置问题。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
