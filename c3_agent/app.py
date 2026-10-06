@@ -51,6 +51,18 @@ Surface (all responses JSON objects):
   control plane against the worker pod's ``securityContext``, and it is used
   exactly as sent.
 
+- ``POST /internal/nodes/{node_id}/agent/delegate-cgroup`` (face B, N83 Phase 1
+  Task 3) ``{"worker": {"node_id", "pod_uid"?, "container_id"?}}`` -> ``{"op",
+  "containerCgroup", "delegated", "cpuMaxOwner"}``. Exactly one of the two lane
+  anchors is present (the same D21/D25 pair ``WorkerCredentials`` carries). The
+  agent **derives** the worker's container cgroup from that anchor
+  (:meth:`c3_agent.lookup.ProcLookup.worker_container_cgroup`), locates it in its
+  own rw cgroupfs view (:mod:`c3_agent.cgroups`) and chowns the whitelist --
+  directory, ``cgroup.procs``, ``cgroup.subtree_control`` -- to the worker uid
+  the kernel reports for that container's init. ``cpu.max`` is deliberately
+  *not* delegated: that is what keeps the worker from raising its own cap
+  (§1.4 N1), and ``cpuMaxOwner`` reports the owner it still has.
+
 Auth: every request must carry ``X-Internal-Key`` equal to
 ``E2B_C3_AGENT_TOKEN`` (constant-time); the service refuses to answer when the
 token is unconfigured.
@@ -78,6 +90,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 import secrets
 import subprocess
 import time
@@ -86,9 +99,15 @@ from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from c3_agent.config import Settings
+from c3_agent.cgroups import (
+    CgroupRefusal,
+    ProcCgroupDelegator,
+    WorkerCgroupDelegator,
+    container_cgroup_name,
+)
 from c3_agent.errors import AgentRefusal
 from c3_agent.fileops import (
     FILE_OP_VERBS,
@@ -130,6 +149,12 @@ AS_UID_OK_PREFIX = "C3-ASUID-OK"
 #: plane is the only party that may name a path (§14.4), and this agent
 #: re-checks every path it is handed against its own four roots.
 MATERIALIZE_OP = "materialize"
+
+#: N83 Phase 1 · Task 3's op: the **one** privileged thing shape W asks of face
+#: B. It hands the worker's container cgroup to the worker uid (65534) so the
+#: worker can build and place its own per-sandbox cgroups; ``cpu.max`` is
+#: deliberately not in the handover (see :mod:`c3_agent.cgroups`).
+CGROUP_DELEGATE_OP = "delegate-cgroup"
 
 #: Distinguishes "the caller said nothing, build the default scanner" from
 #: "the caller says this container does not scan" (``None``) -- the same
@@ -211,6 +236,48 @@ class FileOpBody(BaseModel):
     #: tree no record claims, as nobody, and a worker that crashed and never
     #: came back has no identity to name.
     worker: WorkerCredentials | None = None
+
+
+class DelegateCgroupWorker(BaseModel):
+    """The **anchor** of the worker whose container cgroup is to be delegated.
+
+    Exactly one of the two lanes' anchors is present, and the pair is the same
+    one :class:`WorkerCredentials` has carried since D21 option 2 / D25 -- just
+    without the claimed ``(uid, gid)``: this op does not act *as* the worker, it
+    hands a directory *to* the worker, and the uid it hands it to is read from
+    the kernel for the container init it located (never from this agent's own
+    ``getuid()``, which is root). A body that names both anchors or neither is a
+    shape refusal (422) -- the agent has no rule for "which of these two is the
+    worker" and will not invent one.
+    """
+
+    node_id: str = Field(min_length=1)
+    pod_uid: str | None = Field(default=None, min_length=1)
+    container_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _exactly_one_anchor(self) -> "DelegateCgroupWorker":
+        if (self.pod_uid is None) == (self.container_id is None):
+            raise ValueError(
+                "exactly one of pod_uid / container_id must be present "
+                "(k8s lane / compose lane)"
+            )
+        return self
+
+
+class DelegateCgroupBody(BaseModel):
+    """One delegation instruction: the anchor, and nothing else.
+
+    There is deliberately no ``path`` field. Under R-D the agent **derives** the
+    container cgroup from the anchor (``c3_agent.lookup``) and resolves it inside
+    its own mount view (``c3_agent.cgroups``): a path the caller could name would
+    be a path the caller chose, which is the one thing a chown-to-65534 must
+    never accept (C3 §14.4's "the control plane names paths" is about the
+    *sandbox trees*; this op's target is a kernel object the agent can find by
+    itself).
+    """
+
+    worker: DelegateCgroupWorker
 
 
 class TreePlan(BaseModel):
@@ -349,6 +416,7 @@ def create_app(
     maint_runner: MaintRunner | None = None,
     lookup: ProcLookup | None = None,
     identity_resolver: WorkerIdentityResolver | None = None,
+    cgroup_delegator: WorkerCgroupDelegator | None = None,
     inventory: Any = _UNSET,
 ) -> FastAPI:
     settings = settings or Settings()
@@ -372,6 +440,12 @@ def create_app(
     # ``CAP_SYS_PTRACE``). The k8s lane never reaches it -- its instructions
     # carry no anchor.
     identity_resolver = identity_resolver or ProcWorkerIdentityResolver(lookup)
+    # N83 Phase 1 · Task 3: the one privileged step shape W asks of face B. In
+    # production it is the shipped delegator (locate in the agent's rw cgroupfs
+    # view, chown the whitelist, report ``cpu.max``'s owner); the lanes inject
+    # one for the same reason they inject the ``as_uid`` runner -- the privileged
+    # ``os.chown`` is what the container lanes exercise, not the local ones.
+    cgroup_delegator = cgroup_delegator or ProcCgroupDelegator()
     # Task 6's eyes: built from the container's own knobs unless the caller
     # injected one (tests, an embedder) -- and ``None`` means "this container
     # does not scan", which only the face that mounts the workspaces should be
@@ -417,6 +491,7 @@ def create_app(
     app.state.maint_runner = maint_runner
     app.state.lookup = lookup
     app.state.identity_resolver = identity_resolver
+    app.state.cgroup_delegator = cgroup_delegator
     app.state.inventory = inventory
 
     @app.exception_handler(HTTPException)
@@ -468,6 +543,12 @@ def create_app(
             )
         if op == MATERIALIZE_OP:
             return await _materialize(_validated(MaterializeBody, body))
+        if op == CGROUP_DELEGATE_OP:
+            # 与 ``chown``/``rm``/``walk`` 同一类同步特权步（chown + 一次视图内
+            # 的目录定位），所以同样搬去线程池：事件循环只负责读 body。
+            return await asyncio.to_thread(
+                _delegate_cgroup, _validated(DelegateCgroupBody, body)
+            )
         if op in FILE_OP_VERBS:
             return await asyncio.to_thread(_file_op, op, _validated(FileOpBody, body))
         raise HTTPException(
@@ -573,6 +654,73 @@ def create_app(
                 exc,
             )
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+
+    def _delegate_cgroup(body: DelegateCgroupBody) -> dict[str, Any]:
+        """Hand the worker's container cgroup to the worker (N83 Phase 1, R-D).
+
+        The path is **derived**, never received: the anchor picks a container
+        init out of the host's ``/proc`` (``worker_container_cgroup``), that
+        process's kernel uid/gid is who the directory is handed to
+        (``worker_uid_gid``: the same D25 read, and never this process's own
+        ``getuid()`` -- face B is root, and handing the tree to root would be
+        exactly the wrong delegation), and the directory is located inside the
+        agent's own cgroupfs view by the name the kernel spelled.
+
+        Two ids have to be said out loud here. ``worker.node_id`` is the
+        **worker's** name (the same field the relayed file ops carry), not the
+        node in the URL (D12). And the compose lane's ``container_id`` is the
+        same anchor ``WorkerCredentials`` already carries, so a deployment that
+        overrode ``hostname:`` is refused by name rather than matched loosely.
+
+        Every failure -- the anchor names nothing, names several inits, the mount
+        is not there, the directory is not in the view -- is a 502 with the
+        refusal's own words, the same status a refused ``e2b-maint`` step gets:
+        "the delegation did not happen" must never read as one that did, because
+        the worker's next step (building a per-sandbox cgroup) depends on it.
+        """
+        worker = body.worker
+        if not validate_node_id(worker.node_id):
+            logger.warning(
+                "c3-agent refused delegate-cgroup: the worker identity is not "
+                "a node id"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "worker.node_id is not a valid node id"},
+            )
+        try:
+            kernel_cgroup = lookup.worker_container_cgroup(
+                node_id=worker.node_id,
+                pod_uid=worker.pod_uid,
+                container_id=worker.container_id,
+            )
+            # The worker's own uid/gid, read from the kernel for the container
+            # init just located (the container id the kernel spelled is the
+            # anchor that read wants). Never ``os.getuid()``: this face is root.
+            worker_uid, _worker_gid = lookup.worker_uid_gid(
+                WorkerAnchor(
+                    node_id=worker.node_id,
+                    container_id=container_cgroup_name(kernel_cgroup),
+                )
+            )
+            delegation = cgroup_delegator.delegate(
+                mount=Path(settings.cgroup_mount),
+                kernel_cgroup=kernel_cgroup,
+                worker_uid=worker_uid,
+            )
+        except (LookupRefusal, CgroupRefusal) as exc:
+            logger.warning(
+                "c3-agent refused delegate-cgroup for worker %s: %s",
+                worker.node_id,
+                exc,
+            )
+            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+        return {
+            "op": CGROUP_DELEGATE_OP,
+            "containerCgroup": str(delegation.container_cgroup),
+            "delegated": list(delegation.delegated),
+            "cpuMaxOwner": delegation.cpu_max_owner,
+        }
 
     def _grant_slot(body: GrantSlotBody) -> dict[str, Any]:
         # D12: the path's node id is *this host* while `worker.node_id` is the

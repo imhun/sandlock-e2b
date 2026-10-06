@@ -156,6 +156,15 @@ class Settings:
     tree_copy_window_bytes: int = field(
         default_factory=lambda: _env_int("E2B_TREE_COPY_WINDOW_BYTES", 64 * 1024 * 1024)
     )
+    #: N83 Phase 1 · Task 3: the **rw cgroupfs view** face B sees (Task 2's
+    #: manifests mount it; a deployment that does not says so by naming no
+    #: path). ``delegate-cgroup`` only ever resolves and chowns inside this
+    #: root -- the path itself is derived from the anchor, never taken from the
+    #: instruction -- and a mount that is not there is a named refusal, not a
+    #: silent skip (a worker that is not delegated must fail to start).
+    cgroup_mount: str = field(
+        default_factory=lambda: os.getenv("E2B_CGROUP_MOUNT", "/host-cgroup")
+    )
     uid_pool_start: int = field(
         default_factory=lambda: _env_int("E2B_UID_POOL_START", 10000)
     )
