@@ -412,3 +412,60 @@ def test_a_separated_control_plane_never_wires_an_agent(tmp_path, monkeypatch):
 
     assert calls == []
     assert app.state.quota_agent_client is None
+
+
+# ------------------------------------- its per-sandbox ceiling (N83 phase 2)
+
+
+def test_the_local_nodes_row_carries_the_control_planes_own_ceiling(tmp_path):
+    """N83 phase 2 (D5/D6): the in-process node has no heartbeat to carry a
+    per-sandbox ceiling, so its row carries the control plane's own resolution
+    (``E2B_MAX_SANDBOX_*`` -> ``E2B_MAX_TOTAL_*`` -> ``E2B_DEFAULT_*``) -- and
+    that row is what a create is checked against, not a second copy of the
+    number kept somewhere else."""
+    app = _create_control_app(tmp_path, enable_local_node=True)
+    local = app.state.nodes.get("local")
+    settings = app.state.settings
+
+    assert local.sandbox_cpu_percent_max == settings.max_sandbox_cpu_percent
+    assert local.sandbox_memory_mb_max == settings.max_sandbox_memory_mb
+    assert local.sandbox_processes_max == settings.max_sandbox_processes
+
+
+async def test_a_create_is_refused_by_the_local_nodes_own_ceiling(
+    tmp_path, monkeypatch
+):
+    """The refusal quotes the row above: a per-sandbox memory cap lowered to
+    512 MiB refuses a 1 GiB request by name, while the node's own *total*
+    (8192 MiB) would have admitted it -- so the number in the message is the
+    per-sandbox ceiling and nothing else."""
+    import httpx
+
+    from control_plane.app import create_app
+    from control_plane.config import Settings
+
+    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "512")
+    app = create_app(
+        settings=Settings(
+            api_keys=("local-key",),
+            create_queue_timeout_s=0,
+            workspace_base=tmp_path / "workspaces",
+        )
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            "/sandboxes",
+            headers={"X-API-Key": "local-key"},
+            json={"templateID": "base", "timeout": 300, "memoryMB": 1024},
+        )
+
+    assert app.state.nodes.get("local").sandbox_memory_mb_max == 512
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "code": 400,
+        "message": "memoryMB 1024 exceeds this node's per-sandbox maximum (512)",
+    }
+    assert app.state.nodes.get("local").reserved_memory_mb == 0

@@ -221,6 +221,15 @@ async def _register_node(app, *, node_id: str = WORKER, key: str = KEY_A) -> Non
                 "totalCPUPercent": 6400,
                 "totalDiskMB": 1048576,
                 "totalProcesses": 4096,
+                # N83 phase 2 (R12): a worker on this build reports its
+                # per-sandbox ceiling with every registration (here: the node's
+                # own totals, the D5 default); the create path refuses to size
+                # work on a node whose ceiling has never arrived.
+                "sandboxCeiling": {
+                    "cpuPercent": 6400,
+                    "memoryMB": 65536,
+                    "processes": 4096,
+                },
                 "pidNamespace": "pid:[4026532458]",
                 "containerID": "e4a98a0c5282",
                 "workerUID": WORKER_UID,

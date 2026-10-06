@@ -160,6 +160,19 @@ def _safe_priority(value: object) -> int:
     return max(PRIORITY_MIN, min(PRIORITY_MAX, priority))
 
 
+def cores_from_percent(percent: int) -> int:
+    """``E2B_DEFAULT_CPU_PERCENT`` in the record's own unit (cores), never < 1.
+
+    N83 phase 2 (D6/N84): a :class:`SandboxRecord` carries ``cpu_count`` and the
+    admission ledger carries percent, and the two are one multiplication apart
+    (``cores * 100``) because the record is the single source of both. The
+    conversion rounds a part-core default **up** -- under-booking the ledger is
+    the oversell direction -- and never returns 0, so a default of ``0`` still
+    describes the one core the record has always carried.
+    """
+    return max(1, -(-int(percent) // 100))
+
+
 @dataclass
 class SandboxRecord:
     template_id: str
@@ -1570,6 +1583,13 @@ class SandboxRegistry:
         tenant_id: str | None = None,
         is_admin: bool = False,
         priority: int = PRIORITY_DEFAULT,
+        #: N83 phase 2 (D6): the sandbox's own size. ``cpuCount`` is **cores**
+        #: (the record's unit) and ``memoryMB`` is MiB; each ``None`` keeps the
+        #: deployment's per-sandbox create default, so a caller that does not
+        #: speak about size (the snapshot-restore path, an embedder) behaves
+        #: exactly as it did before.
+        cpu_count: int | None = None,
+        memory_mb: int | None = None,
     ) -> SandboxRecord:
         s = self._settings
         if sandbox_id is not None and not validate_sandbox_id(sandbox_id):
@@ -1578,9 +1598,22 @@ class SandboxRegistry:
         if timeout < 1:
             raise ValueError("timeout must be a positive integer")
         priority = _safe_priority(priority)
+        if cpu_count is not None and int(cpu_count) < 1:
+            raise ValueError("cpu_count must be a positive integer")
+        if memory_mb is not None and int(memory_mb) < 1:
+            raise ValueError("memory_mb must be a positive integer")
 
-        memory_mb = s.default_memory_mb
-        cpu = s.default_cpu_percent
+        # N84: the record's ``cpu_count`` *is* the sandbox's cpu quota and the
+        # ledger's cpu dimension is derived from it, so "what was reserved" and
+        # "what the sandbox is given" cannot disagree. A caller that named no
+        # size gets the deployment default, read in the same unit.
+        cpu_count = (
+            cores_from_percent(s.default_cpu_percent)
+            if cpu_count is None
+            else int(cpu_count)
+        )
+        cpu = cpu_count * 100
+        memory_mb = s.default_memory_mb if memory_mb is None else int(memory_mb)
         disk_mb = s.default_disk_mb
         processes = s.default_max_processes
 
@@ -1646,6 +1679,7 @@ class SandboxRegistry:
                 envd_access_token=access_token() if secure else "",
                 started_at=now,
                 end_at=now + timedelta(seconds=max(1, timeout)),
+                cpu_count=cpu_count,
                 memory_mb=memory_mb,
                 disk_size_mb=disk_mb,
                 metadata=dict(metadata or {}),
@@ -1673,6 +1707,7 @@ class SandboxRegistry:
                 envd_access_token=access_token() if secure else "",
                 started_at=now,
                 end_at=now + timedelta(seconds=max(1, timeout)),
+                cpu_count=cpu_count,
                 memory_mb=memory_mb,
                 disk_size_mb=disk_mb,
                 metadata=dict(metadata or {}),

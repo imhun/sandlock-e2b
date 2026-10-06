@@ -168,6 +168,15 @@ async def _register(app) -> None:
                 "totalCPUPercent": 6400,
                 "totalDiskMB": 1048576,
                 "totalProcesses": 4096,
+                # N83 phase 2 (R12): the per-sandbox ceiling a worker on this
+                # build reports at registration (the node's own totals, the D5
+                # default). Without it the create path refuses by name rather
+                # than sizing work on an unknown ceiling.
+                "sandboxCeiling": {
+                    "cpuPercent": 6400,
+                    "memoryMB": 65536,
+                    "processes": 4096,
+                },
                 "pidNamespace": "pid:[4026532458]",
                 "containerID": "e4a98a0c5282",
                 "workerUID": WORKER_UID,

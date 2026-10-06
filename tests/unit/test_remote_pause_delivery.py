@@ -118,6 +118,14 @@ def make_remote_harness(make_apps):
                 total_cpu_percent=400,
                 total_disk_mb=8192,
                 total_processes=512,
+                # N83 phase 2 (R12): this worker is on the current build, so it
+                # reports the per-sandbox ceiling its creates will be checked
+                # against (the node's own totals, the D5 default).
+                sandbox_ceiling={
+                    "cpuPercent": 400,
+                    "memoryMB": 4096,
+                    "processes": 512,
+                },
             )
             control.state.nodes.remove("local")
         except BaseException:
@@ -164,6 +172,12 @@ def live_remote_harness(make_apps):
                 total_cpu_percent=400,
                 total_disk_mb=8192,
                 total_processes=512,
+                # N83 phase 2 (R12): see the harness above.
+                sandbox_ceiling={
+                    "cpuPercent": 400,
+                    "memoryMB": 4096,
+                    "processes": 512,
+                },
             )
             control.state.nodes.remove("local")
         except BaseException:

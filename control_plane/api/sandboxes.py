@@ -44,6 +44,7 @@ from control_plane.registry.manager import (
     SandboxStateConflictError,
     SandboxRegistry,
     UnknownSandboxError,
+    cores_from_percent,
     workspace_disk_refusal,
 )
 from gateway_common import paths as gateway_paths
@@ -109,13 +110,199 @@ class _CapacityExhausted(Exception):
     """
 
 
-def _default_dims(settings) -> tuple[int, int, int, int]:
-    return (
-        settings.default_memory_mb,
-        settings.default_cpu_percent,
-        settings.default_disk_mb,
-        settings.default_max_processes,
+#: N83 phase 2 (D6): the dimensions a create can be too big in. ``field`` is the
+#: name the refusal uses (the request's own spelling where a client can name
+#: it), ``attribute`` is the node record's per-sandbox ceiling for it, and
+#: ``unit`` converts the create's value into the unit that ceiling is kept in:
+#: ``cpuCount`` is **cores** while both the ledger and the node record count cpu
+#: in percent, which is exactly the N84 mismatch this task closes.
+_SIZE_CEILING_FIELDS = (
+    ("cpuCount", "sandbox_cpu_percent_max", 100),
+    ("memoryMB", "sandbox_memory_mb_max", 1),
+    ("maxProcesses", "sandbox_processes_max", 1),
+)
+
+
+class _SizeCeiling(NamedTuple):
+    """One dimension of one create's size against one node's promise.
+
+    ``field``/``value`` are what a caller (and the refusal) call the number,
+    ``requested`` is the same number in the unit the ceiling is kept in and
+    ``ceiling`` is the node's promise in that unit. Kept together so the three
+    checks cannot drift from their messages.
+    """
+
+    field: str
+    value: int
+    requested: int
+    ceiling: int
+
+
+def _positive_int_field(body: dict[str, Any], name: str, *, default: int) -> int:
+    """A request's own numeric size field, or a named 400.
+
+    Absent keeps the deployment's per-sandbox default; present-but-not-a-
+    positive-integer (``0``, a negative number, a float, a string, a bool,
+    ``null``) is the caller's own mistake and is refused **by name** -- never
+    clamped and never a ``503``. It is the rule the ``timeout``/``priority``
+    checks on this endpoint already use.
+    """
+    if name not in body:
+        return default
+    value = body[name]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise OfficialError(400, f"{name} must be a positive integer")
+    return value
+
+
+def _sandbox_size(settings, body: dict[str, Any]) -> tuple[int, int]:
+    """``(cpu_count, memory_mb)`` -- the size this create names for itself (D6).
+
+    ``cpuCount`` is **cores** (the record's own unit) and ``memoryMB`` is MiB;
+    each absent field keeps the deployment's per-sandbox default. The caller
+    derives the admission ledger's cpu dimension (percent) from ``cpu_count``,
+    which is what makes the record the single source of both and closes N84 --
+    a record that always said one core beside a reserved dimension that came
+    from somewhere else cannot come back through this door.
+    """
+    cpu_count = _positive_int_field(
+        body, "cpuCount", default=cores_from_percent(settings.default_cpu_percent)
     )
+    memory_mb = _positive_int_field(
+        body, "memoryMB", default=settings.default_memory_mb
+    )
+    return cpu_count, memory_mb
+
+
+def _ceiling_text(field: str, ceiling: int) -> str:
+    """A node-record ceiling in the unit the create (and the refusal) speaks.
+
+    Cores for ``cpuCount`` -- the record keeps percent -- and the raw number
+    for the other two. A ceiling that is not a whole number of cores stays
+    exact rather than being rounded into a promise nobody made.
+    """
+    if field == "cpuCount":
+        return f"{ceiling / 100:g}"
+    return str(ceiling)
+
+
+def _reported_ceiling(node, attribute: str) -> int:
+    """A node record's ceiling for one dimension; ``0`` when it has none.
+
+    ``0`` *is* the record's "no ceiling has arrived yet" value (N83 phase 2),
+    so a row written before the field existed, or one whose value is not a
+    number at all, must read as unknown and refuse by name -- never as a
+    number nobody reported, and never as a crash on the create path.
+    """
+    value = getattr(node, attribute, 0)
+    if not isinstance(value, int) or isinstance(value, bool):
+        return 0
+    return value
+
+
+def _node_cannot_size(node_id: str, field: str) -> OfficialError:
+    """503: this node's record carries no ceiling for ``field`` yet.
+
+    The mixed-version window (a worker that is still an older build reports no
+    ``sandboxCeiling``) and any other node whose promise never arrived land
+    here. An unknown ceiling must never read as "unlimited", so the create is
+    refused by name -- node and dimension -- instead of being handed a quota
+    nobody promised.
+    """
+    return OfficialError(
+        503,
+        f"node {node_id} cannot size a sandbox: it has not reported its "
+        f"per-sandbox {field} maximum",
+    )
+
+
+def _size_refusal(check: _SizeCeiling, *, node_id: str) -> OfficialError:
+    """The refusal one dimension earns, against the node that owns the number.
+
+    The client's own two fields are a ``400``: the request cannot be satisfied
+    as written, and a retry that keeps asking for the same size will keep
+    failing. ``maxProcesses`` is not a request field (the number is the
+    deployment's own per-sandbox default), so a node that cannot host it cannot
+    size work at all -- ``503``, naming the node.
+    """
+    shown = _ceiling_text(check.field, check.ceiling)
+    if check.field == "maxProcesses":
+        return OfficialError(
+            503,
+            f"the sandbox's {check.value} maxProcesses exceed node {node_id}'s "
+            f"per-sandbox maximum ({shown})",
+        )
+    return OfficialError(
+        400,
+        f"{check.field} {check.value} exceeds this node's per-sandbox maximum "
+        f"({shown})",
+    )
+
+
+def _size_ceilings(
+    node, *, cpu_count: int, memory_mb: int, processes: int
+) -> tuple[_SizeCeiling, ...]:
+    """This create's three dimensions against one node record, in check order."""
+    values = {"cpuCount": cpu_count, "memoryMB": memory_mb, "maxProcesses": processes}
+    return tuple(
+        _SizeCeiling(
+            field,
+            values[field],
+            values[field] * unit,
+            _reported_ceiling(node, attribute),
+        )
+        for field, attribute, unit in _SIZE_CEILING_FIELDS
+    )
+
+
+def _node_size_refusal(
+    node, *, cpu_count: int, memory_mb: int, processes: int
+) -> OfficialError | None:
+    """The refusal this create earns against the node it **landed on** (D6).
+
+    Called with the node whose admission was just reserved, so every number in
+    the answer belongs to the machine that would have run the sandbox -- a
+    fleet whose nodes disagree still produces a truthful message. ``None``
+    means the node can host this size.
+    """
+    for check in _size_ceilings(
+        node, cpu_count=cpu_count, memory_mb=memory_mb, processes=processes
+    ):
+        if check.ceiling <= 0:
+            return _node_cannot_size(node.node_id, check.field)
+        if check.requested > check.ceiling:
+            return _size_refusal(check, node_id=node.node_id)
+    return None
+
+
+def _fleet_size_refusal(
+    nodes: list, *, cpu_count: int, memory_mb: int, processes: int
+) -> OfficialError | None:
+    """The same refusal, asked of the fleet when *no* node could take the size.
+
+    Placement refuses a size above a node's **total** before any ceiling is
+    consulted, and the deployed lanes cap one sandbox at exactly that total --
+    so without this question an over-ceiling request is answered "No resources
+    available", which reads as "retry when the fleet is quieter" and never will
+    be true. It fires only when **no** healthy node's promise allows the size,
+    so the number it prints is the most generous promise in the fleet (never a
+    number from a machine that would have taken the sandbox), and a node whose
+    promise is still unknown (``0``) keeps it quiet: an unknown ceiling is not
+    proof that nobody could host the size.
+    """
+    values = {"cpuCount": cpu_count, "memoryMB": memory_mb, "maxProcesses": processes}
+    for field, attribute, unit in _SIZE_CEILING_FIELDS:
+        ceilings = [_reported_ceiling(node, attribute) for node in nodes]
+        if not ceilings or any(ceiling <= 0 for ceiling in ceilings):
+            continue
+        best = max(nodes, key=lambda node: _reported_ceiling(node, attribute))
+        ceiling = _reported_ceiling(best, attribute)
+        if values[field] * unit > ceiling:
+            return _size_refusal(
+                _SizeCeiling(field, values[field], values[field] * unit, ceiling),
+                node_id=best.node_id,
+            )
+    return None
 
 
 def _executor_needs_images(mode: str) -> bool:
@@ -1134,7 +1321,16 @@ async def _create_sandbox_attempt(
         raise OfficialError(400, str(e))
     iam_tokens = _normalize_iam(body)
 
-    dims = _default_dims(settings)
+    # N83 phase 2 (D6/N84): the size the request named for itself, in the
+    # record's own units -- and the admission dimensions derived from it, so the
+    # ledger books exactly what the record holds.
+    cpu_count, memory_mb = _sandbox_size(settings, body)
+    dims = (
+        memory_mb,
+        cpu_count * 100,
+        settings.default_disk_mb,
+        settings.default_max_processes,
+    )
     registry = _registry(request)
 
     # Idempotent create: a client-supplied sandbox ID short-circuits an
@@ -1202,8 +1398,35 @@ async def _create_sandbox_attempt(
         processes=dims[3],
     )
     if node is None:
+        # 一个「没有任何节点肯给」的尺寸不是容量问题：机器再多也放不下它。
+        # 部署车道里"单箱上限 = 节点总量"，所以越界请求必然同时越总量 ——
+        # 不在这里问一次，客户端只会拿到"No resources available"（像是"等会儿
+        # 再来试试"），而那个答案永远不会变真。问的是**节点记录里上报的上限**
+        # （不是控制面自己的 Settings，那份在这一步可能描述的是别的机器）。
+        size_refusal = _fleet_size_refusal(
+            [
+                record
+                for record in request.app.state.nodes.list(healthy_only=True)
+                if not record.draining
+            ],
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+            processes=dims[3],
+        )
+        if size_refusal is not None:
+            raise size_refusal
         # 节点层无容量：还没有任何状态可回滚，直接交给调度器决定是否驱逐。
         raise _CapacityExhausted(_node_refusal_message(request, dims))
+    # N83 phase 2 (D6/R12): 上限按**这个请求真落到的那个节点**校验 —— 就是刚
+    # 刚被预留的那个记录，所以拒绝文案里的数字一定属于这台机器；拒绝时把预留
+    # 原样还回去，与下面每一条早退路径同一个做法。记录里还没有上限（混版本窗口：
+    # worker 还是旧版）⇒ 具名 503，绝不无额度放行。
+    size_refusal = _node_size_refusal(
+        node, cpu_count=cpu_count, memory_mb=memory_mb, processes=dims[3]
+    )
+    if size_refusal is not None:
+        _release_node_quota(request, node, dims)
+        raise size_refusal
 
     # Adaptive warm: image cached -> fast path (server-side ID, SDK no-op);
     # image cold -> slow path requiring X-Sandbox-Id, warming before any
@@ -1300,6 +1523,8 @@ async def _create_sandbox_attempt(
             tenant_id=tenant,
             is_admin=is_admin,
             priority=priority,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
         )
     except ResourceUnavailableError as e:
         # 保持既有回滚顺序：先还节点配额，再释放 pending 标记。驱逐重试由

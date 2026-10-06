@@ -215,6 +215,17 @@ async def _register_node(app) -> None:
                 "totalCPUPercent": 6400,
                 "totalDiskMB": 1048576,
                 "totalProcesses": 4096,
+                # N83 phase 2 (R12): a worker on this build reports its
+                # per-sandbox ceiling with every registration (here: the same
+                # numbers as the node's own totals, the D5 default), because
+                # the control plane refuses to size work on a node whose
+                # ceiling has never arrived -- an unknown ceiling must not read
+                # as "unlimited".
+                "sandboxCeiling": {
+                    "cpuPercent": 6400,
+                    "memoryMB": 65536,
+                    "processes": 4096,
+                },
                 "pidNamespace": "pid:[4026532458]",
                 "containerID": "e4a98a0c5282",
                 "workerUID": WORKER_UID,
