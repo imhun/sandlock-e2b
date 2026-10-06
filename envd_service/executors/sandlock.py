@@ -2563,9 +2563,10 @@ class SandlockExecutor(Executor):
                     self._mcp_bind_port, self._mcp_bind_port
                 )
         if self._pid_ns:
-            # S2.2 sibling: own PID namespace. The fork needs a user namespace
-            # first (unprivileged CLONE_NEWPID) and does that in an intermediate
-            # process, so this is independent of net_isolation.
+            # S2.2 sibling: own PID namespace. The engine creates the leader
+            # directly inside its user namespace with clone3 (an unprivileged
+            # CLONE_NEWPID needs that user namespace), so this is independent
+            # of net_isolation.
             kwargs["pid_ns"] = True
         # N35, unconditional since N14 S5: build a real root instead of
         # emulating one, so the kernel resolves paths (a `#!` interpreter, a
@@ -2808,9 +2809,10 @@ class SandlockExecutor(Executor):
                 port = int(mcp_port)
                 self._port_mappings.setdefault(port, port)
         if self._pid_ns:
-            # S2.2 sibling: own PID namespace. The fork needs a user namespace
-            # first (unprivileged CLONE_NEWPID) and does that in an intermediate
-            # process, so this is independent of net_isolation.
+            # S2.2 sibling: own PID namespace. The engine creates the leader
+            # directly inside its user namespace with clone3 (an unprivileged
+            # CLONE_NEWPID needs that user namespace), so this is independent
+            # of net_isolation.
             kwargs["pid_ns"] = True
         # N35, unconditional since N14 S5: build a real root instead of
         # emulating one, so the kernel resolves paths (a `#!` interpreter, a
