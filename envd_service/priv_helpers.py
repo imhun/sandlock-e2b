@@ -196,7 +196,9 @@ def request_cgroup_delegate(
     its own container cgroup, and the one privileged step is the handshake this
     call makes -- the control plane instructs the node's agent (face B) to hand
     the worker's **container cgroup directory** (plus ``cgroup.procs`` /
-    ``cgroup.subtree_control`` / ``cgroup.kill``; never ``cpu.max``) to the
+    ``cgroup.subtree_control``; never ``cpu.max``, and never ``cgroup.kill`` --
+    the worker's kill lands on the ``sbx_<id>`` cgroups it creates itself, whose
+    ``cgroup.kill`` the kernel already hands to it as their creator) to the
     worker's uid. The agent's ``chown`` is idempotent, so this request is too: a
     worker that re-asks (a restart, or a retry its caller owns) gets the same
     answer.

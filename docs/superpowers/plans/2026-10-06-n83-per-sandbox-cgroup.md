@@ -48,7 +48,8 @@ k8s 1.36 / k0s、containerd 2.3。
   `uid=65534`、`CapEff=0`、`/sys/fs/cgroup` 是 `ro,nosuid,nodev,noexec` —— 这三条保持不变。
   ~~也不给它任何 cgroup 写视图~~ ⇒ **2026-10-06 实测修正（§1.4）**：放置只能由处在 worker
   cgroupns 里的进程做，所以 worker 必须拿到一块 **rw 的 cgroupfs 视图**，且**收窄到本 pod 的
-  子树**（`subPathExpr`，§3.5）。它的写权由内核按 cgroupns + DAC 限定在**"被委派给它的 uid 的那些
+  子树**（`subPathExpr`，§3.5；**这条收窄只对 worker 成立** —— 面 B 自己的挂载仍是整节点，见
+  §5 抬头）。它的写权由内核按 cgroupns + DAC 限定在**"被委派给它的 uid 的那些
   cgroup"**内：实测对**未委派**的 cgroup（含别的 pod 的）一切写操作都是 EACCES，对它自己容器的
   `cpu.max` 也是 EACCES（委派不含它）。
   ⚠ **2026-10-06 本地车道实测补充（Task 7 验收）**：这条边界**靠的是收窄**，不是靠 uid ——
@@ -57,7 +58,8 @@ k8s 1.36 / k0s、containerd 2.3。
   （`cpu.max` 仍 EACCES）。⇒ 生产形态（k8s + 收窄）不受影响；compose 车道这条是**已知的车道级性质**，
   已写进 `docs/deploy-clusters.md` §7.48，并作为后续项（每个 compose worker 独立 uid，或也做收窄）。
 - **agent 在形态 W 下只多一件事**：一次性委派（chown worker 容器 cgroup 目录 +
-  `cgroup.procs`/`cgroup.subtree_control`/`cgroup.kill`，**不碰 `cpu.max`**）。不再需要
+  `cgroup.procs`/`cgroup.subtree_control`，**不碰 `cpu.max`**，**也不含 `cgroup.kill`** ——
+  R9/接口层只说这三条；理由见 §3.2 的 `delegate_worker_subtree`）。不再需要
   "建 cgroup / 放进程 / 读用量 / kill" 四个 op（那套随 D2/D3 作废）；路径仍由它自推（QoS 无关），
   与 `priv_common.c` 的白名单纪律一致。
 - **fail 方向钉死 closed**：建不出 cgroup / 写不上限额 / 回读不一致 / 放进程失败 ⇒ **不写
@@ -240,7 +242,10 @@ downward API 的 `metadata.uid`）能正常挂载，挂载根就是本 pod 的 c
 **为什么这条比原计划更窄**：worker 的 cgroupfs 写权被**内核 DAC 限定在"被委派给它的 uid 的 cgroup"**
 （自己的容器 cgroup + 它自己建的 `sbx_*`）—— 未委派的 cgroup 目录仍是 root:0755，它写不了；
 它也没有 CAP_CHOWN，抢不走。原计划的 agent 方案里，agent 拿的是**整节点**的 rw 视图，收窄**只能靠
-代码白名单**；本形态把收窄交给内核 + **挂载收窄（`subPathExpr`）**。
+代码白名单**；本形态把 **worker 侧**的收窄交给内核 + **挂载收窄（`subPathExpr`）**。
+**注意这条只对 worker 成立**：面 B 自己的 rw 挂载仍指向**整节点**（`hostPath /sys/fs/cgroup` →
+`/host-cgroup`，k8s 与三条 compose 车道都是；`test_agent_face_b_carries_its_own_writable_cgroup_view`
+钉着），它那一侧的收窄**仍然只有** op 的派生路径白名单 —— 见 §5 抬头。
 **代价**：worker 从此对**自己 pod 的**沙箱子树有写权（它能节流/杀的都是它自己的沙箱 —— 它本来就能
 kill 它们）。这条与 Global Constraints 里"不给 worker 任何 cgroup 写视图"**冲突**，所以需要人拍。
 **⚠ 收窄是这条边界的一半**（2026-10-06 本地车道实测）：compose 车道上三 worker 同宿主同 uid 65534、
@@ -366,7 +371,7 @@ worker 容器 cgroup（k8s 的 cpu.max = 本节点核数；腾空后 subtree_con
 
 | 时刻 | 谁 | 动作 |
 |---|---|---|
-| **一次性（worker 启动时）** | agent 面 B | **新增**：委派 —— 把 worker 容器 cgroup 目录 + `cgroup.procs`/`cgroup.subtree_control`/`cgroup.kill` chown 给 65534（**`cpu.max` 不委派** ⇒ worker 抬不了自己的上限，§1.4 负例 N1）。路径由 agent 自推（QoS 无关：`kubepods/*/pod<pod_uid>` + `lookup.py` 的容器 init 规则） |
+| **一次性（worker 启动时）** | agent 面 B | **新增**：委派 —— 把 worker 容器 cgroup 目录 + `cgroup.procs`/`cgroup.subtree_control` chown 给 65534（**`cpu.max` 不委派** ⇒ worker 抬不了自己的上限，§1.4 负例 N1；`cgroup.kill` 也不在名单里 —— 理由见 §3.2 的 `delegate_worker_subtree`）。路径由 agent 自推（QoS 无关：`kubepods/*/pod<pod_uid>` + `lookup.py` 的容器 init 规则） |
 | 同上 | worker | **新增**：启动自检（§3.5 保险 2）→ `mkdir worker/` → 把自己搬进去（腾空）→ `+cpu` |
 | 建箱（第一条命令触发槽位） | worker | 已有：`clone3(CLONE_NEWUSER)` → 上报 `{sandbox_id, pid}` → CP；**新增**：`mkdir sbx_<id>` → 写 `cpu.max` → 子进程 spawn 后把它的 pid 写进 `sbx_<id>/cgroup.procs` → 读回校验。**顺序仍然安全**：子进程在身份落盘前不 exec，fork 只能发生在 exec 之后（§3.2 步骤 4） |
 | 同上 | CP | **不再需要新通道**：限额来自 worker 自己的 record（`cpu_percent`），CP 不下发、不校验 |
@@ -375,11 +380,27 @@ worker 容器 cgroup（k8s 的 cpu.max = 本节点核数；腾空后 subtree_con
 
 ## 5. 安全风险（2026-10-06 实测后写死；批准 Phase 1 时要一起看）
 
-> **形态 W 定案后的更新（读本节前先看这段）**：下面"agent 拿到一块整节点 rw cgroupfs 视图"那部分
-> 是 **D2/D3 版本**的风险账，随 §3 作废。W 的实际风险面已经用探针量过，结论在 **§1.4**：
-> worker 侧写权被 cgroupns+DAC 限定在自家容器子树（对别的 pod 全 EACCES），唯一新增的是"能读
-> 同节点其它 pod 的 cgroup 聚合统计"——而 §3.5 的 `subPathExpr` 收窄把这一条也去掉了。本节其余
-> 内容（沙箱面零可见/零可达、fail-closed 的价值、磁盘/网络不走 cgroup）仍然成立。
+> **形态 W 定案后的更新（读本节前先看这段）**：下面的风险账要**分两种挂载形态读**，不能一锅端成
+> "随 §3 作废"。
+>
+> - **worker 侧**：写权被 cgroupns + DAC 限定在自家容器子树（对别的 pod 全 EACCES），且 k8s 上用
+>   `subPathExpr` 把挂载收窄到本 pod —— "能读同节点其它 pod 的 cgroup 聚合统计"那一条确已随 §3.5
+>   收窄去掉（§1.4 探针量过）。收窄的说法**只在这半边成立**。
+> - **agent 面 B**：**仍然持有整节点的 rw cgroupfs 视图** —— 面 B 挂的是 `hostPath
+>   /sys/fs/cgroup` → `/host-cgroup`（k8s `deploy/k8s/c3-agent.yaml` 与三条 compose 车道
+>   `multinode`/`prod`/`stack/prod` 都如此，`test_agent_face_b_carries_its_own_writable_cgroup_view`
+>   钉着）。面 B 是 root + `DAC_OVERRIDE` + 整棵树 rw ⇒ **本节第 1 条风险（挂载范围）对 agent 仍然
+>   活着**：它原则上能写本节点任意 pod 的 cgroup，**唯一收窄是 op 的派生路径白名单**。批准时请按
+>   "agent 持整节点 rw cgroupfs 视图"来算这笔账，别按"已随 §3 撤回"来算。
+>   代码里真实存在的缓解，逐条点名：`container_cgroup_in_view` 只按内核读出的**目录名**匹配、且要求
+>   **命中唯一**（重名即具名 `CgroupRefusal`）、`_is_within` 保证路径不越出挂载根、**请求体不带
+>   路径**（agent 自己按锚点自推，`delegate-cgroup` 不收 path 参数）、以及"不做 path 参数"这条纪律
+>   本身。这些降低"被误用"的概率，但不改变面 B 手里仍是整棵树的事实。
+>   **后续线索**：将来可以把面 B 的挂载收窄到 `/sys/fs/cgroup/kubepods`（或更窄的本节点
+>   kubepods 子树），把这条账也收回来 —— 那是独立、可单独上线的一步，`required` 的批准者应当知道
+>   有这一根杆。
+>
+> 本节其余内容（沙箱面零可见/零可达、fail-closed 的价值、磁盘/网络不走 cgroup）仍然成立。
 
 **结论先说：它不给沙箱开新的逃逸面 —— 新增的风险全在"节点 root 组件多出来的一类权力"和"那块 rw
 挂载的范围"上。**
@@ -510,8 +531,11 @@ NetworkPolicy，worker 敲不进来）；④ 对已被攻破的 CP 边际为零�
     k8s 用 `pod_cgroup_token(pod_uid)`（**QoS 无关**），compose 用 `container_cgroup_token(container_id)`；
     两边都用 `_is_container_init` 把 exec 兄弟目录排除掉。找不到 / 多于一个 ⇒ `LookupRefusal`
   - `c3_agent.cgroups.delegate_worker_subtree(*, mount: Path, container_cgroup: Path, worker_uid: int) -> tuple[str, ...]`
-    —— 只 chown **目录 + `cgroup.procs` + `cgroup.subtree_control` + `cgroup.kill`**，返回被 chown 的条目名；
-    **`cpu.max` 必须在返回值之外**（§1.4 负例 N1 的钉子）
+    —— 只 chown **三条：`.`（目录本身）+ `cgroup.procs` + `cgroup.subtree_control`**，返回被 chown
+    的条目名；**`cpu.max` 必须在返回值之外**（§1.4 负例 N1 的钉子）。**`cgroup.kill` 也不在名单里**
+    （R9）：worker 的 kill/收尾只落在**它自己建的 `sbx_<id>`** 上，那个目录由内核按创建者把属主交给
+    它（65534），`cgroup.kill` 本来就是它的；这份委派清单只为"worker 要写它**容器** cgroup"这一件
+    事开条子，多列一个 `cgroup.kill` 会让文档比实现宽（Minor 1 修正前就是这个状态）。
   - agent op `delegate-cgroup`（挂在**面 B**，与 `chown`/`rm`/`walk`/`materialize` 同一张 op 表）：
     body `{"worker": {"node_id", "pod_uid"?, "container_id"?}}` —— **锚点按车道二选一**，与
     `WorkerCredentials` 的 D21/D25 规则同形（k8s 传 `pod_uid`、compose 传 `container_id`）→

@@ -898,8 +898,10 @@ async def node_cgroup_delegate(node_id: str, request: Request) -> dict[str, Any]
     ``sbx_<sandbox_id>`` cgroups nested under its own container cgroup, and the
     single privileged step is a **one-time** handshake -- the node's agent (face
     B, root) chowns the worker's container cgroup directory plus the files the
-    worker has to write (``cgroup.procs`` / ``cgroup.subtree_control`` /
-    ``cgroup.kill``; never ``cpu.max``) to the worker's uid. The kernel's
+    worker has to write (``cgroup.procs`` / ``cgroup.subtree_control``; never
+    ``cpu.max``, and never ``cgroup.kill`` -- the worker's kill lands on the
+    ``sbx_<id>`` cgroups it created itself, whose ``cgroup.kill`` the kernel
+    already handed to it as their creator) to the worker's uid. The kernel's
     cgroupns + DAC then bound the worker's write authority to its own pod.
 
     The body is empty on purpose: the worker names nothing (hard rules 1/3).

@@ -406,6 +406,38 @@ def test_a_whitelist_entry_the_directory_lacks_is_a_named_refusal(
     assert chowned == []
 
 
+def test_a_chown_that_fails_is_a_named_refusal_not_an_unhandled_500(
+    tmp_path: Path,
+) -> None:
+    """Review Minor 2：``os.chown`` 失败（EPERM/EROFS/ENOENT 竞态）必须转成
+    ``CgroupRefusal``（``app.py`` 才会答可 grep 的 502），不能作为裸 ``OSError``
+    逃出去变成匿名 500。方向无论如何都是 fail-closed（工人建箱按名拒绝）。
+    """
+    mount, container_dir = _cgroup_mount(
+        tmp_path, lane="compose", container=CONTAINER_ID
+    )
+    attempted: list[Path] = []
+
+    def refusing_chown(path: Path, uid: int, gid: int) -> None:
+        attempted.append(path)
+        raise OSError(1, "Operation not permitted")
+
+    with pytest.raises(CgroupRefusal) as refused:
+        delegate_worker_subtree(
+            mount=mount,
+            container_cgroup=container_dir,
+            worker_uid=WORKER_UID,
+            chown=refusing_chown,
+        )
+
+    assert str(refused.value) == (
+        f"the delegation could not hand {container_dir} to uid {WORKER_UID} "
+        "(PermissionError: [Errno 1] Operation not permitted): refusing to "
+        "delegate"
+    )
+    assert attempted == [container_dir]
+
+
 def test_cpu_max_owner_reads_the_files_owner_in_uid_gid_form(tmp_path: Path) -> None:
     """真实读数是 ``stat``：线上 ``cpu.max`` 留在 root 手里，所以是 ``0:0``。
 

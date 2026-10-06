@@ -2117,9 +2117,11 @@ RED 档同一条脚本的判定（**这就是"不弱化"的证据**：RED 五条
   委派把它们的容器 cgroup chown 给了 65534）。对这 2 个 peer：
   `cpu.max = EACCES`（委派故意不含它，⑤ 钉的正是这条），但
   `cgroup.procs` / `subtree_control` / `mkdir = WRITABLE`——**同一个宿主 uid 的 DAC 分不开两个容器**。
-  这是 compose 车道的固有形状（三台 worker 都是 65534），不是 N83 引入的回归；k8s 车道因为
-  `subPathExpr` 把挂载收窄到本 pod，peer 根本不可达，不存在这个形状。脚本把它**逐 peer 上报**
-  （`delegated_peers`），不隐藏、也不当作"通过"。
+  这是 **compose 车道上这次委派自己带来的性质**：N83 的委派把 peer 容器 cgroup 的**目录** chown 给
+  65534，而三台 worker 又**共用同一个宿主 uid**，所以对另两台 worker 的容器 cgroup
+  `cgroup.procs`/`subtree_control`/`mkdir` 可写（`cpu.max` 仍 root 所有 —— 委派故意不含它）。它
+  **不是**与 N83 无关的既有形状；k8s 车道因为 `subPathExpr` 把挂载收窄到本 pod，peer 根本不可达，
+  不存在这个形状。脚本把它**逐 peer 上报**（`delegated_peers`），不隐藏、也不当作"通过"。
 * 因此 ④ 的通过条件（脚本里逐字）：
   `own_delegated AND every_peer_cpu_max_closed AND evidence`，其中 `evidence` =
   有非被委派 peer 时要求它们三写全闭；peer 全不可见时（k8s 收窄形状）退化为"挂载根必须不可写**且**
@@ -2240,6 +2242,10 @@ docker compose -p n83acc -f deploy/compose/docker-compose.multinode.yml -f tmp/n
   范围被两条边界卡住（只有跑在 worker uid 下的进程能用它、只在"整棵树可见"的挂载上成立），
   k8s 车道挂载被 `subPathExpr` 收窄、peer 不可达，**没有这个形状**。不再出现"回归"这种把责任推给
   别处的说法。
+* **报告自己也留了一处（final review 追加）**：本文件 §F1 那条 bullet 当时仍写着"compose 车道的固有
+  形状…不是 N83 引入的回归"—— 于是**只读这份归档报告**的读者会看到与本附加节相反的说法。已改成同一
+  口径：那个 peer 可写形状来自**这次委派把 peer 目录交给 65534 + 三台共用 uid**，不再说"固有/不是
+  回归"。这是计划把本文件引用为 Task 7 证据时必须先消掉的自相矛盾。
 
 ## R4（新 Minor）字段名与断言同文档对不上
 
