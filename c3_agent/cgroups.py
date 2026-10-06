@@ -183,7 +183,24 @@ def delegate_worker_subtree(
         # ``65534:65534`` (and R-C hands over "the worker uid"), so the two are
         # one number here -- the caller read it from the kernel, not from this
         # process's ``getuid()`` (which is root on face B).
-        chown(target, int(worker_uid), int(worker_uid))
+        #
+        # A ``chown`` that fails (``EPERM``/``EROFS`` on face A, ``ENOENT`` for a
+        # directory that raced away between the shape check and here) is turned
+        # into the same named :class:`CgroupRefusal` as every other failure
+        # above: ``app.py`` only maps ``LookupRefusal``/``CgroupRefusal`` onto
+        # its 502, so an uncaught ``OSError`` would answer the op with an
+        # anonymous 500 instead of a greppable ``cgroup-refusal``. The
+        # direction is unchanged either way (the control plane sees a failure,
+        # the worker's create is refused by name), but the name is what an
+        # operator greps for.
+        try:
+            chown(target, int(worker_uid), int(worker_uid))
+        except OSError as exc:
+            raise CgroupRefusal(
+                f"the delegation could not hand {target} to uid "
+                f"{int(worker_uid)} ({type(exc).__name__}: {exc}): refusing to "
+                "delegate"
+            ) from exc
     return tuple(name for name, _target in targets)
 
 

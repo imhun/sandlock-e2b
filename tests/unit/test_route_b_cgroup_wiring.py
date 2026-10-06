@@ -40,8 +40,10 @@ from types import SimpleNamespace
 import pytest
 
 import envd_service.agent as node_agent
+import envd_service.executors.factory as factory_mod
 import envd_service.route_b as rb
 from envd_service.config import Settings
+from envd_service.executors.local import LocalExecutor
 from envd_service.priv_helpers import PrivHelperError
 from envd_service.route_b import RouteBConfig, W1SlotPool
 from envd_service.runtime.sandbox_cgroup import CgroupRefusal, SandboxCgroups
@@ -736,3 +738,108 @@ async def test_the_node_agent_owns_the_startup_lane(monkeypatch) -> None:
 
 async def _never_ending(*_args, **_kwargs) -> None:
     await asyncio.sleep(3600)
+
+
+# ------------------------------------------------- the factory's two local paths
+
+
+def _create_executor(settings):
+    """``create_executor`` with the argument set the health tests use."""
+    return factory_mod.create_executor(
+        settings,
+        workspace_dir="/tmp/ws",
+        base_image=None,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        network=None,
+    )
+
+
+def _expected_local_refusal(mode: str) -> str:
+    """The exact fail-closed text, written out rather than imported."""
+    return (
+        "E2B_SANDBOX_CGROUP=required refuses the LOCAL executor "
+        f"(E2B_EXECUTOR={mode}): it applies no sandbox confinement and no "
+        "per-sandbox cgroup, so this sandbox would run with no quota. Install "
+        "the matching sandlock wheel (E2B_EXECUTOR=auto or sandlock), or set "
+        "E2B_SANDBOX_CGROUP=off to accept uncapped sandboxes."
+    )
+
+
+def test_required_refuses_the_explicit_local_executor_by_name() -> None:
+    """Final review Important 2, route 1: ``E2B_EXECUTOR=local`` + required.
+
+    ``LocalExecutor`` reads no ``sandbox_cgroup`` at all, so before this guard
+    the operator's two switches silently cancelled each other and the sandbox
+    ran uncapped. It must refuse **by name** instead.
+    """
+    with pytest.raises(RuntimeError) as excinfo:
+        _create_executor(_settings(executor="local", sandbox_cgroup="required"))
+
+    assert type(excinfo.value) is RuntimeError
+    assert str(excinfo.value) == _expected_local_refusal("local")
+
+
+def test_required_refuses_autos_missing_sandlock_fallback_by_name(monkeypatch) -> None:
+    """Final review Important 2, route 2: ``auto`` + absent sandlock + required.
+
+    The documented fallback for a genuinely missing package is
+    ``LocalExecutor`` -- fine under the default ``off``, and exactly the
+    "mixed-version, no quota, no confinement" shape the switch forbids under
+    ``required``. Only a ``ModuleNotFoundError`` naming the top-level package
+    reaches this path (a broken install has already refused above).
+    """
+    missing = ModuleNotFoundError("No module named 'sandlock'", name="sandlock")
+    # The dev host is macOS; the probe is Linux-only, so pin it here.
+    monkeypatch.setattr(factory_mod.sys, "platform", "linux")
+    monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: missing)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _create_executor(_settings(executor="auto", sandbox_cgroup="required"))
+
+    assert type(excinfo.value) is RuntimeError
+    assert str(excinfo.value) == _expected_local_refusal("auto")
+
+
+def test_off_keeps_both_local_paths_verbatim(monkeypatch) -> None:
+    """The default lane is byte-for-byte unchanged by the two guards above."""
+    # Route 1: an explicit local executor never even probes sandlock.
+    assert isinstance(
+        _create_executor(_settings(executor="local", sandbox_cgroup="off")),
+        LocalExecutor,
+    )
+    # Route 2: auto + absent still falls back to local, as documented.
+    missing = ModuleNotFoundError("No module named 'sandlock'", name="sandlock")
+    monkeypatch.setattr(factory_mod.sys, "platform", "linux")
+    monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: missing)
+    assert isinstance(
+        _create_executor(_settings(executor="auto", sandbox_cgroup="off")),
+        LocalExecutor,
+    )
+
+
+def test_required_does_not_shadow_the_installed_but_broken_refusal(monkeypatch) -> None:
+    """The new guard closes the two local paths only, not the sandlock ones.
+
+    An installed-but-unusable package still takes the B1 ``unusable`` refusal
+    (never the uncapped fallback, and not the new local message). Pinned here
+    because this file's command is the one that runs the N83 wiring.
+    """
+    broken = ImportError("libsandlock_ffi.so: cannot open shared object file")
+    monkeypatch.setattr(factory_mod.sys, "platform", "linux")
+    monkeypatch.setattr(factory_mod, "_import_sandlock", lambda: broken)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _create_executor(_settings(executor="auto", sandbox_cgroup="required"))
+
+    assert str(excinfo.value) == (
+        "E2B_EXECUTOR=auto cannot run: the sandlock package is installed but "
+        "unusable (ImportError: libsandlock_ffi.so: cannot open shared object "
+        "file); refusing to fall back to the LOCAL executor, which applies no "
+        "sandbox confinement. Reinstall the matching sandlock wheel (or "
+        "rebuild libsandlock_ffi.so) and restage the worker image."
+    )

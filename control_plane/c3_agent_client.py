@@ -699,9 +699,12 @@ class C3AgentClient:
         N83 phase 1 (shape W): the worker manages its own ``sbx_<id>`` cgroups
         under its container cgroup, and the only privileged step is this
         **one-time** handshake -- face B (root) chowns the worker's container
-        cgroup directory plus ``cgroup.procs`` / ``cgroup.subtree_control`` /
-        ``cgroup.kill`` (never ``cpu.max``), and the worker's uid then owns the
-        subtree the kernel's cgroupns + DAC already limit to its own pod.
+        cgroup directory plus ``cgroup.procs`` / ``cgroup.subtree_control``
+        (never ``cpu.max``, and never ``cgroup.kill`` -- the worker's kill lands
+        on the ``sbx_<id>`` cgroups it creates itself, whose ``cgroup.kill`` the
+        kernel already hands to it as their creator), and the worker's uid then
+        owns the subtree the kernel's cgroupns + DAC already limit to its own
+        pod.
 
         The instruction rides **face B**, with the file-op deadline and refusal
         handling (D22: face A is the ``uid_map`` owner; the privileged executor

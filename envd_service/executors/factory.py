@@ -93,6 +93,53 @@ def sandlock_missing_error(mode: str, detail: str) -> RuntimeError:
     )
 
 
+def _sandbox_cgroup_mode(settings) -> str:
+    """``E2B_SANDBOX_CGROUP`` normalized the way route B reads it.
+
+    ``getattr`` keeps a settings double that predates the N83 field on the old
+    behaviour, exactly like ``route_b.sandbox_cgroup_mode``; an unknown value is
+    not this function's to refuse (the worker's startup already refuses it by
+    name), so only ``required`` is meaningful here.
+    """
+    return str(getattr(settings, "sandbox_cgroup", "off") or "off").strip().lower()
+
+
+def sandbox_cgroup_local_error(mode: str) -> RuntimeError:
+    """The fail-closed error for ``E2B_SANDBOX_CGROUP=required`` + a local run.
+
+    N83 phase 1, final review Important 2. ``required`` promises that no sandbox
+    runs without a per-sandbox cgroup. The sandlock executor enforces that
+    through route B's slot pool -- and its in-process mediator refuses by name
+    (``SandlockExecutor._refuse_in_process_without_a_quota``) -- but the
+    *executor factory* could still answer :class:`LocalExecutor` and that class
+    never reads ``settings.sandbox_cgroup``: for an explicit
+    ``E2B_EXECUTOR=local``, or for ``auto`` on an image whose sandlock package
+    is genuinely absent. That sandbox would run with **no quota and no
+    confinement**, silently, which is exactly the mixed-version shape the
+    switch exists to forbid. This names it instead.
+    """
+    return RuntimeError(
+        f"E2B_SANDBOX_CGROUP=required refuses the LOCAL executor "
+        f"(E2B_EXECUTOR={mode}): it applies no sandbox confinement and no "
+        "per-sandbox cgroup, so this sandbox would run with no quota. Install "
+        "the matching sandlock wheel (E2B_EXECUTOR=auto or sandlock), or set "
+        "E2B_SANDBOX_CGROUP=off to accept uncapped sandboxes."
+    )
+
+
+def _refuse_local_executor_without_a_quota(settings, mode: str) -> None:
+    """Raise when the switch is ``required`` and the answer would be local.
+
+    Called on exactly the two fallback paths that reach
+    :class:`LocalExecutor` without a confinement decision already having been
+    made: an explicit ``E2B_EXECUTOR=local``, and ``auto`` with a genuinely
+    absent sandlock package. ``off`` (the default) returns immediately, so the
+    shipped behaviour is byte-for-byte unchanged.
+    """
+    if _sandbox_cgroup_mode(settings) == "required":
+        raise sandbox_cgroup_local_error(mode)
+
+
 def _landlock_ok(min_abi: int = 6) -> bool:
     try:
         import sandlock
@@ -173,7 +220,19 @@ def create_executor(
                 raise sandlock_unusable_error(mode, detail)
             if mode == "sandlock":
                 raise sandlock_missing_error(mode, detail)
-            # auto + genuinely absent: the documented fallback below.
+            # auto + genuinely absent: the documented fallback below -- unless
+            # the same deployment asked for per-sandbox cgroups, in which case
+            # the silent, uncapped LocalExecutor is exactly what must not
+            # happen (N83 phase 1, final review Important 2).
+            _refuse_local_executor_without_a_quota(settings, mode)
+
+    if mode == "local":
+        # The operator's explicit choice -- but not when the same deployment
+        # asked for per-sandbox cgroups: LocalExecutor reads no
+        # `settings.sandbox_cgroup` at all, so `required` names the
+        # contradiction here instead of running the sandbox with no quota
+        # (N83 phase 1, final review Important 2).
+        _refuse_local_executor_without_a_quota(settings, mode)
 
     if mode == "sandlock" or (mode == "auto" and _sandlock_available()):
         if not _landlock_ok():
