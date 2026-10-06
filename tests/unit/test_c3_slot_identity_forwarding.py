@@ -32,6 +32,8 @@ from control_plane.config import Settings as ControlSettings
 from control_plane.node_address import NodeEndpoint, StaticAddressResolver
 from control_plane.registry.manager import SandboxRegistry
 from control_plane.registry.nodes import NodeRegistry
+from envd_service import worker_identity
+from envd_service.priv_helpers import PrivHelperError
 
 KEY_A = "key-node-a"
 ENDPOINT_A = NodeEndpoint("http://10.0.0.1:49983", "10.0.0.1")
@@ -434,6 +436,121 @@ async def test_every_hop_failure_keeps_its_own_name(workspace) -> None:
         "code": 502,
         "message": "沙箱 sbx_forward 的槽位 pid 已不在",
     }
+
+
+# --------------------- N83 phase 1: the worker asks for the cgroup delegation
+#
+# The worker's own side of the handshake (R-C): one POST to the node-scoped
+# endpoint, once, at startup -- no retry loop inside (the caller owns retries),
+# the same credentials the identity reporter presents, and every refusal named
+# (a control plane that refuses must not read as "the worker came up without a
+# delegated subtree"). The body is empty on purpose: the control plane derives
+# the node, the object and the anchor, so the worker names nothing (hard rules
+# 1/3 -- and this is why there is no uid, path or anchor in the signature).
+
+CONTROL_PLANE_URL = "http://control-plane:3000"
+DELEGATED = {
+    "op": "delegate-cgroup",
+    # Task 3's answer shape, verbatim: the agent's own view path, the entries it
+    # chowned (never ``cpu.max``), and who still owns the limit file.
+    "containerCgroup": "/host-cgroup/docker/3f2a1b0c9d8e",
+    "delegated": [".", "cgroup.procs", "cgroup.subtree_control"],
+    "cpuMaxOwner": "0:0",
+}
+
+
+def _delegate_request(handler, **overrides) -> dict:
+    options = dict(
+        control_plane_url=CONTROL_PLANE_URL,
+        node_id=NODE_A,
+        internal_key=KEY_A,
+        timeout_s=5.0,
+        transport=httpx.MockTransport(handler),
+    )
+    options.update(overrides)
+    return worker_identity.request_cgroup_delegate(**options)
+
+
+def test_the_worker_asks_once_and_names_nothing() -> None:
+    """One POST, empty body, the worker's own key -- and the answer verbatim."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=DELEGATED)
+
+    answer = _delegate_request(handler)
+    assert answer == DELEGATED
+    assert len(seen) == 1
+    request = seen[0]
+    assert str(request.url) == (
+        f"{CONTROL_PLANE_URL}/internal/nodes/{NODE_A}/cgroup-delegate"
+    )
+    assert request.headers["X-Internal-Key"] == KEY_A
+    # The body is empty: the control plane derives everything (R-A), and a
+    # worker that could name the anchor or a path would be naming privilege.
+    assert request.content == b""
+
+
+def test_a_refused_delegation_is_fail_closed_and_named_once() -> None:
+    """The control plane's refusal reaches the caller; nothing is retried here."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            503,
+            json={
+                "code": 503,
+                "message": (
+                    f"node {NODE_A} carries no anchor the agent can locate its "
+                    "worker container by (compose: the worker's container id; "
+                    "k8s: the worker pod uid): refusing to instruct the agent"
+                ),
+            },
+        )
+
+    with pytest.raises(PrivHelperError) as excinfo:
+        _delegate_request(handler)
+    assert str(excinfo.value) == (
+        "the control plane refused the cgroup delegation (HTTP 503): "
+        f"node {NODE_A} carries no anchor the agent can locate its worker "
+        "container by (compose: the worker's container id; k8s: the worker pod "
+        "uid): refusing to instruct the agent"
+    )
+    # ``no retry loop inside``: the caller owns retries, so exactly one call.
+    assert len(calls) == 1
+
+
+def test_an_unreachable_control_plane_is_a_named_refusal() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    with pytest.raises(PrivHelperError) as excinfo:
+        _delegate_request(handler)
+    assert str(excinfo.value) == (
+        "the control plane is unreachable for the cgroup delegation: "
+        "connection refused"
+    )
+
+
+def test_a_worker_that_cannot_name_its_control_plane_refuses_without_dialling(
+) -> None:
+    """An empty URL (the reporter's own seam, used verbatim) is a named refusal."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=DELEGATED)
+
+    with pytest.raises(PrivHelperError) as excinfo:
+        _delegate_request(handler, control_plane_url="")
+    assert str(excinfo.value) == (
+        "this worker does not know which control plane to ask, or which node "
+        "it is (E2B_CONTROL_PLANE_URL / E2B_NODE_ID): refusing to request the "
+        "cgroup delegation"
+    )
+    assert seen == []
 
 
 @pytest.mark.asyncio

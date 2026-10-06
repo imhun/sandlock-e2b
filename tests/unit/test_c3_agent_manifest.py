@@ -238,6 +238,11 @@ def test_face_b_is_the_file_face_with_c1s_capability_set() -> None:
         # resolves for a `.route-b` slot document is one this process can
         # actually open (`chown` walks the real path, not the variable).
         "node-state": "/var/lib/e2b/state",
+        # N83 phase 1 / Task 2：形态 W 的"一次性委派"是这个面做的，所以它有
+        # 自己的一块 **rw** cgroupfs 视图。核 = 整棵宿主树（`/sys/fs/cgroup`），
+        # 不是 worker 那种按 pod 收窄的视图：面 B 自己解析 worker 容器的
+        # cgroup 路径，那条路径与 QoS 无关（计划 §3.2 步骤 1）。
+        "host-cgroup": "/host-cgroup",
     }
 
 
@@ -254,6 +259,7 @@ def test_face_a_carries_no_mounts_and_the_pod_ships_only_the_three_it_needs() ->
     assert face_a.get("volumeMounts") in (None, [])
     volumes = {v["name"]: v for v in _pod_spec(agent)["volumes"]}
     assert sorted(volumes) == [
+        "host-cgroup",
         "image-cache",
         "node-state",
         "shared",

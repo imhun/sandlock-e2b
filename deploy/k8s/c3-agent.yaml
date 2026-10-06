@@ -673,6 +673,16 @@ spec:
               value: /var/lib/e2b-sandboxes
             - name: E2B_IMAGE_CACHE_DIR
               value: /var/lib/e2b-images
+            # N83 phase 1 / Task 2: this face's own **rw** cgroupfs view.
+            # Shape W（计划 §3.2）里 worker 自管 `sbx_<id>` 子树，而"一次性委派"
+            # （把 worker 容器 cgroup 子树 chown 给它）是**面 B** 做的 —— 所以
+            # 委派这个 op 要有一块真的 cgroupfs。挂的是**整棵**树
+            # （`/sys/fs/cgroup`），不是 worker 那种被 `subPathExpr` 收窄的视图：
+            # 面 B 自己解析 worker 容器的 cgroup 路径，那条路径与 QoS 无关
+            # （计划 §3.2 步骤 1）。只挂给面 B —— 面 A 与两个 owner init 都不挂，
+            # 也**不许**有人把运行期自己的 `/sys/fs/cgroup` 重新挂进来。
+            - name: E2B_CGROUP_MOUNT
+              value: /host-cgroup
             # Task 3: the byte cap one tree copy must respect. Face B is where
             # a snapshot payload is unpacked into a tree
             # (`c3_agent/materialize.py`), and the 900 MiB restore already put
@@ -778,6 +788,12 @@ spec:
             # （`priv_common.c` 按解析后的路径比较，挂在别处的同名目录不算）。
             - name: node-state
               mountPath: /var/lib/e2b/state
+            # N83 phase 1 / Task 2：面 B 的 rw cgroupfs 视图（见上面
+            # `E2B_CGROUP_MOUNT` 的说明）。rw = 不写 `readOnly: true`；它跟别的
+            # mount 一样是容器里的一个挂载点，`readOnlyRootFilesystem` 管的是容器
+            # 自己的 rootfs，与这里无关。
+            - name: host-cgroup
+              mountPath: /host-cgroup
           resources:
             requests:
               cpu: 10m
@@ -821,6 +837,13 @@ spec:
           hostPath:
             path: /var/lib/e2b/state
             type: DirectoryOrCreate
+        # N83 phase 1 / Task 2：宿主的整棵 cgroupfs，只挂在面 B 上（“一次性委派”
+        # 的执行者）。`type: Directory`（不是 DirectoryOrCreate）：cgroup v2 一定
+        # 已经挂在那儿，DirectoryOrCreate 只会掩盖“kubelet/内核里根本没有它”的错。
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
 ---
 # "只有两条通道"的连接层：agent 只接受 **control-plane** pod 进来的连接（只在那两
 # 个端口上），worker 直接来敲会被网络层挡掉 —— 不靠 agent 自己判断（判据 ⑥ 的

@@ -55,12 +55,51 @@ from pathlib import Path
 from typing import Callable
 
 from envd_service.priv_helpers import PrivHelperError
+from envd_service.runtime.sandbox_cgroup import SandboxCgroups
+from envd_service.worker_identity import reported_container_id
+from gateway_common.worker_identity import container_cgroup_token
 
 logger = logging.getLogger(__name__)
 
 
 #: How much of a slot's stderr is kept once it is being drained.
 SLOT_STDERR_TAIL_BYTES = 8192
+
+#: The values ``E2B_SANDBOX_CGROUP`` accepts (N83 phase 1). Anything else is a
+#: named configuration refusal, never a silent "off": a typo that read as "off"
+#: would run the whole fleet without a per-sandbox quota while looking
+#: configured, which is the one outcome the switch exists to prevent.
+SANDBOX_CGROUP_MODES = ("off", "required")
+
+#: ``cpu.max`` for a caller that does not know the sandbox's declared share. It
+#: is the same number as the control plane's own ``E2B_DEFAULT_CPU_PERCENT``, so
+#: "nobody said" keeps the documented floor instead of an unbounded one.
+DEFAULT_CGROUP_PERCENT = 100
+
+CGROUP_MODE_ERROR = (
+    "E2B_SANDBOX_CGROUP must be 'off' or 'required': {value!r} would leave every "
+    "sandbox running without a per-sandbox quota while looking configured -- "
+    "delete the line (the default is off), or set it to 'required'"
+)
+
+#: The switch and its handle are one invariant, not two independent fields:
+#: ``required`` without a handle is exactly the fail-open this task exists to
+#: close -- the pool stays live, ``_attach_cgroup`` returns early on ``None``,
+#: and every sandbox runs uncapped while the deployment believes otherwise.
+#: Refused by name where the mode itself is validated, so a hand-built config
+#: (``from_settings`` always resolves both together) cannot reach that shape.
+CGROUP_HANDLE_MISSING_ERROR = (
+    "E2B_SANDBOX_CGROUP=required needs a SandboxCgroups handle: without one "
+    "the pool attaches nothing and every sandbox runs without its per-sandbox "
+    "quota, which is the fail-open this switch exists to prevent -- build the "
+    "handle with sandbox_cgroups_for(settings), or set "
+    "E2B_SANDBOX_CGROUP=off"
+)
+
+#: One handle per (mount, worker uid, lane token). Exactly one object may run
+#: ``setup()``: an ``attach`` can only succeed through the instance whose
+#: self-check landed, so every caller in this process has to get the same one.
+_CGROUP_HANDLES: dict[tuple, SandboxCgroups] = {}
 
 
 class SlotStderrDrain:
@@ -408,6 +447,76 @@ def default_channel_factory(handle: "SlotHandle"):
     return SuperviseChannel(str(handle.sock_path), handle.token or "")
 
 
+def sandbox_cgroup_mode(settings) -> str:
+    """``E2B_SANDBOX_CGROUP`` as a known switch value, or a refusal by name.
+
+    ``off`` is the shipped default and means "this deployment does not do
+    per-sandbox cgroups": every path below is then a no-op, and the worker is
+    byte-for-byte the pre-N83 one. ``required`` means the opposite -- a sandbox
+    that would run without a quota fails by name -- so an unknown value cannot
+    be treated as either: it is refused here, at startup, the way the retired
+    root levers are (``config.refuse_retired_root_levers``).
+
+    ``getattr`` keeps a settings double that predates these fields on the old
+    behaviour, exactly like the rest of the startup guards.
+    """
+    mode = str(getattr(settings, "sandbox_cgroup", "off") or "off").strip().lower()
+    if mode not in SANDBOX_CGROUP_MODES:
+        raise ValueError(CGROUP_MODE_ERROR.format(value=mode))
+    return mode
+
+
+def cgroup_container_token() -> str | None:
+    """The container-id token that narrows this lane's mount, or ``None``.
+
+    k8s and compose differ in exactly this. On k8s the mount root **is** this
+    pod's cgroup (``subPathExpr`` narrows it), so the delegated directory is a
+    direct child and no token is needed. On compose the mount is the whole VM
+    tree, and the handle has to narrow it by container id -- the same switch the
+    control plane's shape detector reads (``reported_container_id``: ``None`` on
+    k8s, where the worker's hostname is a pod name and could never be a
+    container id). A compose worker whose hostname is not a container id gets
+    ``None`` here as well; the handle then refuses **by name** at startup rather
+    than narrowing to some other container's subtree.
+    """
+    container_id = reported_container_id()
+    return container_cgroup_token(container_id) if container_id else None
+
+
+def sandbox_cgroups_for(settings) -> SandboxCgroups | None:
+    """The process-wide per-sandbox cgroup handle, or ``None`` when off.
+
+    ``off`` returns ``None`` **without constructing anything**: that is what
+    makes the default lane byte-identical to the pre-N83 worker. ``required``
+    builds (once per mount / worker uid / lane token) the one handle this
+    process uses -- the startup lane calls ``setup()`` on it and the route-B
+    pool ``attach()``es through it, and those must be the same object: an
+    ``attach`` can only succeed under the parent a ``setup`` established.
+
+    An unknown switch value is refused by name (see
+    :func:`sandbox_cgroup_mode`) rather than read as "off".
+    """
+    mode = sandbox_cgroup_mode(settings)
+    if mode == "off":
+        return None
+    mount = Path(getattr(settings, "cgroup_mount", "/pod-cgroup"))
+    worker_uid = os.geteuid()
+    token = cgroup_container_token()
+    key = (str(mount), worker_uid, token)
+    handle = _CGROUP_HANDLES.get(key)
+    if handle is None:
+        handle = SandboxCgroups(
+            mount=mount, worker_uid=worker_uid, container_token=token
+        )
+        _CGROUP_HANDLES[key] = handle
+    return handle
+
+
+def reset_sandbox_cgroups() -> None:
+    """Drop the cached handle (tests / a worker that re-reads its settings)."""
+    _CGROUP_HANDLES.clear()
+
+
 class W1SlotPool:
     """Fixed-uid route-B slot fleet (W1 recycle semantics).
 
@@ -420,6 +529,14 @@ class W1SlotPool:
     Acquisition and release block (spawn + wait for the registered socket +
     the slot's first ``stats`` reply), so the async callers use
     :meth:`acquire` / :meth:`release`, which run them on a worker thread.
+
+    N83 phase 1 adds one optional collaborator: the per-sandbox cgroup handle
+    (``sandbox_cgroups``). With it the pool places each child in ``sbx_<id>``
+    *after* the fork and *before* the identity report -- the ordering that makes
+    everything the sandbox ever forks live inside its quota -- and tears that
+    cgroup down when the slot is retired. ``None`` (the default, and what a
+    deployment with ``E2B_SANDBOX_CGROUP=off`` resolves to) leaves the whole
+    lifecycle exactly as it was.
     """
 
     def __init__(
@@ -437,6 +554,7 @@ class W1SlotPool:
         verb_timeout_s: float = 15.0,
         slot_identity: str = "agent-grant",
         identity_reporter: Callable[[str, int], object] | None = None,
+        sandbox_cgroups: "SandboxCgroups | None" = None,
     ) -> None:
         if transport not in ("fd", "path"):
             raise ValueError(
@@ -482,6 +600,7 @@ class W1SlotPool:
             )
         self.slot_identity = slot_identity
         self._identity_reporter = identity_reporter
+        self._sandbox_cgroups = sandbox_cgroups
         self.transport = transport
         self.verb_timeout_s = verb_timeout_s
         self.channel_factory = channel_factory or default_channel_factory
@@ -562,6 +681,7 @@ class W1SlotPool:
         *,
         uid: int | None = None,
         name: str | None = None,
+        cpu_percent: int | None = None,
     ) -> SlotHandle:
         """Lease a uid (``uid`` when given, else the least-recently-freed) and
         start its slot.
@@ -569,6 +689,13 @@ class W1SlotPool:
         ``program_json`` defaults to :data:`PARKING_PROGRAM`. Returns only once
         the slot's registered socket answers ``stats`` with a launched
         instance, so a caller can ``exec`` immediately.
+
+        ``cpu_percent`` is the sandbox's **declared** share (the control plane's
+        ``cpuPercent``, e.g. 200 for two cores) -- deliberately not the
+        ``min(100, ...)`` the fork's policy ceiling clamps to. It is what the
+        per-sandbox cgroup's ``cpu.max`` carries; ``None`` means the caller does
+        not know, and the pool falls back to
+        :data:`DEFAULT_CGROUP_PERCENT`.
         """
         with self._ledger:
             uid = self._take_uid_locked(sandbox_id, uid)
@@ -665,6 +792,11 @@ class W1SlotPool:
             # the pipe (and wedge the slot) while the generation is still
             # coming up, which is exactly when this waits.
             stderr_drain = SlotStderrDrain(process)
+            # N83 phase 1: place the child in its sandbox cgroup **before** the
+            # identity report below -- see :meth:`_attach_cgroup`. A refusal
+            # here is the end of this create: no identity is reported, so the
+            # child cannot exec, and it is killed on the way out.
+            self._attach_cgroup(sandbox_id, process, cpu_percent, slot_name)
             if self._identity_reporter is not None:
                 # C3 Task 3 (ruling D9.1): report the child, then keep going --
                 # nothing "releases" it, it polls setresuid itself. The report
@@ -725,6 +857,79 @@ class W1SlotPool:
             handle.instance_pid,
         )
         return handle
+
+    def _attach_cgroup(
+        self,
+        sandbox_id: str,
+        process,
+        cpu_percent: int | None,
+        slot_name: str,
+    ) -> None:
+        """Place ``process`` in ``sbx_<sandbox_id>``, or refuse the create.
+
+        **The timing is the security property** (N83 phase 1, plan section 4).
+        The child is forked but cannot ``exec`` until its identity lands
+        (``slot_identity`` polls ``setresuid``), and ``fork`` can only happen
+        after ``exec`` -- so placing it here, before the identity report, means
+        everything the sandbox ever forks is inside the cgroup. Reporting the
+        identity first would leave a window in which the sandbox runs outside
+        its quota; that is the one ordering this method exists to keep.
+
+        Fail closed: a refusal kills the child and re-raises, so the caller
+        never sees a live slot for a sandbox that has no quota (the module has
+        already removed whatever cgroup it had created).
+        """
+        cgroups = self._sandbox_cgroups
+        if cgroups is None:
+            return
+        percent = (
+            DEFAULT_CGROUP_PERCENT if cpu_percent is None else int(cpu_percent)
+        )
+        try:
+            cgroups.attach(
+                sandbox_id=sandbox_id, pid=process.pid, cpu_percent=percent
+            )
+        except BaseException:
+            logger.error(
+                "route-B slot %s: the sandbox cgroup for %s (pid %s, %d%%) "
+                "could not be attached; killing the child -- this create fails "
+                "rather than run without a quota (N83 phase 1)",
+                slot_name,
+                sandbox_id,
+                process.pid,
+                percent,
+                exc_info=True,
+            )
+            try:
+                process.kill()
+            except OSError:  # pragma: no cover - already gone
+                pass
+            raise
+
+    def _release_cgroup(self, handle: SlotHandle) -> None:
+        """Best-effort teardown of ``handle``'s cgroup; never fails the retire.
+
+        ``release`` is idempotent and treats an absent cgroup as success
+        (``False``), which is the "the GC or a previous retire already removed
+        it" case. A real refusal (a directory that is there but cannot be
+        removed) is a named ``cgroup-refusal`` -- it is logged here and does not
+        stop the slot teardown, because the uid and the process have to come
+        back regardless.
+        """
+        cgroups = self._sandbox_cgroups
+        if cgroups is None:
+            return
+        try:
+            cgroups.release(sandbox_id=handle.sandbox_id)
+        except Exception as exc:  # noqa: BLE001 - teardown must not fail here
+            logger.warning(
+                "route-B slot %s: the cgroup for sandbox %s was not released "
+                "(%s); the subtree stays for the next create to refuse or the "
+                "node's GC to reclaim",
+                handle.name,
+                handle.sandbox_id,
+                exc,
+            )
 
     def _write_slot_documents(
         self,
@@ -991,6 +1196,12 @@ class W1SlotPool:
             except OSError:
                 pass
             handle.events_socket = None
+        # N83 phase 1: the generation's cgroup goes with the generation. The
+        # call is best-effort by construction (see :meth:`_release_cgroup`): a
+        # cgroup that is already gone is success, and one that refuses is a
+        # named warning -- the uid still has to come back, because W1 recycles
+        # by restarting the slot and a leaked uid would leak the reuse window.
+        self._release_cgroup(handle)
         self._return_uid_locked(handle.uid)
         logger.info("route-B slot %s released uid %d", handle.name, handle.uid)
 
@@ -1829,6 +2040,10 @@ def slot_pool_for(
         # starts privileged children, the other unprivileged ones that wait for
         # a grant. They must never share a ledger.
         config.slot_identity,
+        # N83 phase 1: a fleet that attaches each child to a cgroup and one that
+        # does not are different shapes too -- sharing the ledger would hide
+        # which of them placed a given slot.
+        id(config.sandbox_cgroups),
     )
     pool = _POOLS.get(key)
     if pool is None:
@@ -1843,6 +2058,7 @@ def slot_pool_for(
             verb_timeout_s=config.verb_timeout_s,
             slot_identity=config.slot_identity,
             identity_reporter=config.identity_reporter,
+            sandbox_cgroups=config.sandbox_cgroups,
         )
         _POOLS[key] = pool
     return pool
@@ -1883,6 +2099,17 @@ class RouteBConfig:
     #: (``envd_service.worker_identity.build_identity_reporter``) and injected by
     #: tests; ``agent-grant`` without one is refused by the pool.
     identity_reporter: Callable[[str, int], object] | None = None
+    #: N83 phase 1: the per-sandbox cgroup handle this fleet attaches through,
+    #: or ``None`` when ``E2B_SANDBOX_CGROUP=off`` (the default). Resolved once
+    #: per process by :func:`sandbox_cgroups_for`, so the object the startup
+    #: lane ran ``setup()`` on is the one every pool here attaches through.
+    sandbox_cgroups: SandboxCgroups | None = None
+    #: N83 phase 1: the switch itself, carried alongside the handle so the
+    #: executor can refuse a sandbox that would run **in-process** (route B
+    #: declined) when the deployment asked for per-sandbox cgroups -- an
+    #: in-process mediator has no cgroup to attach to, and ``required`` must
+    #: never mean "run without a quota" (plan Review Focus 4).
+    sandbox_cgroup: str = "off"
 
     def __post_init__(self) -> None:
         """Refuse the retired mode by name -- for direct construction too.
@@ -1897,6 +2124,19 @@ class RouteBConfig:
                 "unshares and the per-node agent writes its identity); "
                 f"{self.slot_identity!r} is retired (open-issues N52)"
             )
+        # Same rule for the cgroup switch (N83 phase 1): an unknown value is
+        # refused by name rather than read as "off" -- "off" is a fleet with no
+        # quota at all, and a typo must not be able to select it silently.
+        mode = str(self.sandbox_cgroup or "off").strip().lower()
+        if mode not in SANDBOX_CGROUP_MODES:
+            raise ValueError(CGROUP_MODE_ERROR.format(value=mode))
+        self.sandbox_cgroup = mode
+        # ...and the mode and the handle are one invariant (fix round 1,
+        # review Finding 1): a hand-built ``required`` config with no handle
+        # would otherwise be a live fleet that silently attaches nothing --
+        # the exact fail-open direction every other refusal here closes.
+        if mode == "required" and self.sandbox_cgroups is None:
+            raise ValueError(CGROUP_HANDLE_MISSING_ERROR)
 
     @classmethod
     def from_settings(cls, settings) -> "RouteBConfig":
@@ -1944,6 +2184,11 @@ class RouteBConfig:
             ),
             slot_identity=slot_identity,
             identity_reporter=build_identity_reporter(settings),
+            # N83 phase 1: ``off`` (the default) resolves to ``None`` without
+            # constructing anything; an unknown switch value is refused here, by
+            # name, before a fleet is built on top of it.
+            sandbox_cgroups=sandbox_cgroups_for(settings),
+            sandbox_cgroup=sandbox_cgroup_mode(settings),
         )
 
     @property

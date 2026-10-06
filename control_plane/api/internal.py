@@ -14,6 +14,11 @@ node, and the request must come from the node's expected address):
 * ``POST /internal/nodes/{node_id}/heartbeat``
 * ``GET  /internal/nodes/{node_id}/sandboxes``
 * ``POST /internal/nodes/{node_id}/reconcile``
+* ``POST /internal/nodes/{node_id}/cgroup-delegate`` -- the worker asks, once,
+  for its own container cgroup subtree to be delegated to it (N83 phase 1); the
+  body is empty and the control plane derives the node, the object and the
+  anchor (k8s: the pod uid its resolver read; compose: its own record's
+  container id) before instructing the node's agent on face B
 * ``POST /internal/nodes/{node_id}/slot-identity`` -- the worker reports the
   ``{sandbox_id, pid}`` of a slot child it just forked (C3 Task 3, ruling D9.1);
   the control plane answers by instructing the node's agent, **with the uid and
@@ -883,6 +888,59 @@ async def node_slot_identity(node_id: str, request: Request) -> dict[str, Any]:
         "pid": pid,
         "agent": answer,
     }
+
+
+@router.post("/internal/nodes/{node_id}/cgroup-delegate")
+async def node_cgroup_delegate(node_id: str, request: Request) -> dict[str, Any]:
+    """Ask this node's agent for the worker's one-shot cgroup delegation (N83).
+
+    Shape W of the per-sandbox-cgroup work: the worker builds and enforces the
+    ``sbx_<sandbox_id>`` cgroups nested under its own container cgroup, and the
+    single privileged step is a **one-time** handshake -- the node's agent (face
+    B, root) chowns the worker's container cgroup directory plus the files the
+    worker has to write (``cgroup.procs`` / ``cgroup.subtree_control``; never
+    ``cpu.max``, and never ``cgroup.kill`` -- the worker's kill lands on the
+    ``sbx_<id>`` cgroups it created itself, whose ``cgroup.kill`` the kernel
+    already handed to it as their creator) to the worker's uid. The kernel's
+    cgroupns + DAC then bound the worker's write authority to its own pod.
+
+    The body is empty on purpose: the worker names nothing (hard rules 1/3).
+    The node comes from the credential (①/② plus the source-IP second factor --
+    the same identity layer every node-scoped handler runs, called and not
+    copied), the anchor the agent locates the container by comes from the
+    control plane's own records (``_worker_identity_anchor``: the compose lane's
+    container id, or -- for a shape that verified the identity itself -- none,
+    and the client uses the resolver's pod uid instead), and the client
+    addresses the agent's **face B**.
+
+    Idempotent by construction: the agent's ``chown`` is, so a worker that
+    re-asks (a restart, or a retry its caller owns) gets the same answer -- the
+    second call is not a refusal.
+    """
+    node_id, _endpoint = _require_node_identity(request, node_id)
+    node = request.app.state.nodes.get(node_id)
+    if node is None:
+        raise OfficialError(404, f"Node {node_id} not found")
+    client = getattr(request.app.state, "c3_agent_client", None)
+    if client is None:
+        raise OfficialError(
+            503,
+            "this control plane has no C3 agent client configured: refusing to "
+            "delegate the worker's cgroup",
+        )
+    # D21/D25: the anchor travels only for the shape whose identity the kernel
+    # re-checks (compose). A node in that shape with no recorded container id is
+    # a named 503 *here* -- an instruction the agent cannot confirm is exactly
+    # the one that must not be sent. The k8s shape carries none, and the client
+    # then uses the pod uid its own resolver read from the API.
+    anchor = _worker_identity_anchor(request, node, node_id)
+    try:
+        answer = await client.delegate_cgroup(
+            node_id=node_id, worker_container_id=anchor
+        )
+    except AgentClientError as exc:
+        raise OfficialError(exc.status_code, str(exc)) from exc
+    return {**answer, "nodeID": node_id, "workerAnchor": anchor}
 
 
 def _owned_sandbox(request: Request, node_id: str, sandbox_id: Any):

@@ -182,6 +182,66 @@ def request_identity(
     return answer if isinstance(answer, dict) else {"answer": answer}
 
 
+def request_cgroup_delegate(
+    *,
+    control_plane_url: str,
+    node_id: str,
+    internal_key: str,
+    timeout_s: float = 5.0,
+    transport=None,
+) -> dict:
+    """Ask the control plane for this worker's one-shot cgroup delegation.
+
+    N83 phase 1 (shape W): the worker manages the sandbox cgroups nested under
+    its own container cgroup, and the one privileged step is the handshake this
+    call makes -- the control plane instructs the node's agent (face B) to hand
+    the worker's **container cgroup directory** (plus ``cgroup.procs`` /
+    ``cgroup.subtree_control``; never ``cpu.max``, and never ``cgroup.kill`` --
+    the worker's kill lands on the ``sbx_<id>`` cgroups it creates itself, whose
+    ``cgroup.kill`` the kernel already hands to it as their creator) to the
+    worker's uid. The agent's ``chown`` is idempotent, so this request is too: a
+    worker that re-asks (a restart, or a retry its caller owns) gets the same
+    answer.
+
+    Like :func:`request_identity` this dials the control plane and nothing else
+    (hard rule 5), and the worker names **nothing** -- the node comes from the
+    URL and the credential, and the anchor the agent locates the container by
+    comes from the control plane's own records (k8s: the worker pod uid it read
+    from the API; compose: the container id recorded at register/heartbeat).
+
+    There is deliberately **no retry loop inside**: the caller owns retries, so
+    a refusal is raised once, named, and never silently re-attempted behind it.
+    Every failure is a :class:`PrivHelperError`.
+    """
+    import httpx
+
+    url = (
+        f"{str(control_plane_url).rstrip('/')}/internal/nodes/{node_id}"
+        "/cgroup-delegate"
+    )
+    try:
+        with httpx.Client(timeout=float(timeout_s), transport=transport) as client:
+            response = client.post(url, headers={"X-Internal-Key": internal_key})
+    except httpx.HTTPError as exc:
+        detail = str(exc) or type(exc).__name__
+        raise PrivHelperError(
+            f"the control plane is unreachable for the cgroup delegation: {detail}"
+        ) from exc
+    if response.status_code >= 300:
+        detail = _error_detail(response)
+        raise PrivHelperError(
+            "the control plane refused the cgroup delegation "
+            f"(HTTP {response.status_code}): {detail}"
+        )
+    try:
+        answer = response.json()
+    except ValueError as exc:
+        raise PrivHelperError(
+            "the control plane answered the cgroup delegation with a non-JSON body"
+        ) from exc
+    return answer if isinstance(answer, dict) else {"answer": answer}
+
+
 def _error_detail(response) -> str:
     """The refusal's own words: ``message`` (control plane) or ``error``."""
     try:

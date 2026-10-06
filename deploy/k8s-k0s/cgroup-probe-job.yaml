@@ -1,0 +1,95 @@
+# N83 Phase 1 · Task 1：cgroup 放置形态定形探针（一次性 Job，跑完就删）
+#
+# 为什么是这个形状（2026-10-06 实测修正）：
+#   * 上一版计划写的 `hostCgroupNamespace: true` **不是 k8s 的字段**（服务端 OpenAPI 里
+#     没有，Job 被 strict decoding 拒了）。实测：k8s 里只有 `privileged: true` 才拿到
+#     **host cgroupns + rw 的 cgroupfs 挂载**；非特权（哪怕 root + CHOWN/DAC_OVERRIDE/FOWNER，
+#     也就是 c3-agent 面 B 的现有形状）拿到的是 `0::/` 私有 cgroupns + **ro** 挂载。
+#   * 所以探针按**面 B 的真实形状**跑：非特权、root、三个能力，自己挂一块 **rw 的
+#     hostPath cgroupfs**。要量的是"光靠这块 rw 视图（没有 host cgroupns）能走到哪一步"：
+#     看得见宿主整棵树吗？能 mkdir 吗？建出来的子 cgroup 有 cpu.max 吗？写得进吗？
+#     能把一个 pid 迁进去吗（这一步有 cgroupns 边界，预期失败）？
+#
+#   * 两个副本、每节点一个：两台 worker 各在一台上，探针在**自己节点**上找 worker pod
+#     的 cgroup。用 podAntiAffinity 钉死"一节点一份"，避免两个探针挤在一台。
+#
+#   * 探针只碰它自己建的 `sbx_probe` 目录，退出前删干净；候选 A 若真的改到过 worker
+#     容器目录的 `cgroup.subtree_control`，按原值写回（读数里如实记录）。
+#
+# 用法（仓库根，KUBECONFIG 指向本项目集群）：
+#   kubectl -n sandlock create configmap cgroup-probe \
+#     --from-file=probe_cgroup_placement.py=deploy/scripts/acceptance/probe_cgroup_placement.py
+#   kubectl -n sandlock apply -f deploy/k8s-k0s/cgroup-probe-job.yaml
+#   kubectl -n sandlock wait --for=condition=complete job/cgroup-probe --timeout=180s
+#   kubectl -n sandlock logs -l job-name=cgroup-probe --prefix
+#   kubectl -n sandlock delete job cgroup-probe configmap cgroup-probe
+#
+# 读数与判据：docs/superpowers/plans/2026-10-06-n83-per-sandbox-cgroup.md §3。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cgroup-probe
+  namespace: sandlock
+  labels:
+    app: cgroup-probe
+spec:
+  completions: 2
+  parallelism: 2
+  # 不设 backoffLimit 之外的花样：探针失败要看得见，别自动重试把读数搅浑。
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 900
+  template:
+    metadata:
+      labels:
+        app: cgroup-probe
+    spec:
+      restartPolicy: Never
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: cgroup-probe
+              topologyKey: kubernetes.io/hostname
+      # 唯一的特权形态：看宿主进程表（面 B 本来就有）；cgroup 只看自己挂的那块 rw 视图。
+      hostPID: true
+      containers:
+        - name: probe
+          # 用已在两台节点上拉好的 agent 镜像：自带 python3，不引入新的拉取面。
+          image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0-1044-g489d6e0-20261006-092329
+          command:
+            - python3
+            - -u
+            - /probe/probe_cgroup_placement.py
+            - --json
+          env:
+            # 两台 worker 的 pod uid：探针在**自己**节点上只会命中一个。
+            - name: E2B_PROBE_WORKER_POD_UIDS
+              value: "a5cdb0bc-4777-4330-ad1c-01f062572177,3206ac7e-f55b-421c-9ef5-a8795485ccc4"
+          securityContext:
+            runAsUser: 0
+            # 与 c3-agent 面 B 同一套能力集：写 cgroupfs 目录/文件靠 DAC_OVERRIDE，
+            # 不需要 SYS_ADMIN（这正是要验证的一点）。
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+            seccompProfile:
+              type: RuntimeDefault
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: host-cgroup
+              mountPath: /host-cgroup
+            - name: probe
+              mountPath: /probe
+      volumes:
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: probe
+          configMap:
+            name: cgroup-probe

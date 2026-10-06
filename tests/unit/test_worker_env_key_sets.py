@@ -256,6 +256,15 @@ KEY_CLASSES: dict[str, set[str]] = {
     "netns_pair": {"E2B_ENABLE_NET_ISOLATION", "E2B_FD_INJECT_CONNECT"},
     "egress_switch": {"E2B_ENABLE_NETWORK"},
     "route_b_root": {"E2B_ROUTE_B_TMP_ROOT"},
+    # N83 phase 1 / Task 2 (2026-10-06): the per-sandbox cgroup switch and the
+    # mount root its rw cgroupfs view lands on. The fleet names both
+    # (`E2B_SANDBOX_CGROUP=off` in `deploy/k8s/worker.yaml`, flipped to
+    # `required` by the k0s overlay) and so do the three C3 compose stacks (the
+    # same rw bind, `off` by default). The single-machine build example
+    # (`docker-compose.yml`) and the SDK test runner build no per-sandbox cgroup
+    # at all, so both carry neither key -- their `.env` classes below name that
+    # absence rather than letting a missing switch look like an oversight.
+    "sandbox_cgroup": {"E2B_SANDBOX_CGROUP", "E2B_CGROUP_MOUNT"},
 }
 
 #: Keys a *stack* declares that the k8s manifest does not, in exactly one named
@@ -370,6 +379,7 @@ _DEMO_MISSING = (
     | KEY_CLASSES["egress_switch"]
     | KEY_CLASSES["route_b_root"]
     | KEY_CLASSES["slot_identity"]
+    | KEY_CLASSES["sandbox_cgroup"]
 )
 
 #: The test runner: it names only what the in-container suite needs to build
@@ -385,6 +395,7 @@ _RUNNER_MISSING = (
     | KEY_CLASSES["egress_switch"]
     | KEY_CLASSES["route_b_root"]
     | KEY_CLASSES["slot_identity"]
+    | KEY_CLASSES["sandbox_cgroup"]
 )
 
 #: Per stack: the k8s keys it may not declare, and the keys it adds.

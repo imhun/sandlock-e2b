@@ -195,6 +195,72 @@ def build_identity_reporter(
     return _report
 
 
+def request_cgroup_delegate(
+    *,
+    timeout_s: float,
+    settings=None,
+    control_plane_url: str | None = None,
+    node_id: str | None = None,
+    internal_key: str | None = None,
+    transport=None,
+) -> dict[str, Any]:
+    """Ask, once, for this worker's cgroup subtree to be delegated to it.
+
+    N83 phase 1 (shape W): the worker builds and enforces the per-sandbox
+    ``sbx_<sandbox_id>`` cgroups itself, and the single privileged step is the
+    **one-time** handshake this call makes -- the control plane instructs the
+    node's agent (face B, root) to hand the worker's own container cgroup
+    directory (plus the files it has to write: ``cgroup.procs`` /
+    ``cgroup.subtree_control`` -- never ``cpu.max``, and never ``cgroup.kill``:
+    the worker's kill lands on the ``sbx_<id>`` cgroups it creates itself, whose
+    ``cgroup.kill`` the kernel already hands to it as their creator) to the
+    worker's uid. The agent's ``chown`` is idempotent, so re-asking is safe: a
+    restarted worker calls this again and gets the same answer.
+
+    The URL, node id, credential and deadline are the identity reporter's own
+    (``E2B_CONTROL_PLANE_URL`` / ``E2B_NODE_ID`` from the worker's environment,
+    ``settings.internal_api_key``, and the caller's ``timeout_s``); the keyword
+    overrides exist for an embedder that already knows them (the tests) and are
+    used verbatim when given, including an explicit ``""``. The worker names
+    **nothing** in the request -- no anchor, no path, no uid: the control plane
+    derives the node from the credential and the anchor from its own records.
+
+    There is deliberately **no retry loop inside** (the caller owns retries),
+    and every failure -- unreachable, refused, non-JSON -- is a named
+    :class:`~envd_service.priv_helpers.PrivHelperError` rather than a silent
+    "the worker came up without a delegated subtree".
+    """
+    from envd_service.priv_helpers import (
+        PrivHelperError,
+        request_cgroup_delegate as _request,
+    )
+
+    url = (
+        control_plane_url
+        if control_plane_url is not None
+        else os.getenv("E2B_CONTROL_PLANE_URL", "")
+    )
+    node = node_id if node_id is not None else os.getenv("E2B_NODE_ID", "")
+    key = (
+        internal_key
+        if internal_key is not None
+        else (getattr(settings, "internal_api_key", "") or "")
+    )
+    if not url or not node:
+        raise PrivHelperError(
+            "this worker does not know which control plane to ask, or which "
+            "node it is (E2B_CONTROL_PLANE_URL / E2B_NODE_ID): refusing to "
+            "request the cgroup delegation"
+        )
+    return _request(
+        control_plane_url=str(url),
+        node_id=str(node),
+        internal_key=str(key),
+        timeout_s=float(timeout_s),
+        transport=transport,
+    )
+
+
 def worker_identity_fields() -> dict[str, int]:
     """The worker's own uid/gid, as the control-plane report spells them.
 

@@ -359,6 +359,16 @@ EPERM——网关+命令同实例变体依赖其修复，探针 `deploy/scripts/
 headroom 已关闭在 E2B 侧（FUP #3）：默认箱从 512 MiB 提到 1 GiB
 （`E2B_DEFAULT_MEMORY_MB`），fork 逻辑未改动。
 
+**口径更新（2026-10-06，N83 Phase 1 每沙箱 cgroup 落地之后）**：上面这套记账按**进程属主
+uid** 汇总，而 route-B 槽位的 `sandlock-superv` 与它管的载荷**同 uid** —— "这段 CPU 是谁烧的"
+在 cgroup 之前靠 uid 归属，在 cgroup 之后**多了一层内核口径**：supervisor 现在跑在沙箱**自己的**
+`sbx_<id>` 子树里，它的 CPU 既照旧计入这条 uid 汇总（活动判定与 Phase 0 的 `measuredCpuPercent`
+口径都没变），又和载荷一起被同一个 `cpu.max` 节流。也就是说，**"沙箱自己烧了多少"与"沙箱被
+允许烧多少"第一次是同一个口径**：洪泛的 supervisor 花的是租户自己的额度（本地车道读数见
+`docs/reports/n83-task-7-cgroup-acceptance.md` —— 探针单独跑 0.84 核；四路并发 0.99 核 ≤ 1 核额度
+且 `nr_throttled` 增长），不再出现"客户端只占 2%、worker pod 却涨 1 核"那种**记账与归属分家**
+的形状。这条更新只覆盖 CPU 维度；磁盘与网络仍各走各的账（§5 的开关与阈值不变）。
+
 
 ## 9. 排期
 

@@ -10,6 +10,13 @@ discipline -- exact matches, named refusals, never a guess:
   option 2 as amended by ruling **D25**) -- :meth:`ProcLookup.worker_uid_gid`,
   used by the compose lane, whose face B has no pod spec to read the way the
   k8s lane does.
+* **where is this worker's *container* cgroup** (N83 Phase 1, Task 3) --
+  :meth:`ProcLookup.worker_container_cgroup`, the anchor the one-shot delegation
+  chowns to the worker. It is the same candidate rule as
+  :meth:`ProcLookup.worker_uid_gid` (the anchor token *and* the container's own
+  init), and its answer is the path the *kernel* spells -- which is relative to
+  this face's cgroup namespace root, so the caller that needs the agent's mount
+  view resolves it by directory name (``c3_agent.cgroups``).
 
 **The slot half (D9.3).** The worker forks the slot's child and reports the pid
 **it** knows; the agent,
@@ -87,6 +94,11 @@ DEFAULT_PROC_ROOT = Path("/proc")
 #: ``/proc/<pid>/status`` is a few hundred bytes; a file that is much larger is
 #: not a status file and is refused rather than partially parsed.
 _STATUS_MAX_BYTES = 65536
+
+#: cgroup v2's single hierarchy line in ``/proc/<pid>/cgroup``. cgroup v1's
+#: numbered lines do not exist on a v2 host, and a reading without this one is
+#: refused rather than parsed loosely.
+_CGROUP_V2_PREFIX = "0::"
 
 class LookupRefusal(Exception):
     """A named, fail-closed refusal: no host pid may be written from this."""
@@ -435,6 +447,105 @@ class ProcLookup:
                 "steps act as)"
             )
         return uid, gid
+
+    def worker_container_cgroup(
+        self,
+        *,
+        node_id: str,
+        pod_uid: str | None = None,
+        container_id: str | None = None,
+    ) -> str:
+        """Where this worker's **container** cgroup is, in the kernel's spelling.
+
+        N83 Phase 1's one-shot delegation hands exactly one directory to the
+        worker -- its container's cgroup -- and this is the half of the answer
+        the kernel owns: which directory *is* that container's. The anchor is the
+        lane's own (ruling D25's two shapes, exactly one per instruction):
+
+        * **k8s** -- the pod UID the control plane read from the pod API:
+          candidates are matched by ``pod<uid>`` (``pod_cgroup_token``), so the
+          QoS segment is irrelevant (the plan's §1.4 收窄 probe measured both);
+        * **compose** -- the worker's container id (its hostname; ruling D25):
+          matched by ``container_cgroup_token`` against the world-readable
+          ``/proc/<pid>/cgroup``, the same read :meth:`worker_uid_gid` makes.
+
+        The anchor alone is not enough, which is the second half of the
+        predicate: the candidate must also be the **container's init**
+        (:meth:`_is_container_init`, ``NSpid`` reading ``[<host pid>, 1]``). A
+        ``kubectl exec`` lands in a sibling cgroup that carries the very same
+        anchor, and handing the worker an exec cgroup would be handing it the
+        wrong directory -- measured shape, not a hypothetical.
+
+        Zero candidates (a recreated worker, a stale anchor, a host pid
+        namespace) and more than one (a pod with several container inits) are
+        both named refusals: the caller has nothing safe to chown in either case.
+
+        What is returned is the path **as the kernel spells it for this reader**
+        -- and this face has a private cgroup namespace, so that spelling is
+        relative to its own root and may carry ``..`` (measured 2026-10-06;
+        ``c3_agent.cgroups`` resolves it into the agent's mount view by name).
+        """
+        if pod_uid is None and container_id is None:
+            raise LookupRefusal(
+                f"worker {node_id} names no single cgroup anchor (pod uid or "
+                "container id): refusing"
+            )
+        if pod_uid is not None and container_id is not None:
+            raise LookupRefusal(
+                f"worker {node_id} names both a pod uid and a container id: "
+                "refusing to locate its container cgroup"
+            )
+        if pod_uid is not None:
+            if not validate_pod_uid(pod_uid):
+                raise LookupRefusal(
+                    f"the pod uid ({pod_uid!r}) carried for worker {node_id} is "
+                    "not a pod uid: refusing"
+                )
+            token = pod_cgroup_token(pod_uid)
+        else:
+            assert container_id is not None  # the branch above fixed this
+            if not validate_container_id(container_id):
+                raise LookupRefusal(
+                    f"the container id ({container_id!r}) carried for worker "
+                    f"{node_id} is not a container id: refusing"
+                )
+            token = container_cgroup_token(container_id)
+        candidates: list[str] = []
+        for pid in self._iter_entries():
+            cgroup = self._cgroup(pid)
+            if cgroup is not None and token in cgroup and self._is_container_init(pid):
+                candidates.append(cgroup)
+        if len(candidates) > 1:
+            raise LookupRefusal(
+                f"worker {node_id}'s container anchor matches more than one "
+                "container-init process: refusing (ambiguous)"
+            )
+        if not candidates:
+            raise LookupRefusal(
+                f"worker {node_id}'s container holds no process this agent can "
+                "identify as the container's init: refusing to locate its "
+                "container cgroup"
+            )
+        return self._cgroup_path(candidates[0], node_id=node_id)
+
+    @staticmethod
+    def _cgroup_path(cgroup_text: str, *, node_id: str) -> str:
+        """The cgroup v2 path out of one ``/proc/<pid>/cgroup`` reading.
+
+        cgroup v2 has a single hierarchy line (``0::/…``); anything else is a
+        shape this agent has no rule for, and a reading that names no path is a
+        named refusal rather than an empty string that a caller might join onto
+        a mount.
+        """
+        for line in cgroup_text.splitlines():
+            if line.startswith(_CGROUP_V2_PREFIX):
+                path = line[len(_CGROUP_V2_PREFIX) :].strip()
+                if path and path != "/":
+                    return path
+        raise LookupRefusal(
+            f"worker {node_id}'s container init carries no cgroup v2 path this "
+            "agent can read: refusing to locate its container cgroup"
+        )
 
     def host_pid(
         self, container_pid: int, identity: WorkerIdentity, *, sandbox_id: str

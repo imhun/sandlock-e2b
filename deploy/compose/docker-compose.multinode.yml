@@ -369,6 +369,11 @@ services:
       # leaves the workers at the code default (10000/1000).
       E2B_UID_POOL_START: ${E2B_UID_POOL_START:-10000}
       E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE:-1000}
+      # N83 phase 1 / Task 2：面 B 的 rw cgroupfs 视图（`/sys/fs/cgroup:/host-cgroup`
+      # 在下面的 volumes 里）。委派（把 worker 容器 cgroup 子树 chown 给它）是
+      # **这个**容器做的（形态 W，计划 §3.2），所以它要有一块真的 cgroupfs；
+      # 挂整棵树而非收窄视图 —— 它自己解析 worker 容器路径，那条路径与 QoS 无关。
+      E2B_CGROUP_MOUNT: /host-cgroup
       # C3 Task 6: the eyes, on face B (the container that mounts the shared
       # workspaces). This stack now carries the `redis` service, so its control
       # plane has a *shared* record store and the sweep's leg (a) no longer
@@ -382,6 +387,10 @@ services:
       E2B_C3_AGENT_SCAN_BACKOFF_MAX_S: ${E2B_C3_AGENT_SCAN_BACKOFF_MAX_S:-600}
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
+      # N83 phase 1 / Task 2：面 B 的 rw cgroupfs 视图（见上面
+      # `E2B_CGROUP_MOUNT`）。`type: Directory` 的 compose 等价物就是这个绑定；
+      # 只挂给面 B —— 面 A 不挂。
+      - /sys/fs/cgroup:/host-cgroup
     # `agent-plane` only: this is the other half of the same two-channel split.
     networks:
       - agent-plane
@@ -435,6 +444,17 @@ services:
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
+      # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
+      # default, inert) and where the rw cgroupfs view lands. This lane gets the
+      # same *narrowed* view k8s gets, by a different device: compose **has**
+      # `volume.subpath`, but for `type: bind` it is silently ignored (measured:
+      # a non-existent subpath still mounts the source root, no warning) and it
+      # interpolates at parse time, so it cannot name a container id. The bind
+      # source is therefore this service's own static `cgroup_parent`
+      # (`/e2b-${COMPOSE_PROJECT_NAME}-worker-1` below; Docker creates it and the
+      # container lands at `<parent>/<container-id>`), never the whole tree.
+      E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}
+      E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}
       # N36 (2026-09-26): the fleet shape, so wildcard allowOut works here.
       # Each sandbox runs its own loopback-only netns and egress goes through
       # the supervisor's connect-fd injection; the wildcard-DNS `:53` bind then
@@ -468,8 +488,18 @@ services:
       # that takes a sandbox offline.
       E2B_PID_NS: "true"
       E2B_ENABLE_NETWORK: "true"
+    # N83 phase 1 / Task 2: the per-sandbox cgroup parent Docker creates for
+    # this worker. The bind source below is exactly this slice (`/sys/fs/cgroup`
+    # + this path), so the two can never drift -- pinned by
+    # `tests/unit/test_worker_manifest_permissions.py`. Indexed by the compose
+    # project name so two stacks on one VM never share a parent.
+    cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-1
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
+      # N83 phase 1 / Task 2: the worker's rw cgroupfs view (plan §3.5),
+      # narrowed to this worker's own slice: the bind source equals the
+      # `cgroup_parent` above, never the whole Docker VM tree.
+      - /sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-1:/pod-cgroup
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
     # E2B_QUOTA_AGENT_URL + quota-agent). The file runs the fleet shape:
     # per-sandbox netns, so wildcard allowOut rules resolve through the
@@ -522,6 +552,17 @@ services:
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
+      # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
+      # default, inert) and where the rw cgroupfs view lands. This lane gets the
+      # same *narrowed* view k8s gets, by a different device: compose **has**
+      # `volume.subpath`, but for `type: bind` it is silently ignored (measured:
+      # a non-existent subpath still mounts the source root, no warning) and it
+      # interpolates at parse time, so it cannot name a container id. The bind
+      # source is therefore this service's own static `cgroup_parent`
+      # (`/e2b-${COMPOSE_PROJECT_NAME}-worker-2` below; Docker creates it and the
+      # container lands at `<parent>/<container-id>`), never the whole tree.
+      E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}
+      E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}
       # N36 (2026-09-26): the fleet shape, so wildcard allowOut works here.
       # Each sandbox runs its own loopback-only netns and egress goes through
       # the supervisor's connect-fd injection; the wildcard-DNS `:53` bind then
@@ -555,8 +596,18 @@ services:
       # that takes a sandbox offline.
       E2B_PID_NS: "true"
       E2B_ENABLE_NETWORK: "true"
+    # N83 phase 1 / Task 2: the per-sandbox cgroup parent Docker creates for
+    # this worker. The bind source below is exactly this slice (`/sys/fs/cgroup`
+    # + this path), so the two can never drift -- pinned by
+    # `tests/unit/test_worker_manifest_permissions.py`. Indexed by the compose
+    # project name so two stacks on one VM never share a parent.
+    cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-2
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
+      # N83 phase 1 / Task 2: the worker's rw cgroupfs view (plan §3.5),
+      # narrowed to this worker's own slice: the bind source equals the
+      # `cgroup_parent` above, never the whole Docker VM tree.
+      - /sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-2:/pod-cgroup
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
     # E2B_QUOTA_AGENT_URL + quota-agent). The file runs the fleet shape:
     # per-sandbox netns, so wildcard allowOut rules resolve through the
@@ -609,6 +660,17 @@ services:
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
+      # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
+      # default, inert) and where the rw cgroupfs view lands. This lane gets the
+      # same *narrowed* view k8s gets, by a different device: compose **has**
+      # `volume.subpath`, but for `type: bind` it is silently ignored (measured:
+      # a non-existent subpath still mounts the source root, no warning) and it
+      # interpolates at parse time, so it cannot name a container id. The bind
+      # source is therefore this service's own static `cgroup_parent`
+      # (`/e2b-${COMPOSE_PROJECT_NAME}-worker-3` below; Docker creates it and the
+      # container lands at `<parent>/<container-id>`), never the whole tree.
+      E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}
+      E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}
       # N36 (2026-09-26): the fleet shape, so wildcard allowOut works here.
       # Each sandbox runs its own loopback-only netns and egress goes through
       # the supervisor's connect-fd injection; the wildcard-DNS `:53` bind then
@@ -642,8 +704,18 @@ services:
       # that takes a sandbox offline.
       E2B_PID_NS: "true"
       E2B_ENABLE_NETWORK: "true"
+    # N83 phase 1 / Task 2: the per-sandbox cgroup parent Docker creates for
+    # this worker. The bind source below is exactly this slice (`/sys/fs/cgroup`
+    # + this path), so the two can never drift -- pinned by
+    # `tests/unit/test_worker_manifest_permissions.py`. Indexed by the compose
+    # project name so two stacks on one VM never share a parent.
+    cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-3
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
+      # N83 phase 1 / Task 2: the worker's rw cgroupfs view (plan §3.5),
+      # narrowed to this worker's own slice: the bind source equals the
+      # `cgroup_parent` above, never the whole Docker VM tree.
+      - /sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-3:/pod-cgroup
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
     # E2B_QUOTA_AGENT_URL + quota-agent). The file runs the fleet shape:
     # per-sandbox netns, so wildcard allowOut rules resolve through the

@@ -2824,6 +2824,141 @@ worker 启动自检 `seccomp self-check: filter mode active, user namespaces all
 `unknown: blob upload unknown to registry`，构建本身两平台都已成功），**原样重跑一次即成功**；
 下次遇到这个报错直接重试，不要当成配置问题。
 
+### 7.48 本地车道验收：N83 Phase 1 每沙箱 cgroup —— **local compose lane 全绿，k0s 还没滚**（2026-10-06；2026-10-06 在 `d600b7e` 上复跑；同日 **compose 车道也收窄**后在新分支上复验）
+
+**先说这一节是什么、不是什么**：这是"**本地 lane 先绿**"的读数（`AGENTS.md` 的顺序），**不是上线记录**
+—— 自建 k0s（`172.18.80.94` / `.80.140`）这次**一个 pod 都没碰**。验收脚本、RED→GREEN 全文、
+每一条原始读数在 `docs/reports/n83-task-7-cgroup-acceptance.md`，脚本本体是
+`deploy/scripts/acceptance/cgroup_acceptance.py`（对任何 E2B endpoint 都跑得动，但**车道相关的东西一共五个，都得给**：`--api-url` / `--api-key`、`--internal-url`（控制面**内部** API，从 worker 容器里可达的那个地址）、`--internal-key`、`--nodes`（CP 认识的那些 node id，同时进 `{node}` 替换）、`--worker-exec-template`。k0s 上不能只换后两个 —— `--internal-url` 与两个 key 的默认值是 compose 专用的，照默认值跑会直接失败；脚本的 docstring 里有一条完整的 k0s 命令）。
+
+> **本节读数取自 `d600b7e`（`n83/acceptance-final`，含 final-review 修复 `d8be58a`）上的复跑** ——
+> 同一支脚本、同一份配方；车道 `-p n83acc2`、宿主端口 **3250**。原始 JSON、重跑命令与"读数移动"
+> （相对 `164c987` 那一版）在 `docs/reports/n83-task-7-cgroup-acceptance.md`（§3.1 / §4 / §5 / §0）。
+>
+> **⚠ 下面这张表的 ④ 行是"收窄前"的 compose 形状**（peer 容器可见，`check4_mode = peer-container`）。
+> 2026-10-06 当天 compose 车道也加上了与 k8s 等价的收窄（`cgroup_parent` + 同名 bind，见本节末尾的
+> 坑 5 与"收窄"段），并在分支 `n83/compose-narrow` 上用**同一支脚本**复验：车道 `-p n83narrow`、
+> 宿主端口 **3300**，④ 第一次走 **`narrowed-mount`** 分支（peer 可见数 **0**、挂载根三条写全
+> `EACCES`）。两个形状的原始 JSON 与逐项读数都在 `docs/reports/n83-task-7-cgroup-acceptance.md`。
+
+**车道**：本机 compose 多节点栈 `deploy/compose/docker-compose.multinode.yml`（3 worker + 控制面 +
+redis + agent 两面），**项目名 `n83acc2`、宿主端口 `3250`**（Task 7 那一趟是 `n83acc` / `3200`；
+复跑换名换端口，避开用户栈与旧趟残留）—— 用户那套 live 栈（project `compose`、
+3100）全程没动，也**没有**对它跑过 `up/down/build`；验收完 `docker compose -p n83acc2 … down` 拆掉
+（镜像留着）。三处 override 的来历（都在 `tmp/`，gitignored）：① 端口用 `ports: !override` 覆盖
+hardcode 的 `3100:3000`（compose 对 `ports` 是**追加**合并，只写新端口会同时绑 3100 ⇒ 撞车）；
+② 盘/进程两维照抄用户 `tmp/n80/compose-override.yml`（Docker VM 整盘已用 ~111 GB，而清单里
+`E2B_NODE_DISK_MB: 4096` 是准入配额 ⇒ 不覆盖就是 `503 No resources available`）；③ 本次自己的
+`E2B_SANDBOX_CGROUP=required` 与 `E2B_SANDBOX_NOTIFY_RATE_LIMIT=0`（后者**只在这次验收里**关掉
+通知限流，用来量"洪泛花自己的额度"，量完随栈拆掉 = 撤回）。agent 两面用 **本 worktree 现构建的
+镜像**（`docker build -f deploy/docker/Dockerfile.agent -t e2b-sandlock-agent:n83acc2 .` 后由
+`AGENT_IMAGE` 指过去），否则跑的是旧 registry 镜像、委派 op 根本不存在。
+（2026-10-06 的 **compose 收窄复验**用同一份配方，只换 `-p n83narrow` 与宿主端口 **3300**；
+agent 镜像是 `e2b-sandlock-agent:n83narrow`。收窄那一步见本节末尾的坑 5。）
+
+**RED → GREEN（同一条车道、同一支脚本，只翻 `E2B_SANDBOX_CGROUP`）**：
+
+| 检查 | RED（`off`，限流关） | GREEN（`required`，限流关） |
+|---|---|---|
+| ① 额度是真的 | 4 自旋 ⇒ CP 内部视图 `measuredCpuPercent = **400.52**`（声明 100）；沙箱**没有** cgroup 可读 | `measuredCpuPercent = **100.16**`（= 声明额度）；`cpu.max` 读回 `100000 100000`；同节点第二个沙箱往返 min **31.15 ms** vs 静默基线 **39.65 ms**（判据 = 3× 静默 min-of-5，本例上限 118.95 ms）。⚠ **这条子判据的能力边界要说清**：RED 档（4 自旋、无 cgroup）的邻居 min 是 **26.84 ms vs 静默 27.45 ms** —— 本车道这条负载下邻居**确实没有掉速**，所以它只能发现**粗粒度饿死**（N82 那种 860 ms 停顿），细微劣化它分辨不出来；"邻居不被吵"的正面证据以 ③ 的额度记账为准（CPU 记在沙箱自己的账上、超了被节流），不是这条 rtt |
+| ② 内核在强制 | 无 `sbx_<id>` ⇒ 具名失败（没有可节流的东西） | 3.13 s 自旋：`usage_usec +3,201,252`（1.022 核）、**`nr_throttled +32`**、`throttled_usec +9,588,263 µs` |
+| ③ 洪泛花自己的额度 | 探针 9185 op/s；**`sbx` cgroup 不存在**（这笔 CPU 记不到沙箱账上） | 探针单跑 **9,794 op/s / 0.840 核**（≤ 1 核额度）；**四路并发 11,945 op/s（2986×4）/ 0.994 核 ≤ 额度、`nr_throttled +12`** —— 额度真的 binding |
+| ④ 收窄/视图形状 | 无被委派目录（worker 的 cgroup 视图里没有 `worker/` 子树） | 三台 worker：自家容器 cgroup 属主 **65534**、`cgroup.procs`/`cgroup.subtree_control` **可写**、`cpu.max` **EACCES**、`/proc/self/cgroup = 0::/worker`；**同层的 15 个 peer 容器 cgroup** 逐个探：非被委派的（root 所有，控制面/redis/agent/另一套栈的容器）`cpu.max`/`cgroup.procs`/`mkdir` **全 EACCES**；被委派的那 2 个（同宿主的另两台 worker，uid 都是 65534）`cpu.max` 仍 **EACCES**，但 `cgroup.procs`/`subtree_control`/`mkdir` 按 uid 归我们 —— 如实记在 `delegated_peers` 里，见下面第 4 条坑；挂载根 `/pod-cgroup`（它不是容器、是 Docker VM 的 cgroup 根）单独探：三个写全 EACCES |
+| ⑤ 负例（fail closed） | — | 三台 worker 对**自家** `cpu.max` 的 `open(O_WRONLY)` 全 **EACCES**（委派故意不含它） |
+
+**⭐ 收窄后的复验（2026-10-06，`n83/compose-narrow`，车道 `-p n83narrow` / 宿主端口 3300）**：上表 ④
+那一格是**收窄前**的形状（peer 可见、`check4_mode = peer-container`、每台 15 个 peer）。收窄之后同一支
+脚本第一次走 **`narrowed-mount`** 分支：三台 worker 的 `/pod-cgroup` = cgroupfs 文件 + **恰好一个容器
+目录（自己的，属主 65534，`subtree_control = cpu`）**，`peer_containers_count = 0`，`docker/` 与
+`kubepods*` **不存在**；挂载根就是 Docker 刚建的那个父切片（`cpu.max = max 100000`、
+`cgroup.subtree_control = cpuset cpu io memory pids`、自己没有进程），它的 `cpu.max`/`cgroup.procs`/
+`mkdir` 三条写全 **EACCES** ⇒ `evidence = true`。同一条脚本的 GREEN 档仍然**五条全 PASS**、RED 档
+（`off`）仍然**五条全 FAIL 且具名**（① `399.93`、③ 探针 `9,125 op/s` 且找不到 `sbx_<id>`、
+④ "cannot pick this worker's delegated container cgroup under /pod-cgroup: 0 candidates"）。**"跨 worker
+的 DoS"**（在 peer 的容器 cgroup 里 `mkdir`，让对方的"恰好一个被委派的子目录"自检具名拒绝）**随这次
+收窄消失**：peer 的容器目录已经不在挂载命名空间里。原始 JSON 见
+`docs/reports/n83-task-7-cgroup-acceptance.md`。
+
+**"邻居付账"这条症状的直接读数（RED 的补充，一次性探针）**：同一条 `openclose` 洪泛（限流关、无
+每沙箱 cgroup）期间，`worker-1`（本轮 hosting 节点）**自己容器 cgroup** 的 `cpu.stat` 涨 **0.860 核（中位）/ 0.869 核（峰）**，
+另两台 0.03 核 —— 也就是 N82 量到的"CPU 记在 worker pod 上、租户账上是 0"。GREEN 里同一笔 CPU
+落在 `sbx_<id>` 子树里（0.84 核），租户账与归属第一次合一。
+
+**上线剧本（Step 3，两点纪律）**：`git log --oneline <在版 sha>..HEAD` 看清镜像带什么 → 构建 →
+**第一次 apply 让 `E2B_SANDBOX_CGROUP=off` 滚完并冒烟建箱**（确认新镜像 + 新清单本身没问题、delegation
+op 在位但惰性）→ **第二次 apply** 把 `deploy/k8s-k0s/worker-capacity.patch.yaml` 里那行翻成
+`required` 再滚 → 线上只复验**本地证明不了的形状事实**：④ 的 k8s 版（worker 内 `ls /pod-cgroup`
+**看不到** `kubepods/`，因为 `subPathExpr` 把挂载收窄到本 pod；自家容器 cgroup 是 65534 所有、
+`cpu.procs`/`subtree_control` 可写）+ 一条端到端冒烟（② 的 3 s 自旋读数）。任何一条红 ⇒ 立刻用
+下面的回退杆。
+
+**回退杆（停一次就够）**：把 `deploy/k8s-k0s/worker-capacity.patch.yaml`**第 41 行**那一条
+（`- name: E2B_SANDBOX_CGROUP`，第 42 行是它的 `value: "required"`）的 value 翻回 **`"off"`** 并 apply（compose 车道同理：
+`deploy/compose/docker-compose.multinode.yml` 的 `${E2B_SANDBOX_CGROUP:-off}`）。`off` 是代码默认，
+于是行为逐字节回到 Phase 1 之前；**已经在跑的沙箱 cgroup 会在它被拆除时照常 `cgroup.kill` + `rmdir`
+释放**，不需要额外清理（worker 重建时 `worker/` 目录由自检复用/拒绝，见 `sandbox_cgroup.py`）。
+
+**这次踩到的六个坑（都会在 k0s 上再遇到，先记下）**：
+
+1. **沙箱 cgroup 目录名是 `sbx_<sandbox_id>`，而 CP 给的 `sandbox_id` 本身就带 `sbx_` 前缀**
+   ⇒ 实际目录是 `sbx_sbx_<hex>`。别用"看起来对不对"去猜路径，脚本是**按模块写死的那条规则**拼的。
+2. **compose 里每台 worker 都能看到整棵 VM 树**（**收窄前**的形状；2026-10-06 收窄之后只看得到
+   自己那一片，见坑 5）⇒ 当年单靠"哪个 worker 找得到 `sbx_<id>`"判不出
+   hosting 节点（三台都找得到）。定位必须两步：先问**控制面自己的逐节点记录**
+   （`GET /internal/nodes/{node}/sandboxes`，从该 worker 内部发——它是 node-scoped + 源 IP 第二因子），
+   再用"**自家被委派的容器 cgroup 之下**"作为归属判据（收窄之后第一步其实退化成"多余的一步"，
+   脚本照旧这么做 —— 它是两条车道通用的形式）。
+3. **`sbx_<id>` 是"第一条命令"建的，不是 create 建的**（plan §4）；create 之后立刻找 cgroup 会 0 命中。
+   另外：额度被自己的进程占满后，**再往这个沙箱排新命令会撞 30 s 命令队列超时**（RPC `RateLimitException`）
+   —— 所以"多客户端压力"要在**同一条命令**里起（这也正是 ③ 的四路并发那样写的原因）。
+4. **"别的容器不可写"必须真的去探一个 peer 容器**（fix round 1 的 Spec 项）：挂载根 `/pod-cgroup`
+   自己就是一个带 `cpu.max` 的 cgroup（**它不是容器**，owner 0:0），一版实现从根开始自上而下走、
+   碰到第一个 `cpu.max` 就停 ⇒ 探到的是根，peer 容器一个都没访问到，而文档却写成"别的容器全 EACCES"
+   （**文档与读数不符**，已修：现在 `_VIEW_SCRIPT` 只走 `own.parent` 下的同层目录，逐个探 peer，
+   根单独探）。顺带量到一条**由这次委派自己带来的性质**：本地车道三台 worker **共用同一个宿主 uid
+   65534**，而 N83 的委派正是把 peer 容器 cgroup 的**目录** chown 给 65534 ⇒ 另两台 worker 的容器
+   cgroup 里 `cgroup.procs`/`subtree_control`/`mkdir` 对我们是**可写**的（只有 `cpu.max` 保持 root
+   所有 —— 委派故意不含它，⑤ 也钉着这一条）。**这条性质属于 compose 车道上的委派本身**，范围被两条
+   边界卡住：只有**跑在 worker uid（65534）下**的进程能用它，且只在**整棵 VM 树可见**的挂载上成立；
+   k8s 车道挂载被 `subPathExpr` 收窄到本 pod，peer 根本不可达，**不存在这个形状**。验收脚本把这条
+   **逐 peer 如实上报**（`delegated_peers`），不隐藏、也不当作通过；它是 Phase 1 接受的已知代价之一。
+   **⚠ 这段读数保留为历史（收窄前的形状）**：2026-10-06 当天 compose 车道也收窄了（坑 5），此后
+   `check4_mode = narrowed-mount`、`peer_containers_count = 0`，这条"同 uid 的 peer 可写"在**今天的
+   两条车道上都不成立**。它没有被删除、也没有被改写 —— 它是"少了收窄，DAC 挡不住同 uid"的那份证据。
+5. **compose 的 `volume.subpath` 对 `type: bind` 是静默无效的（2026-10-06 实测）**：想用
+   `long syntax` + `subpath:` 复刻 k8s 的 `subPathExpr` 收窄，**做不到** —— (1) 实测写一个
+   **不存在**的 subpath，容器照样起来、挂上的还是**源根**（`/sys/fs/cgroup`），**没有任何告警或错误**；
+   (2) 它是**解析期**插值（`.env`/环境变量那一层），展开不出**容器 id**，而"本容器的 cgroup 目录"正是
+   `subPathExpr` 在 k8s 上靠运行时 downward API 才拿到的那个值。⇒ compose 车道的收窄只能用**静态父切片**：
+   `cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-<n>`（Docker 建它，容器落在
+   `<parent>/<container-id>`）+ 把 `/sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-<n>` 挂到
+   `/pod-cgroup`。**`${COMPOSE_PROJECT_NAME}` 是要求而不是装饰**：同一台 VM 上两套栈（用户自己那套
+   与任何一次验收）必须各有各的父切片，否则一个挂载里会出现两套栈的 `worker-1` 容器、"恰好一个被委派
+   的子目录"那条自检就会**具名拒绝**、该 worker 永远不 ready —— 这正是收窄要挡的跨栈 DoS 的形状。
+   `tests/unit/test_worker_manifest_permissions.py` 逐车道断言 **bind 源 == 该 service 的
+   `cgroup_parent`**（`/sys/fs/cgroup` + 它），两者不许漂移。
+6. **`compose down` 不会删掉 Docker 建的那个父切片（`/e2b-<project>-worker-<n>`）**：Docker 只回收
+   **容器自己**的 cgroup 目录，父切片留着（`down -v` 也一样：卷删了，cgroup 目录还在 —— 本轮的收尾就是
+   手工 `rmdir /sys/fs/cgroup/e2b-n83narrow-worker-{1,2,3}`）。它要么**手工 `rmdir`**，要么下一次
+   **同项目名**的 `up` 直接复用它；两条都可以，但别以为 `down` 已经清干净了。**它不构成拒绝风险**：
+   worker 的启动自检是"**先按被委派的 uid** 找目录"（`worker/` + `cpu` + 属主 65534 那一条，
+   `envd_service/runtime/sandbox_cgroup.py::_owned_candidates`），**空**的陈旧父切片里没有这样的子目录，
+   自检看不到它、也不会因为"多了个目录"而拒绝 ⇒ 多一个空父切片只是**不整洁**，不是危险。
+   （**例外，说清楚**：如果那一片里留下的是属主 65534 的**子目录**，它会被算成第二个候选项 ⇒
+   `ambiguous-delegation` 具名拒绝 —— 那是**另一类**残留，不是本节说的空切片。）
+   **危险的那种残留是"活的切片里多出来的子目录"** —— 一个留在别人容器 cgroup 里的目录会让对方
+   "恰好一个"的自检具名拒绝 —— 那正是这次收窄要挡的形状（坑 4/坑 5）。
+
+**怎么再跑一遍**（本地车道；k0s 车道的完整五参数命令见脚本 docstring，不能只换 `--worker-exec-template`/`--nodes`）：`deploy/compose/.env` 从 `.env.example` 复制（`AGENT_IMAGE` 指向本 worktree 构建的
+agent 镜像，`d600b7e` 那趟用的是 `e2b-sandlock-agent:n83acc2`）→ `docker compose -p n83acc2 -f
+deploy/compose/docker-compose.multinode.yml -f tmp/n83acc2-override.yml up -d` → 等三台 worker 日志
+出现 `cgroup lane ready (attempt N): cgroup ready parent=…` → 跑
+`python deploy/scripts/acceptance/cgroup_acceptance.py --api-url http://127.0.0.1:3250 --api-key
+"$E2B_API_KEY" --internal-key internal-key --internal-url http://control-plane:3000 --nodes
+worker-1,worker-2,worker-3 --worker-exec-template 'docker exec -i n83acc2-{node}-1 bash -lc'`（~100 s，
+末尾一行 `"ok": true`）。**首次 create 可能撞 `428: warm_required`**（base 镜像正在目标节点上预热）——
+稍等片刻用同一条命令重跑即绿。→ `docker compose -p n83acc2 … down`。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
