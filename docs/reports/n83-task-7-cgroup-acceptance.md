@@ -1437,8 +1437,13 @@ ls /sys/fs/cgroup | grep -c n83narrow                                   ⇒ 0（
 
 评审结果：**Spec ❌（check ④）+ 4 条 Important + 3 条 minor**。逐条处置如下，全部在同一个 worktree
 （`/Users/polus/project/ai/sandlock-e2b.wt/task7`，branch `n83/task7`）里改、**GREEN 与 RED 都重跑**过。
-本节引用的每个数字都取自本节归档的那两份 JSON（`tmp/n83-acceptance-green.json` /
-`tmp/n83-acceptance-red.json`，与 §4/§5 的代码块逐字一致）。
+本节引用的每个数字都取自**本附录自己那一轮**归档的两份 JSON（当时工作树
+`/Users/polus/project/ai/sandlock-e2b.wt/task7` 的 `tmp/n83-acceptance-green.json` /
+`tmp/n83-acceptance-red.json`，即 `164c987` 那一版；它们与**当时**的 §4/§5 代码块逐字一致）。
+**⚠ 那两份 JSON 不是今天 §4/§5 里那两份**：本文件之后又刷新过两次归档（`d600b7e` 的 acceptance-final、
+以及 `c9b3515`+`d550e1d` 的 compose-narrow），今天的 §4/§5 是 **`n83narrow` / 3300** 那一趟的原始 stdout
+（`check4_mode = narrowed-mount`）。因此本节只与**本节所记的那一轮**自洽，**不能**拿今天的 §4/§5 核对；
+要核今天的数，看 §0/§7 与 §4/§5 本身。
 
 ## F1（Spec ❌ + Important）check ④ 探的不是 peer 容器
 

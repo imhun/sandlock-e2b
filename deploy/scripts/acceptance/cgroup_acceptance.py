@@ -35,10 +35,11 @@ about a *reading*, never about "the call did not error":
    EACCES on every write.
 
    "Peer" means an actual container directory beside ours under the same
-   parent (``/pod-cgroup/docker/<other-container-id>`` on compose, a sibling
-   container directory under the pod directory on k8s) — **not** the mounted
-   root, which is a cgroup of its own and is probed separately for exactly
-   that reason (fix round 1, finding 1).
+   parent — a sibling container directory under the pod directory on k8s, or
+   ``/pod-cgroup/docker/<other-container-id>`` on a lane whose mount is *not*
+   narrowed (what the compose lanes were before 2026-10-06) — **not** the
+   mounted root, which is a cgroup of its own and is probed separately for
+   exactly that reason (fix round 1, finding 1).
 
    Check ④ therefore asserts: (a) our own delegated cgroup is writable on
    ``cgroup.procs``/``cgroup.subtree_control`` and **not** on ``cpu.max``;
@@ -47,8 +48,19 @@ about a *reading*, never about "the call did not error":
    ``mkdir``); and (d) if no peer is visible at all (a narrowed mount), the
    mount root refuses ``cpu.max``/``cgroup.procs``/``mkdir``. The delegated
    peers that *are* writable — the same-uid case above — are reported per peer
-   as ``delegated_peers`` rather than hidden, and the k8s lane does not have
-   that shape at all because its mount is narrowed to the pod.
+   as ``delegated_peers`` rather than hidden.
+
+   **Both shipped lanes narrow the mount**, by different devices, so both
+   assert (d) and neither can produce (b)/(c) today: k8s takes
+   ``hostPath …/kubepods/<qos>`` with ``subPathExpr: pod$(POD_UID)``, and each
+   compose worker declares a static ``cgroup_parent:
+   /e2b-${COMPOSE_PROJECT_NAME}-worker-<n>`` with the matching
+   ``/sys/fs/cgroup<that path>`` bind (compose **has** ``volume.subpath``, but
+   for ``type: bind`` it is silently ignored, and it interpolates at parse
+   time, so it can never name a container id). The ``peer-container`` branch —
+   (b) plus (c), and the same-uid ``delegated_peers`` reading — is what a
+   *non-narrowed* mount produces, i.e. what the compose lane was before
+   2026-10-06.
 5. **The negative (fail closed).** ``open(<own container cgroup>/cpu.max,
    O_WRONLY)`` must fail ``EACCES``: the delegation deliberately excludes
    ``cpu.max``, so a worker cannot lift its own ceiling.
@@ -91,10 +103,14 @@ three of the defaults are compose-only):
   observe.
 
 What a sandbox cgroup's path is differs by lane and is therefore discovered, not
-assumed: the k8s mount is narrowed to the pod (``/pod-cgroup/sbx_<id>``), the
-compose mount is the whole Docker-VM tree (``/pod-cgroup/<driver>/<id>/sbx_...``),
-so the script walks the mount for ``sbx_<sandbox_id>`` and refuses when it finds
-zero or more than one.
+assumed. Both shipped lanes narrow the mount to *this worker's own* parent, by
+different devices (k8s: ``subPathExpr: pod$(POD_UID)`` into the pod directory;
+compose: a static ``cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-<n>``
+with the matching bind), so the sandbox sits at
+``/pod-cgroup/<container-id>/sbx_<sandbox_id>`` on both. The script still does
+not assume that depth: it locates this worker's own delegated container cgroup
+first (see ``_OWN_SCRIPT``) and then requires ``sbx_<sandbox_id>`` to be its
+direct child, refusing on zero or more than one.
 
 Usage (local lane; the override in ``tmp/`` is what sets ``required`` and the
 rate limit):
@@ -227,11 +243,16 @@ class WorkerShell:
 def locate_cgroup(shell: WorkerShell, node: str, mount: str, sandbox_id: str) -> str:
     """The sandbox's cgroup *under this worker's own delegated cgroup*, or a refusal.
 
-    Finding by name alone is not enough on the compose lane: every worker
-    mounts the whole Docker-VM tree, so a bare ``sbx_<id>`` search finds the
-    directory *from any worker* -- and "which node hosts this sandbox" is the
-    question check 1 has to answer. The owning worker is the one whose own
-    delegated container cgroup holds the ``sbx_<id>`` child.
+    Finding by name alone is not enough on a lane whose mount is shared: before
+    the 2026-10-06 narrowing, every compose worker mounted the whole Docker-VM
+    tree, so a bare ``sbx_<id>`` search found the directory *from any worker* --
+    and "which node hosts this sandbox" is the question check 1 has to answer.
+    The owning worker is the one whose own delegated container cgroup holds the
+    ``sbx_<id>`` child, which is also exactly what this function requires: it
+    resolves that worker's own delegated cgroup first and then demands
+    ``sbx_<id>`` be its direct child. Both shipped lanes are narrowed today
+    (k8s ``subPathExpr``, compose static ``cgroup_parent`` + matching bind), but
+    the rule is the same there, so no lane needs its own spelling.
     """
     if not _SANDBOX_ID_RE.match(sandbox_id):
         raise Refusal(f"refusing to interpolate a non-sandbox id: {sandbox_id!r}")
@@ -351,11 +372,14 @@ def lane_env(shell: WorkerShell, node: str) -> dict:
 #: The lane-neutral identity of "this worker's own container cgroup": the unique
 #: directory this worker drained itself into and enabled cpu on -- holder of a
 #: ``worker/`` child and of ``cpu`` in ``cgroup.subtree_control`` (plan §3.5 /
-#: §4). On k8s that is a direct child of the (subPathExpr-narrowed) mount root;
-#: on compose it sits under ``docker/<container-id>`` in the whole VM tree. A
-#: name-based rule would be wrong on one lane or the other -- and on compose a
-#: bare name search matches from *every* worker, since they all mount the same
-#: tree.
+#: §4). Both lanes narrow the mount to this worker's own parent, so it is a
+#: direct child of the mount root on both (k8s: the ``subPathExpr``-narrowed
+#: pod directory; compose: the static ``cgroup_parent`` slice). Before the
+#: 2026-10-06 compose narrowing it sat under ``docker/<container-id>`` in the
+#: whole VM tree -- a shape where a bare name search matched from *every*
+#: worker, since they all mounted the same tree. A name-based rule would still
+#: be wrong on one lane or the other, which is why the identity is the
+#: ``worker/`` + ``cpu`` + owner-uid triple below.
 _OWN_SCRIPT = r"""
 import json, os, pathlib, sys
 
@@ -1062,10 +1086,13 @@ def main() -> int:
                 }
                 for peer in delegated_peers
             ]
-            # Which shape of evidence this lane can produce: peers visible and
-            # closed (compose), or no peer visible at all because the mount root
-            # is not the node's cgroup tree (k8s, subPathExpr-narrowed). A
-            # whole-tree mount that shows no peer is *not* evidence.
+            # Which shape of evidence this lane can produce: no peer visible at
+            # all because the mount is narrowed to this worker's own parent
+            # (both shipped lanes now -- k8s subPathExpr, compose static
+            # cgroup_parent + matching bind), or peers visible and closed, which
+            # is what a *non-narrowed* mount produces (the compose lanes before
+            # 2026-10-06). A whole-tree mount that shows no peer is *not*
+            # evidence.
             facts["peer_visible"] = bool(peers)
             facts["mount_looks_narrowed"] = not any(
                 name == "docker"

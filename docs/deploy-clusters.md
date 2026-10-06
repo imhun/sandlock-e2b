@@ -2898,7 +2898,7 @@ op 在位但惰性）→ **第二次 apply** 把 `deploy/k8s-k0s/worker-capacity
 于是行为逐字节回到 Phase 1 之前；**已经在跑的沙箱 cgroup 会在它被拆除时照常 `cgroup.kill` + `rmdir`
 释放**，不需要额外清理（worker 重建时 `worker/` 目录由自检复用/拒绝，见 `sandbox_cgroup.py`）。
 
-**这次踩到的五个坑（都会在 k0s 上再遇到，先记下）**：
+**这次踩到的六个坑（都会在 k0s 上再遇到，先记下）**：
 
 1. **沙箱 cgroup 目录名是 `sbx_<sandbox_id>`，而 CP 给的 `sandbox_id` 本身就带 `sbx_` 前缀**
    ⇒ 实际目录是 `sbx_sbx_<hex>`。别用"看起来对不对"去猜路径，脚本是**按模块写死的那条规则**拼的。
@@ -2937,6 +2937,17 @@ op 在位但惰性）→ **第二次 apply** 把 `deploy/k8s-k0s/worker-capacity
    的子目录"那条自检就会**具名拒绝**、该 worker 永远不 ready —— 这正是收窄要挡的跨栈 DoS 的形状。
    `tests/unit/test_worker_manifest_permissions.py` 逐车道断言 **bind 源 == 该 service 的
    `cgroup_parent`**（`/sys/fs/cgroup` + 它），两者不许漂移。
+6. **`compose down` 不会删掉 Docker 建的那个父切片（`/e2b-<project>-worker-<n>`）**：Docker 只回收
+   **容器自己**的 cgroup 目录，父切片留着（`down -v` 也一样：卷删了，cgroup 目录还在 —— 本轮的收尾就是
+   手工 `rmdir /sys/fs/cgroup/e2b-n83narrow-worker-{1,2,3}`）。它要么**手工 `rmdir`**，要么下一次
+   **同项目名**的 `up` 直接复用它；两条都可以，但别以为 `down` 已经清干净了。**它不构成拒绝风险**：
+   worker 的启动自检是"**先按被委派的 uid** 找目录"（`worker/` + `cpu` + 属主 65534 那一条，
+   `envd_service/runtime/sandbox_cgroup.py::_owned_candidates`），**空**的陈旧父切片里没有这样的子目录，
+   自检看不到它、也不会因为"多了个目录"而拒绝 ⇒ 多一个空父切片只是**不整洁**，不是危险。
+   （**例外，说清楚**：如果那一片里留下的是属主 65534 的**子目录**，它会被算成第二个候选项 ⇒
+   `ambiguous-delegation` 具名拒绝 —— 那是**另一类**残留，不是本节说的空切片。）
+   **危险的那种残留是"活的切片里多出来的子目录"** —— 一个留在别人容器 cgroup 里的目录会让对方
+   "恰好一个"的自检具名拒绝 —— 那正是这次收窄要挡的形状（坑 4/坑 5）。
 
 **怎么再跑一遍**（本地车道；k0s 车道的完整五参数命令见脚本 docstring，不能只换 `--worker-exec-template`/`--nodes`）：`deploy/compose/.env` 从 `.env.example` 复制（`AGENT_IMAGE` 指向本 worktree 构建的
 agent 镜像，`d600b7e` 那趟用的是 `e2b-sandlock-agent:n83acc2`）→ `docker compose -p n83acc2 -f

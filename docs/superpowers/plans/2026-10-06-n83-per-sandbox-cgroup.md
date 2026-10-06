@@ -331,6 +331,13 @@ worker-1:
 必须各有各的父切片，否则一个挂载里会出现两套栈的 `worker-1` 容器、"恰好一个被委派的子目录"这条自检
 就会具名拒绝。CI 钉子（`tests/unit/test_worker_manifest_permissions.py`）逐车道断言
 **bind 源 == 该 service 的 `cgroup_parent`**（`/sys/fs/cgroup` + 它），两者不许漂移。
+**运维注意（2026-10-06 实测）**：`compose down`（含 `down -v`）**不会**删掉 Docker 建的这个父切片
+`/e2b-<project>-worker-<n>` —— 手工 `rmdir` 或下一次**同项目名**的 `up` 复用它，两条都行（本轮收尾就是
+手工 `rmdir` 那三个）。陈旧的**空**父切片**不是拒绝风险**：worker 的启动自检先按"被委派给它的 uid"筛
+目录（`sandbox_cgroup.py::_owned_candidates`），空的父切片里没有这样的子目录，它只是**不整洁**；
+（例外：切片里留下属主 65534 的**子目录**时会被算成第二个候选项 ⇒ `ambiguous-delegation` 具名拒绝，
+那是**另一类**残留。）
+危险的是"活的切片里多出来的子目录"，那才是收窄要挡的形状。
 
 **② 保险 1：CI 钉子（防漂移）** —— 加在清单钉子测试里（`tests/unit/test_worker_manifest_permissions.py`
 一族）：
