@@ -188,13 +188,15 @@ def test_worker_seccomp_profile_is_the_default_plus_pidfd_getfd_and_a_narrowed_u
     # back or someone reverted the narrowing.
     assert {"clone3"} in lists
     assert {"pivot_root", "umount2"} in lists
-    unshare_entries = [
-        entry for entry in WORKER_SECCOMP["syscalls"] if "unshare" in entry["names"]
-    ]
-    assert unshare_entries == [], (
-        "unshare must be denied by defaultAction: the engine creates every "
-        f"namespace with clone3 and has no unshare caller left, got {unshare_entries}"
-    )
+    # N80: the engine creates every namespace with clone3, so `unshare` is
+    # admitted only through two masked one-bit rules that exist for envd's two
+    # capability probes -- never unconditionally.
+    assert not any(
+        entry["action"] == "SCMP_ACT_ALLOW"
+        and "unshare" in entry["names"]
+        and not entry.get("args")
+        for entry in WORKER_SECCOMP["syscalls"]
+    ), "unshare must never be an unconditional allow"
     # Everything that was capability-gated in the upstream default profile must
     # stay gated: a deployment that *does* carry the capability keeps the access
     # the kernel would grant it, and one that does not stays denied.
@@ -618,21 +620,37 @@ def test_the_worker_profile_never_denies_clone3() -> None:
     assert len(allowed) >= 1, "clone3 must be explicitly allowed"
 
 
-def test_the_worker_profile_denies_unshare_outright() -> None:
-    """N80: nothing on the sandbox path calls unshare any more.
+def test_the_worker_profile_narrows_unshare_to_the_two_capability_probes() -> None:
+    """N80: `unshare` is admitted for exactly two bits, and neither is the engine's.
 
-    With the user, PID, mount and network namespaces all created by the one
-    clone3 call, `unshare` has no caller left inside the worker: the sandbox
-    never gets it, and the engine no longer issues it. The old conditional
-    rule admitted every flavour whose cgroup/uts/ipc bits were clear -- i.e.
-    exactly the namespace kinds a sandbox wants.
+    The engine creates the user, PID, mount and network namespaces with one
+    clone3 call, so the sandbox path never calls unshare. Two capability
+    probes still do, both in envd's startup path: the seccomp self-check
+    probes `unshare(CLONE_NEWUSER)` (it is how the shipped profile is told
+    apart from the runtime default), and the real-root check then probes
+    `unshare(CLONE_NEWNS)` inside that fresh user namespace. Each rule is a
+    masked equality on a single bit, so a call asking for anything else --
+    NEWPID, NEWNET, or the cgroup/uts/ipc trio -- falls through to
+    defaultAction and is refused. A bare `unshare(CLONE_NEWNS)` passing the
+    filter still fails the kernel's own CAP_SYS_ADMIN check, which this worker
+    does not satisfy.
+
+    A third entry, a widened mask, or a rule that stops being masked is the
+    change this test exists to catch. Retiring the two probes is what deletes
+    these rules.
     """
     profile = json.loads(WORKER_SECCOMP_TEXT)
-    for group in profile["syscalls"]:
-        assert "unshare" not in group["names"], (
-            "unshare must be denied by defaultAction, not admitted by a rule "
-            f"(found action {group['action']})"
-        )
+    unshare = [group for group in profile["syscalls"] if "unshare" in group["names"]]
+    assert [group["names"] for group in unshare] == [["unshare"], ["unshare"]]
+    for group in unshare:
+        assert group["action"] == "SCMP_ACT_ALLOW"
+        assert not group.get("includes") and not group.get("excludes")
+    assert [group["args"] for group in unshare] == [
+        [{"index": 0, "value": 268435456, "valueTwo": 268435456,
+          "op": "SCMP_CMP_MASKED_EQ"}],
+        [{"index": 0, "value": 131072, "valueTwo": 131072,
+          "op": "SCMP_CMP_MASKED_EQ"}],
+    ]
 
 
 def test_seccomp_installer_rolls_when_the_profile_changes() -> None:

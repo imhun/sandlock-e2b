@@ -52,6 +52,40 @@
 	"syscalls": [
 		{
 			"names": [
+				"unshare"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [
+				{
+					"index": 0,
+					"value": 268435456,
+					"valueTwo": 268435456,
+					"op": "SCMP_CMP_MASKED_EQ"
+				}
+			],
+			"comment": "N80: two callers are left, both are capability probes in envd's startup path -- the seccomp self-check probes `unshare(CLONE_NEWUSER)` and the real-root check then probes `unshare(CLONE_NEWNS)` inside that fresh user namespace. The engine itself creates every namespace with clone3, so NEWPID/NEWNET and the cgroup/uts/ipc trio stay refused; a bare `unshare(CLONE_NEWNS)` without a user namespace is still denied by the kernel's own CAP_SYS_ADMIN check. Moving both probes to clone3 is what retires these two bits.",
+			"includes": {},
+			"excludes": {}
+		},
+		{
+			"names": [
+				"unshare"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [
+				{
+					"index": 0,
+					"value": 131072,
+					"valueTwo": 131072,
+					"op": "SCMP_CMP_MASKED_EQ"
+				}
+			],
+			"comment": "N80: two callers are left, both are capability probes in envd's startup path -- the seccomp self-check probes `unshare(CLONE_NEWUSER)` and the real-root check then probes `unshare(CLONE_NEWNS)` inside that fresh user namespace. The engine itself creates every namespace with clone3, so NEWPID/NEWNET and the cgroup/uts/ipc trio stay refused; a bare `unshare(CLONE_NEWNS)` without a user namespace is still denied by the kernel's own CAP_SYS_ADMIN check. Moving both probes to clone3 is what retires these two bits.",
+			"includes": {},
+			"excludes": {}
+		},
+		{
+			"names": [
 				"_llseek",
 				"_newselect",
 				"accept",
