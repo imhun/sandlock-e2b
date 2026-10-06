@@ -425,6 +425,40 @@ def test_the_ceiling_carries_no_mediation_tier_for_the_slot(monkeypatch) -> None
         rb.supervise_policy_document(dict(ceiling, mediation_run_as="supervisor"))
 
 
+def test_the_cgroup_lane_reaches_the_fork_policy(monkeypatch) -> None:
+    """N83 phase 2 (Task 4, D7): the lane switch rides the policy document.
+
+    ``E2B_SANDBOX_CGROUP=required`` is the one deployment in which the kernel
+    is the enforcer of a sandbox's memory and task budgets, so it is also the
+    only lane allowed to tell the fork to retire the mediator's own
+    address-space accounting. ``off`` must put *nothing* on the wire -- not
+    ``false``, but no key at all, because that lane's document has to stay
+    byte-for-byte the one it was before this field existed.
+    """
+    off = _executor(monkeypatch, route_b=_config(mode="auto"))
+    assert "kernel_enforced_limits" not in off._policy_ceiling()
+    off_doc = rb.supervise_policy_document(off._policy_ceiling())
+    assert "kernel_enforced_limits" not in off_doc
+
+    on = _executor(
+        monkeypatch,
+        route_b=_config(
+            mode="auto", sandbox_cgroup="required", sandbox_cgroups=_HandleStub()
+        ),
+    )
+    on_doc = rb.supervise_policy_document(on._policy_ceiling())
+    assert on_doc["kernel_enforced_limits"] is True
+
+    # The two lanes differ by exactly that one key: switching lanes changes
+    # what the fork is told about *notification accounting*, and nothing else
+    # about the sandbox.
+    assert set(on_doc) - set(off_doc) == {"kernel_enforced_limits"}
+    assert set(off_doc) - set(on_doc) == set()
+    assert {
+        key: value for key, value in on_doc.items() if key != "kernel_enforced_limits"
+    } == off_doc
+
+
 # ------------------------------------------------------------------ lease
 
 

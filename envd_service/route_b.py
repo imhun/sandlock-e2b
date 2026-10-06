@@ -1336,6 +1336,15 @@ SUPERVISE_POLICY_FIELDS: frozenset[str] = frozenset(
         "http_inject_ca",
         "http_key",
         "http_ports",
+        # N83 phase 2 / Task 4 (D7): the one lane statement the fork needs to
+        # retire the mediator's own memory accounting (`E2B_SANDBOX_CGROUP=
+        # required` ⇒ kernel-enforced ⇒ `kernel_enforced_limits` on the wire;
+        # see `Sandbox::kernel_enforced_limits` and
+        # `SandboxExecutor._kernel_enforced_limits`). It is in this set because
+        # the fork parses the slot's `--policy` document with
+        # `deny_unknown_fields`, so a field missing here is a startup refusal,
+        # not a dropped one.
+        "kernel_enforced_limits",
         "max_cpu",
         "max_disk",
         "max_memory",

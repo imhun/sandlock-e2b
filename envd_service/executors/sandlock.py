@@ -1711,14 +1711,7 @@ class SandlockExecutor(Executor):
         record instead of starting a sandbox nobody capped. ``off`` (the
         default) returns immediately: the fallback path is exactly as it was.
         """
-        mode = (
-            str(getattr(self._route_b, "sandbox_cgroup", "off") or "off")
-            .strip()
-            .lower()
-            if self._route_b is not None
-            else "off"
-        )
-        if mode != "required":
+        if not self._kernel_enforced_limits():
             return
         raise RuntimeError(
             "E2B_SANDBOX_CGROUP=required refuses an in-process sandbox: this "
@@ -1727,6 +1720,24 @@ class SandlockExecutor(Executor):
             "control-plane reporter), or set E2B_SANDBOX_CGROUP=off to accept "
             "uncapped sandboxes."
         )
+
+    def _kernel_enforced_limits(self) -> bool:
+        """Does this deployment enforce the sandbox's budgets in the kernel?
+
+        ``E2B_SANDBOX_CGROUP=required`` is that question, and the worker
+        already reads it from route B's config for the in-process refusal
+        above. N83 phase 2 (Task 4, D7) asks the same one twice more -- the
+        slot policy has to be told, so the fork can retire the mediator's own
+        accounting notifications (``kernel_enforced_limits`` on the wire) --
+        and one reader is what keeps the three answers from drifting apart.
+
+        ``off`` (the default) answers ``False``, and a settings double that
+        predates the field reads the same way route B's own default does.
+        """
+        if self._route_b is None:
+            return False
+        mode = str(getattr(self._route_b, "sandbox_cgroup", "off") or "off")
+        return mode.strip().lower() == "required"
 
     def _open_route_b_instance(self):
         """Lease this sandbox's slot and wrap it in the instance shim.
@@ -2621,6 +2632,14 @@ class SandlockExecutor(Executor):
             "uid": sandbox_uid,
             "gid": sandbox_gid,
         }
+        if self._kernel_enforced_limits():
+            # N83 phase 2 (Task 4, D7): the one lane in which the kernel is the
+            # enforcer of this sandbox's memory budget tells the fork so, and
+            # the fork retires the address-space accounting family it no longer
+            # needs (`Sandbox::kernel_enforced_limits`). Deliberately absent --
+            # not `False` -- off the lane, because that document has to stay
+            # byte-for-byte the one it was before this field existed.
+            kwargs["kernel_enforced_limits"] = True
         if self._mcp_bind_port is not None:
             # The SDK starts the MCP gateway inside the sandbox; the whole
             # instance may bind its HTTP port (per-sandbox allocated MCP

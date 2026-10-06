@@ -14,8 +14,14 @@
     export E2B_API_KEY=...
     python deploy/scripts/acceptance/probe_n82_traced_syscall_costs.py --op openclose --seconds 40
 
-    --op 取 openclose | close | mmap | getdents | uname | chdir | stat | getpid
+    --op 取 openclose | close | mmap | clone | getdents | uname | chdir | stat | getpid
     （`stat` 是 N81 之后的对照：应当 0 停顿、几十万 op/s；`getpid` 是纯循环对照。）
+
+`clone` 是 N83 Phase 2 Task 4 加进来的那一支（R7）：没有它，退通知表就只量得到 mmap
+那一半。它 run 的是**热 fork 循环**的形状 —— `fork()` + `waitpid()` 一次 —— 也就是
+`seccomp_plan::BASE_NOTIF_SYSCALLS` 的 clone/clone3 与 wait 族各吃一条通知。两族在
+Task 4 里**都没有退**（理由见 `seccomp_plan.rs`），所以这一支的读数在退表前后应当**持平**；
+它正是"另一半没退"的证据，不是对照组。
 """
 
 from __future__ import annotations
@@ -47,6 +53,11 @@ INNER = dedent(
         elif OP == "mmap":
             m = mmap_mod.mmap(-1, 4096)
             m.close()
+        elif OP == "clone":
+            pid = os.fork()
+            if pid == 0:
+                os._exit(0)
+            os.waitpid(pid, 0)
         elif OP == "getdents":
             os.listdir(DENT)
         elif OP == "uname":
