@@ -575,10 +575,14 @@ services:
       E2B_NODE_DISK_MB: ${E2B_NODE_DISK_MB:-4096}
       E2B_NODE_PROCESSES: ${E2B_NODE_PROCESSES:-256}
       # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
-      # default, inert) and where the rw cgroupfs view lands. This lane has no
-      # `subPathExpr`, so the view is the whole Docker VM tree
-      # (`/sys/fs/cgroup:/pod-cgroup` in `&worker-volumes` below) and the worker
-      # picks its own subtree by the directory face B delegated to it.
+      # default, inert) and where the rw cgroupfs view lands. This lane gets the
+      # same *narrowed* view k8s gets, by a different device: compose **has**
+      # `volume.subpath`, but for `type: bind` it is silently ignored (measured:
+      # a non-existent subpath still mounts the source root, no warning) and it
+      # interpolates at parse time, so it cannot name a container id. The bind
+      # source is therefore the service's own static `cgroup_parent`
+      # (`/e2b-${COMPOSE_PROJECT_NAME}-worker-1` below; Docker creates it and the
+      # container lands at `<parent>/<container-id>`), never the whole tree.
       E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}
       E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}
       # Same per-sandbox reservation units as the control plane declares
@@ -599,13 +603,17 @@ services:
       E2B_QUOTA_AGENT_URL: ${E2B_QUOTA_AGENT_URL:-}
       E2B_QUOTA_AGENT_TOKEN: ${E2B_QUOTA_AGENT_TOKEN:-}
       E2B_QUOTA_AGENT_TIMEOUT_S: ${E2B_QUOTA_AGENT_TIMEOUT_S:-5}
+    # N83 phase 1 / Task 2: the per-sandbox cgroup parent Docker creates for
+    # this worker. The bind source in `&worker-volumes` is exactly this slice
+    # (`/sys/fs/cgroup` + this path), so the two can never drift -- pinned by
+    # `tests/unit/test_worker_manifest_permissions.py`. Indexed by the compose
+    # project name so two stacks on one VM never share a parent.
+    cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-1
     volumes: &worker-volumes
       - sandbox-shared:/var/lib/e2b-sandboxes
-      # N83 phase 1 / Task 2: the worker's rw cgroupfs view (plan §3.5). No
-      # `subPathExpr` in compose, so this is the whole tree; the worker picks its
-      # own subtree by the **delegated** directory (`sbx_<id>` sits beside the
-      # `worker/` owning cgroup).
-      - /sys/fs/cgroup:/pod-cgroup
+      # N83 phase 1 / Task 2: the worker's rw cgroupfs view (plan §3.5), narrowed
+      # to this worker's own slice: the bind source equals `cgroup_parent` above.
+      - /sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-1:/pod-cgroup
     # C3 (Task 4 slice B): **the bounding set is empty.** Track F/F1 declared
     # `SETUID`/`SETGID`/`CHOWN`/`DAC_OVERRIDE` here only so the image's
     # file-capability brokers could be `exec`d (file caps must be a subset of
@@ -669,6 +677,13 @@ services:
       # shape evidence, cost measurements, contracts and the observation
       # checklist live in docs/production-deployment-requirements.md §2.4.10.
       E2B_PID_NS: ${E2B_PID_NS_WORKER2:-true}
+    # N83 phase 1 / Task 2: its own parent + the bind of exactly that slice
+    # (`<<: *worker` would otherwise share worker-1's narrowed view, whose one
+    # delegated child directory would then be a different worker's container).
+    cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-2
+    volumes:
+      - sandbox-shared:/var/lib/e2b-sandboxes
+      - /sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-2:/pod-cgroup
 
   # Server-side XFS project quota manager (E2.6, A6). It owns the privilege the
   # worker no longer has: ``xfs_quota -x`` is gated on CAP_SYS_ADMIN, so the

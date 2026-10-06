@@ -2686,28 +2686,93 @@ def _compose_block(text: str, service: str) -> str:
 
 
 def test_compose_lanes_declare_the_workers_narrowed_cgroup_view() -> None:
-    """§3.5: compose has no `subPathExpr`, so the worker sees the whole VM tree.
+    """N83 §3.5 (compose): the same *narrow* view k8s gets, by a static parent.
 
-    The narrowed shape is a k8s-only device; on the compose lane the worker
-    recognises its own subtree by the *delegated* directory (the local-lane
-    runtime check is Task 7's). What has to stay true in every lane is the
-    pair of knobs and the rw bind, so the code path is the same on both sides.
+    k8s narrows with `subPathExpr: pod$(POD_UID)`; compose cannot use that
+    device — `volume.subpath` is **silently ignored** on a `type: bind`
+    (measured 2026-10-06: a non-existent subpath still mounted the source root,
+    no warning) and it interpolates at parse time, so it can never name a
+    container id. Each worker therefore declares its own `cgroup_parent`
+    (`/e2b-${COMPOSE_PROJECT_NAME}-worker-<n>`, which Docker creates, landing the
+    container at `<parent>/<container-id>`) and bind-mounts exactly that slice.
+    The equality itself is asserted by the test below; this one pins the two
+    knobs the code reads and that the bind is no longer the whole VM tree.
     """
     for path, text in (
         ("deploy/compose/docker-compose.multinode.yml", COMPOSE_MULTINODE),
         ("deploy/compose/docker-compose.prod.yml", COMPOSE_PROD),
         ("deploy/stack/docker-compose.prod.yml", STACK_COMPOSE),
     ):
-        if path.endswith("multinode.yml"):
-            # No anchor here: each of the three workers repeats its whole block.
-            blocks = [_multinode_worker_block(name) for name in MULTINODE_WORKERS]
-        else:
-            # worker-1 is the `&worker`/`&worker-env` anchor worker-2/3 inherit.
-            blocks = [_compose_block(text, "worker-1")]
-        for block in blocks:
-            assert "\n      E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}\n" in block, path
-            assert "\n      E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}\n" in block, path
-            assert "\n      - /sys/fs/cgroup:/pod-cgroup\n" in block, path
+        names = _compose_worker_names(text)
+        assert names, path
+        # Where the knobs are *declared*: every worker in the anchor-less
+        # multinode file, and worker-1 only in the two anchored prod files
+        # (worker-2/3 inherit it through `<<: *worker`, so it is not in their
+        # text -- the slice equality below is checked on all of them instead).
+        declaring = names if path.endswith("multinode.yml") else ["worker-1"]
+        for name in declaring:
+            block = _compose_block(text, name)
+            assert "\n      E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}\n" in block, (path, name)
+            assert "\n      E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}\n" in block, (path, name)
+            _parent, source = _compose_worker_cgroup_slice(block)
+            # No lane may bind the runtime's whole cgroupfs at `/pod-cgroup` any
+            # more (the bare `/sys/fs/cgroup` bind that the face-B `/host-cgroup`
+            # mount still needs is a different target and is pinned elsewhere).
+            assert source != COMPOSE_CGROUP_ROOT, (path, name, source)
+
+
+#: The cgroupfs root the narrow binds are relatives of. `/sys/fs/cgroup` itself
+#: is exactly what the worker view must *not* be any more.
+COMPOSE_CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def _compose_worker_names(text: str) -> list[str]:
+    """Every `worker-<n>:` service key in one compose file, in file order."""
+    return re.findall(r"^  (worker-\d+):", text, flags=re.MULTILINE)
+
+
+def _compose_worker_cgroup_slice(block: str) -> tuple[str, str]:
+    """One worker service block's `(cgroup_parent, /pod-cgroup bind source)`."""
+    parents = re.findall(r"^ +cgroup_parent: +(\S+) *$", block, flags=re.MULTILINE)
+    binds = re.findall(r"^ +- (\S+):/pod-cgroup *$", block, flags=re.MULTILINE)
+    assert len(parents) == 1, parents
+    assert len(binds) == 1, binds
+    return parents[0], binds[0]
+
+
+def test_compose_worker_cgroup_bind_is_exactly_its_own_parent() -> None:
+    """The bind source and `cgroup_parent` can never drift (N83, 2026-10-06).
+
+    The two halves are one fact written twice: the rw cgroupfs view must be the
+    very slice `cgroup_parent` creates (`/sys/fs/cgroup` + that path). A
+    hand-edit that moves one — or re-points a worker at its neighbour's slice,
+    which would make the mount hold a *different* worker's container directory —
+    has to fail here, not on the lane. The project-scoped, service-specific name
+    is load-bearing, not decoration: `${COMPOSE_PROJECT_NAME}` keeps two stacks
+    on one VM (the user's own `compose` stack and an acceptance run) from
+    sharing a parent, whose two container directories would then break the
+    worker's "exactly one delegated child" startup self-check.
+    """
+    for path, text in (
+        ("deploy/compose/docker-compose.multinode.yml", COMPOSE_MULTINODE),
+        ("deploy/compose/docker-compose.prod.yml", COMPOSE_PROD),
+        ("deploy/stack/docker-compose.prod.yml", STACK_COMPOSE),
+    ):
+        names = _compose_worker_names(text)
+        assert names, path
+        slices: dict[str, str] = {}
+        for name in names:
+            block = _compose_block(text, name)
+            parent, source = _compose_worker_cgroup_slice(block)
+            assert source != COMPOSE_CGROUP_ROOT, (path, name, source)
+            assert source == COMPOSE_CGROUP_ROOT + parent, (path, name, source, parent)
+            assert "${COMPOSE_PROJECT_NAME}" in parent, (path, name, parent)
+            assert parent.endswith(f"-{name}"), (path, name, parent)
+            slices[name] = parent
+        # Two workers must never share one slice: the narrowed mount would then
+        # hold both containers and the "exactly one delegated child" self-check
+        # would refuse by design.
+        assert len(set(slices.values())) == len(slices), (path, slices)
 
 
 def test_compose_agent_face_b_carries_the_host_cgroup_view() -> None:

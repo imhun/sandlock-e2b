@@ -445,10 +445,14 @@ services:
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
       # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
-      # default, inert) and where the rw cgroupfs view lands. On this lane the
-      # view is the whole Docker VM tree (`/sys/fs/cgroup:/pod-cgroup` in the
-      # volumes below) -- compose has no `subPathExpr`, so the worker recognises
-      # its own subtree by the **delegated** directory instead (plan §3.5).
+      # default, inert) and where the rw cgroupfs view lands. This lane gets the
+      # same *narrowed* view k8s gets, by a different device: compose **has**
+      # `volume.subpath`, but for `type: bind` it is silently ignored (measured:
+      # a non-existent subpath still mounts the source root, no warning) and it
+      # interpolates at parse time, so it cannot name a container id. The bind
+      # source is therefore this service's own static `cgroup_parent`
+      # (`/e2b-${COMPOSE_PROJECT_NAME}-worker-1` below; Docker creates it and the
+      # container lands at `<parent>/<container-id>`), never the whole tree.
       E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}
       E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}
       # N36 (2026-09-26): the fleet shape, so wildcard allowOut works here.
@@ -484,13 +488,18 @@ services:
       # that takes a sandbox offline.
       E2B_PID_NS: "true"
       E2B_ENABLE_NETWORK: "true"
+    # N83 phase 1 / Task 2: the per-sandbox cgroup parent Docker creates for
+    # this worker. The bind source below is exactly this slice (`/sys/fs/cgroup`
+    # + this path), so the two can never drift -- pinned by
+    # `tests/unit/test_worker_manifest_permissions.py`. Indexed by the compose
+    # project name so two stacks on one VM never share a parent.
+    cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-1
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
-      # N83 phase 1 / Task 2: the rw cgroupfs view the worker writes the
-      # per-sandbox cgroup through (plan §3.5). There is no `subPathExpr` here,
-      # so this is the whole Docker VM tree; the worker picks its own subtree by
-      # the directory face B delegated to it.
-      - /sys/fs/cgroup:/pod-cgroup
+      # N83 phase 1 / Task 2: the worker's rw cgroupfs view (plan §3.5),
+      # narrowed to this worker's own slice: the bind source equals the
+      # `cgroup_parent` above, never the whole Docker VM tree.
+      - /sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-1:/pod-cgroup
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
     # E2B_QUOTA_AGENT_URL + quota-agent). The file runs the fleet shape:
     # per-sandbox netns, so wildcard allowOut rules resolve through the
@@ -544,10 +553,14 @@ services:
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
       # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
-      # default, inert) and where the rw cgroupfs view lands. On this lane the
-      # view is the whole Docker VM tree (`/sys/fs/cgroup:/pod-cgroup` in the
-      # volumes below) -- compose has no `subPathExpr`, so the worker recognises
-      # its own subtree by the **delegated** directory instead (plan §3.5).
+      # default, inert) and where the rw cgroupfs view lands. This lane gets the
+      # same *narrowed* view k8s gets, by a different device: compose **has**
+      # `volume.subpath`, but for `type: bind` it is silently ignored (measured:
+      # a non-existent subpath still mounts the source root, no warning) and it
+      # interpolates at parse time, so it cannot name a container id. The bind
+      # source is therefore this service's own static `cgroup_parent`
+      # (`/e2b-${COMPOSE_PROJECT_NAME}-worker-2` below; Docker creates it and the
+      # container lands at `<parent>/<container-id>`), never the whole tree.
       E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}
       E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}
       # N36 (2026-09-26): the fleet shape, so wildcard allowOut works here.
@@ -583,13 +596,18 @@ services:
       # that takes a sandbox offline.
       E2B_PID_NS: "true"
       E2B_ENABLE_NETWORK: "true"
+    # N83 phase 1 / Task 2: the per-sandbox cgroup parent Docker creates for
+    # this worker. The bind source below is exactly this slice (`/sys/fs/cgroup`
+    # + this path), so the two can never drift -- pinned by
+    # `tests/unit/test_worker_manifest_permissions.py`. Indexed by the compose
+    # project name so two stacks on one VM never share a parent.
+    cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-2
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
-      # N83 phase 1 / Task 2: the rw cgroupfs view the worker writes the
-      # per-sandbox cgroup through (plan §3.5). There is no `subPathExpr` here,
-      # so this is the whole Docker VM tree; the worker picks its own subtree by
-      # the directory face B delegated to it.
-      - /sys/fs/cgroup:/pod-cgroup
+      # N83 phase 1 / Task 2: the worker's rw cgroupfs view (plan §3.5),
+      # narrowed to this worker's own slice: the bind source equals the
+      # `cgroup_parent` above, never the whole Docker VM tree.
+      - /sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-2:/pod-cgroup
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
     # E2B_QUOTA_AGENT_URL + quota-agent). The file runs the fleet shape:
     # per-sandbox netns, so wildcard allowOut rules resolve through the
@@ -643,10 +661,14 @@ services:
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
       # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
-      # default, inert) and where the rw cgroupfs view lands. On this lane the
-      # view is the whole Docker VM tree (`/sys/fs/cgroup:/pod-cgroup` in the
-      # volumes below) -- compose has no `subPathExpr`, so the worker recognises
-      # its own subtree by the **delegated** directory instead (plan §3.5).
+      # default, inert) and where the rw cgroupfs view lands. This lane gets the
+      # same *narrowed* view k8s gets, by a different device: compose **has**
+      # `volume.subpath`, but for `type: bind` it is silently ignored (measured:
+      # a non-existent subpath still mounts the source root, no warning) and it
+      # interpolates at parse time, so it cannot name a container id. The bind
+      # source is therefore this service's own static `cgroup_parent`
+      # (`/e2b-${COMPOSE_PROJECT_NAME}-worker-3` below; Docker creates it and the
+      # container lands at `<parent>/<container-id>`), never the whole tree.
       E2B_SANDBOX_CGROUP: ${E2B_SANDBOX_CGROUP:-off}
       E2B_CGROUP_MOUNT: ${E2B_CGROUP_MOUNT:-/pod-cgroup}
       # N36 (2026-09-26): the fleet shape, so wildcard allowOut works here.
@@ -682,13 +704,18 @@ services:
       # that takes a sandbox offline.
       E2B_PID_NS: "true"
       E2B_ENABLE_NETWORK: "true"
+    # N83 phase 1 / Task 2: the per-sandbox cgroup parent Docker creates for
+    # this worker. The bind source below is exactly this slice (`/sys/fs/cgroup`
+    # + this path), so the two can never drift -- pinned by
+    # `tests/unit/test_worker_manifest_permissions.py`. Indexed by the compose
+    # project name so two stacks on one VM never share a parent.
+    cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-3
     volumes:
       - worker-data:/var/lib/e2b-sandboxes
-      # N83 phase 1 / Task 2: the rw cgroupfs view the worker writes the
-      # per-sandbox cgroup through (plan §3.5). There is no `subPathExpr` here,
-      # so this is the whole Docker VM tree; the worker picks its own subtree by
-      # the directory face B delegated to it.
-      - /sys/fs/cgroup:/pod-cgroup
+      # N83 phase 1 / Task 2: the worker's rw cgroupfs view (plan §3.5),
+      # narrowed to this worker's own slice: the bind source equals the
+      # `cgroup_parent` above, never the whole Docker VM tree.
+      - /sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-3:/pod-cgroup
     # A6: no SYS_ADMIN (shared-volume bind deleted in A4; quota via
     # E2B_QUOTA_AGENT_URL + quota-agent). The file runs the fleet shape:
     # per-sandbox netns, so wildcard allowOut rules resolve through the

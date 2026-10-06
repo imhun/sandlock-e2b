@@ -54,11 +54,16 @@ k8s 1.36 / k0s、containerd 2.3。
   §5 抬头）。它的写权由内核按 cgroupns + DAC 限定在**"被委派给它的 uid 的那些
   cgroup"**内：实测对**未委派**的 cgroup（含别的 pod 的）一切写操作都是 EACCES，对它自己容器的
   `cpu.max` 也是 EACCES（委派不含它）。
-  ⚠ **2026-10-06 本地车道实测补充（Task 7 验收）**：这条边界**靠的是收窄**，不是靠 uid ——
-  compose 车道上三个 worker 同宿主、**共用 uid 65534**、挂载是整棵树（没有 `subPathExpr`），
-  于是每台能对**别的 worker 被委派的**容器 cgroup 写 `cgroup.procs`/`cgroup.subtree_control`/`mkdir`
-  （`cpu.max` 仍 EACCES）。⇒ 生产形态（k8s + 收窄）不受影响；compose 车道这条是**已知的车道级性质**，
-  已写进 `docs/deploy-clusters.md` §7.48，并作为后续项（每个 compose worker 独立 uid，或也做收窄）。
+  ⚠ **2026-10-06 本地车道实测补充（Task 7 验收，随后由 compose 收窄修掉）**：这条边界**靠的是收窄**，
+  不是靠 uid —— compose 车道上三个 worker 同宿主、**共用 uid 65534**、当时挂载是整棵树，于是每台能对
+  **别的 worker 被委派的**容器 cgroup 写 `cgroup.procs`/`cgroup.subtree_control`/`mkdir`
+  （`cpu.max` 仍 EACCES）。那是**当时**的车道形状，读数原样保留在
+  `docs/reports/n83-task-7-cgroup-acceptance.md` 的 F1/R3 与 `docs/deploy-clusters.md` §7.48 坑 4。
+  **compose 车道当天也收窄了**（2026-10-06，本文档 §3.5 的 compose 版：`cgroup_parent:
+  /e2b-${COMPOSE_PROJECT_NAME}-worker-<n>` + 同名的、`volume` 直接指向这一片的 bind）——注意 compose
+  **有** `volume.subpath`，但它对 `type: bind` 是**静默忽略**的（实测：不存在的 subpath 照样挂上源根、
+  无告警），且它是解析期插值、命名不了容器 id，所以静态父切片才是这条车道的收窄装置。今天三条 compose
+  车道的挂载只看得到自己那一片，peer 容器根本不在挂载命名空间里（复验见 §7.48）。
 - **agent 在形态 W 下只多一件事**：一次性委派（chown worker 容器 cgroup 目录 +
   `cgroup.procs`/`cgroup.subtree_control`，**不碰 `cpu.max`**，**也不含 `cgroup.kill`** ——
   R9/接口层只说这三条；理由见 §3.2 的 `delegate_worker_subtree`）。不再需要
@@ -251,8 +256,11 @@ downward API 的 `metadata.uid`）能正常挂载，挂载根就是本 pod 的 c
 **代价**：worker 从此对**自己 pod 的**沙箱子树有写权（它能节流/杀的都是它自己的沙箱 —— 它本来就能
 kill 它们）。这条与 Global Constraints 里"不给 worker 任何 cgroup 写视图"**冲突**，所以需要人拍。
 **⚠ 收窄是这条边界的一半**（2026-10-06 本地车道实测）：compose 车道上三 worker 同宿主同 uid 65534、
-挂载是整棵树 ⇒ 被委派的 **peer** 容器 cgroup 互相可写（`cpu.max` 除外）。它**不该被读成"内核对 DAC
-的约束足够"** —— 收窄（或每 worker 独立 uid）才是把边界钉回"只有自己那棵"的那一步。
+**当时**挂载是整棵树 ⇒ 被委派的 **peer** 容器 cgroup 互相可写（`cpu.max` 除外）。它**不该被读成
+"内核对 DAC 的约束足够"** —— 收窄（或每 worker 独立 uid）才是把边界钉回"只有自己那棵"的那一步。
+**这条后续项当天就落地了**：compose 车道改走 §3.5 ①bis 的两个静态形状（`cgroup_parent` + 指向这一片
+的 bind），今天三台 worker 的挂载里 peer 容器根本不可见；原读数保留在
+`docs/reports/n83-task-7-cgroup-acceptance.md` 的 F1/R3 与 `docs/deploy-clusters.md` §7.48 坑 4。
 
 ### 3.3 另一条路（F）：不做 cgroup，回到 N82 的备选
 
@@ -303,6 +311,27 @@ volumes:
 （等价写法：把 QoS 放进 env `E2B_CGROUP_QOS`、`subPathExpr: "$(E2B_CGROUP_QOS)/pod$(POD_UID)"` ——
 多一个变量展开，好处是运行期代码/日志也能读到同一个值。二选一，不要两处都写。）
 
+**①bis 三条 compose 车道的同一个收窄（2026-10-06 落地）**：compose **有** `volume.subpath`，但它在这里
+**用不了**，两个理由都是实测的 —— (1) 对 `type: bind` 它被**静默忽略**（写一个不存在的 subpath，照样
+挂上源根，没有任何告警；见 `docs/deploy-clusters.md` 的踩坑表）；(2) 它是**解析期**插值，展开的是
+`.env`/环境变量那一层，**命名不了容器 id**（k8s 那边靠运行时 downward API 的 `POD_UID` 才做得到）。
+所以 compose 车道的收窄装置是**两个静态形状**，一条车道一组：
+
+```yaml
+worker-1:
+  cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-1   # Docker 建这个切片
+  volumes:
+    - /sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-1:/pod-cgroup   # ← 只挂自己这一片
+```
+
+实测（本机 Docker VM，cgroupfs driver）：容器落在 `/e2b-<project>-worker-1/<container-id>`；父切片自己
+带 `cpu.max`（`max 100000`）、`cgroup.subtree_control` 已开（`cpuset cpu io memory pids`）、没有自己的
+进程 —— 正好满足启动自检的两条（挂载根有 `cpu.max` + 至少一个子目录），也让 `+cpu` 不 `EBUSY`。
+**`${COMPOSE_PROJECT_NAME}` 是要求，不是装饰**：同一台 VM 上的两套栈（用户自己那套与任何一次验收）
+必须各有各的父切片，否则一个挂载里会出现两套栈的 `worker-1` 容器、"恰好一个被委派的子目录"这条自检
+就会具名拒绝。CI 钉子（`tests/unit/test_worker_manifest_permissions.py`）逐车道断言
+**bind 源 == 该 service 的 `cgroup_parent`**（`/sys/fs/cgroup` + 它），两者不许漂移。
+
 **② 保险 1：CI 钉子（防漂移）** —— 加在清单钉子测试里（`tests/unit/test_worker_manifest_permissions.py`
 一族）：
 
@@ -323,9 +352,11 @@ volumes:
    有界等待（`E2B_CGROUP_DELEGATE_WAIT_S`，默认 30 s）；等不到、或出现两个 ⇒ 具名拒绝启动。
    这条同时**独立验证了 agent 的路径推导**（它走的是 QoS 无关的 `kubepods/*/pod<pod_uid>` +
    `lookup.py` 的容器 init 规则）⇒ 两侧不会以同一种方式同时错；
-   （**两条车道同一条规则，搜索空间不同**：k8s 的挂载根就是 pod 目录 ⇒ 只看一层；compose 的挂载是
-   整棵 VM 树 ⇒ 在挂载内做一次有界走查，按容器 id（= 容器 hostname，现成的
-   `container_cgroup_token`）先缩到候选，再确认它归 65534。别的容器的 cgroup 都是 root 所有，
+   （**两条车道同一条规则，搜索空间不同**：k8s 的挂载根就是 pod 目录 ⇒ 只看一层；compose 在 2026-10-06
+   收窄**之前**是整棵 VM 树 ⇒ 在挂载内做一次有界走查，按容器 id（= 容器 hostname，现成的
+   `container_cgroup_token`）先缩到候选，再确认它归 65534。收窄（§3.5 ①bis）之后两块挂载的根都恰好
+   是本 worker 的父目录，这条走查规则**照旧通用**（收窄前的形状也仍然满足它），所以
+   `envd_service/runtime/sandbox_cgroup.py` 不必分车道。别的容器的 cgroup 都是 root 所有，
    所以"恰好一个"这条判据在两条车道上都成立。）
 3. 通过之后才执行 §3.2 的步骤 2–5（腾空 → `+cpu` → 接管沙箱）。
 
@@ -386,7 +417,8 @@ worker 容器 cgroup（k8s 的 cpu.max = 本节点核数；腾空后 subtree_con
 > "随 §3 作废"。
 >
 > - **worker 侧**：写权被 cgroupns + DAC 限定在自家容器子树（对别的 pod 全 EACCES），且 k8s 上用
->   `subPathExpr` 把挂载收窄到本 pod —— "能读同节点其它 pod 的 cgroup 聚合统计"那一条确已随 §3.5
+>   `subPathExpr` 把挂载收窄到本 pod（**compose 车道 2026-10-06 用 `cgroup_parent` + 同名 bind 达到
+>   同一形状**，见 §3.5 ①bis）—— "能读同节点其它 pod 的 cgroup 聚合统计"那一条确已随 §3.5
 >   收窄去掉（§1.4 探针量过）。收窄的说法**只在这半边成立**。
 > - **agent 面 B**：**仍然持有整节点的 rw cgroupfs 视图** —— 面 B 挂的是 `hostPath
 >   /sys/fs/cgroup` → `/host-cgroup`（k8s `deploy/k8s/c3-agent.yaml` 与三条 compose 车道
@@ -443,9 +475,11 @@ NetworkPolicy，worker 敲不进来）；④ 对已被攻破的 CP 边际为零�
   且必须**收窄**。** 定案前它是零写路（`/sys/fs/cgroup` 是 `ro` 挂载 —— `echo $$ > cgroup.procs` 与
   `mkdir` 都是 **`Read-only file system`**）。**Task 1 的实测把它改了**：放置只能由处在 worker
   cgroupns 里的进程做 ⇒ worker 拿一块 rw cgroupfs 视图（k8s 用 `subPathExpr` 收窄到本 pod 子树；
-  compose 是整棵树），由**它自己**建/写 `sbx_<id>`；agent 不再有"建/放/读/kill"四个 op，只剩
+  compose 2026-10-06 之前是整棵树、之后用 `cgroup_parent` + 同名 bind 收窄到本 worker 那一片，见
+  §3.5 ①bis），由**它自己**建/写 `sbx_<id>`；agent 不再有"建/放/读/kill"四个 op，只剩
   **一次性委派**（详情 §3.2/§4）。**capability 仍然是零** —— 写权全靠内核的 cgroupns + DAC。
-  ⚠ 由此产生的那条车道级风险（同 uid 的 peer 可写）见本节末尾"第四条风险"。
+  ⚠ 由此产生的那条车道级风险（同 uid 的 peer 可写）见本节末尾"第四条风险"—— 它已在 2026-10-06
+  当天由 compose 收窄（§3.5 ①bis）修掉，那一段的读数作为历史保留。
   **万一 worker 被攻破**：新增的是"对**本节点**同侪沙箱的**进程级**控制（节流/杀）"。**范围不变**
   —— file-op 那条已经有对象检查（`record.node_id != node_id` → 403），也就是说它今天就能对本节点
   的沙箱做数据级操作；新的是**种类**（进程 vs 数据），不是范围。缓解：cgroup op 复用同一条归属检查
@@ -467,6 +501,19 @@ NetworkPolicy，worker 敲不进来）；④ 对已被攻破的 CP 边际为零�
 搬移 ⇒ 可规避自己容器级额度、消耗邻居预算）。**裁定**：不阻塞 Phase 1（生产形态是 k8s + 收窄），
 如实写进 `docs/deploy-clusters.md` §7.48，并登记为后续项 —— compose 车道要么给每个 worker **独立 uid**、
 要么也做收窄。**这条正是"收窄是边界的一半"的证据**：少了它，内核对 DAC 的约束不足以把写权钉回自己那棵。
+
+> **2026-10-06 当天收尾（本条风险的 re-scope；上面的读数整段保留为历史）**：compose 车道**也收窄了**
+> —— 三条 compose 车道（`multinode`/`prod`/`stack/prod`）的每个 worker 现在都是
+> `cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-<n>` + 指向**这一片**的 bind（§3.5 ①bis；
+> compose 的 `volume.subpath` 对 `type: bind` 静默无效、且是解析期插值，所以只能用静态父切片）。
+> 复验（`-p n83narrow`、宿主端口 3300，`E2B_SANDBOX_CGROUP=required`）：三台 worker 的 `/pod-cgroup`
+> 里**只有 cgroupfs 文件 + 恰好一个容器目录（自己的）**，`docker/`、`kubepods*` 都不存在；验收脚本
+> check ④ 因此第一次走 **`narrowed-mount`** 分支（peer 可见数 **0**，证据 = 挂载根三条写全 EACCES），
+> 不再是当年的 `peer-container`（15 个 peer）。原始 JSON 与读数在
+> `docs/reports/n83-task-7-cgroup-acceptance.md`（本轮归档）与 `docs/deploy-clusters.md` §7.48。
+> 于是**这条风险今天只在"收窄前的 compose 形状"上成立**；k8s 与今天的 compose 都满足"peer 不在挂载
+> 命名空间里"。剩下的形态事实照旧：同一个宿主 uid 之所以当年能写 peer，是因为委派把 peer 容器 cgroup
+> 的**目录** chown 给了 65534 —— 收窄把它变成了够不着，而不是让 DAC 学会了区分。
 
 ---
 
@@ -494,13 +541,16 @@ NetworkPolicy，worker 敲不进来）；④ 对已被攻破的 CP 边际为零�
 - Modify: `deploy/k8s-k0s/worker-capacity.patch.yaml`（把 `E2B_SANDBOX_CGROUP` 覆盖成 `required`；
   这条与 idle-pause 三个数同一纪律：代码默认关、取值在清单）
 - Modify: `deploy/compose/docker-compose.multinode.yml`（**本地验收车道**：worker-1/2/3 各加
-  `/sys/fs/cgroup:/pod-cgroup`（rw）绑定 + `E2B_SANDBOX_CGROUP` / `E2B_CGROUP_MOUNT` 两个 env；
+  `cgroup_parent: /e2b-${COMPOSE_PROJECT_NAME}-worker-<n>` + `/sys/fs/cgroup/e2b-${COMPOSE_PROJECT_NAME}-worker-<n>:/pod-cgroup`
+  （rw）绑定 + `E2B_SANDBOX_CGROUP` / `E2B_CGROUP_MOUNT` 两个 env；
   `c3-agent-maint`（面 B）加同一块 rw 绑定 —— 委派就是它做的）
 - Modify: `deploy/compose/docker-compose.prod.yml` 与 `deploy/stack/docker-compose.prod.yml`
   （同样的改动，保持两条 compose 车道与生产示例同步；`tests/unit/test_compose_base_image_shape.py`
   一族会盯住它们）
-  注：compose 没有 `subPathExpr`，本地 lane 看到的是整棵 Docker VM 树 —— worker 靠"**被委派的那个
-  目录**"认自己（k8s 侧则是收窄到 pod 子树），两侧走同一段代码
+  注：**compose 有 `volume.subpath`，但绑不进来** —— 对 `type: bind` 它被静默忽略（实测：不存在的
+  subpath 照样挂源根、无告警），而且它是解析期插值、展开不出容器 id。所以收窄用静态父切片
+  （§3.5 ①bis）：挂载根就是本 worker 的父目录，worker 侧认"**被委派的那个目录**"这条代码在两条
+  车道上照旧通用（k8s 的挂载根是 pod 目录 ⇒ 一层；compose 走一次有界走查）。
 - Test: `tests/unit/test_worker_manifest_permissions.py`
 
 **Interfaces:**
