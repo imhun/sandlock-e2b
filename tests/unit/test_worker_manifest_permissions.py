@@ -139,9 +139,9 @@ def test_stack_worker2_carries_the_pid_ns_canary() -> None:
     assert "\n      E2B_PID_NS: ${E2B_PID_NS:-true}\n" in STACK_COMPOSE
 
 
-#: The two entries every process in the worker container gets regardless of its
-#: capabilities: the upstream default profile's own allowlist, and the N35
-#: real-root pair (see the test below).
+#: The entries every process in the worker container gets regardless of its
+#: capabilities: the upstream default profile's own allowlist, the N35
+#: real-root pair (see the test below), and N80's `clone3`.
 def _unconditional_allowlists() -> list[set[str]]:
     entries = [
         entry
@@ -150,7 +150,9 @@ def _unconditional_allowlists() -> list[set[str]]:
         and not entry.get("includes")
         and not entry.get("args")
     ]
-    assert len(entries) == 2, "expected the default allowlist plus the N35 pair"
+    assert len(entries) == 3, (
+        "expected the default allowlist, the N35 pair and N80's clone3"
+    )
     return [set(entry["names"]) for entry in entries]
 
 
@@ -177,24 +179,22 @@ def test_worker_seccomp_profile_is_the_default_plus_pidfd_getfd_and_a_narrowed_u
     lists = _unconditional_allowlists()
     allowed = max(lists, key=len)
     assert "pidfd_getfd" in allowed
-    # `unshare` moved out of the unconditional list into its own masked entry.
     assert "unshare" not in allowed
-    narrowed = [
-        entry
-        for entry in WORKER_SECCOMP["syscalls"]
-        if entry["action"] == "SCMP_ACT_ALLOW" and "unshare" in entry["names"]
+    # N80 (2026-10-06): the engine creates the leader's user, PID, mount and
+    # network namespaces in one `clone3` call, so `clone3` is unconditional
+    # now -- and `unshare` is gone from the profile entirely, because nothing
+    # in the worker calls it any more (`sandbox::probe_userns_self_map` probes
+    # with clone3 too). A `unshare` entry reappearing here means a caller came
+    # back or someone reverted the narrowing.
+    assert {"clone3"} in lists
+    assert {"pivot_root", "umount2"} in lists
+    unshare_entries = [
+        entry for entry in WORKER_SECCOMP["syscalls"] if "unshare" in entry["names"]
     ]
-    assert len(narrowed) == 1, "exactly one unshare entry"
-    assert narrowed[0]["names"] == ["unshare"], "and it names only unshare"
-    assert not narrowed[0].get("includes") and not narrowed[0].get("excludes")
-    # 234881152 == CLONE_NEWTIME|NEWCGROUP|NEWUTS|NEWIPC, i.e. the namespace
-    # types this deployment never creates; `valueTwo` defaults to 0, so the
-    # condition is "none of those bits are set".
-    assert narrowed[0]["args"] == [
-        {"index": 0, "value": 234881152, "op": "SCMP_CMP_MASKED_EQ"}
-    ]
-    # ...and the other unconditional entry is exactly the N35 pair, nothing more.
-    assert min(lists, key=len) == {"pivot_root", "umount2"}
+    assert unshare_entries == [], (
+        "unshare must be denied by defaultAction: the engine creates every "
+        f"namespace with clone3 and has no unshare caller left, got {unshare_entries}"
+    )
     # Everything that was capability-gated in the upstream default profile must
     # stay gated: a deployment that *does* carry the capability keeps the access
     # the kernel would grant it, and one that does not stays denied.
@@ -590,6 +590,49 @@ def test_seccomp_installer_ships_the_exact_shipped_profile() -> None:
     payload = _installer_configmap_payload()
     assert payload == WORKER_SECCOMP_TEXT
     assert json.loads(payload) == json.loads(WORKER_SECCOMP_TEXT)
+
+
+def test_the_worker_profile_never_denies_clone3() -> None:
+    """N80: the engine creates the PID-namespace leader with clone3 itself.
+
+    The profile used to carry an unconditional `clone3 -> SCMP_ACT_ERRNO (38)`
+    rule in the non-CAP_SYS_ADMIN branch -- the Docker default's "pretend the
+    syscall does not exist" trick that lets older runtimes fall back to
+    clone(2). Measurements on the target (arm64) showed the rule never firing,
+    but "the kernel happens to get the call" is not a contract. The engine now
+    depends on clone3, so the profile has to say so.
+    """
+    profile = json.loads(WORKER_SECCOMP_TEXT)
+    for group in profile["syscalls"]:
+        if group["action"] != "SCMP_ACT_ALLOW":
+            assert "clone3" not in group["names"], (
+                "clone3 must not appear in a denying rule: the engine needs it "
+                "to create the leader inside its namespaces, got action "
+                f"{group['action']}"
+            )
+    allowed = [
+        group
+        for group in profile["syscalls"]
+        if "clone3" in group["names"] and group["action"] == "SCMP_ACT_ALLOW"
+    ]
+    assert len(allowed) >= 1, "clone3 must be explicitly allowed"
+
+
+def test_the_worker_profile_denies_unshare_outright() -> None:
+    """N80: nothing on the sandbox path calls unshare any more.
+
+    With the user, PID, mount and network namespaces all created by the one
+    clone3 call, `unshare` has no caller left inside the worker: the sandbox
+    never gets it, and the engine no longer issues it. The old conditional
+    rule admitted every flavour whose cgroup/uts/ipc bits were clear -- i.e.
+    exactly the namespace kinds a sandbox wants.
+    """
+    profile = json.loads(WORKER_SECCOMP_TEXT)
+    for group in profile["syscalls"]:
+        assert "unshare" not in group["names"], (
+            "unshare must be denied by defaultAction, not admitted by a rule "
+            f"(found action {group['action']})"
+        )
 
 
 def test_seccomp_installer_rolls_when_the_profile_changes() -> None:

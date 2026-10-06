@@ -33,7 +33,7 @@ metadata:
     app: seccomp-installer
 data:
   # Byte-for-byte the file at deploy/seccomp/sandlock-worker.json (pinned by
-  # tests/unit/test_worker_manifest_permissions.py); sha256 3dca226ec12fb6893321a112559494042d8db92345d9f0451f6e6e1bee270f0d
+  # tests/unit/test_worker_manifest_permissions.py); sha256 d39657fde5fe9941420a6b288db5bd2064aef70c7782a20a8a13de2107e81a83
   #
   # `|` (keep), NOT `|-` (strip). The profile file ends with a newline, so `|-`
   # hands the node a payload one byte shorter than the very file this comment
@@ -458,22 +458,6 @@ data:
     		},
     		{
     			"names": [
-    				"unshare"
-    			],
-    			"action": "SCMP_ACT_ALLOW",
-    			"args": [
-    				{
-    					"index": 0,
-    					"value": 234881152,
-    					"op": "SCMP_CMP_MASKED_EQ"
-    				}
-    			],
-    			"comment": "C3: narrowed from unconditional. The mask is CLONE_NEWTIME|NEWCGROUP|NEWUTS|NEWIPC, so only the namespace types this deployment actually builds (user, net, pid, mount) are reachable -- a process that is root inside its own user namespace can no longer create a UTS/IPC/cgroup/time namespace. See deploy/seccomp/README.md.",
-    			"includes": {},
-    			"excludes": {}
-    		},
-    		{
-    			"names": [
     				"personality"
     			],
     			"action": "SCMP_ACT_ALLOW",
@@ -737,16 +721,11 @@ data:
     			"names": [
     				"clone3"
     			],
-    			"action": "SCMP_ACT_ERRNO",
-    			"errnoRet": 38,
+    			"action": "SCMP_ACT_ALLOW",
     			"args": [],
-    			"comment": "",
+    			"comment": "N80: the engine creates the PID-namespace leader (user, PID, mount and network namespaces) with one clone3 call, so the worker needs it. The namespace flags live in clone3's argument struct and seccomp cannot filter them; the sandbox's own inner filter is what refuses namespace flags from untrusted workloads.",
     			"includes": {},
-    			"excludes": {
-    				"caps": [
-    					"CAP_SYS_ADMIN"
-    				]
-    			}
+    			"excludes": {}
     		},
     		{
     			"names": [
@@ -948,7 +927,7 @@ spec:
         # sha256 of the profile payload. Bump it (with the ConfigMap) when the
         # profile changes: the pod template hash change is what rolls the
         # DaemonSet, and the test above fails until the two agree.
-        checksum/profile: "3dca226ec12fb6893321a112559494042d8db92345d9f0451f6e6e1bee270f0d"
+        checksum/profile: "d39657fde5fe9941420a6b288db5bd2064aef70c7782a20a8a13de2107e81a83"
     spec:
       # Every node, including tainted control-plane nodes: a node without the
       # profile cannot run the worker pod at all.

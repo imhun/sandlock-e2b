@@ -411,22 +411,6 @@
 		},
 		{
 			"names": [
-				"unshare"
-			],
-			"action": "SCMP_ACT_ALLOW",
-			"args": [
-				{
-					"index": 0,
-					"value": 234881152,
-					"op": "SCMP_CMP_MASKED_EQ"
-				}
-			],
-			"comment": "C3: narrowed from unconditional. The mask is CLONE_NEWTIME|NEWCGROUP|NEWUTS|NEWIPC, so only the namespace types this deployment actually builds (user, net, pid, mount) are reachable -- a process that is root inside its own user namespace can no longer create a UTS/IPC/cgroup/time namespace. See deploy/seccomp/README.md.",
-			"includes": {},
-			"excludes": {}
-		},
-		{
-			"names": [
 				"personality"
 			],
 			"action": "SCMP_ACT_ALLOW",
@@ -690,16 +674,11 @@
 			"names": [
 				"clone3"
 			],
-			"action": "SCMP_ACT_ERRNO",
-			"errnoRet": 38,
+			"action": "SCMP_ACT_ALLOW",
 			"args": [],
-			"comment": "",
+			"comment": "N80: the engine creates the PID-namespace leader (user, PID, mount and network namespaces) with one clone3 call, so the worker needs it. The namespace flags live in clone3's argument struct and seccomp cannot filter them; the sandbox's own inner filter is what refuses namespace flags from untrusted workloads.",
 			"includes": {},
-			"excludes": {
-				"caps": [
-					"CAP_SYS_ADMIN"
-				]
-			}
+			"excludes": {}
 		},
 		{
 			"names": [
