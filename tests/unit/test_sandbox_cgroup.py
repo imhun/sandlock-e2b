@@ -273,3 +273,150 @@ def test_cpu_max_for_scales_percent_to_a_100ms_period() -> None:
     assert cpu_max_for(100) == "100000 100000"
     assert cpu_max_for(50) == "50000 100000"
     assert cpu_max_for(1) == "1000 100000"
+
+
+def test_setup_refuses_when_the_worker_cgroup_cannot_be_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    worker = parent / "worker"
+    real_mkdir = Path.mkdir
+
+    def deny(self: Path, *args: object, **kwargs: object) -> None:
+        if self == worker:
+            raise PermissionError(13, "Permission denied")
+        real_mkdir(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "mkdir", deny)
+    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid())
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.setup(wait_s=0.2)
+    assert str(excinfo.value) == f"cgroup-refusal worker-mkdir: {worker}"
+    assert worker.exists() is False
+
+
+def test_setup_cleans_up_the_worker_cgroup_when_a_later_step_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    control = parent / "cgroup.subtree_control"
+    real_write = Path.write_text
+
+    def deny(self: Path, *args: object, **kwargs: object) -> int:
+        if self == control:
+            raise PermissionError(13, "Permission denied")
+        return real_write(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", deny)
+    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid())
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.setup(wait_s=0.2)
+    # Named refusal, the created worker/ cgroup is gone, and the drained pid is
+    # back in the parent.
+    assert str(excinfo.value) == f"cgroup-refusal subtree-control-write: {control}"
+    assert (parent / "worker").exists() is False
+    assert (parent / "cgroup.procs").read_text() == f"{SELF_PID}\n"
+
+
+def test_attach_refuses_when_the_sandbox_cgroup_cannot_be_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg.setup(wait_s=0.2)
+    target = parent / "sbx_alpha"
+    real_mkdir = Path.mkdir
+
+    def deny(self: Path, *args: object, **kwargs: object) -> None:
+        if self == target:
+            raise PermissionError(13, "Permission denied")
+        real_mkdir(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "mkdir", deny)
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(sandbox_id="alpha", pid=4242, cpu_percent=100)
+    assert str(excinfo.value) == f"cgroup-refusal sbx-mkdir: {target}"
+    assert target.exists() is False
+
+
+def test_attach_refuses_when_an_existing_target_cannot_be_read(tmp_path: Path) -> None:
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg.setup(wait_s=0.2)
+    # Exists, but has no cgroup.procs to read: the reuse probe fails, and that
+    # must be a named refusal, not a bare OSError.
+    target = parent / "sbx_alpha"
+    target.mkdir()
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(sandbox_id="alpha", pid=4242, cpu_percent=100)
+    assert str(excinfo.value) == f"cgroup-refusal attach-io: {target}"
+    assert target.exists() is True
+
+
+def test_release_refuses_when_cgroup_kill_cannot_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg.setup(wait_s=0.2)
+    target = parent / "sbx_alpha"
+    target.mkdir()
+    _write(target / "cgroup.kill", "")
+    real_write = Path.write_text
+
+    def deny(self: Path, *args: object, **kwargs: object) -> int:
+        if self == target / "cgroup.kill":
+            raise PermissionError(13, "Permission denied")
+        return real_write(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", deny)
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.release(sandbox_id="alpha")
+    assert str(excinfo.value) == f"cgroup-refusal release-kill: {target}"
+    # The kill did not take: the cgroup is still there, not half-removed.
+    assert target.exists() is True
+
+
+@pytest.mark.parametrize("bad_id", ["../evil", "a/b", ""])
+def test_attach_refuses_a_path_escaping_sandbox_id(tmp_path: Path, bad_id: str) -> None:
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg.setup(wait_s=0.2)
+    before = sorted(child.name for child in parent.iterdir())
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(sandbox_id=bad_id, pid=4242, cpu_percent=100)
+
+    assert str(excinfo.value) == (
+        f"cgroup-refusal sandbox-id: {bad_id!r} is not a valid sandbox id"
+    )
+    # Nothing was created, inside the delegated subtree or out of it.
+    assert sorted(child.name for child in parent.iterdir()) == before
+    assert (tmp_path / "evil").exists() is False
+
+
+def test_release_refuses_a_path_escaping_sandbox_id(tmp_path: Path) -> None:
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(mount=mount, worker_uid=os.getuid(), proc_root=tmp_path / "proc")
+    cg.setup(wait_s=0.2)
+    before = sorted(child.name for child in parent.iterdir())
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.release(sandbox_id="a/b")
+
+    assert str(excinfo.value) == (
+        "cgroup-refusal sandbox-id: 'a/b' is not a valid sandbox id"
+    )
+    assert sorted(child.name for child in parent.iterdir()) == before

@@ -20,12 +20,20 @@ Docker VM, both reproduced):
   ``cpu.max`` it just made;
 * teardown is ``cgroup.kill`` (mode 0200, write-only) then ``rmdir``.
 
-Every write is verified by reading the value back, and a failure removes what
-the call created before raising :class:`CgroupRefusal` -- fail closed, never
-"assume it worked". The only injected state is the two facts a unit lane cannot
-observe: ``proc_root`` for ``/proc/<pid>/cgroup`` placement, and (for the
-compose lane) ``container_token`` to narrow the search to our container's
-cgroup among the whole mounted VM tree.
+The module is *fail closed*: every syscall that builds, writes, places, or
+removes a cgroup is wrapped, and any failure is translated into a
+:class:`CgroupRefusal` with a stable, greppable ``cgroup-refusal <reason>:``
+name -- a bare ``OSError`` never escapes :meth:`SandboxCgroups.setup`,
+:meth:`SandboxCgroups.attach`, or :meth:`SandboxCgroups.release`. A failed
+``setup`` removes the ``worker/`` cgroup it created and moves any drained pids
+back, and a failed ``attach`` removes the ``sbx_<id>`` it created, so a refusal
+leaves the node as it was. ``sandbox_id`` is validated before it ever reaches a
+path, so it cannot climb out of the delegated subtree.
+
+The only injected state is the two facts a unit lane cannot observe:
+``proc_root`` for ``/proc/<pid>/cgroup`` placement, and (for the compose lane)
+``container_token`` to narrow the search to our container's cgroup among the
+whole mounted VM tree.
 """
 
 from __future__ import annotations
@@ -34,6 +42,8 @@ import logging
 import os
 import time
 from pathlib import Path
+
+from gateway_common.paths import validate_sandbox_id
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +65,9 @@ class CgroupRefusal(Exception):
     Raised for every failure of this module -- a mount root that is not this
     pod's cgroup, a delegation that never arrived or arrived twice, a readback
     that does not match what was written, a sandbox cgroup that is already
-    occupied. The message is a stable, greppable ``cgroup-refusal <reason>:``
-    line so a startup failure names its cause instead of leaving a mystery.
+    occupied, or any syscall that made one of those steps impossible. The
+    message is a stable, greppable ``cgroup-refusal <reason>:`` line so a
+    startup failure names its cause instead of leaving a mystery.
     """
 
 
@@ -74,7 +85,13 @@ def _cgroup_pids(cgroup_dir: Path) -> list[int]:
     the module just asked for.
     """
     text = (cgroup_dir / "cgroup.procs").read_text()
-    return [int(token) for token in text.split()]
+    try:
+        return [int(token) for token in text.split()]
+    except ValueError as exc:
+        raise CgroupRefusal(
+            f"cgroup-refusal procs-format: {cgroup_dir}/cgroup.procs is not a pid "
+            f"list: {text!r}"
+        ) from exc
 
 
 def _remove_cgroup_dir(target: Path) -> None:
@@ -122,12 +139,28 @@ class SandboxCgroups:
 
         Returns the evidence line the caller logs: which directory was taken as
         the parent, how many pids were drained, and the enabled controller set.
+        On any failure the ``worker/`` cgroup this call created is removed and
+        its pids are moved back before a :class:`CgroupRefusal` is raised.
         """
-        self._precheck()
-        parent = self._await_delegated(wait_s)
-        self._parent = parent
-        drained = self._drain(parent)
-        enabled = self._enable_cpu(parent)
+        parent: Path | None = None
+        worker: Path | None = None
+        created = False
+        try:
+            self._precheck()
+            parent = self._await_delegated(wait_s)
+            self._parent = parent
+            worker = parent / "worker"
+            created = self._prepare_worker_dir(worker)
+            drained = self._drain_into(parent, worker)
+            enabled = self._enable_cpu(parent)
+        except CgroupRefusal:
+            if parent is not None and worker is not None:
+                self._discard_worker(parent, worker, created)
+            raise
+        except OSError as exc:
+            if parent is not None and worker is not None:
+                self._discard_worker(parent, worker, created)
+            raise CgroupRefusal(f"cgroup-refusal setup-io: {parent or self._mount}") from exc
         return (
             f"cgroup ready parent={parent} worker_uid={self._worker_uid} "
             f"drained={len(drained)} subtree_control={enabled}"
@@ -197,25 +230,40 @@ class SandboxCgroups:
                     found.append(candidate)
         return found
 
-    def _drain(self, parent: Path) -> list[int]:
-        """Move our own pids out of the parent so ``+cpu`` is allowed."""
+    def _prepare_worker_dir(self, worker: Path) -> bool:
+        """Create ``worker/`` (or reuse an empty one). Returns whether we made it."""
+        try:
+            worker.mkdir()
+            return True
+        except FileExistsError:
+            try:
+                occupied = (worker / "cgroup.procs").read_text().split()
+            except OSError as exc:
+                raise CgroupRefusal(
+                    f"cgroup-refusal worker-reuse-read: {worker}"
+                ) from exc
+            if occupied:
+                raise CgroupRefusal(
+                    f"cgroup-refusal drain-reused: {worker}/cgroup.procs is not empty"
+                )
+            return False
+        except OSError as exc:
+            raise CgroupRefusal(f"cgroup-refusal worker-mkdir: {worker}") from exc
+
+    def _drain_into(self, parent: Path, worker: Path) -> list[int]:
+        """Move our own pids into ``worker/`` so ``+cpu`` on the parent is allowed."""
         pids = _cgroup_pids(parent)
         if os.getpid() not in pids:
             raise CgroupRefusal(
                 f"cgroup-refusal self-placement: worker pid {os.getpid()} is not "
                 f"in {parent}/cgroup.procs"
             )
-        worker = parent / "worker"
-        try:
-            worker.mkdir()
-        except FileExistsError:
-            if (worker / "cgroup.procs").read_text().split():
-                raise CgroupRefusal(
-                    f"cgroup-refusal drain-reused: {worker}/cgroup.procs is not empty"
-                )
         procs = worker / "cgroup.procs"
-        procs.write_text("".join(f"{pid}\n" for pid in pids))
-        read_back = [int(token) for token in procs.read_text().split()]
+        try:
+            procs.write_text("".join(f"{pid}\n" for pid in pids))
+        except OSError as exc:
+            raise CgroupRefusal(f"cgroup-refusal worker-drain-write: {procs}") from exc
+        read_back = _cgroup_pids(worker)
         if sorted(read_back) != sorted(pids):
             raise CgroupRefusal(
                 f"cgroup-refusal drain-readback: {procs} holds {read_back!r}, "
@@ -232,7 +280,12 @@ class SandboxCgroups:
     def _enable_cpu(self, parent: Path) -> str:
         """Enable the cpu controller on the (now empty) parent, then verify it."""
         control = parent / "cgroup.subtree_control"
-        control.write_text("+cpu")
+        try:
+            control.write_text("+cpu")
+        except OSError as exc:
+            raise CgroupRefusal(
+                f"cgroup-refusal subtree-control-write: {control}"
+            ) from exc
         read_back = control.read_text().strip()
         # The kernel echoes the *enabled set* ("cpu"), not the "+cpu" command.
         enabled = {token.lstrip("+-") for token in read_back.split()}
@@ -251,19 +304,25 @@ class SandboxCgroups:
         Returns the cgroup directory. Reuse-or-refuse: an existing directory
         that already holds pids is refused, never silently shared.
         """
+        self._validate_sandbox_id(sandbox_id)
         parent = self._require_parent()
         target = parent / f"sbx_{sandbox_id}"
         created = False
-        if target.exists():
-            held = _cgroup_pids(target)
-            if held:
-                raise CgroupRefusal(
-                    f"cgroup-refusal sbx-in-use: {target} already holds pids {held!r}"
-                )
-        else:
-            target.mkdir()
-            created = True
         try:
+            if target.exists():
+                held = _cgroup_pids(target)
+                if held:
+                    raise CgroupRefusal(
+                        f"cgroup-refusal sbx-in-use: {target} already holds pids {held!r}"
+                    )
+            else:
+                try:
+                    target.mkdir()
+                except OSError as exc:
+                    raise CgroupRefusal(
+                        f"cgroup-refusal sbx-mkdir: {target}"
+                    ) from exc
+                created = True
             quota = cpu_max_for(cpu_percent)
             cpu_max = target / "cpu.max"
             cpu_max.write_text(quota)
@@ -297,16 +356,24 @@ class SandboxCgroups:
 
     def release(self, *, sandbox_id: str) -> bool:
         """Kill and remove ``sbx_<id>``. Absent is ``False``, not an error."""
+        self._validate_sandbox_id(sandbox_id)
         parent = self._require_parent()
         target = parent / f"sbx_{sandbox_id}"
-        if not target.exists():
-            return False
-        kill = target / "cgroup.kill"
-        if kill.exists():
-            # Write-only (mode 0200) on a real cgroupfs: no readback is possible.
-            kill.write_text("1")
         try:
+            if not target.exists():
+                return False
+            kill = target / "cgroup.kill"
+            if kill.exists():
+                # Write-only (mode 0200) on a real cgroupfs: no readback is possible.
+                try:
+                    kill.write_text("1")
+                except OSError as exc:
+                    raise CgroupRefusal(
+                        f"cgroup-refusal release-kill: {target}"
+                    ) from exc
             _remove_cgroup_dir(target)
+        except CgroupRefusal:
+            raise
         except OSError as exc:
             raise CgroupRefusal(
                 f"cgroup-refusal release-rmdir: could not rmdir {target}"
@@ -314,6 +381,13 @@ class SandboxCgroups:
         return True
 
     # -- helpers -------------------------------------------------------
+
+    def _validate_sandbox_id(self, sandbox_id: str) -> None:
+        """Reject an id that could climb out of the delegated subtree."""
+        if not validate_sandbox_id(sandbox_id):
+            raise CgroupRefusal(
+                f"cgroup-refusal sandbox-id: {sandbox_id!r} is not a valid sandbox id"
+            )
 
     def _require_parent(self) -> Path:
         if self._parent is None:
@@ -331,6 +405,28 @@ class SandboxCgroups:
         raise CgroupRefusal(
             f"cgroup-refusal proc-cgroup: {path} is not a cgroup v2 line: {text!r}"
         )
+
+    def _discard_worker(self, parent: Path, worker: Path, created: bool) -> None:
+        """Best-effort undo of a ``worker/`` cgroup this call created."""
+        if not created:
+            return
+        # Put the drained pids back so the cgroup is empty and can be removed.
+        try:
+            drained = _cgroup_pids(worker)
+            if drained:
+                (parent / "cgroup.procs").write_text("".join(f"{p}\n" for p in drained))
+        except OSError:
+            pass
+        try:
+            kill = worker / "cgroup.kill"
+            if kill.exists():
+                kill.write_text("1")
+        except OSError:
+            pass
+        try:
+            _remove_cgroup_dir(worker)
+        except OSError:
+            logger.warning("cgroup-refusal cleanup: could not rmdir %s", worker)
 
     def _discard(self, target: Path, created: bool) -> None:
         """Best-effort removal of a cgroup this call created, before refusing."""
