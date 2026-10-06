@@ -89,12 +89,14 @@ four more, same rule -- each one a reading:
    carries no ceiling at all (the mixed-version window, R12) the same request
    is a named ``503``, which is this check's RED.
 9. **Peak and task unit.** ``memory.max``/``memory.high`` equal the declared
-   ``memoryMB`` byte for byte and ``pids.max`` equals the lane's declared
-   ``E2B_DEFAULT_MAX_PROCESSES`` (read out of the worker container, never
-   hard-coded); a held 64 MiB allocation shows in ``memory.peak``; and
-   ``pids.current`` counts a **thread** as a task exactly like a process (two
-   threads add 2, one forked process adds 1 -- the unit Task 5's probe read as
-   ``pids.current = 3`` for 2 threads + 1 process).
+   ``memoryMB`` byte for byte and ``pids.max`` equals **this box's own recorded
+   declaration** -- the worker's ``_runtime/<id>/sandbox.json``
+   ``max_processes``, read out of the worker container, never hard-coded and
+   never a deployment-wide env (the lane's ``E2B_DEFAULT_MAX_PROCESSES`` is
+   printed beside it as a secondary cross-check); a held 64 MiB allocation
+   shows in ``memory.peak``; and ``pids.current`` counts a **thread** as a task
+   exactly like a process (two threads add 2, one forked process adds 1 -- the
+   unit Task 5's probe read as ``pids.current = 3`` for 2 threads + 1 process).
 
 The script drives **any** E2B endpoint, so everything lane-specific is a
 parameter — and a real cluster run needs **all five** of them (fix round 1,
@@ -1477,12 +1479,14 @@ def main() -> int:
                 and pids_events_max_peak >= 1
                 and busy_rtt["min_ms"] <= bound_ms,
                 criterion=(
-                    "pids.max == the lane's declared E2B_DEFAULT_MAX_PROCESSES; the "
-                    "fork bomb's own errno is EAGAIN; pids.current reaches pids.max "
-                    "exactly while cgroup.procs is still below it (the kernel's task "
-                    "wall, which counts threads -- the mediator's process counter "
-                    "cannot produce this); pids.events.max grows; a same-node "
-                    "neighbour keeps its round trip"
+                    "pids.max == this box's own recorded declaration (the worker's "
+                    "_runtime/<id>/sandbox.json max_processes; the lane's "
+                    "E2B_DEFAULT_MAX_PROCESSES is printed alongside, never the "
+                    "criterion); the fork bomb's own errno is EAGAIN; pids.current "
+                    "reaches pids.max exactly while cgroup.procs is still below it "
+                    "(the kernel's task wall, which counts threads -- the mediator's "
+                    "process counter cannot produce this); pids.events.max grows; a "
+                    "same-node neighbour keeps its round trip"
                 ),
                 declared_processes=declared_tasks,
                 declared_processes_source=declared_record.get("path"),
@@ -1653,8 +1657,10 @@ def main() -> int:
                 and process_delta == 1,
                 criterion=(
                     "memory.max/memory.high == the declared memoryMB byte for byte; "
-                    "pids.max == the lane's declared E2B_DEFAULT_MAX_PROCESSES; a "
-                    "held 64 MiB allocation moves memory.peak into "
+                    "pids.max == this box's own recorded declaration (the worker's "
+                    "_runtime/<id>/sandbox.json max_processes; the lane's "
+                    "E2B_DEFAULT_MAX_PROCESSES is printed alongside, never the "
+                    "criterion); a held 64 MiB allocation moves memory.peak into "
                     "[64 MiB, memory.max]; and pids.current counts a thread exactly "
                     "like a process (2 threads add 2, 1 forked process adds 1, both "
                     "measured against the same holder with neither -- the unit Task "
