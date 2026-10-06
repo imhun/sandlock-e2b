@@ -104,6 +104,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # N83 phase 1 / Task 2: the pod's own uid, expanded into the cgroup
+            # view's `subPathExpr` below (`pod$(POD_UID)`). `metadata.uid` is the
+            # same identity kubelet used to lay the pod's cgroup out under
+            # `/kubepods/<qos>/pod<uid>`, so the mount root is *this* pod's
+            # cgroup directory and not a neighbour's.
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: E2B_NODE_ID
               valueFrom:
                 fieldRef:
@@ -650,6 +659,18 @@ spec:
               value: "20"
             - name: E2B_NODE_PROCESSES
               value: "256"
+            # N83 phase 1 / Task 2: the per-sandbox cgroup switch and where the
+            # narrowed cgroupfs view lands. `off` is the code default (inert:
+            # no sandbox cgroup is built, no limit is written, behaviour is
+            # byte-for-byte today's) -- the deploy manifest is where the value
+            # lives, exactly like the idle-pause trio, and the k0s overlay
+            # (`deploy/k8s-k0s/worker-capacity.patch.yaml`) is what turns it to
+            # `required` on the cluster. `E2B_CGROUP_MOUNT` names the mount root
+            # the startup self-check and the cgroup module both read.
+            - name: E2B_SANDBOX_CGROUP
+              value: "off"
+            - name: E2B_CGROUP_MOUNT
+              value: /pod-cgroup
           resources:
             limits:
               memory: 2Gi
@@ -748,6 +769,20 @@ spec:
             # *not* here -- N57 keeps them on the shared `E2B_STATE_BASE`.)
             - name: node-state
               mountPath: /var/lib/e2b/state
+            # N83 phase 1 / Task 2: ONE rw cgroupfs view, narrowed to this
+            # pod's own cgroup subtree. `subPathExpr: pod$(POD_UID)` narrows the
+            # hostPath below to `/sys/fs/cgroup/kubepods/burstable/pod<uid>`;
+            # the QoS segment is written literally in the volume (plan §3.5 ①)
+            # and a CI pin (`test_worker_cgroup_view_qos_segment_matches_the_
+            # derived_qos`) keeps it equal to the QoS `resources` derives.
+            # Measured (plan §1.4): narrowing to the pod subtree removes the
+            # read access to other pods' statistics that the whole-tree view
+            # left open, while the sandbox-cgroup chain still runs end to end.
+            # The mount is rw (no `readOnly`) and never the runtime's own
+            # `/sys/fs/cgroup`.
+            - name: cgpod
+              mountPath: /pod-cgroup
+              subPathExpr: "pod$(POD_UID)"
       volumes:
         - name: shared
           persistentVolumeClaim:
@@ -786,6 +821,18 @@ spec:
           hostPath:
             path: /var/lib/e2b/state
             type: DirectoryOrCreate
+        # N83 phase 1 / Task 2: the host's cgroupfs, narrowed by the mount's
+        # `subPathExpr` to this pod's own subtree. QoS is written literally
+        # (`burstable`, from `resources` above: a limit with no request) because
+        # a mismatch is silent on the node -- kubelet would `mkdir` a *fake*
+        # cgroup and mount it (plan §1.4), leaving the pod `1/1 Running` with
+        # zero events and one leaked cgroup per rebuild. The k0s overlay rewrites
+        # `resources` (requests 500m/512Mi under limits 4/4Gi) and must keep the
+        # derived class Burstable -- the CI pin checks that too.
+        - name: cgpod
+          hostPath:
+            path: /sys/fs/cgroup/kubepods/burstable
+            type: Directory
 ---
 apiVersion: v1
 kind: Service

@@ -33,6 +33,13 @@ spec:
               value: "8192"
             - name: E2B_NODE_PROCESSES
               value: "1024"
+            # N83 phase 1 / Task 2: the per-sandbox cgroup switch, flipped on
+            # the cluster. The code default is `off` (inert); this overlay is the
+            # only place the value moves -- same discipline as the four numbers
+            # above. `required` means the worker's startup self-check is
+            # fail-closed (plan §3.5 insurance 2), never "best effort".
+            - name: E2B_SANDBOX_CGROUP
+              value: "required"
           resources:
             requests:
               cpu: 500m
