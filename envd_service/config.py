@@ -759,16 +759,44 @@ def read_seccomp_mode(path: str = "/proc/self/status") -> int | None:
 def _userns_probe() -> tuple[bool, str]:
     """Can this process still create a user namespace without capabilities?
 
-    The shipped profile allows `unshare` unconditionally; the runtime default
-    gates it on CAP_SYS_ADMIN, which the non-root worker does not have. So the
-    probe separates "our profile" from "some other filter" -- the case the
-    `Seccomp:` field alone cannot see. A subprocess rather than a fork: envd is
-    multi-threaded and the child only has to run one syscall.
+    The shipped profile admits `clone3` (the engine creates the leader inside
+    its namespaces with it); the runtime default answers it ENOSYS, which is
+    how it keeps runtimes that predate the syscall falling back to clone(2).
+    So clone3 succeeds where "some other filter" is installed and fails here
+    -- the case the `Seccomp:` field alone cannot see. A subprocess rather
+    than a fork: envd is multi-threaded and the child only has to run one
+    syscall.
+
+    N80 (2026-10-06): this used to probe `unshare(CLONE_NEWUSER)`, which is
+    the *other* profile's signature now -- the shipped one deliberately
+    refuses it. The probe has to ask the question the spawn path asks.
     """
     import subprocess
     import sys
 
-    code = "import os; os.unshare(os.CLONE_NEWUSER)"
+    code = (
+        "import ctypes, os, struct\n"
+        "CLONE_NEWUSER, SIGCHLD, SYS_CLONE3 = 0x10000000, 17, 435\n"
+        "real_uid, real_gid = os.getuid(), os.getgid()\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "args = struct.pack('<11Q', CLONE_NEWUSER, 0, 0, 0, SIGCHLD, 0, 0, 0, 0, 0, 0)\n"
+        "buf = ctypes.create_string_buffer(args, len(args))\n"
+        "ctypes.set_errno(0)\n"
+        "pid = libc.syscall(SYS_CLONE3, ctypes.byref(buf), len(args))\n"
+        "if pid == 0:\n"
+        "    ok = True\n"
+        "    try:\n"
+        "        open('/proc/self/uid_map', 'w').write('0 %d 1\\n' % real_uid)\n"
+        "        open('/proc/self/setgroups', 'w').write('deny\\n')\n"
+        "        open('/proc/self/gid_map', 'w').write('0 %d 1\\n' % real_gid)\n"
+        "    except OSError:\n"
+        "        ok = False\n"
+        "    os._exit(0 if ok else 1)\n"
+        "if pid < 0:\n"
+        "    raise OSError(ctypes.get_errno(), 'clone3(CLONE_NEWUSER)')\n"
+        "_, status = os.waitpid(pid, 0)\n"
+        "raise SystemExit(0 if os.WEXITSTATUS(status) == 0 else 3)\n"
+    )
     result = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,

@@ -217,6 +217,7 @@ _REAL_ROOT_PROBE = r'''
 import ctypes
 import os
 import platform
+import struct
 from pathlib import Path
 
 
@@ -227,6 +228,7 @@ class _Failed(Exception):
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 real_uid, real_gid = os.getuid(), os.getgid()
 CLONE_NEWUSER, CLONE_NEWNS = 0x10000000, 0x00020000
+SYS_CLONE3, SIGCHLD = 435, 17
 MS_BIND, MS_REC, MS_PRIVATE = 4096, 16384, 1 << 18
 
 PIVOT_ROOT_NR = __PIVOT_ROOT_NR__
@@ -238,8 +240,8 @@ def check(label, call):
         raise _Failed(f"{label}: {os.strerror(ctypes.get_errno())}")
 
 
-try:
-    check("unshare(CLONE_NEWUSER)", lambda: libc.unshare(CLONE_NEWUSER))
+def in_the_new_namespaces():
+    """Every step the fork's real-root phase walks, inside the namespaces."""
     # The maps have to exist before the namespace has capabilities the kernel
     # will honour on a mount.
     for path, text in (
@@ -253,7 +255,6 @@ try:
             if "uid_map" in path or "gid_map" in path:
                 raise _Failed(f"write {path}: {exc.strerror}") from exc
             break
-    check("unshare(CLONE_NEWNS)", lambda: libc.unshare(CLONE_NEWNS))
     check(
         "mount(NULL, /, MS_REC|MS_PRIVATE)",
         lambda: libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None),
@@ -281,12 +282,37 @@ try:
         lambda: libc.syscall(nr, b".", b"."),
     )
     check("umount2(MNT_DETACH)", lambda: libc.umount2(b".", 2))
-except _Failed as exc:
-    print(exc)
-except Exception as exc:  # a probe that raises is a probe that failed
-    print(f"{type(exc).__name__}: {exc}")
-else:
-    print("ok")
+
+
+def fail(reason):
+    print(reason, flush=True)
+    os._exit(0)
+
+
+# N80 (2026-10-06): the sandbox gets its user and mount namespaces from one
+# clone3 call, so that is what this probes. Asking with unshare would answer a
+# question the deployment no longer asks -- the engine does not call it, and
+# the shipped profile no longer admits it.
+args = struct.pack(
+    "<11Q", CLONE_NEWUSER | CLONE_NEWNS, 0, 0, 0, SIGCHLD, 0, 0, 0, 0, 0, 0
+)
+buf = ctypes.create_string_buffer(args, len(args))
+ctypes.set_errno(0)
+pid = libc.syscall(SYS_CLONE3, ctypes.byref(buf), len(args))
+if pid < 0:
+    fail(f"clone3(CLONE_NEWUSER|CLONE_NEWNS): {os.strerror(ctypes.get_errno())}")
+if pid == 0:
+    try:
+        in_the_new_namespaces()
+    except _Failed as exc:
+        fail(str(exc))
+    except Exception as exc:  # a probe that raises is a probe that failed
+        fail(f"{type(exc).__name__}: {exc}")
+    print("ok", flush=True)
+    os._exit(0)
+_, status = os.waitpid(pid, 0)
+if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
+    print("clone3 child died before it could finish the root steps", flush=True)
 '''.replace("__PIVOT_ROOT_NR__", repr(_PIVOT_ROOT_NR))
 
 #: How long the child probe may take. Generous on purpose: this runs once per
