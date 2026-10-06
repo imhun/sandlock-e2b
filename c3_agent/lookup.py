@@ -12,11 +12,14 @@ discipline -- exact matches, named refusals, never a guess:
   k8s lane does.
 * **where is this worker's *container* cgroup** (N83 Phase 1, Task 3) --
   :meth:`ProcLookup.worker_container_cgroup`, the anchor the one-shot delegation
-  chowns to the worker. It is the same candidate rule as
-  :meth:`ProcLookup.worker_uid_gid` (the anchor token *and* the container's own
-  init), and its answer is the path the *kernel* spells -- which is relative to
-  this face's cgroup namespace root, so the caller that needs the agent's mount
-  view resolves it by directory name (``c3_agent.cgroups``).
+  chowns to the worker. Its candidate rule is the anchor token, the container's
+  own init (:meth:`ProcLookup._is_container_init`), **and** the worker's own
+  uid: on k8s the pod-uid anchor alone matches both the sandbox (pause)
+  container and the worker (measured 65535 vs 65534; ``docs/deploy-clusters.md``
+  §7.49), so the uid the control plane named is the discriminator. Its answer is
+  the path the *kernel* spells -- which is relative to this face's cgroup
+  namespace root, so the caller that needs the agent's mount view resolves it by
+  directory name (``c3_agent.cgroups``).
 
 **The slot half (D9.3).** The worker forks the slot's child and reports the pid
 **it** knows; the agent,
@@ -452,6 +455,7 @@ class ProcLookup:
         self,
         *,
         node_id: str,
+        worker_uid: int,
         pod_uid: str | None = None,
         container_id: str | None = None,
     ) -> str:
@@ -476,15 +480,37 @@ class ProcLookup:
         anchor, and handing the worker an exec cgroup would be handing it the
         wrong directory -- measured shape, not a hypothetical.
 
+        **The anchor plus init is *still* ambiguous on k8s**, which is why the
+        third discriminator is the worker's own uid (this method's
+        ``worker_uid``, named by the control plane and never by the worker):
+        every k8s pod runs a **sandbox (pause) container** beside the worker,
+        and that container is its own container's init in the same
+        ``pod<uid>`` cgroup -- so the ``pod<uid>`` anchor matches *both*. They
+        are told apart by their guest uid, and only that way: measured on the
+        live cluster, 2026-10-06 (``docs/deploy-clusters.md`` §7.49) --
+        ``/pause`` at uid **65535** and ``python -m envd_service`` at uid
+        **65534**, same pod, both container inits.
+
         Zero candidates (a recreated worker, a stale anchor, a host pid
-        namespace) and more than one (a pod with several container inits) are
-        both named refusals: the caller has nothing safe to chown in either case.
+        namespace), no candidate carrying the expected uid (the pause container
+        is the only init, or the worker identity drifted), and more than one
+        candidate carrying it are **all** named refusals: the caller has nothing
+        safe to chown in any of them, and "pick the first" is never an answer.
 
         What is returned is the path **as the kernel spells it for this reader**
         -- and this face has a private cgroup namespace, so that spelling is
         relative to its own root and may carry ``..`` (measured 2026-10-06;
         ``c3_agent.cgroups`` resolves it into the agent's mount view by name).
         """
+        if (
+            not isinstance(worker_uid, int)
+            or isinstance(worker_uid, bool)
+            or worker_uid <= 0
+        ):
+            raise LookupRefusal(
+                f"worker {node_id} carries no usable worker uid "
+                f"({worker_uid!r}): refusing to locate its container cgroup"
+            )
         if pod_uid is None and container_id is None:
             raise LookupRefusal(
                 f"worker {node_id} names no single cgroup anchor (pod uid or "
@@ -510,10 +536,27 @@ class ProcLookup:
                     f"{node_id} is not a container id: refusing"
                 )
             token = container_cgroup_token(container_id)
-        candidates: list[str] = []
+        anchor_inits: list[tuple[int, str]] = []
         for pid in self._iter_entries():
             cgroup = self._cgroup(pid)
             if cgroup is not None and token in cgroup and self._is_container_init(pid):
+                anchor_inits.append((pid, cgroup))
+        candidates: list[str] = []
+        observed_uids: set[int] = set()
+        for pid, cgroup in anchor_inits:
+            pair = self._uid_gid(pid)
+            if pair is None:
+                if (self._proc_root / str(pid)).exists():
+                    raise LookupRefusal(
+                        f"the kernel's uid for one of worker {node_id}'s "
+                        "container-init processes cannot be read: refusing to "
+                        "locate its container cgroup"
+                    )
+                # Gone between the walk and the read: it is not a process of
+                # this container any more.
+                continue
+            observed_uids.add(pair[0])
+            if pair[0] == worker_uid:
                 candidates.append(cgroup)
         if len(candidates) > 1:
             raise LookupRefusal(
@@ -521,10 +564,16 @@ class ProcLookup:
                 "container-init process: refusing (ambiguous)"
             )
         if not candidates:
+            if not observed_uids:
+                raise LookupRefusal(
+                    f"worker {node_id}'s container holds no process this agent "
+                    "can identify as the container's init: refusing to locate "
+                    "its container cgroup"
+                )
             raise LookupRefusal(
-                f"worker {node_id}'s container holds no process this agent can "
-                "identify as the container's init: refusing to locate its "
-                "container cgroup"
+                f"worker {node_id}'s container-init processes carry uids "
+                f"{sorted(observed_uids)} but not the expected worker uid "
+                f"{worker_uid}: refusing to locate its container cgroup"
             )
         return self._cgroup_path(candidates[0], node_id=node_id)
 

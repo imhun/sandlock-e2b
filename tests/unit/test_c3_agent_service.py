@@ -244,6 +244,7 @@ async def test_the_delegate_cgroup_op_is_routed_and_its_lookup_refusal_is_named(
                 "worker": {
                     "node_id": WORKER,
                     "pod_uid": "6d3cdd7b-3a5e-4a1f-9a6b-0c1d2e3f4a5b",
+                    "uid": 65534,
                 }
             },
         )

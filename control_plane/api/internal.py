@@ -18,7 +18,9 @@ node, and the request must come from the node's expected address):
   for its own container cgroup subtree to be delegated to it (N83 phase 1); the
   body is empty and the control plane derives the node, the object and the
   anchor (k8s: the pod uid its resolver read; compose: its own record's
-  container id) before instructing the node's agent on face B
+  container id) **plus the worker's own uid from its node record** (the
+  discriminator that tells the k8s worker apart from its pod's sandbox/pause
+  container) before instructing the node's agent on face B
 * ``POST /internal/nodes/{node_id}/slot-identity`` -- the worker reports the
   ``{sandbox_id, pid}`` of a slot child it just forked (C3 Task 3, ruling D9.1);
   the control plane answers by instructing the node's agent, **with the uid and
@@ -913,6 +915,16 @@ async def node_cgroup_delegate(node_id: str, request: Request) -> dict[str, Any]
     and the client uses the resolver's pod uid instead), and the client
     addresses the agent's **face B**.
 
+    The node's ``worker_uid`` rides beside the anchor as the **discriminator**
+    (never the worker's word, mirroring the file-op path): on k8s the pod-uid
+    anchor plus the agent's container-init rule match both the worker and the
+    pod's sandbox (pause) container, so the agent matches a candidate's own
+    kernel uid against this value to pick the worker (measured 65535 vs 65534;
+    ``docs/deploy-clusters.md`` §7.49). A node record with no verified
+    ``worker_uid`` is a named 503 here -- the same refusal the file-op path
+    answers -- because an instruction without the discriminator is exactly the
+    one the agent must not act on.
+
     Idempotent by construction: the agent's ``chown`` is, so a worker that
     re-asks (a restart, or a retry its caller owns) gets the same answer -- the
     second call is not a refusal.
@@ -921,6 +933,17 @@ async def node_cgroup_delegate(node_id: str, request: Request) -> dict[str, Any]
     node = request.app.state.nodes.get(node_id)
     if node is None:
         raise OfficialError(404, f"Node {node_id} not found")
+    # The delegation's second discriminator (N83 fix): the worker's own uid,
+    # named by the control plane's record -- the same field the file-op path
+    # reads at ``internal.py`` (``worker.uid``). Without it the agent cannot
+    # tell the k8s worker apart from its pod's sandbox (pause) container.
+    worker_uid = getattr(node, "worker_uid", None)
+    if worker_uid is None:
+        raise OfficialError(
+            503,
+            f"node {node_id} has reported no worker identity (workerUID/"
+            "workerGID): refusing to instruct the agent",
+        )
     client = getattr(request.app.state, "c3_agent_client", None)
     if client is None:
         raise OfficialError(
@@ -936,7 +959,9 @@ async def node_cgroup_delegate(node_id: str, request: Request) -> dict[str, Any]
     anchor = _worker_identity_anchor(request, node, node_id)
     try:
         answer = await client.delegate_cgroup(
-            node_id=node_id, worker_container_id=anchor
+            node_id=node_id,
+            worker_uid=int(worker_uid),
+            worker_container_id=anchor,
         )
     except AgentClientError as exc:
         raise OfficialError(exc.status_code, str(exc)) from exc

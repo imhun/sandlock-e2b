@@ -402,6 +402,9 @@ FLEET = "fleet-key"
 NODE_ENDPOINT = NodeEndpoint("http://10.0.0.1:49983", "10.0.0.1")
 CONTAINER_ID = "3f2a1b0c9d8e"
 WORKER_POD_UID = "6d3cdd7b-3a5e-4a1f-9a6b-0c1d2e3f4a5b"
+#: The worker's own uid -- the delegation's second discriminator (N83 fix).
+WORKER_UID = 65534
+WORKER_GID = 65534
 DELEGATION_ANSWER = {
     "op": "delegate-cgroup",
     # Task 3's own answer shape: the path inside the *agent's* cgroup view, the
@@ -465,7 +468,7 @@ def _delegation_app(workspace, *, client, settings=None, worker_identity_source=
         # resolver's pod uid. The compose lane's kernel-deferral shape is what
         # the two lane tests below name explicitly.
         worker_identity_source=(
-            StaticWorkerIdentitySource({})
+            StaticWorkerIdentitySource({NODE_ID: (WORKER_UID, WORKER_GID)})
             if worker_identity_source is None
             else worker_identity_source
         ),
@@ -491,6 +494,8 @@ async def _enroll_node(app, *, key: str = KEY_NODE, container_id=None) -> None:
     }
     if container_id is not None:
         body["containerID"] = container_id
+    body["workerUID"] = WORKER_UID
+    body["workerGID"] = WORKER_GID
     async with _delegation_client(app) as client:
         resp = await client.post(
             "/internal/nodes/register",
@@ -537,7 +542,13 @@ def test_the_delegation_hands_the_agents_answer_back_with_the_node_and_anchor(
     }
     # The worker names nothing: the instruction is the control plane's whole
     # derivation (the node from the credential, the anchor from its records).
-    assert agent.calls == [{"node_id": NODE_ID, "worker_container_id": None}]
+    assert agent.calls == [
+        {
+            "node_id": NODE_ID,
+            "worker_container_id": None,
+            "worker_uid": WORKER_UID,
+        }
+    ]
 
 
 def test_a_second_delegation_call_succeeds_the_same_way(workspace) -> None:
@@ -555,8 +566,16 @@ def test_a_second_delegation_call_succeeds_the_same_way(workspace) -> None:
     assert (first.status_code, second.status_code) == (200, 200)
     assert first.json() == second.json()
     assert agent.calls == [
-        {"node_id": NODE_ID, "worker_container_id": None},
-        {"node_id": NODE_ID, "worker_container_id": None},
+        {
+            "node_id": NODE_ID,
+            "worker_container_id": None,
+            "worker_uid": WORKER_UID,
+        },
+        {
+            "node_id": NODE_ID,
+            "worker_container_id": None,
+            "worker_uid": WORKER_UID,
+        },
     ]
 
 
@@ -639,7 +658,11 @@ def test_the_compose_lane_carries_the_container_id_anchor_to_face_b() -> None:
         transport=httpx.MockTransport(handler),
     )
     answer = asyncio.run(
-        client.delegate_cgroup(node_id=NODE_ID, worker_container_id=CONTAINER_ID)
+        client.delegate_cgroup(
+            node_id=NODE_ID,
+            worker_container_id=CONTAINER_ID,
+            worker_uid=WORKER_UID,
+        )
     )
     assert answer == DELEGATION_ANSWER
     assert len(seen) == 1
@@ -650,7 +673,11 @@ def test_the_compose_lane_carries_the_container_id_anchor_to_face_b() -> None:
     )
     assert request.headers["X-Internal-Key"] == "c3-agent-sekret"
     assert json.loads(request.content) == {
-        "worker": {"node_id": NODE_ID, "container_id": CONTAINER_ID}
+        "worker": {
+            "node_id": NODE_ID,
+            "container_id": CONTAINER_ID,
+            "uid": WORKER_UID,
+        }
     }
 
 
@@ -677,14 +704,18 @@ def test_the_k8s_lane_carries_the_worker_pod_uid_to_face_b() -> None:
         timeout_s=2.0,
         transport=httpx.MockTransport(handler),
     )
-    asyncio.run(client.delegate_cgroup(node_id=NODE_ID))
+    asyncio.run(client.delegate_cgroup(node_id=NODE_ID, worker_uid=WORKER_UID))
     assert len(seen) == 1
     request = seen[0]
     assert str(request.url) == (
         "http://10.244.1.7:49986/internal/nodes/k0s-worker-0/agent/delegate-cgroup"
     )
     assert json.loads(request.content) == {
-        "worker": {"node_id": NODE_ID, "pod_uid": WORKER_POD_UID}
+        "worker": {
+            "node_id": NODE_ID,
+            "pod_uid": WORKER_POD_UID,
+            "uid": WORKER_UID,
+        }
     }
 
 
@@ -705,7 +736,9 @@ def test_a_shape_without_a_face_b_address_refuses_the_delegation_by_name() -> No
     with pytest.raises(AgentClientError) as excinfo:
         asyncio.run(
             client.delegate_cgroup(
-                node_id=NODE_ID, worker_container_id=CONTAINER_ID
+                node_id=NODE_ID,
+                worker_container_id=CONTAINER_ID,
+                worker_uid=WORKER_UID,
             )
         )
     assert str(excinfo.value) == (
@@ -762,7 +795,11 @@ def test_the_compose_lane_hands_the_recorded_container_id_to_the_client(
         "workerAnchor": CONTAINER_ID,
     }
     assert agent.calls == [
-        {"node_id": NODE_ID, "worker_container_id": CONTAINER_ID}
+        {
+            "node_id": NODE_ID,
+            "worker_container_id": CONTAINER_ID,
+            "worker_uid": WORKER_UID,
+        }
     ]
 
 
@@ -789,6 +826,34 @@ def test_a_compose_node_with_no_container_id_is_a_named_503(workspace) -> None:
             f"node {NODE_ID} has reported no container id for the agent to "
             "confirm its worker identity against (a C3 worker must keep the "
             "runtime's hostname): refusing to instruct the agent"
+        ),
+    }
+    assert agent.calls == []
+
+
+def test_a_node_with_no_worker_uid_is_a_named_503(workspace) -> None:
+    """N83 fix ①: the delegation now needs the worker's own uid as a discriminator.
+
+    A node record with no verified ``worker_uid`` (an older worker, or a shape
+    whose pin the control plane could not read) cannot name the value the agent
+    must match against ``/proc/<pid>/status`` -- and an instruction without it is
+    the one the agent must refuse. The control plane names that *here*, the same
+    503 the file-op path answers, and nothing reaches the wire.
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(
+        workspace,
+        client=agent,
+        worker_identity_source=StaticWorkerIdentitySource({}),
+    )
+    asyncio.run(_enroll_node(app))
+    resp = _delegate(app)
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "code": 503,
+        "message": (
+            f"node {NODE_ID} has reported no worker identity (workerUID/"
+            "workerGID): refusing to instruct the agent"
         ),
     }
     assert agent.calls == []

@@ -52,12 +52,16 @@ Surface (all responses JSON objects):
   exactly as sent.
 
 - ``POST /internal/nodes/{node_id}/agent/delegate-cgroup`` (face B, N83 Phase 1
-  Task 3) ``{"worker": {"node_id", "pod_uid"?, "container_id"?}}`` -> ``{"op",
-  "containerCgroup", "delegated", "cpuMaxOwner"}``. Exactly one of the two lane
-  anchors is present (the same D21/D25 pair ``WorkerCredentials`` carries). The
-  agent **derives** the worker's container cgroup from that anchor
-  (:meth:`c3_agent.lookup.ProcLookup.worker_container_cgroup`), locates it in its
-  own rw cgroupfs view (:mod:`c3_agent.cgroups`) and chowns the whitelist --
+  Task 3) ``{"worker": {"node_id", "uid", "pod_uid"?, "container_id"?}}`` ->
+  ``{"op", "containerCgroup", "delegated", "cpuMaxOwner"}``. Exactly one of the
+  two lane anchors is present (the same D21/D25 pair ``WorkerCredentials``
+  carries), and ``uid`` is the worker's own guest uid **named by the control
+  plane** -- the discriminator that tells the worker apart from the k8s pod's
+  sandbox (pause) container, which the pod-uid anchor alone also matches
+  (measured 65535 vs 65534; ``docs/deploy-clusters.md`` §7.49). The agent
+  **derives** the worker's container cgroup from that anchor plus the uid
+  (:meth:`c3_agent.lookup.ProcLookup.worker_container_cgroup`), locates it in
+  its own rw cgroupfs view (:mod:`c3_agent.cgroups`) and chowns the whitelist --
   directory, ``cgroup.procs``, ``cgroup.subtree_control`` -- to the worker uid
   the kernel reports for that container's init. ``cpu.max`` is deliberately
   *not* delegated: that is what keeps the worker from raising its own cap
@@ -249,9 +253,18 @@ class DelegateCgroupWorker(BaseModel):
     ``getuid()``, which is root). A body that names both anchors or neither is a
     shape refusal (422) -- the agent has no rule for "which of these two is the
     worker" and will not invent one.
+
+    ``uid`` is **required** and is the same value the control plane names in its
+    node record (hard rules 1/3: the worker never supplies it). It is not the
+    uid the directory is handed to -- that one is still read from the kernel --
+    it is the **discriminator** the lookup matches a candidate's own
+    ``/proc/<pid>/status`` ``Uid:`` against. On k8s it is the only thing that
+    tells the worker (65534) apart from the pod's sandbox/pause container
+    (65535): the pod uid anchor plus the container-init rule match both.
     """
 
     node_id: str = Field(min_length=1)
+    uid: int = Field(ge=1)
     pod_uid: str | None = Field(default=None, min_length=1)
     container_id: str | None = Field(default=None, min_length=1)
 
@@ -672,6 +685,13 @@ def create_app(
         same anchor ``WorkerCredentials`` already carries, so a deployment that
         overrode ``hostname:`` is refused by name rather than matched loosely.
 
+        ``worker.uid`` is the control plane's value, and it is a predicate, not
+        the chown target: the lookup accepts a container init only when the
+        kernel's own ``Uid:`` for it equals this number, which is what tells the
+        k8s worker apart from its pod's sandbox (pause) container (both are
+        container inits under the same ``pod<uid>``; measured 65534 vs 65535).
+        The chown target stays the uid the kernel reports for the located init.
+
         Every failure -- the anchor names nothing, names several inits, the mount
         is not there, the directory is not in the view -- is a 502 with the
         refusal's own words, the same status a refused ``e2b-maint`` step gets:
@@ -691,6 +711,7 @@ def create_app(
         try:
             kernel_cgroup = lookup.worker_container_cgroup(
                 node_id=worker.node_id,
+                worker_uid=worker.uid,
                 pod_uid=worker.pod_uid,
                 container_id=worker.container_id,
             )
