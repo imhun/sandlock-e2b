@@ -21,9 +21,30 @@ manifest edit that no runtime test would catch.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 
+import httpx
+import pytest
 import yaml
+
+from control_plane.app import create_app as create_control_app
+from control_plane.c3_agent_client import (
+    AgentClientError,
+    AgentTarget,
+    C3AgentClient,
+    ComposeAgentAddressResolver,
+    StaticAgentAddressResolver,
+)
+from control_plane.config import Settings as ControlSettings
+from control_plane.node_address import NodeEndpoint, StaticAddressResolver
+from control_plane.registry.manager import SandboxRegistry
+from control_plane.registry.nodes import NodeRegistry
+from control_plane.worker_identity_source import (
+    KernelWorkerIdentitySource,
+    StaticWorkerIdentitySource,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 K8S = REPO / "deploy" / "k8s"
@@ -358,3 +379,431 @@ def test_no_worker_shape_carries_the_agent_token() -> None:
                 path.name,
                 face,
             )
+
+
+# ------------------ N83 phase 1: the one-shot cgroup-delegation handshake
+#
+# Shape W (per-sandbox cgroup, phase 1) gives the worker a one-time handshake:
+# at startup it asks the control plane, once, to have the node's agent delegate
+# the worker's own container cgroup subtree to it. Everything privileged stays
+# where it already was -- the worker names nothing (the body is empty; the
+# control plane derives the node, the object and the anchor), the control plane
+# dials the agent's **face B** with the lane's own anchor, and every refusal on
+# the way is named (a node with no anchor, no client, an agent that refuses).
+#
+# The anchor is the D21/D25 pair, one shape each: compose carries the worker's
+# container id, k8s carries the worker pod's uid -- and a lane that has neither
+# refuses by name instead of instructing an agent that cannot locate the
+# container the delegation is for.
+
+NODE_ID = "node_a"
+KEY_NODE = "key-node-a"
+FLEET = "fleet-key"
+NODE_ENDPOINT = NodeEndpoint("http://10.0.0.1:49983", "10.0.0.1")
+CONTAINER_ID = "3f2a1b0c9d8e"
+WORKER_POD_UID = "6d3cdd7b-3a5e-4a1f-9a6b-0c1d2e3f4a5b"
+DELEGATION_ANSWER = {
+    "op": "delegate-cgroup",
+    # Task 3's own answer shape: the path inside the *agent's* cgroup view, the
+    # entries it chowned (``"."`` is the container directory itself -- and
+    # ``cpu.max`` is never among them), and who still owns the limit file.
+    "containerCgroup": "/host-cgroup/docker/3f2a1b0c9d8e",
+    "delegated": [".", "cgroup.procs", "cgroup.subtree_control"],
+    "cpuMaxOwner": "0:0",
+}
+
+
+class _StubDelegateClient:
+    """Records the delegation instruction; answers like the agent would."""
+
+    def __init__(
+        self,
+        *,
+        answer: dict | None = None,
+        refuse: str | None = None,
+        status_code: int = 502,
+    ) -> None:
+        self.calls: list[dict] = []
+        self._answer = DELEGATION_ANSWER if answer is None else answer
+        self._refuse = refuse
+        self._status_code = status_code
+
+    async def delegate_cgroup(self, **kwargs) -> dict:
+        self.calls.append(kwargs)
+        if self._refuse is not None:
+            raise AgentClientError(self._refuse, status_code=self._status_code)
+        return dict(self._answer)
+
+
+def _delegation_settings(**overrides) -> ControlSettings:
+    defaults = dict(
+        api_keys=("local-key",),
+        internal_api_key=FLEET,
+        internal_api_keys=(),
+        internal_node_keys={KEY_NODE: NODE_ID},
+        max_sandboxes=200,
+        max_total_memory_mb=0,
+        max_total_cpu_percent=0,
+        max_total_disk_mb=0,
+        max_total_processes=0,
+    )
+    defaults.update(overrides)
+    return ControlSettings(**defaults)
+
+
+def _delegation_app(workspace, *, client, settings=None, worker_identity_source=None):
+    settings = settings or _delegation_settings()
+    return create_control_app(
+        settings=settings,
+        registry=SandboxRegistry(settings),
+        nodes_registry=NodeRegistry(heartbeat_timeout=600.0),
+        workspace_base=workspace,
+        node_address_resolver=StaticAddressResolver({NODE_ID: NODE_ENDPOINT}),
+        c3_agent_client=client,
+        # The k8s shape (no kernel deferral -> no anchor travels): the identity
+        # is verified by the control plane itself, so the client uses the
+        # resolver's pod uid. The compose lane's kernel-deferral shape is what
+        # the two lane tests below name explicitly.
+        worker_identity_source=(
+            StaticWorkerIdentitySource({})
+            if worker_identity_source is None
+            else worker_identity_source
+        ),
+    )
+
+
+def _delegation_client(app, *, source_ip: str = "10.0.0.1") -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, client=(source_ip, 44444)),
+        base_url="http://control",
+    )
+
+
+async def _enroll_node(app, *, key: str = KEY_NODE, container_id=None) -> None:
+    """Register node A -- the node-scoped identity every delegation needs."""
+    body = {
+        "nodeID": NODE_ID,
+        "address": NODE_ENDPOINT.address,
+        "totalMemoryMB": 1024,
+        "totalCPUPercent": 100,
+        "totalDiskMB": 1024,
+        "totalProcesses": 64,
+    }
+    if container_id is not None:
+        body["containerID"] = container_id
+    async with _delegation_client(app) as client:
+        resp = await client.post(
+            "/internal/nodes/register",
+            headers={"X-Internal-Key": key},
+            json=body,
+        )
+    assert resp.status_code == 200
+
+
+async def _post_delegation(app, *, headers, source_ip: str = "10.0.0.1"):
+    async with _delegation_client(app, source_ip=source_ip) as client:
+        return await client.post(
+            f"/internal/nodes/{NODE_ID}/cgroup-delegate",
+            headers=headers,
+        )
+
+
+def _delegate(app, *, key: str = KEY_NODE, source_ip: str = "10.0.0.1"):
+    return asyncio.run(
+        _post_delegation(app, headers={"X-Internal-Key": key}, source_ip=source_ip)
+    )
+
+
+def test_the_delegation_hands_the_agents_answer_back_with_the_node_and_anchor(
+    workspace,
+) -> None:
+    """③ the happy path: the agent's own answer, plus the node and the anchor.
+
+    The control plane does not invent a cgroup path here: the agent located the
+    container and performed the chown, so ``containerCgroup`` and ``delegated``
+    are *its* words, carried back verbatim. What the control plane adds is the
+    identity it proved (the node) and the anchor it derived (``None`` in this
+    k8s-shaped lane, where the resolver's pod uid is the anchor instead).
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+    resp = _delegate(app)
+    assert resp.status_code == 200
+    assert resp.json() == {
+        **DELEGATION_ANSWER,
+        "nodeID": NODE_ID,
+        "workerAnchor": None,
+    }
+    # The worker names nothing: the instruction is the control plane's whole
+    # derivation (the node from the credential, the anchor from its records).
+    assert agent.calls == [{"node_id": NODE_ID, "worker_container_id": None}]
+
+
+def test_a_second_delegation_call_succeeds_the_same_way(workspace) -> None:
+    """④ idempotent: a worker that retries its startup handshake is not punished.
+
+    The chown the agent performs is idempotent, so the handshake is too -- the
+    second answer is byte-for-byte the first, and nothing about the first call
+    is remembered to refuse the second (a restarted worker re-asks).
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+    first = _delegate(app)
+    second = _delegate(app)
+    assert (first.status_code, second.status_code) == (200, 200)
+    assert first.json() == second.json()
+    assert agent.calls == [
+        {"node_id": NODE_ID, "worker_container_id": None},
+        {"node_id": NODE_ID, "worker_container_id": None},
+    ]
+
+
+def test_an_agents_refusal_is_forwarded_by_name(workspace) -> None:
+    """② the agent refused (or could not be reached): the refusal travels.
+
+    The control plane's answer carries the agent hop's own words and its own
+    status, so "the agent would not delegate this subtree" is never flattened
+    into a bare 500 -- or worse, into a success.
+    """
+    agent = _StubDelegateClient(
+        refuse=(
+            f"the agent for node {NODE_ID} refused the cgroup delegation: "
+            "worker container cgroup is ambiguous"
+        ),
+    )
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+    resp = _delegate(app)
+    assert resp.status_code == 502
+    assert resp.json() == {
+        "code": 502,
+        "message": (
+            f"the agent for node {NODE_ID} refused the cgroup delegation: "
+            "worker container cgroup is ambiguous"
+        ),
+    }
+
+
+def test_a_lane_with_no_anchor_refuses_before_dialling(workspace) -> None:
+    """① no anchor, no instruction: a named 503 and nothing on the wire.
+
+    This is the client's own refusal (R-B): a resolved target that carries no
+    pod uid and a caller that carried no container id leaves the agent unable
+    to locate the worker's container, so the instruction is never sent.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=DELEGATION_ANSWER)
+
+    client = C3AgentClient(
+        resolver=ComposeAgentAddressResolver(
+            "http://c3-agent:49985", "http://c3-agent-maint:49986"
+        ),
+        token="c3-agent-sekret",
+        timeout_s=2.0,
+        transport=httpx.MockTransport(handler),
+    )
+    app = _delegation_app(workspace, client=client)
+    asyncio.run(_enroll_node(app))
+    resp = _delegate(app)
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "code": 503,
+        "message": (
+            f"node {NODE_ID} carries no anchor the agent can locate its worker "
+            "container by (compose: the worker's container id; k8s: the worker "
+            "pod uid): refusing to instruct the agent"
+        ),
+    }
+    assert seen == []
+
+
+def test_the_compose_lane_carries_the_container_id_anchor_to_face_b() -> None:
+    """The compose lane: the worker's container id, addressed to face B."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=DELEGATION_ANSWER)
+
+    client = C3AgentClient(
+        resolver=ComposeAgentAddressResolver(
+            "http://c3-agent:49985", "http://c3-agent-maint:49986"
+        ),
+        token="c3-agent-sekret",
+        timeout_s=2.0,
+        transport=httpx.MockTransport(handler),
+    )
+    answer = asyncio.run(
+        client.delegate_cgroup(node_id=NODE_ID, worker_container_id=CONTAINER_ID)
+    )
+    assert answer == DELEGATION_ANSWER
+    assert len(seen) == 1
+    request = seen[0]
+    # Face B -- the same listener the privileged file verbs use (D22).
+    assert str(request.url) == (
+        f"http://c3-agent-maint:49986/internal/nodes/c3-agent/agent/delegate-cgroup"
+    )
+    assert request.headers["X-Internal-Key"] == "c3-agent-sekret"
+    assert json.loads(request.content) == {
+        "worker": {"node_id": NODE_ID, "container_id": CONTAINER_ID}
+    }
+
+
+def test_the_k8s_lane_carries_the_worker_pod_uid_to_face_b() -> None:
+    """The k8s lane: the pod uid the resolver read, never the worker's word."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=DELEGATION_ANSWER)
+
+    client = C3AgentClient(
+        resolver=StaticAgentAddressResolver(
+            {
+                NODE_ID: AgentTarget(
+                    node_identity="k0s-worker-0",
+                    url="http://10.244.1.7:49985",
+                    pod_uid=WORKER_POD_UID,
+                    maint_url="http://10.244.1.7:49986",
+                )
+            }
+        ),
+        token="c3-agent-sekret",
+        timeout_s=2.0,
+        transport=httpx.MockTransport(handler),
+    )
+    asyncio.run(client.delegate_cgroup(node_id=NODE_ID))
+    assert len(seen) == 1
+    request = seen[0]
+    assert str(request.url) == (
+        "http://10.244.1.7:49986/internal/nodes/k0s-worker-0/agent/delegate-cgroup"
+    )
+    assert json.loads(request.content) == {
+        "worker": {"node_id": NODE_ID, "pod_uid": WORKER_POD_UID}
+    }
+
+
+def test_a_shape_without_a_face_b_address_refuses_the_delegation_by_name() -> None:
+    """A compose shape that named only face A cannot delegate."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=DELEGATION_ANSWER)
+
+    client = C3AgentClient(
+        resolver=ComposeAgentAddressResolver("http://c3-agent:49985"),
+        token="c3-agent-sekret",
+        timeout_s=2.0,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(AgentClientError) as excinfo:
+        asyncio.run(
+            client.delegate_cgroup(
+                node_id=NODE_ID, worker_container_id=CONTAINER_ID
+            )
+        )
+    assert str(excinfo.value) == (
+        f"cannot determine the cgroup-delegation agent address for node "
+        f"{NODE_ID} (E2B_C3_AGENT_MAINT_URL / E2B_C3_AGENT_MAINT_PORT): "
+        "refusing to instruct an agent the control plane cannot locate"
+    )
+    assert excinfo.value.status_code == 503
+    assert seen == []
+
+
+def test_the_identity_layer_guards_the_delegation_endpoint(workspace) -> None:
+    """① credential, ② source IP -- the same layers as every node-scoped handler."""
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent)
+    asyncio.run(_enroll_node(app))
+    unauthenticated = asyncio.run(_post_delegation(app, headers={}))
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json() == {"code": 401, "message": "Unauthorized"}
+    stolen = _delegate(app, source_ip="10.0.0.2")
+    assert stolen.status_code == 403
+    assert stolen.json() == {
+        "code": 403,
+        "message": (
+            f"request for node {NODE_ID} came from 10.0.0.2, expected 10.0.0.1"
+        ),
+    }
+    assert agent.calls == []
+
+
+def test_the_compose_lane_hands_the_recorded_container_id_to_the_client(
+    workspace,
+) -> None:
+    """The compose anchor: the node record's own container id (D25).
+
+    This is the half of R-A's derivation that only the control plane can do:
+    the worker names nothing, the resolver has no pod uid in this lane, and the
+    value the agent must locate the container by comes from the record the
+    worker reported at register/heartbeat -- read back here through
+    ``_worker_identity_anchor``, never from the request.
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(
+        workspace,
+        client=agent,
+        worker_identity_source=KernelWorkerIdentitySource(),
+    )
+    asyncio.run(_enroll_node(app, container_id=CONTAINER_ID))
+    resp = _delegate(app)
+    assert resp.status_code == 200
+    assert resp.json() == {
+        **DELEGATION_ANSWER,
+        "nodeID": NODE_ID,
+        "workerAnchor": CONTAINER_ID,
+    }
+    assert agent.calls == [
+        {"node_id": NODE_ID, "worker_container_id": CONTAINER_ID}
+    ]
+
+
+def test_a_compose_node_with_no_container_id_is_a_named_503(workspace) -> None:
+    """The kernel-deferral shape with nothing recorded refuses by name.
+
+    R-B's compose clause, and the reason it lives in the control plane: this is
+    a *record* problem (an older worker, or a stack that overrode ``hostname:``),
+    not a missing pod uid -- and an instruction the agent cannot confirm is
+    exactly the one that must not be sent.
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(
+        workspace,
+        client=agent,
+        worker_identity_source=KernelWorkerIdentitySource(),
+    )
+    asyncio.run(_enroll_node(app))
+    resp = _delegate(app)
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "code": 503,
+        "message": (
+            f"node {NODE_ID} has reported no container id for the agent to "
+            "confirm its worker identity against (a C3 worker must keep the "
+            "runtime's hostname): refusing to instruct the agent"
+        ),
+    }
+    assert agent.calls == []
+
+
+def test_no_agent_client_refuses_the_delegation_by_name(workspace) -> None:
+    """A control plane with no agent wired refuses; it does not 500."""
+    app = _delegation_app(workspace, client=None)
+    asyncio.run(_enroll_node(app))
+    resp = _delegate(app)
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "code": 503,
+        "message": (
+            "this control plane has no C3 agent client configured: refusing to "
+            "delegate the worker's cgroup"
+        ),
+    }
