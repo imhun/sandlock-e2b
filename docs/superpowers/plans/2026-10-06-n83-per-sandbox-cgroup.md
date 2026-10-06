@@ -11,8 +11,10 @@
 worker pod 的 cgroup 之下建 `sbx_<sandbox_id>` 子 cgroup，并在**现有 `grant-slot` 这一步里**
 完成"建 cgroup → 写限额 → 回读校验 → 把槽位进程放进去 → **再**授予身份"。槽位子进程在身份落盘前
 不会 `exec`（`slot_identity._await_identity` 轮询），而 fork 只能发生在 exec 之后 ⇒ **放置早于
-任何 fork，TOCTOU 按构造关闭**。worker 保持**零 cgroup 写路**：写走 CP→agent，与 file-op 同一条
-已鉴权通道。
+任何 fork，TOCTOU 按构造关闭**。⚠ **这段是定案前（D2/D3 版本）的写法**：那时设想"worker 零 cgroup
+写路、写走 CP→agent"。**Task 1 的实测推翻了它** —— 放置只能由处在 worker cgroupns 里的进程做，所以
+worker 必须拿一块**收窄的** rw cgroupfs 视图并**自己**建/写自己的 `sbx_<id>`；agent 只做一次性委派。
+真实形状以 §3.2 与 §4 为准。
 
 **Tech Stack:** Python 3.14（c3-agent / control-plane / worker）、cgroup v2（节点内核 6.12）、
 k8s 1.36 / k0s、containerd 2.3。
@@ -416,11 +418,13 @@ NetworkPolicy，worker 敲不进来）；④ 对已被攻破的 CP 边际为零�
 
 **worker 面与沙箱面（2026-10-06 实测；这两面才是用户实际担心的）**
 
-- **worker 面：今天对 cgroup 零写路。** `uid=65534 CapEff=0000000000000000`，
-  `/sys/fs/cgroup` 是 `ro` 挂载 —— `echo $$ > cgroup.procs` 与 `mkdir` 都是
-  **`Read-only file system`**。Phase 1 必须保持这一点：**写走 CP→agent**（与现成的
-  file-op 同一条：worker 只报 `{sandbox_id, op}`，CP 派生目标并做归属检查，agent 执行），
-  worker 只保留**读**（Phase 0 的计量）。
+- **worker 面：`uid=65534 CapEff=0000000000000000` 保持不变；cgroup 写路是 Phase 1 新开的、
+  且必须**收窄**。** 定案前它是零写路（`/sys/fs/cgroup` 是 `ro` 挂载 —— `echo $$ > cgroup.procs` 与
+  `mkdir` 都是 **`Read-only file system`**）。**Task 1 的实测把它改了**：放置只能由处在 worker
+  cgroupns 里的进程做 ⇒ worker 拿一块 rw cgroupfs 视图（k8s 用 `subPathExpr` 收窄到本 pod 子树；
+  compose 是整棵树），由**它自己**建/写 `sbx_<id>`；agent 不再有"建/放/读/kill"四个 op，只剩
+  **一次性委派**（详情 §3.2/§4）。**capability 仍然是零** —— 写权全靠内核的 cgroupns + DAC。
+  ⚠ 由此产生的那条车道级风险（同 uid 的 peer 可写）见本节末尾"第四条风险"。
   **万一 worker 被攻破**：新增的是"对**本节点**同侪沙箱的**进程级**控制（节流/杀）"。**范围不变**
   —— file-op 那条已经有对象检查（`record.node_id != node_id` → 403），也就是说它今天就能对本节点
   的沙箱做数据级操作；新的是**种类**（进程 vs 数据），不是范围。缓解：cgroup op 复用同一条归属检查
