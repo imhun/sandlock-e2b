@@ -633,8 +633,16 @@ def test_the_worker_profile_admits_unshare_only_for_the_slot_handshake() -> None
     cgroup/uts/ipc trio fall through to defaultAction.
 
     A second entry, a widened mask, or a rule that stops being masked is the
-    change this test catches. Moving that handshake onto clone3 is what
-    deletes this rule.
+    change this test catches.
+
+    This rule is **terminal, not debt**: a clone3 handshake was probed and
+    rejected (`deploy/scripts/acceptance/probe_slot_clone3_shape.py`). clone3
+    puts the namespaces on the child, and `execve` then clears the fresh user
+    namespace's capabilities -- the uid is still unmapped, so the process has
+    no valid identity there -- which is exactly the CAP_SETUID the handshake
+    needs for `setresuid(X)` once the grant lands. Measured both ways: without
+    the exec the same `uid_map` write succeeds. `unshare` keeps the
+    capabilities because it enters the namespace *after* exec.
     """
     profile = json.loads(WORKER_SECCOMP_TEXT)
     entries = [group for group in profile["syscalls"] if "unshare" in group["names"]]
