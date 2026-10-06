@@ -620,25 +620,31 @@ def test_the_worker_profile_never_denies_clone3() -> None:
     assert len(allowed) >= 1, "clone3 must be explicitly allowed"
 
 
-def test_the_worker_profile_denies_unshare_outright() -> None:
-    """N80: nothing in the worker calls unshare any more.
+def test_the_worker_profile_admits_unshare_only_for_the_slot_handshake() -> None:
+    """N80: `unshare` has exactly one caller left, and it is not the engine's.
 
     The engine creates the user, PID, mount and network namespaces with one
-    clone3 call, and the two capability probes that used to call unshare --
-    envd's seccomp self-check and its real-root check -- were rewritten to
-    probe with clone3, because a probe has to ask the question the spawn path
-    asks. With no caller left, the profile denies the call through
-    defaultAction and the old masked rules are gone.
+    clone3 call, and both capability probes (the seccomp self-check and the
+    real-root check) were rewritten to probe with clone3. What is left is
+    route B's slot identity handshake: it unshares CLONE_NEWUSER so that the
+    process about to exec `sandlock-supervise` is the one inside the namespace
+    -- the opposite of what clone3 does, which puts a *child* there. One
+    masked single-bit rule admits it; NEWPID, NEWNS, NEWNET and the
+    cgroup/uts/ipc trio fall through to defaultAction.
 
-    A `unshare` entry reappearing means a caller came back, or someone
-    reverted one of the probes; that is the change this test catches.
+    A second entry, a widened mask, or a rule that stops being masked is the
+    change this test catches. Moving that handshake onto clone3 is what
+    deletes this rule.
     """
     profile = json.loads(WORKER_SECCOMP_TEXT)
     entries = [group for group in profile["syscalls"] if "unshare" in group["names"]]
-    assert entries == [], (
-        "unshare must be denied by defaultAction: the engine and both "
-        f"capability probes use clone3, got {entries}"
-    )
+    assert [group["names"] for group in entries] == [["unshare"]]
+    assert entries[0]["action"] == "SCMP_ACT_ALLOW"
+    assert not entries[0].get("includes") and not entries[0].get("excludes")
+    assert entries[0]["args"] == [
+        {"index": 0, "value": 268435456, "valueTwo": 268435456,
+         "op": "SCMP_CMP_MASKED_EQ"}
+    ]
 
 
 def test_seccomp_installer_rolls_when_the_profile_changes() -> None:
