@@ -1,0 +1,662 @@
+"""N83 phase 1: the per-sandbox cgroup wired into the route-B slot lifecycle.
+
+The switch is ``E2B_SANDBOX_CGROUP`` (``off`` by default). With it off, nothing
+here -- the pool's acquire path, the retire path, the worker's startup lane --
+may touch a cgroup at all, which is what keeps the shipped default
+byte-identical to the pre-N83 worker. With it ``required``, the rules that make
+the cgroup a *quota* rather than a decoration are pinned:
+
+* the child is placed (``attach``) **after** it is forked and **before** its
+  identity is reported -- the child cannot ``exec`` until its identity lands
+  (``slot_identity`` polls ``setresuid``) and ``fork`` can only happen after
+  ``exec``, so everything the sandbox ever forks is inside the cgroup (the
+  TOCTOU guarantee, plan section 4);
+* a refusal anywhere on that path fails the create **by name** and leaves
+  nothing behind -- no half slot, no reported identity, and never "run without
+  a quota";
+* a sandbox that would run **in-process** (route B declined: no host uid, no
+  reporter, ``E2B_ROUTE_B=off``) is refused by name as well, because the
+  in-process mediator has no cgroup at all (plan Review Focus 4).
+
+The startup lane (delegation handshake, then the worker's own self-check) is
+covered here too: it is retried in the background and must never crash the
+worker -- a control plane that is briefly away is not a reason to crash-loop a
+node -- while creates keep being refused by name until it lands.
+
+The cgroup itself is faked throughout: Task 5's module is the real thing, and
+``tests/unit/test_sandbox_cgroup.py`` is its evidence. What this file pins is
+the *wiring*: who is called, in what order, with which numbers, and what
+happens when the answer is no.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import envd_service.agent as node_agent
+import envd_service.route_b as rb
+from envd_service.config import Settings
+from envd_service.priv_helpers import PrivHelperError
+from envd_service.route_b import RouteBConfig, W1SlotPool
+from envd_service.runtime.sandbox_cgroup import CgroupRefusal, SandboxCgroups
+
+SANDBOX_ID = "sbx_cgroup"
+CHILD_PID = 4242
+#: The declared (unclamped) share this sandbox asked for: two cores. The pool
+#: must hand *this* to ``attach``, not the fork policy's ``min(100, ...)``.
+DECLARED_PERCENT = 200
+CONTROL_PLANE_URL = "http://control-plane:3000"
+NODE_ID = "worker-1"
+
+
+# ------------------------------------------------------------------- doubles
+
+
+class FakeProcess:
+    """The spawned child, as the pool sees it."""
+
+    def __init__(self, pid: int = CHILD_PID) -> None:
+        self.pid = pid
+        self.stderr = None
+        self.returncode: int | None = None
+        self.killed = 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed += 1
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.returncode = 0 if self.returncode is None else self.returncode
+        return 0
+
+
+class FakeChannel:
+    """Answers the readiness probe and records the order of every verb."""
+
+    def __init__(self, handle, order: list, replies: dict) -> None:
+        self._order = order
+        self._replies = replies
+
+    def request(self, verb, args=None, fds=()):
+        self._order.append(verb)
+        return self._replies.get(verb, {})
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def _channel_factory(order: list):
+    def _factory(handle):
+        return FakeChannel(handle, order, {"stats": {"launched": True, "pid": 7}})
+
+    return _factory
+
+
+class FakeCgroups:
+    """A stand-in for Task 5's ``SandboxCgroups`` that records every call.
+
+    ``attach_error`` / ``release_error`` make one of the two refuse, which is
+    how the fail-closed half of the wiring is exercised without a real
+    cgroupfs.
+    """
+
+    def __init__(
+        self,
+        order: list | None = None,
+        *,
+        attach_error: BaseException | None = None,
+        release_error: BaseException | None = None,
+    ) -> None:
+        self._order = order if order is not None else []
+        self._attach_error = attach_error
+        self._release_error = release_error
+        self.attached: list[dict] = []
+        self.released: list[str] = []
+
+    def attach(self, *, sandbox_id: str, pid: int, cpu_percent: int) -> str:
+        self.attached.append(
+            {"sandbox_id": sandbox_id, "pid": pid, "cpu_percent": cpu_percent}
+        )
+        self._order.append("attach")
+        if self._attach_error is not None:
+            raise self._attach_error
+        return f"/pod-cgroup/sbx_{sandbox_id}"
+
+    def release(self, *, sandbox_id: str) -> bool:
+        self.released.append(sandbox_id)
+        if self._release_error is not None:
+            raise self._release_error
+        return True
+
+
+def _settings(**overrides) -> SimpleNamespace:
+    values = dict(
+        route_b="on",
+        route_b_slots=0,
+        uid_pool_start=20000,
+        uid_pool_size=8,
+        route_b_tmp_root="/tmp/n83-cgroup-wiring-test",
+        route_b_transport="fd",
+        route_b_verb_timeout_s=15.0,
+        slot_identity="agent-grant",
+        control_plane_url=CONTROL_PLANE_URL,
+        node_id=NODE_ID,
+        internal_api_key="internal-key",
+        slot_identity_timeout_s=10.0,
+        sandbox_cgroup="off",
+        cgroup_mount="/pod-cgroup",
+        cgroup_delegate_wait_s=30.0,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _pool(
+    tmp_path: Path,
+    order: list,
+    *,
+    sandbox_cgroups=None,
+    reports: list | None = None,
+    **overrides,
+) -> tuple[W1SlotPool, list, list]:
+    """A pool whose child, channel and identity report are all fakes."""
+    spawned: list[FakeProcess] = []
+    reported = reports if reports is not None else []
+
+    def _spawn(**kwargs):
+        process = FakeProcess()
+        spawned.append(process)
+        return process
+
+    def _reporter(sandbox_id: str, pid: int):
+        order.append("report")
+        reported.append((sandbox_id, pid))
+        return {"status": "ok"}
+
+    options = dict(
+        uid_start=20000,
+        size=2,
+        tmp_root=tmp_path / "slots",
+        supervise_bin=tmp_path / "sandlock-supervise",
+        spawner=_spawn,
+        channel_factory=_channel_factory(order),
+        socket_timeout_s=2.0,
+        slot_identity="agent-grant",
+        identity_reporter=_reporter,
+        sandbox_cgroups=sandbox_cgroups,
+    )
+    options.update(overrides)
+    return W1SlotPool(**options), spawned, reported
+
+
+@pytest.fixture(autouse=True)
+def _pools_reset(monkeypatch, tmp_path):
+    """Keep the process-wide fleet out of the way of the production-path cases."""
+    monkeypatch.setattr(
+        rb, "default_supervise_bin", lambda: tmp_path / "sandlock-supervise"
+    )
+    rb.reset_slot_pools()
+    rb.reset_sandbox_cgroups()
+    yield
+    rb.reset_slot_pools()
+    rb.reset_sandbox_cgroups()
+
+
+# ------------------------------------------------------- the switch: resolve
+
+
+def test_the_settings_default_to_an_off_lane(monkeypatch) -> None:
+    """R-A: ``off``, ``/pod-cgroup``, 30 s -- the shipped defaults."""
+    for name in (
+        "E2B_SANDBOX_CGROUP",
+        "E2B_CGROUP_MOUNT",
+        "E2B_CGROUP_DELEGATE_WAIT_S",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings()
+    assert settings.sandbox_cgroup == "off"
+    assert settings.cgroup_mount == Path("/pod-cgroup")
+    assert settings.cgroup_delegate_wait_s == 30.0
+
+
+def test_the_settings_read_the_documented_switch_names(monkeypatch) -> None:
+    """The manifests set these three, so the spellings are pinned here."""
+    monkeypatch.setenv("E2B_SANDBOX_CGROUP", "Required")
+    monkeypatch.setenv("E2B_CGROUP_MOUNT", "/host-cgroup")
+    monkeypatch.setenv("E2B_CGROUP_DELEGATE_WAIT_S", "5")
+    settings = Settings()
+    assert settings.sandbox_cgroup == "required"
+    assert settings.cgroup_mount == Path("/host-cgroup")
+    assert settings.cgroup_delegate_wait_s == 5.0
+
+
+def test_the_switch_resolves_to_no_handle_at_all_when_off() -> None:
+    """``off`` must not construct the module -- not even to ask it anything."""
+    assert rb.sandbox_cgroups_for(_settings(sandbox_cgroup="off")) is None
+
+
+def test_an_unknown_switch_value_is_refused_by_name() -> None:
+    """A typo must not read as "off": that would be a quota-less fleet."""
+    settings = _settings(sandbox_cgroup="requried")
+    with pytest.raises(ValueError) as excinfo:
+        rb.sandbox_cgroups_for(settings)
+    assert "E2B_SANDBOX_CGROUP must be 'off' or 'required'" in str(excinfo.value)
+    assert "'requried'" in str(excinfo.value)
+    with pytest.raises(ValueError) as excinfo:
+        RouteBConfig.from_settings(settings)
+    assert "E2B_SANDBOX_CGROUP must be 'off' or 'required'" in str(excinfo.value)
+
+
+def test_the_required_switch_builds_one_handle_for_the_whole_process(
+    monkeypatch,
+) -> None:
+    """One process, one handle: only the object that ran ``setup`` can attach."""
+    built: list[dict] = []
+
+    class Recording:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+    monkeypatch.setattr(rb, "SandboxCgroups", Recording)
+    settings = _settings(sandbox_cgroup="required", cgroup_mount="/pod-cgroup")
+    first = rb.sandbox_cgroups_for(settings)
+    assert first is rb.sandbox_cgroups_for(settings)
+    assert built == [
+        {
+            "mount": Path("/pod-cgroup"),
+            "worker_uid": os.geteuid(),
+            "container_token": None,
+        }
+    ]
+
+
+def test_the_compose_lane_hands_the_worker_its_container_id(monkeypatch) -> None:
+    """R-E: the compose mount is the whole VM tree -- narrow it by our id."""
+    built: list[dict] = []
+
+    class Recording:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+    monkeypatch.setattr(rb, "SandboxCgroups", Recording)
+    monkeypatch.setattr(rb, "reported_container_id", lambda: "3f2a1b0c9d8e")
+    rb.sandbox_cgroups_for(_settings(sandbox_cgroup="required"))
+    assert built[0]["container_token"] == "3f2a1b0c9d8e"
+
+
+def test_the_k8s_lane_hands_no_container_token(monkeypatch) -> None:
+    """The k8s mount root is already this pod's cgroup: one level, no walk."""
+    built: list[dict] = []
+
+    class Recording:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+    monkeypatch.setattr(rb, "SandboxCgroups", Recording)
+    monkeypatch.setattr(rb, "reported_container_id", lambda: None)
+    rb.sandbox_cgroups_for(_settings(sandbox_cgroup="required"))
+    assert built[0]["container_token"] is None
+
+
+# ------------------------------------------------ the switch: off is a no-op
+
+
+def test_with_the_switch_off_nothing_touches_a_cgroup(
+    monkeypatch, tmp_path
+) -> None:
+    """The shipped default: a full acquire, and no cgroup object anywhere."""
+    constructed: list = []
+
+    class Recording:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    monkeypatch.setattr(rb, "SandboxCgroups", Recording)
+    monkeypatch.setattr(rb, "_spawn_slot_identity", lambda *a, **kw: FakeProcess())
+    order: list = []
+    config = RouteBConfig.from_settings(_settings(sandbox_cgroup="off"))
+    assert config.sandbox_cgroups is None
+    config.identity_reporter = lambda sandbox_id, pid: {}
+    pool = rb.slot_pool_for(config, channel_factory=_channel_factory(order))
+    handle = pool.acquire_sync(
+        SANDBOX_ID, {"ceiling": {}}, uid=20001, cpu_percent=DECLARED_PERCENT
+    )
+
+    assert constructed == []
+    assert handle.uid == 20001
+    # Byte-identical to today's lifecycle: no attach, nothing new at all.
+    assert order == ["stats"]
+
+
+def test_the_pool_never_releases_a_cgroup_it_was_not_given(tmp_path) -> None:
+    """``release`` on the off switch is the same no-op as ``attach``."""
+    order: list = []
+    pool, _spawned, _reports = _pool(tmp_path, order, sandbox_cgroups=None)
+    pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
+    pool.release_sync(SANDBOX_ID)
+    assert order == ["report", "stats", "shutdown"]
+
+
+# ------------------------------------------------------ the acquire ordering
+
+
+def test_the_child_is_placed_before_its_identity_is_reported(tmp_path) -> None:
+    """The TOCTOU guarantee: attach before the report, with the child's pid."""
+    order: list = []
+    fake = FakeCgroups(order)
+    pool, spawned, reports = _pool(tmp_path, order, sandbox_cgroups=fake)
+    handle = pool.acquire_sync(
+        SANDBOX_ID, {"ceiling": {}}, uid=20001, cpu_percent=DECLARED_PERCENT
+    )
+
+    assert order == ["attach", "report", "stats"]
+    assert fake.attached == [
+        {"sandbox_id": SANDBOX_ID, "pid": CHILD_PID, "cpu_percent": DECLARED_PERCENT}
+    ]
+    assert reports == [(SANDBOX_ID, CHILD_PID)]
+    assert spawned[0].killed == 0
+    assert handle.uid == 20001
+
+
+def test_the_declared_percent_reaches_attach_unchanged(tmp_path) -> None:
+    """Not ``min(100, cpu_percent)``: the cgroup is the declared share."""
+    order: list = []
+    fake = FakeCgroups(order)
+    pool, _spawned, _reports = _pool(tmp_path, order, sandbox_cgroups=fake)
+    pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001, cpu_percent=400)
+    pool.acquire_sync(
+        "sbx_two", {"ceiling": {}}, uid=20000, cpu_percent=DECLARED_PERCENT
+    )
+
+    assert [call["cpu_percent"] for call in fake.attached] == [400, DECLARED_PERCENT]
+
+
+def test_a_caller_with_no_declared_percent_gets_the_plan_default(tmp_path) -> None:
+    """``None`` is "the caller does not know", and 100% is the documented floor."""
+    order: list = []
+    fake = FakeCgroups(order)
+    pool, _spawned, _reports = _pool(tmp_path, order, sandbox_cgroups=fake)
+    pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
+    assert fake.attached[0]["cpu_percent"] == 100
+
+
+# ------------------------------------------------------- the fail-closed half
+
+
+def test_required_and_not_ready_refuses_the_create_by_name(tmp_path) -> None:
+    """A lane whose ``setup`` never ran has no parent: refuse, do not place.
+
+    The refusal is Task 5's own ``setup-not-run``: the pool holds the handle,
+    the handle holds no delegated parent, and the sentence names exactly that.
+    """
+    order: list = []
+    handle = SandboxCgroups(mount=tmp_path / "pod-cgroup", worker_uid=os.geteuid())
+    pool, spawned, reports = _pool(tmp_path, order, sandbox_cgroups=handle)
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001, cpu_percent=200)
+    assert str(excinfo.value) == (
+        "cgroup-refusal setup-not-run: call setup() before attach() or release()"
+    )
+    # Nothing half-built: the child is dead, no identity was reported, and the
+    # uid went back to the ledger with it.
+    assert spawned[0].killed == 1
+    assert reports == []
+    assert pool.acquired_uid(SANDBOX_ID) is None
+    # The uid came back with the refusal (W1 recycles it, never leaks it): the
+    # next create reaches the same named refusal rather than "the slot segment
+    # is exhausted" or "that uid is outside the segment".
+    with pytest.raises(CgroupRefusal) as again:
+        pool.acquire_sync("sbx_after", {"ceiling": {}}, uid=20001)
+    assert str(again.value) == (
+        "cgroup-refusal setup-not-run: call setup() before attach() or release()"
+    )
+    assert spawned[1].killed == 1
+
+
+def test_a_refused_attach_kills_the_child_and_reports_nothing(tmp_path) -> None:
+    """An ungrantable child must not be left behind polling for an identity."""
+    order: list = []
+    fake = FakeCgroups(
+        order, attach_error=CgroupRefusal("cgroup-refusal cpu-max: nope")
+    )
+    pool, spawned, reports = _pool(tmp_path, order, sandbox_cgroups=fake)
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
+    assert str(excinfo.value) == "cgroup-refusal cpu-max: nope"
+    assert reports == []
+    assert order == ["attach"]
+    assert spawned[0].killed == 1
+    assert pool.acquired_uid(SANDBOX_ID) is None
+
+
+# ------------------------------------------------------------ the retire path
+
+
+def test_retire_releases_the_sandbox_cgroup_exactly_once(tmp_path) -> None:
+    """W1 recycle ends the generation *and* its cgroup, once per generation."""
+    order: list = []
+    fake = FakeCgroups(order)
+    pool, _spawned, _reports = _pool(tmp_path, order, sandbox_cgroups=fake)
+    handle = pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
+
+    pool.release_sync(SANDBOX_ID)
+    assert fake.released == [SANDBOX_ID]
+    # A second release is a no-op: the ledger has nothing left to retire.
+    pool.release_sync(SANDBOX_ID)
+    assert fake.released == [SANDBOX_ID]
+    assert pool.slot(SANDBOX_ID) is None
+    assert handle.process.returncode == 0
+
+
+def test_a_refused_release_is_a_named_warning_and_teardown_still_ends(
+    tmp_path, caplog
+) -> None:
+    """Teardown never fails because the cgroup is already gone (or wedged)."""
+    order: list = []
+    fake = FakeCgroups(
+        order, release_error=CgroupRefusal("cgroup-refusal release-rmdir: busy")
+    )
+    pool, _spawned, _reports = _pool(tmp_path, order, sandbox_cgroups=fake)
+    pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
+
+    with caplog.at_level(logging.WARNING, logger=rb.__name__):
+        pool.release_sync(SANDBOX_ID)
+
+    assert fake.released == [SANDBOX_ID]
+    assert pool.acquired_uid(SANDBOX_ID) is None
+    assert "cgroup-refusal release-rmdir: busy" in caplog.text
+    # ...and the uid is immediately leasable again: teardown completed.
+    assert pool.acquire_sync("sbx_next", {"ceiling": {}}, uid=20001).uid == 20001
+
+
+# ------------------------------------------------- the worker's startup lane
+
+
+def test_the_startup_lane_is_not_started_when_the_switch_is_off(
+    monkeypatch,
+) -> None:
+    """``off`` reaches no further than the resolver: no task, no handshake."""
+    calls: list = []
+    monkeypatch.setattr(
+        node_agent, "request_cgroup_delegate", lambda **kw: calls.append(kw)
+    )
+    assert node_agent.start_cgroup_lane(_settings(sandbox_cgroup="off")) is None
+    assert calls == []
+
+
+async def test_the_startup_lane_delegates_first_then_self_checks(
+    monkeypatch, caplog
+) -> None:
+    """R-B's order: one delegation request, then ``SandboxCgroups.setup``.
+
+    The answer's ``containerCgroup``/``delegated`` are logged at info level --
+    they are the only place an operator can see what the agent handed over.
+    """
+    order: list = []
+
+    def _delegate(**kwargs):
+        order.append("delegate")
+        return {
+            "op": "delegate-cgroup",
+            "containerCgroup": "/kubepods/burstable/podabc/3f2a1b0c9d8e",
+            "delegated": [".", "cgroup.procs", "cgroup.subtree_control"],
+            "nodeID": NODE_ID,
+            "workerAnchor": None,
+        }
+
+    class ReadyCgroups:
+        def setup(self, *, wait_s: float) -> str:
+            order.append("setup")
+            return (
+                "cgroup ready parent=/pod-cgroup/3f2a1b0c9d8e drained=1 "
+                "subtree_control=cpu"
+            )
+
+    monkeypatch.setattr(node_agent, "request_cgroup_delegate", _delegate)
+    with caplog.at_level(logging.INFO, logger=node_agent.__name__):
+        task = node_agent.start_cgroup_lane(
+            _settings(sandbox_cgroup="required"),
+            sandbox_cgroups=ReadyCgroups(),
+        )
+        await asyncio.wait_for(task, timeout=5)
+
+    assert order == ["delegate", "setup"]
+    assert "/kubepods/burstable/podabc/3f2a1b0c9d8e" in caplog.text
+    assert "cgroup.procs" in caplog.text
+    assert "cgroup ready parent=/pod-cgroup/3f2a1b0c9d8e drained=1" in caplog.text
+
+
+async def test_a_failed_attempt_is_retried_and_does_not_crash_the_worker(
+    monkeypatch, caplog
+) -> None:
+    """Neither hop may crash the process: the lane retries, creates keep failing.
+
+    Both halves fail here -- the delegation is away once, the self-check twice --
+    and the lane keeps re-running *both* in order until one attempt gets through.
+    """
+    attempts: list = []
+    delegations = {"n": 0}
+
+    def _delegate(**kwargs):
+        delegations["n"] += 1
+        attempts.append(f"delegate-{delegations['n']}")
+        if delegations["n"] == 1:
+            raise PrivHelperError(
+                "the control plane is unreachable for the cgroup delegation: "
+                "connection refused"
+            )
+        return {"op": "delegate-cgroup", "containerCgroup": "/pod-cgroup/x"}
+
+    class FlakyCgroups:
+        def __init__(self) -> None:
+            self.setups = 0
+
+        def setup(self, *, wait_s: float) -> str:
+            self.setups += 1
+            attempts.append(f"setup-{self.setups}")
+            if self.setups < 3:
+                raise CgroupRefusal("cgroup-refusal delegation-timeout: not yet")
+            return "cgroup ready parent=/pod-cgroup/3f2a1b0c9d8e"
+
+    monkeypatch.setattr(node_agent, "request_cgroup_delegate", _delegate)
+    monkeypatch.setattr(node_agent, "CGROUP_RETRY_INTERVAL_S", 0.01)
+    with caplog.at_level(logging.WARNING, logger=node_agent.__name__):
+        task = node_agent.start_cgroup_lane(
+            _settings(sandbox_cgroup="required"), sandbox_cgroups=FlakyCgroups()
+        )
+        await asyncio.wait_for(task, timeout=5)
+
+    assert attempts == [
+        "delegate-1",
+        "delegate-2",
+        "setup-1",
+        "delegate-3",
+        "setup-2",
+        "delegate-4",
+        "setup-3",
+    ]
+    assert "connection refused" in caplog.text
+    assert "cgroup-refusal delegation-timeout: not yet" in caplog.text
+
+
+async def test_a_hop_that_never_lands_keeps_retrying_without_raising(
+    monkeypatch,
+) -> None:
+    """The lane is a hard dependency, not a startup gate: it simply keeps going."""
+    attempts: list = []
+
+    def _delegate(**kwargs):
+        attempts.append(len(attempts) + 1)
+        raise PrivHelperError("the control plane is unreachable")
+
+    class NeverReady:
+        def setup(self, *, wait_s: float) -> str:
+            raise AssertionError("setup must not run while the delegation fails")
+
+    monkeypatch.setattr(node_agent, "request_cgroup_delegate", _delegate)
+    monkeypatch.setattr(node_agent, "CGROUP_RETRY_INTERVAL_S", 0.01)
+    task = node_agent.start_cgroup_lane(
+        _settings(sandbox_cgroup="required"), sandbox_cgroups=NeverReady()
+    )
+    while len(attempts) < 3:
+        await asyncio.sleep(0.01)
+        assert not task.done(), "a failing lane must retry instead of finishing"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert attempts == [1, 2, 3]
+
+
+def test_an_unknown_switch_value_is_refused_at_startup(monkeypatch) -> None:
+    """A typo is a configuration refusal, not a silent "off"."""
+    with pytest.raises(ValueError) as excinfo:
+        node_agent.start_cgroup_lane(_settings(sandbox_cgroup="on"))
+    assert "E2B_SANDBOX_CGROUP must be 'off' or 'required'" in str(excinfo.value)
+
+
+async def test_the_node_agent_owns_the_startup_lane(monkeypatch) -> None:
+    """The lifespan's start/stop pair takes the lane with it."""
+
+    def _unreachable(**kwargs):
+        raise PrivHelperError("the control plane is unreachable")
+
+    monkeypatch.setattr(node_agent.NodeAgent, "_loop", _never_ending)
+    monkeypatch.setattr(node_agent, "request_cgroup_delegate", _unreachable)
+    monkeypatch.setattr(node_agent, "CGROUP_RETRY_INTERVAL_S", 0.01)
+    agent = node_agent.NodeAgent(
+        settings=_settings(sandbox_cgroup="required"),
+        runtime_registry=SimpleNamespace(),
+        control_plane_url=CONTROL_PLANE_URL,
+        node_address="10.0.0.5",
+        node_id=NODE_ID,
+    )
+
+    agent.start()
+    lane = agent._cgroup_task
+    assert lane is not None
+    await asyncio.sleep(0.05)
+    assert not lane.done(), "a failing lane must retry instead of finishing"
+    await agent.stop()
+    assert lane.cancelled()
+    assert agent._cgroup_task is None
+
+
+async def _never_ending(*_args, **_kwargs) -> None:
+    await asyncio.sleep(3600)

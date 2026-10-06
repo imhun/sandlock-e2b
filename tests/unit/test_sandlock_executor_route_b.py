@@ -117,7 +117,14 @@ class FakePool:
         )
 
     def acquire_sync(
-        self, sandbox_id, policy_json, program_json=None, *, uid=None, name=None
+        self,
+        sandbox_id,
+        policy_json,
+        program_json=None,
+        *,
+        uid=None,
+        name=None,
+        cpu_percent=None,
     ):
         self.acquire_calls.append(
             {
@@ -126,6 +133,8 @@ class FakePool:
                 "program": program_json,
                 "uid": uid,
                 "name": name,
+                # N83 phase 1: the sandbox's declared share, unclamped.
+                "cpu_percent": cpu_percent,
             }
         )
         handle = SlotHandle(
@@ -431,6 +440,9 @@ async def test_first_exec_leases_this_sandbox_uid_with_the_full_ceiling(
             "program": None,
             "uid": HOST_UID,
             "name": "sbx_route_b",
+            # N83 phase 1: the sandbox's declared share rides the lease, so the
+            # pool can write it into ``sbx_<id>``'s ``cpu.max``.
+            "cpu_percent": 100,
         }
     ]
     policy = pool.acquire_calls[0]["policy"]
@@ -573,13 +585,28 @@ async def test_slot_that_never_starts_is_restarted_once_then_reported(
 
     record = pool.acquire_sync
 
-    def _dead_on_first(sandbox_id, policy_json, program_json=None, *, uid=None, name=None):
+    def _dead_on_first(
+        sandbox_id,
+        policy_json,
+        program_json=None,
+        *,
+        uid=None,
+        name=None,
+        cpu_percent=None,
+    ):
         attempts.append(uid)
         if len(attempts) == 1:
             raise SlotDeadError(
                 f"route-B slot {name} (uid {uid}) exited before binding: boom"
             )
-        return record(sandbox_id, policy_json, program_json, uid=uid, name=name)
+        return record(
+            sandbox_id,
+            policy_json,
+            program_json,
+            uid=uid,
+            name=name,
+            cpu_percent=cpu_percent,
+        )
 
     pool.acquire_sync = _dead_on_first
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
@@ -878,3 +905,65 @@ def test_the_refusal_predicate_tracks_the_forks_privilege_rule(
     )
     ex = _executor(monkeypatch, route_b=None, **case)
     assert ex._in_process_mediation_is_refused() is want
+
+
+# ------------------------------------- N83 phase 1: the declared cpu share
+
+
+async def test_the_declared_cpu_share_rides_the_lease_unclamped(monkeypatch) -> None:
+    """``200`` reaches the pool as ``200`` -- the fork policy's clamp is not it.
+
+    The policy ceiling clamps ``max_cpu`` to ``min(100, ...)`` for the fork's own
+    user-space throttle; the per-sandbox cgroup is what enforces the *declared*
+    share (two cores here), so the number that travels on the lease has to be
+    the declared one.
+    """
+    ROOTFS.mkdir(parents=True, exist_ok=True)
+    pool = FakePool()
+    monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
+    ex = _executor(monkeypatch, route_b=_config(mode="auto"), cpu_percent=200)
+
+    await ex.start(_exec_cmd(["/bin/true"]))
+
+    assert [call["cpu_percent"] for call in pool.acquire_calls] == [200]
+    # The two spellings really are different: the fork's own ceiling still
+    # clamps, and that is the point of the assertion above.
+    assert pool.acquire_calls[0]["policy"]["max_cpu"] == 100
+
+
+def test_an_in_process_sandbox_is_refused_when_the_cgroup_is_required(
+    monkeypatch,
+) -> None:
+    """Plan Review Focus 4: no slot means no cgroup, and ``required`` means no.
+
+    A sandbox that route B declines runs under the in-process mediator, which
+    has no per-sandbox cgroup at all -- so a deployment that asked for one must
+    fail the create by name instead of starting an uncapped sandbox.
+    """
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    with pytest.raises(
+        RuntimeError,
+        match=r"^E2B_SANDBOX_CGROUP=required refuses an in-process sandbox: ",
+    ) as excinfo:
+        _executor(
+            monkeypatch,
+            route_b=_config(
+                mode="auto", identity_reporter=None, sandbox_cgroup="required"
+            ),
+        )
+    # The decline's own words are in the refusal: the operator gets the fix,
+    # not just the switch that failed.
+    assert "needs the control-plane reporter" in str(excinfo.value)
+
+
+def test_an_in_process_sandbox_still_falls_back_when_the_cgroup_is_off(
+    monkeypatch,
+) -> None:
+    """The shipped default: the in-process fallback is exactly as it was."""
+    monkeypatch.setattr(os, "geteuid", lambda: 65534)
+    ex = _executor(
+        monkeypatch,
+        route_b=_config(mode="auto", identity_reporter=None, sandbox_cgroup="off"),
+    )
+    assert ex._route_b_active is False
+    assert "needs the control-plane reporter" in ex._route_b_decline

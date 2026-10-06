@@ -940,6 +940,8 @@ class SandlockExecutor(Executor):
         self._route_b = route_b
         self._route_b_decline = self._route_b_decline_reason()
         self._route_b_active = self._route_b_decline is None
+        if not self._route_b_active:
+            self._refuse_in_process_without_a_quota(self._route_b_decline)
         # N25: consumer of the slot's pushed append events, installed by the
         # runtime context (`SandboxRuntimeContext`) right after construction.
         # ``None`` means the numbers keep coming from the filesystem alone.
@@ -1693,6 +1695,39 @@ class SandlockExecutor(Executor):
         """The pool key for this sandbox (slots are leased per sandbox)."""
         return self._sandbox_id or self.instance_name
 
+    def _refuse_in_process_without_a_quota(self, reason: str) -> None:
+        """N83 phase 1, plan Review Focus 4: no slot ⇒ no create when required.
+
+        A sandbox that does not get a route-B slot runs under the **in-process**
+        mediator, and that mediator has no per-sandbox cgroup at all -- there is
+        no ``sbx_<id>`` to attach its process tree to. A deployment that asked
+        for per-sandbox cgroups (``E2B_SANDBOX_CGROUP=required``) therefore
+        cannot serve it: letting it run is exactly the silent "no quota" the
+        switch forbids, and it is the shape an operator hits by turning
+        ``E2B_ROUTE_B=off`` (or dropping the per-sandbox host uid, or the
+        control-plane reporter) while the cgroup switch still says required.
+
+        Raised at construction, so the create fails with the decline reason on
+        record instead of starting a sandbox nobody capped. ``off`` (the
+        default) returns immediately: the fallback path is exactly as it was.
+        """
+        mode = (
+            str(getattr(self._route_b, "sandbox_cgroup", "off") or "off")
+            .strip()
+            .lower()
+            if self._route_b is not None
+            else "off"
+        )
+        if mode != "required":
+            return
+        raise RuntimeError(
+            "E2B_SANDBOX_CGROUP=required refuses an in-process sandbox: this "
+            f"sandbox would run without a per-sandbox cgroup ({reason}). Give "
+            "the sandbox a route-B slot (per-sandbox host uid + the "
+            "control-plane reporter), or set E2B_SANDBOX_CGROUP=off to accept "
+            "uncapped sandboxes."
+        )
+
     def _open_route_b_instance(self):
         """Lease this sandbox's slot and wrap it in the instance shim.
 
@@ -1713,6 +1748,11 @@ class SandlockExecutor(Executor):
                 document,
                 uid=uid,
                 name=self.instance_name,
+                # N83 phase 1: the sandbox's **declared** share. The policy
+                # ceiling above clamps to ``min(100, ...)`` for the fork's own
+                # throttle; the cgroup is what actually enforces the declared
+                # number, so it must travel unclamped.
+                cpu_percent=self._cpu_percent,
             )
 
         try:

@@ -46,6 +46,7 @@ from envd_service.uid_pool import (
 )
 from envd_service.worker_identity import (
     reported_container_id,
+    request_cgroup_delegate,
     worker_identity_fields,
     worker_pid_namespace,
 )
@@ -1776,6 +1777,99 @@ def _scan_workspace_runtimes(
     return records, unmaterialised
 
 
+#: How long the startup cgroup lane waits between attempts (N83 phase 1). Each
+#: attempt is itself bounded by ``E2B_CGROUP_DELEGATE_WAIT_S``; this only spaces
+#: the retries. The lane never gives up on its own: it is a hard dependency of a
+#: ``required`` deployment, so a create is refused by name until it lands, and a
+#: control plane that is briefly away must not put the worker in a crash loop.
+CGROUP_RETRY_INTERVAL_S = 5.0
+
+
+def start_cgroup_lane(
+    settings: Settings, *, sandbox_cgroups=None
+) -> "asyncio.Task | None":
+    """Start the per-sandbox cgroup lane, or return ``None`` when it is off.
+
+    N83 phase 1, ruling R-B. ``E2B_SANDBOX_CGROUP=off`` (the default) reaches no
+    further than this: no task, no delegation request, no cgroup handle -- the
+    worker is the pre-N83 one. ``required`` starts one background task that, per
+    attempt, asks the control plane for this worker's container cgroup (the
+    agent's one-shot delegation) and then runs the worker's own self-check
+    (``SandboxCgroups.setup``). Both are bounded by
+    ``E2B_CGROUP_DELEGATE_WAIT_S``.
+
+    **It never crashes the worker and never stops retrying.** The plan's ruling
+    (and the reason) is explicit: a control plane that is briefly unavailable
+    must not turn into a crash loop, so a failed attempt is logged and retried,
+    while the route-B pool keeps refusing every create by name -- ``required``
+    never degrades into "run without a quota".
+
+    An *unknown* switch value is the one thing refused here, by name: a typo
+    must not read as "off" (that is a whole fleet without a quota while looking
+    configured). See :func:`envd_service.route_b.sandbox_cgroup_mode`.
+
+    ``sandbox_cgroups`` is the handle to bring up; the production path leaves it
+    unset and resolves the process-wide one from ``settings``, and tests inject
+    a double.
+    """
+    from envd_service.route_b import sandbox_cgroup_mode, sandbox_cgroups_for
+
+    mode = sandbox_cgroup_mode(settings)
+    if mode == "off":
+        return None
+    handle = (
+        sandbox_cgroups
+        if sandbox_cgroups is not None
+        else sandbox_cgroups_for(settings)
+    )
+    return asyncio.create_task(_cgroup_lane_loop(settings, handle))
+
+
+async def _cgroup_lane_loop(settings: Settings, handle) -> None:
+    """Delegate, self-check, retry -- forever, and without ever raising.
+
+    One attempt is: one delegation request, then ``setup``. The delegation's
+    answer is logged at info level because ``containerCgroup``/``delegated``
+    are the only place an operator can see *what* the agent handed over, and
+    the self-check's evidence line carries the parent it settled on.
+    """
+    wait_s = float(getattr(settings, "cgroup_delegate_wait_s", 30.0) or 30.0)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            answer = await asyncio.to_thread(
+                request_cgroup_delegate, timeout_s=wait_s, settings=settings
+            )
+            logger.info(
+                "cgroup delegation answer (attempt %d): nodeID=%s "
+                "containerCgroup=%s delegated=%s workerAnchor=%s",
+                attempt,
+                answer.get("nodeID"),
+                answer.get("containerCgroup"),
+                answer.get("delegated"),
+                answer.get("workerAnchor"),
+            )
+            # The self-check blocks (bounded walk + a bounded wait for the
+            # delegation to appear), so it goes to a worker thread too.
+            evidence = await asyncio.to_thread(handle.setup, wait_s=wait_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - retried on purpose
+            logger.warning(
+                "cgroup lane not ready (attempt %d): %s -- retrying in %.1fs; "
+                "sandbox creates are refused by name until it lands "
+                "(E2B_SANDBOX_CGROUP=required, N83 phase 1)",
+                attempt,
+                exc,
+                CGROUP_RETRY_INTERVAL_S,
+            )
+            await asyncio.sleep(CGROUP_RETRY_INTERVAL_S)
+            continue
+        logger.info("cgroup lane ready (attempt %d): %s", attempt, evidence)
+        return
+
+
 class NodeAgent:
     """Periodically registers with the control plane and sends heartbeats."""
 
@@ -1866,6 +1960,10 @@ class NodeAgent:
         self._push_task: asyncio.Task | None = None
         self._node_id: str | None = None
         self._task: asyncio.Task | None = None
+        #: N83 phase 1: the per-sandbox cgroup lane (delegation handshake, then
+        #: the worker's own self-check). ``None`` -- what ``E2B_SANDBOX_CGROUP=
+        #: off`` resolves to -- means the lane does not exist at all.
+        self._cgroup_task: asyncio.Task | None = None
         #: The reconcile round currently running, if any. The round is its own
         #: task so the heartbeat never waits behind it (see ``_loop``), and it
         #: is single-flight: a trigger that arrives while one runs stays set
@@ -1884,6 +1982,13 @@ class NodeAgent:
         self._reconcile_retry_attempts = 0
 
     def start(self) -> None:
+        # N83 phase 1: the cgroup lane is this worker's own startup path (it is
+        # not part of the heartbeat loop, and it must run even on a worker that
+        # has no node address yet). ``start_cgroup_lane`` is a no-op unless
+        # ``E2B_SANDBOX_CGROUP=required``; it never raises on a *runtime*
+        # failure -- it retries -- but an unknown switch value is refused by
+        # name, here, at startup.
+        self._cgroup_task = start_cgroup_lane(self._settings)
         if not self._control_url or not self._node_address:
             return
         self._task = asyncio.create_task(self._loop())
@@ -2936,6 +3041,7 @@ class NodeAgent:
             "_disk_loop_task",
             "_cpu_loop_task",
             "_push_task",
+            "_cgroup_task",
         ):
             task: asyncio.Task | None = getattr(self, attribute, None)
             if task is None:

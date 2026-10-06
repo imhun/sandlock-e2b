@@ -535,6 +535,32 @@ class Settings:
             "E2B_SLOT_IDENTITY_REPORT_TIMEOUT_S", 10.0
         )
     )
+    # N83 phase 1: the per-sandbox cgroup lane. ``off`` (the default) leaves the
+    # worker byte-for-byte as it was -- no delegation request, no cgroup handle,
+    # and the route-B slot lifecycle never touches a cgroup. ``required`` turns
+    # the lane on: the worker asks the control plane for its container cgroup
+    # (the agent's one-shot delegation), builds its ``sbx_<id>`` subtree under
+    # it, and every path that could otherwise run a sandbox without a quota
+    # refuses **by name** (route-B attach, and the in-process fallback).
+    sandbox_cgroup: str = field(
+        default_factory=lambda: (
+            os.getenv("E2B_SANDBOX_CGROUP") or "off"
+        ).strip().lower()
+    )
+    #: Where the worker's read-write cgroupfs view is mounted. k8s narrows it
+    #: with ``subPathExpr`` to this pod's own cgroup; the compose lane mounts
+    #: the whole VM tree there and the handle narrows by container id.
+    cgroup_mount: Path = field(
+        default_factory=lambda: Path(os.getenv("E2B_CGROUP_MOUNT", "/pod-cgroup"))
+    )
+    #: Per-attempt bound for the startup cgroup lane, in seconds: both the
+    #: control-plane delegation request and ``SandboxCgroups.setup``'s
+    #: self-check. A failure does **not** stop the worker -- the lane retries in
+    #: the background -- but it does keep every create refused by name until it
+    #: lands (``required`` never means "run without a quota").
+    cgroup_delegate_wait_s: float = field(
+        default_factory=lambda: _env_float("E2B_CGROUP_DELEGATE_WAIT_S", 30.0)
+    )
     # Quota maintenance (E2.4): periodic over-limit + disk watermark scans and
     # startup orphan project reconciliation.
     quota_monitor_interval_s: float = field(
