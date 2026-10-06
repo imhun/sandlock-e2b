@@ -65,6 +65,37 @@ about a *reading*, never about "the call did not error":
    O_WRONLY)`` must fail ``EACCES``: the delegation deliberately excludes
    ``cpu.max``, so a worker cannot lift its own ceiling.
 
+Phase 2 (``E2B_SANDBOX_CGROUP=required`` with N83 phase 2's Tasks 1-5) adds
+four more, same rule -- each one a reading:
+
+6. **The memory ceiling kills, and only the allocator.**
+   ``memory.max``/``memory.high`` read back exactly the declared ``memoryMB``;
+   a process that allocates past it is **SIGKILLed** (the shell that ran it
+   reports ``hog_exit=137``, i.e. 128 + SIGKILL, and the box's own
+   ``memory.events`` shows ``oom_kill=1`` with ``oom_group_kill=0`` -- D3: the
+   rest of the box survives). A second sandbox on the same node keeps its
+   command round trip.
+7. **The task ceiling answers ``EAGAIN``, from the kernel.** A fork bomb in one
+   box forks until it is refused, and that refusal is the **kernel's**:
+   ``pids.current`` reaches ``pids.max`` exactly while ``cgroup.procs`` (the
+   process count the mediator itself counts) is still *under* the limit, and
+   the box's ``pids.events`` shows ``max >= 1``. Both are readings the
+   mediator's own counter cannot produce -- it does not count threads, which is
+   why the kernel's wall arrives first. A neighbour sandbox stays healthy.
+8. **An over-ceiling create is a named ``400``.** ``cpuCount: 8`` (or a
+   ``memoryMB`` past the node's promise) answers ``400`` with the exact message
+   the node's own ceiling implies, while a request *at* the ceiling is
+   accepted -- so "always refuses" cannot pass either. On a node whose record
+   carries no ceiling at all (the mixed-version window, R12) the same request
+   is a named ``503``, which is this check's RED.
+9. **Peak and task unit.** ``memory.max``/``memory.high`` equal the declared
+   ``memoryMB`` byte for byte and ``pids.max`` equals the lane's declared
+   ``E2B_DEFAULT_MAX_PROCESSES`` (read out of the worker container, never
+   hard-coded); a held 64 MiB allocation shows in ``memory.peak``; and
+   ``pids.current`` counts a **thread** as a task exactly like a process (two
+   threads add 2, one forked process adds 1 -- the unit Task 5's probe read as
+   ``pids.current = 3`` for 2 threads + 1 process).
+
 The script drives **any** E2B endpoint, so everything lane-specific is a
 parameter — and a real cluster run needs **all five** of them (fix round 1,
 finding 4: the earlier "just swap two flags" recipe could not work, because
@@ -176,6 +207,24 @@ _N82_BASELINE = {"ops_per_s": 18149, "cores_on_worker_pod": 1.02}
 #: starvation, not a subtle one -- the report says so in as many words.
 _NEIGHBOUR_RTT_FACTOR = 3.0
 _NEIGHBOUR_RTT_FLOOR_MS = 50.0
+
+#: The nine checks a complete run owes a verdict on: phase 1's five (plan Task
+#: 7 Step 1, Phase 1) plus phase 2's four (``docs/superpowers/plans/
+#: 2026-10-06-n83-phase2-memory-pids.md``, Task 7 Step 1). A run that is
+#: missing any of them is not ``ok``, whatever the ones it did take say --
+#: including the RED legs, where a check that could not take its reading must
+#: still appear by name.
+_EXPECTED_CHECKS = (
+    "1_quota_is_real",
+    "2_kernel_enforces",
+    "3_flood_spends_own_quota",
+    "4_narrowing_view_shape",
+    "5_own_cpu_max_eacces",
+    "6_memory_ceiling_kills",
+    "7_task_budget_eagain",
+    "8_oversize_named_400",
+    "9_peak_and_task_unit",
+)
 
 
 class Refusal(RuntimeError):
@@ -333,7 +382,26 @@ def sandboxes_on_node(
 _LANE_ENV_SCRIPT = r"""
 import json, os, pathlib, sys
 
-WANTED = ("E2B_SANDBOX_CGROUP", "E2B_CGROUP_MOUNT", "E2B_SANDBOX_NOTIFY_RATE_LIMIT")
+WANTED = (
+    "E2B_SANDBOX_CGROUP",
+    "E2B_CGROUP_MOUNT",
+    "E2B_SANDBOX_NOTIFY_RATE_LIMIT",
+    # N83 phase 2 / Task 7: the *declaration* check 9 compares the kernel's
+    # ``pids.max`` against. The control plane is the face that declares it
+    # (``E2B_DEFAULT_MAX_PROCESSES`` -> ``record.max_processes`` ->
+    # ``pids.max``); the worker carries the same value on this lane so the run
+    # can read the declaration from inside the deployment it is measuring,
+    # instead of hard-coding a number that a future lane would silently
+    # invalidate. Unset (the field is absent) is a *named* failure in check 9.
+    "E2B_DEFAULT_MAX_PROCESSES",
+    # ... and the three per-sandbox ceilings check 8's expected refusal text is
+    # built from: the worker reports these in its heartbeat, the control plane
+    # quotes them back in the ``400``, and reading them out of the container is
+    # what keeps the expectation from being a hard-coded "2".
+    "E2B_MAX_SANDBOX_CPU_PERCENT",
+    "E2B_MAX_SANDBOX_MEMORY_MB",
+    "E2B_MAX_SANDBOX_PROCESSES",
+)
 
 
 def from_proc1():
@@ -546,6 +614,217 @@ def read_view(shell: WorkerShell, node: str, mount: str, own: str) -> dict:
     return shell.json(node, script)
 
 
+# -- phase 2: the memory / pids readings -----------------------------------
+#
+# Everything a check needs to turn "the kernel is enforcing this" into a
+# number: one worker-side read of the box's own limit files and event
+# counters (same device as ``read_cpu_stat``: the worker is the only role whose
+# delegated view holds the box).
+
+#: Check 6's box. A 64 MiB sandbox makes "allocate past the budget" a
+#: sub-second reading instead of a multi-GiB one, and the declared number is
+#: what the kernel's ``memory.max`` is compared against.
+_HOG_MEMORY_MB = 64
+#: Check 7's box. Big enough that the *task* wall is the only thing that can
+#: stop the fork bomb (a memory wall would be a different reading).
+_FORK_MEMORY_MB = 512
+#: Check 9's box, and the allocation held inside it: the ceiling stays far
+#: away, so ``memory.peak`` is a reading about the allocation, not the wall.
+_PEAK_MEMORY_MB = 256
+_PEAK_ALLOC_BYTES = 64 * 1024 * 1024
+#: What a shell reports for a child the kernel OOM-killed (128 + SIGKILL).
+_SIGKILL_EXIT = 128 + 9
+#: ``EAGAIN`` **as the sandbox's kernel defines it**. The reading is the
+#: Linux sandbox's ``errno``, so this must not come from the harness host's
+#: ``errno`` module: on macOS ``errno.EAGAIN`` is 35, and comparing the
+#: sandbox's 11 against it would report a correct EAGAIN as a failure.
+_LINUX_EAGAIN = 11
+
+_LIMITS_SCRIPT = r"""
+import json, pathlib
+
+p = pathlib.Path(__CGROUP_PATH__)
+
+
+def rd(name):
+    try:
+        return (p / name).read_text().strip()
+    except OSError as exc:
+        return "ERR:%s" % exc
+
+
+def events(name):
+    out = {}
+    try:
+        for line in (p / name).read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if value:
+                out[key] = int(value)
+    except OSError as exc:
+        out = {"ERR": str(exc)}
+    return out
+
+
+print(json.dumps({
+    "path": str(p),
+    "memory_max": rd("memory.max"),
+    "memory_high": rd("memory.high"),
+    "memory_current": rd("memory.current"),
+    "memory_peak": rd("memory.peak"),
+    "memory_events": events("memory.events"),
+    "pids_max": rd("pids.max"),
+    "pids_current": rd("pids.current"),
+    "pids_events": events("pids.events"),
+    "cgroup_procs": len((p / "cgroup.procs").read_text().split()),
+}))
+"""
+
+
+def read_limits(shell: WorkerShell, node: str, cgroup_path: str) -> dict:
+    """The box's memory/pids limits, its peak, and both event counters.
+
+    ``memory.max``/``memory.high``/``pids.max`` are the kernel's own readback
+    of what the worker wrote; ``memory.events``/``pids.events`` are the
+    counters Task 5 ships. Deliberately one read: the three limits and the
+    counters come from the same instant of the same directory.
+    """
+    script = "python3 - <<'PY'\n%s\nPY" % (
+        _LIMITS_SCRIPT.replace("__CGROUP_PATH__", json.dumps(cgroup_path))
+    )
+    return shell.json(node, script)
+
+
+#: A process that touches fresh anonymous memory until the kernel takes it out.
+_HOG_SCRIPT = r"""
+blocks = []
+while True:
+    block = bytearray(4 * 1024 * 1024)
+    for offset in range(0, len(block), 4096):
+        block[offset] = 1
+    blocks.append(block)
+"""
+
+#: ``hog_exit`` is the *only* thing the shell says, and it says it after the
+#: allocator is gone -- so the reading is "the child ended with 137", not "the
+#: command failed somehow". When the shell does not get to say anything (the
+#: OOM kill races the command's own bookkeeping), the e2b result carries the
+#: kill instead; check 6 reads either shape, exactly (see ``run_phase2_checks``).
+_HOG_COMMAND = (
+    "cat > hog.py <<'PYEOF'\n"
+    + _HOG_SCRIPT
+    + "PYEOF\npython3 hog.py; printf '{\"hog_exit\": %d}\\n' $?"
+)
+
+#: Fork until the box refuses, report what the *caller* saw, then hold the
+#: children so the harness can read ``pids.current`` while the box is full
+#: (``__PACE__`` spaces the forks so a poller can watch the wall arrive).
+_FORK_SCRIPT = r"""
+import errno, json, os, signal, time
+
+kids = []
+err = None
+for _ in range(600):
+    try:
+        pid = os.fork()
+    except OSError as exc:
+        err = exc.errno
+        break
+    if pid == 0:
+        signal.pause()
+        os._exit(0)
+    kids.append(pid)
+    time.sleep(__PACE__)
+print(json.dumps({"forks": len(kids), "errno": err}), flush=True)
+time.sleep(__SECONDS__)
+for pid in kids:
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+"""
+
+#: ``threads`` Python threads and ``procs`` forked children, then hold -- the
+#: one program check 9 varies to read the unit ``pids.current`` counts in.
+#: Run with ``python3 -c`` (no heredoc, no ``cat``): the command's own plumbing
+#: is then exactly the shell envd spawns plus this interpreter, and nothing
+#: else that could be counted as a task while the reading is taken.
+_HOLD_SCRIPT = r"""
+import json, os, sys, threading, time
+
+threads = __THREADS__
+procs = __PROCS__
+for _ in range(procs):
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(10)
+        os._exit(0)
+for _ in range(threads):
+    threading.Thread(target=time.sleep, args=(12,)).start()
+print(json.dumps({"pid": os.getpid()}), flush=True)
+time.sleep(12)
+"""
+
+
+def hold_command(threads: int, procs: int) -> str:
+    """``python3 -c`` with the holder's counts baked in (see ``_HOLD_SCRIPT``)."""
+    code = _HOLD_SCRIPT.replace("__THREADS__", str(threads)).replace(
+        "__PROCS__", str(procs)
+    )
+    return "python3 -c " + shlex.quote(code)
+
+
+#: Allocate ``argv[1]`` bytes of fresh anonymous memory, touch every page, and
+#: hold -- so ``memory.peak`` moves and ``memory.current`` stays there.
+_ALLOC_HOLD_SCRIPT = r"""
+import sys, time
+
+size = int(sys.argv[1])
+block = bytearray(size)
+for offset in range(0, len(block), 4096):
+    block[offset] = 1
+print("allocated", len(block), flush=True)
+time.sleep(int(sys.argv[2]))
+"""
+
+
+def api_request(
+    api_url: str,
+    api_key: str,
+    *,
+    method: str = "GET",
+    path: str,
+    body: dict | None = None,
+    timeout: float = 60.0,
+) -> tuple[int, dict | None, str]:
+    """One raw HTTP call to the E2B API: ``(status, json, raw text)``.
+
+    A refusal is a *reading* on this path, never an exception: checks 8's
+    whole point is the difference between a ``400``, a ``503`` and a ``201``,
+    and an ``HTTPError`` carries the body the same way the success path does.
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"{api_url.rstrip('/')}{path}",
+        data=None if body is None else json.dumps(body).encode(),
+        method=method,
+        headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode()
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode()
+        status = exc.code
+    try:
+        payload = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        payload = None
+    return status, payload, raw
+
+
 # -- client-side helpers ---------------------------------------------------
 
 
@@ -684,7 +963,661 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 - a create failure is a named refusal
             raise Refusal(f"sandbox create failed: {type(exc).__name__}: {exc}") from exc
 
+    def create_sized(metadata: dict, *, cpu_count: int, memory_mb: int):
+        """Create a sandbox through the *public* API, naming its own size.
+
+        The SDK's ``Sandbox.create`` has no ``cpuCount``/``memoryMB``
+        arguments, so checks 6/9 drive the endpoint the client's own JSON
+        would: a raw ``POST /sandboxes``. The create's own answer is a thin
+        handle (id + token), so the *declaration* is read back with
+        ``GET /sandboxes/{id}`` -- the record's own ``cpuCount``/``memoryMB``,
+        which is what the kernel's readback is then compared against, never a
+        number this script hoped it sent.
+        """
+        status, payload, raw = api_request(
+            args.api_url,
+            args.api_key,
+            method="POST",
+            path="/sandboxes",
+            body={
+                "templateID": args.template,
+                "timeout": args.sandbox_timeout_s,
+                "metadata": metadata,
+                "cpuCount": cpu_count,
+                "memoryMB": memory_mb,
+            },
+        )
+        if status != 201 or not isinstance(payload, dict) or not payload.get("sandboxID"):
+            raise Refusal(f"sized create answered {status}: {raw[:300]}")
+        info_status, declared, info_raw = api_request(
+            args.api_url,
+            args.api_key,
+            path=f"/sandboxes/{payload['sandboxID']}",
+        )
+        if info_status != 200 or not isinstance(declared, dict):
+            raise Refusal(
+                f"the record for {payload['sandboxID']} could not be read back "
+                f"({info_status}): {info_raw[:200]}"
+            )
+        sandbox = Sandbox.connect(
+            payload["sandboxID"],
+            api_url=args.api_url,
+            sandbox_url=args.api_url,
+            api_key=args.api_key,
+        )
+        boxes.append((sandbox, {"declared": declared}))
+        return sandbox, declared
+
+    def declared_processes(node: str) -> int:
+        """The lane's per-sandbox task declaration, as a container sees it.
+
+        Check 9 compares the kernel's ``pids.max`` with this number, so the
+        number has to come from the deployment rather than from this file: the
+        control plane declares it (``E2B_DEFAULT_MAX_PROCESSES`` ->
+        ``record.max_processes`` -> the create payload -> ``pids.max``) and the
+        lane carries the same key on the workers so the run can read it inside
+        the container it is measuring. A lane that does not declare it is a
+        **named refusal**, never a hard-coded fallback -- a fallback is exactly
+        what would make the comparison vacuous.
+        """
+        observed = report["lane"]["worker_env"].get(node, {}).get("observed", {})
+        value = (observed.get("E2B_DEFAULT_MAX_PROCESSES") or {}).get("value")
+        if not isinstance(value, str) or not value.strip().isdigit() or int(value) < 1:
+            raise Refusal(
+                f"the lane does not declare E2B_DEFAULT_MAX_PROCESSES inside {node} "
+                f"(read {value!r}), so check 9 has no declaration to compare the "
+                "kernel's pids.max against"
+            )
+        return int(value)
+
+    def declared_ceiling(node: str, key: str, unit: int) -> int:
+        """One dimension of the node's per-sandbox ceiling, read in-container.
+
+        Check 8's refusal text quotes the node's promise, so the expected text
+        is built from the same ``E2B_MAX_SANDBOX_*`` the worker reports in its
+        heartbeat -- read out of the worker container, so a lane that moved a
+        ceiling moves the expectation with it.
+        """
+        observed = report["lane"]["worker_env"].get(node, {}).get("observed", {})
+        value = (observed.get(key) or {}).get("value")
+        if not isinstance(value, str) or not value.strip().isdigit() or int(value) < 1:
+            raise Refusal(
+                f"the lane does not declare {key} inside {node} (read {value!r}), so "
+                "check 8 cannot know which ceiling the refusal should quote"
+            )
+        return int(value) // unit
+
+    def neighbour_on(node: str, *, label: str, memory_mb: int, cpu_count: int = 1):
+        """A second sandbox on ``node`` -- the neighbour half of checks 6/7.
+
+        Placement balances by remaining capacity (``rank_candidates``), so a
+        fresh box deliberately avoids the node that already carries one. The
+        search therefore *fills* the other nodes instead of killing its
+        mistakes: a node admits two 100%-cpu boxes, and by the pigeonhole a
+        same-node one appears once the others are full. The candidates that
+        landed elsewhere are real boxes with real readings and are reported;
+        they are freed with the rest of this check's boxes.
+        """
+        for _ in range(6):
+            box, _declared = create_sized(
+                {"n83_acceptance": label}, cpu_count=cpu_count, memory_mb=memory_mb
+            )
+            box.commands.run("true")
+            try:
+                box_node, box_cgroup = locate(box.sandbox_id)
+            except Refusal:
+                box_node, box_cgroup = None, None
+            if box_node == node:
+                return box, box_cgroup
+            note_box(box, box_node, box_cgroup)
+        raise Refusal(f"no sandbox landed on {node} for the neighbour half of {label}")
+
+    def kill_created_since(marker: int) -> None:
+        """Free the boxes one check created, once its readings are taken.
+
+        The fleet admits two 100%-cpu sandboxes per node (the node's own 200%
+        ceiling), so a check that held its boxes would leave the *next* check
+        unable to place a neighbour on the same node -- the opposite of what
+        the neighbour readings mean. Killing here (rather than at the end of
+        the run) is also what the readings want: each check measures a fresh
+        box on a quiet node.
+        """
+        while len(boxes) > marker:
+            sandbox, _info = boxes.pop()
+            kill(sandbox)
+
+    def parse_json_line(output: str, key: str):
+        """The last JSON line's ``key``, or ``None`` -- a reading, not a guess."""
+        for line in reversed((output or "").splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if key in payload:
+                return payload[key]
+        return None
+
+    def hold_reading(
+        box,
+        node: str,
+        cgroup: str,
+        *,
+        threads: int,
+        procs: int,
+        quiet: int,
+        window_s: float = 8.0,
+    ) -> dict:
+        """Run the holder with N threads / N forked children, and read the box.
+
+        The reading is taken *while* the holder is alive (a background thread
+        blocks on the command), because ``pids.current`` is a snapshot: what
+        matters is what it reaches with the extra tasks present, not what it is
+        after they exit.
+
+        Waits for the box to come back to ``quiet`` first: the previous
+        holder's own processes (a forked child lives 10 s) and the plumbing of
+        the command that just finished can still be draining, and a task
+        counted here would be read as part of *this* holder's unit (measured:
+        an unsettled baseline read 9 instead of 8, which turns the two-thread
+        delta into 1).
+
+        The *steady* minimum -- after this holder's own plumbing has settled --
+        is what the unit is read from; the peak is kept for the record.
+        """
+        holder: dict = {}
+
+        def run_holder() -> None:
+            holder["result"] = box.commands.run(
+                hold_command(threads, procs),
+                timeout=180,
+            )
+
+        settled = False
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            probe = read_limits(shell, node, cgroup)
+            if probe["pids_current"].isdigit() and int(probe["pids_current"]) == quiet:
+                settled = True
+                break
+            time.sleep(0.5)
+        thread = threading.Thread(target=run_holder, daemon=True)
+        thread.start()
+        started = time.monotonic()
+        peak_tasks = 0
+        peak_procs = 0
+        steady: list[int] = []
+        while time.monotonic() - started < window_s:
+            time.sleep(0.5)
+            try:
+                sample = read_limits(shell, node, cgroup)
+            except Refusal:
+                break
+            tasks = int(sample["pids_current"]) if sample["pids_current"].isdigit() else 0
+            if tasks > peak_tasks:
+                peak_tasks = tasks
+                peak_procs = int(sample["cgroup_procs"])
+            # The command's plumbing is on its way out for the first couple of
+            # seconds; the steady window is what the unit is read from.
+            if time.monotonic() - started >= 3.0:
+                steady.append(tasks)
+        thread.join(timeout=60)
+        return {
+            "threads": threads,
+            "forked_processes": procs,
+            "settled_to_quiet": settled,
+            "quiet_pids_current": quiet,
+            "steady_pids_current": min(steady) if steady else None,
+            "steady_samples": steady,
+            "peak_pids_current": peak_tasks,
+            "cgroup_procs_at_peak": peak_procs,
+            "holder_output": (getattr(holder.get("result"), "stdout", "") or "").strip()[:120],
+        }
+
+    def run_phase2_checks() -> None:
+        """Checks 6-9: what the kernel does to a live sandbox (N83 phase 2).
+
+        Run *before* checks 1-5 and each in its own ``try``: on a lane whose
+        phase-1 lane is absent -- ``E2B_SANDBOX_CGROUP=off``, or the
+        mixed-version window where the worker reports no ceiling at all -- a
+        refusal here is a *named failed reading* for that check, not a reason
+        to stop before the phase-2 checks have said what they saw.
+        """
+        # ---- check 6: the memory ceiling kills, and only the allocator ----
+        marker = len(boxes)
+        try:
+            hog, hog_declared = create_sized(
+                {"n83_acceptance": "hog"}, cpu_count=1, memory_mb=_HOG_MEMORY_MB
+            )
+            hog.commands.run("true")  # the first command is what builds the slot
+            hog_node, hog_cgroup = locate(hog.sandbox_id)
+            if hog_cgroup is None:
+                raise Refusal(
+                    "no sbx_<id> cgroup under the hosting worker's own delegated "
+                    "cgroup (E2B_SANDBOX_CGROUP off?), so there is no memory.max "
+                    "to read and no kernel to kill the allocator"
+                )
+            note_box(hog, hog_node, hog_cgroup)
+            declared_bytes = str(int(hog_declared["memoryMB"]) * 1024 * 1024)
+            before = read_limits(shell, hog_node, hog_cgroup)
+            neighbour, neighbour_cgroup = neighbour_on(
+                hog_node, label="hog-neighbour", memory_mb=_HOG_MEMORY_MB
+            )
+            quiet_rtt = client_roundtrip_ms(neighbour)
+            # Two shapes of the same reading. When the shell that ran the
+            # allocator survives -- it has almost no memory of its own -- it
+            # reports ``128 + SIGKILL`` in ``hog_exit``; when the command's own
+            # result carries the kill instead, e2b renders it as
+            # ``CommandExitException ... Killed``. Both say "the kernel killed
+            # the allocator", and which one arrives is a race inside the
+            # sandbox's command plumbing (measured: both, alternating), so the
+            # check reads either, exactly, and never a substring.
+            #
+            # The box is sampled *while* the hog runs, not only after it: an
+            # OOM kill can cost the route-B slot its control stream, and the
+            # worker then rebuilds the instance -- which is a fresh
+            # ``sbx_<id>`` directory with its counters back at zero (measured:
+            # the control plane logged ``oom_kill grew from 0 to 1`` for a box
+            # whose directory read ``oom_kill: 0`` a moment later). The peak
+            # over the live samples is therefore the reading; the reset itself
+            # is reported.
+            hog_stdout = ""
+            command_killed = False
+            hog_result: dict = {}
+
+            def run_hog() -> None:
+                try:
+                    hog_result["run"] = hog.commands.run(_HOG_COMMAND, timeout=180)
+                except Exception as exc:  # noqa: BLE001 - a signalled command is a reading
+                    hog_result["error"] = exc
+
+            hog_thread = threading.Thread(target=run_hog, daemon=True)
+            hog_thread.start()
+            live: list[dict] = []
+            while hog_thread.is_alive():
+                try:
+                    live.append(read_limits(shell, hog_node, hog_cgroup))
+                except Refusal:
+                    break
+                time.sleep(0.3)
+            hog_thread.join(timeout=200)
+            hog_run = hog_result.get("run")
+            if hog_run is not None:
+                hog_stdout = hog_run.stdout or ""
+            elif hog_result.get("error") is not None:
+                command_killed = (
+                    str(hog_result["error"]).rstrip().splitlines()[-1].strip()
+                    == "Killed"
+                )
+            hog_exit = parse_json_line(hog_stdout, "hog_exit")
+            oom_kill_peak = max(
+                (entry["memory_events"].get("oom_kill", 0) for entry in live), default=0
+            )
+            oom_group_kill_peak = max(
+                (entry["memory_events"].get("oom_group_kill", 0) for entry in live),
+                default=0,
+            )
+            counter_reset = any(
+                later["memory_events"].get("oom_kill", 0)
+                < earlier["memory_events"].get("oom_kill", 0)
+                for earlier, later in zip(live, live[1:])
+            )
+            # D3's other half, read directly: the rest of the box is still
+            # there and still answering.
+            try:
+                box_alive = (
+                    hog.commands.run("echo box-alive", timeout=60).stdout.strip()
+                    == "box-alive"
+                )
+            except Exception:  # noqa: BLE001 - a dead box is the reading
+                box_alive = False
+            busy_rtt = client_roundtrip_ms(neighbour)
+            after = read_limits(shell, hog_node, hog_cgroup)
+            bound_ms = max(
+                _NEIGHBOUR_RTT_FACTOR * quiet_rtt["min_ms"], _NEIGHBOUR_RTT_FLOOR_MS
+            )
+            record(
+                "6_memory_ceiling_kills",
+                before["memory_max"] == declared_bytes
+                and before["memory_high"] == declared_bytes
+                and (hog_exit == _SIGKILL_EXIT or command_killed)
+                and oom_kill_peak == 1
+                and oom_group_kill_peak == 0
+                and box_alive
+                and busy_rtt["min_ms"] <= bound_ms,
+                criterion=(
+                    "memory.max/memory.high == the declared memoryMB (byte for byte); "
+                    "the allocator is SIGKILLed (the surviving shell reports "
+                    "128+SIGKILL, or the command's own result carries the kill); the "
+                    "box's own memory.events shows oom_kill=1 and oom_group_kill=0 "
+                    "(D3: only the allocator dies), read live because an OOM kill "
+                    "can cost the slot its control stream and the rebuilt box "
+                    "starts its counters at zero; the box still answers a command; "
+                    "the same-node neighbour's round trip stays within "
+                    f"{_NEIGHBOUR_RTT_FACTOR:g}x its quiet min (floor "
+                    f"{_NEIGHBOUR_RTT_FLOOR_MS:g} ms)"
+                ),
+                declared_memory_mb=hog_declared["memoryMB"],
+                declared_bytes=int(declared_bytes),
+                hog_exit=hog_exit,
+                hog_command_killed=command_killed,
+                hog_stdout=hog_stdout.strip()[:200],
+                box_still_answers=box_alive,
+                live_samples=len(live),
+                oom_kill_peak=oom_kill_peak,
+                oom_group_kill_peak=oom_group_kill_peak,
+                memory_events_counter_reset=counter_reset,
+                memory_peak_live_max=max(
+                    (int(entry["memory_peak"]) for entry in live if entry["memory_peak"].isdigit()),
+                    default=None,
+                ),
+                memory_max_before=before["memory_max"],
+                memory_high_before=before["memory_high"],
+                memory_peak_after=after["memory_peak"],
+                memory_events_after=after["memory_events"],
+                sandbox_cgroup=hog_cgroup,
+                hog_node=hog_node,
+                neighbour_node=hog_node,
+                neighbour_quiet_rtt=quiet_rtt,
+                neighbour_busy_rtt=busy_rtt,
+                neighbour_bound_ms=round(bound_ms, 2),
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed reading is a reading
+            record("6_memory_ceiling_kills", False, reason=f"{type(exc).__name__}: {exc}")
+        finally:
+            kill_created_since(marker)
+
+        # ---- check 7: the task ceiling answers EAGAIN, from the kernel -----
+        marker = len(boxes)
+        try:
+            forker, _fork_declared = create_sized(
+                {"n83_acceptance": "forkbomb"}, cpu_count=1, memory_mb=_FORK_MEMORY_MB
+            )
+            forker.commands.run("true")
+            fork_node, fork_cgroup = locate(forker.sandbox_id)
+            if fork_cgroup is None:
+                raise Refusal(
+                    "no sbx_<id> cgroup under the hosting worker's own delegated "
+                    "cgroup (E2B_SANDBOX_CGROUP off?), so there is no pids.max, no "
+                    "pids.current and no pids.events to read -- and an EAGAIN from "
+                    "the mediator's own process counter would prove nothing about "
+                    "the kernel"
+                )
+            note_box(forker, fork_node, fork_cgroup)
+            declared_tasks = declared_processes(fork_node)
+            before = read_limits(shell, fork_node, fork_cgroup)
+            neighbour, neighbour_cgroup = neighbour_on(
+                fork_node, label="fork-neighbour", memory_mb=_HOG_MEMORY_MB
+            )
+            quiet_rtt = client_roundtrip_ms(neighbour)
+            script = _FORK_SCRIPT.replace("__SECONDS__", "20").replace("__PACE__", "0.05")
+            holder: dict = {}
+
+            def run_forker() -> None:
+                holder["result"] = forker.commands.run(
+                    "cat > forker.py <<'PYEOF'\n" + script + "PYEOF\npython3 forker.py",
+                    timeout=180,
+                )
+
+            thread = threading.Thread(target=run_forker, daemon=True)
+            thread.start()
+            peak_tasks = 0
+            peak_procs = 0
+            pids_events_max_peak = 0
+            pids_events_reset = False
+            previous_max = 0
+            while thread.is_alive():
+                time.sleep(0.4)
+                try:
+                    sample = read_limits(shell, fork_node, fork_cgroup)
+                except Refusal:
+                    break
+                tasks = int(sample["pids_current"]) if sample["pids_current"].isdigit() else 0
+                if tasks > peak_tasks:
+                    peak_tasks = tasks
+                    peak_procs = int(sample["cgroup_procs"])
+                seen = sample["pids_events"].get("max", 0)
+                pids_events_max_peak = max(pids_events_max_peak, seen)
+                pids_events_reset = pids_events_reset or seen < previous_max
+                previous_max = seen
+            thread.join(timeout=120)
+            busy_rtt = client_roundtrip_ms(neighbour)
+            after = read_limits(shell, fork_node, fork_cgroup)
+            result = holder.get("result")
+            forks = parse_json_line(getattr(result, "stdout", "") or "", "forks")
+            errno_read = parse_json_line(getattr(result, "stdout", "") or "", "errno")
+            bound_ms = max(
+                _NEIGHBOUR_RTT_FACTOR * quiet_rtt["min_ms"], _NEIGHBOUR_RTT_FLOOR_MS
+            )
+            record(
+                "7_task_budget_eagain",
+                before["pids_max"] == str(declared_tasks)
+                and errno_read == _LINUX_EAGAIN
+                and peak_tasks == declared_tasks
+                # The kernel's wall, not the mediator's: at the moment the box
+                # held the most tasks, it held *fewer processes* than the same
+                # budget -- the mediator does not count threads, so a mediator
+                # refusal could not have produced this reading.
+                and peak_procs < declared_tasks
+                and pids_events_max_peak >= 1
+                and busy_rtt["min_ms"] <= bound_ms,
+                criterion=(
+                    "pids.max == the lane's declared E2B_DEFAULT_MAX_PROCESSES; the "
+                    "fork bomb's own errno is EAGAIN; pids.current reaches pids.max "
+                    "exactly while cgroup.procs is still below it (the kernel's task "
+                    "wall, which counts threads -- the mediator's process counter "
+                    "cannot produce this); pids.events.max grows; a same-node "
+                    "neighbour keeps its round trip"
+                ),
+                declared_processes=declared_tasks,
+                pids_max_before=before["pids_max"],
+                forks=forks,
+                errno=errno_read,
+                peak_pids_current=peak_tasks,
+                cgroup_procs_at_peak=peak_procs,
+                pids_events_after=after["pids_events"],
+                pids_events_max_peak=pids_events_max_peak,
+                pids_events_counter_reset=pids_events_reset,
+                forker_stdout=(getattr(result, "stdout", "") or "").strip()[:200],
+                sandbox_cgroup=fork_cgroup,
+                fork_node=fork_node,
+                neighbour_quiet_rtt=quiet_rtt,
+                neighbour_busy_rtt=busy_rtt,
+                neighbour_bound_ms=round(bound_ms, 2),
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed reading is a reading
+            record("7_task_budget_eagain", False, reason=f"{type(exc).__name__}: {exc}")
+        finally:
+            kill_created_since(marker)
+
+        # ---- check 8: an over-ceiling create is a named 400 ---------------
+        marker = len(boxes)
+        try:
+            ceiling_node = nodes[0]
+            cpu_ceiling = declared_ceiling(
+                ceiling_node, "E2B_MAX_SANDBOX_CPU_PERCENT", 100
+            )
+            memory_ceiling = declared_ceiling(
+                ceiling_node, "E2B_MAX_SANDBOX_MEMORY_MB", 1
+            )
+            cpu_status, cpu_body, cpu_raw = api_request(
+                args.api_url,
+                args.api_key,
+                method="POST",
+                path="/sandboxes",
+                body={"templateID": args.template, "cpuCount": cpu_ceiling * 4},
+            )
+            mem_status, mem_body, mem_raw = api_request(
+                args.api_url,
+                args.api_key,
+                method="POST",
+                path="/sandboxes",
+                body={"templateID": args.template, "memoryMB": memory_ceiling * 4 + 1},
+            )
+            # The boundary: *at* the ceiling must not be refused (otherwise
+            # "refuses everything" would pass this check).
+            ok_status, ok_body, ok_raw = api_request(
+                args.api_url,
+                args.api_key,
+                method="POST",
+                path="/sandboxes",
+                body={
+                    "templateID": args.template,
+                    "timeout": 60,
+                    "cpuCount": cpu_ceiling,
+                    "memoryMB": _HOG_MEMORY_MB,
+                },
+            )
+            at_ceiling_id = (ok_body or {}).get("sandboxID")
+            delete_status = None
+            if ok_status == 201 and at_ceiling_id:
+                delete_status = api_request(
+                    args.api_url,
+                    args.api_key,
+                    method="DELETE",
+                    path=f"/sandboxes/{at_ceiling_id}",
+                )[0]
+            expected_cpu = (
+                f"cpuCount {cpu_ceiling * 4} exceeds this node's per-sandbox "
+                f"maximum ({cpu_ceiling})"
+            )
+            expected_mem = (
+                f"memoryMB {memory_ceiling * 4 + 1} exceeds this node's per-sandbox "
+                f"maximum ({memory_ceiling})"
+            )
+            record(
+                "8_oversize_named_400",
+                cpu_status == 400
+                and (cpu_body or {}).get("message") == expected_cpu
+                and mem_status == 400
+                and (mem_body or {}).get("message") == expected_mem
+                and ok_status == 201,
+                criterion=(
+                    "cpuCount/memoryMB past the node's per-sandbox ceiling answer "
+                    "exactly 400 with the message that quotes that ceiling, and a "
+                    "request *at* the ceiling is accepted (201); a node that has not "
+                    "reported a ceiling answers the named 503 instead (R12)"
+                ),
+                ceiling_source=f"E2B_MAX_SANDBOX_* read inside {ceiling_node}",
+                cpu_ceiling=cpu_ceiling,
+                memory_ceiling=memory_ceiling,
+                cpu_status=cpu_status,
+                cpu_message=(cpu_body or {}).get("message"),
+                cpu_expected=expected_cpu,
+                memory_status=mem_status,
+                memory_message=(mem_body or {}).get("message"),
+                memory_expected=expected_mem,
+                at_ceiling_status=ok_status,
+                at_ceiling_delete_status=delete_status,
+                at_ceiling_raw=ok_raw[:200],
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed reading is a reading
+            record("8_oversize_named_400", False, reason=f"{type(exc).__name__}: {exc}")
+        finally:
+            kill_created_since(marker)
+
+        # ---- check 9: peak memory and the task unit ------------------------
+        marker = len(boxes)
+        try:
+            box, declared = create_sized(
+                {"n83_acceptance": "peak"}, cpu_count=1, memory_mb=_PEAK_MEMORY_MB
+            )
+            box.commands.run("true")
+            node, cgroup = locate(box.sandbox_id)
+            if cgroup is None:
+                raise Refusal(
+                    "no sbx_<id> cgroup under the hosting worker's own delegated "
+                    "cgroup (E2B_SANDBOX_CGROUP off?), so there is no memory.peak "
+                    "and no pids.current to read"
+                )
+            note_box(box, node, cgroup)
+            declared_memory_bytes = int(declared["memoryMB"]) * 1024 * 1024
+            declared_tasks = declared_processes(node)
+            limits = read_limits(shell, node, cgroup)
+            holder = box.commands.run(
+                "cat > alloc.py <<'PYEOF'\n"
+                + _ALLOC_HOLD_SCRIPT
+                + "PYEOF\npython3 alloc.py %d 12" % _PEAK_ALLOC_BYTES,
+                background=True,
+                timeout=120,
+            )
+            peak = 0
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                sample = read_limits(shell, node, cgroup)
+                if sample["memory_peak"].isdigit():
+                    peak = max(peak, int(sample["memory_peak"]))
+                if peak >= _PEAK_ALLOC_BYTES:
+                    break
+            holder.wait()
+            quiet = int(limits["pids_current"])
+            baseline = hold_reading(
+                box, node, cgroup, threads=0, procs=0, quiet=quiet
+            )
+            two_threads = hold_reading(
+                box, node, cgroup, threads=2, procs=0, quiet=quiet
+            )
+            one_process = hold_reading(
+                box, node, cgroup, threads=0, procs=1, quiet=quiet
+            )
+            thread_delta = (
+                two_threads["steady_pids_current"] - baseline["steady_pids_current"]
+            )
+            process_delta = (
+                one_process["steady_pids_current"] - baseline["steady_pids_current"]
+            )
+            record(
+                "9_peak_and_task_unit",
+                limits["memory_max"] == str(declared_memory_bytes)
+                and limits["memory_high"] == str(declared_memory_bytes)
+                and limits["pids_max"] == str(declared_tasks)
+                and peak >= _PEAK_ALLOC_BYTES
+                and peak <= declared_memory_bytes
+                and thread_delta == 2
+                and process_delta == 1,
+                criterion=(
+                    "memory.max/memory.high == the declared memoryMB byte for byte; "
+                    "pids.max == the lane's declared E2B_DEFAULT_MAX_PROCESSES; a "
+                    "held 64 MiB allocation moves memory.peak into "
+                    "[64 MiB, memory.max]; and pids.current counts a thread exactly "
+                    "like a process (2 threads add 2, 1 forked process adds 1, both "
+                    "measured against the same holder with neither -- the unit Task "
+                    "5's probe read as 3 for 2 threads + 1 process)"
+                ),
+                declared_memory_mb=declared["memoryMB"],
+                declared_memory_bytes=declared_memory_bytes,
+                declared_processes=declared_tasks,
+                memory_max=limits["memory_max"],
+                memory_high=limits["memory_high"],
+                pids_max=limits["pids_max"],
+                peak_after_alloc=peak,
+                peak_alloc_bytes=_PEAK_ALLOC_BYTES,
+                pids_current_idle=limits["pids_current"],
+                pids_current_quiet=quiet,
+                pids_current_holder_threads0_processes0=baseline,
+                pids_current_holder_threads2_processes0=two_threads,
+                pids_current_holder_threads0_processes1=one_process,
+                thread_delta=thread_delta,
+                process_delta=process_delta,
+                sandbox_cgroup=cgroup,
+                node=node,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed reading is a reading
+            record("9_peak_and_task_unit", False, reason=f"{type(exc).__name__}: {exc}")
+        finally:
+            kill_created_since(marker)
+
     try:
+        # N83 phase 2 / Task 7: checks 6-9 run first, each in its own try (see
+        # run_phase2_checks): they are the checks that must still report a
+        # named reading on a lane where the phase-1 lane is off, or where the
+        # worker predates the ceiling (the mixed-version window) and the
+        # creates below refuse.
+        run_phase2_checks()
+
         # ---- check 1: the quota is real ----------------------------------
         first = create({"n83_acceptance": "spinner"})
         boxes.append((first, {}))
@@ -1166,19 +2099,11 @@ def main() -> int:
     report["ok"] = bool(report["checks"]) and all(
         entry.get("pass") for entry in report["checks"].values()
     )
-    if len(report["checks"]) != 5:
+    if len(report["checks"]) != len(_EXPECTED_CHECKS):
         report["ok"] = False
         report.setdefault("missing_checks", [])
         report["missing_checks"] = [
-            name
-            for name in (
-                "1_quota_is_real",
-                "2_kernel_enforces",
-                "3_flood_spends_own_quota",
-                "4_narrowing_view_shape",
-                "5_own_cpu_max_eacces",
-            )
-            if name not in report["checks"]
+            name for name in _EXPECTED_CHECKS if name not in report["checks"]
         ]
 
     payload = json.dumps(report, indent=2, ensure_ascii=False, default=str)

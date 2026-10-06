@@ -3131,6 +3131,80 @@ uid 相符；评审六条规格全过），按 `AGENTS.md` 先在**本地 compos
 **待填（Task 7 Step 4）**：重滚的版本号、线上 ⑥⑦⑧⑨ 的读数、混版本窗口的实际时长、以及"k8s pod
 层真的把 `memory`/`pids` 委派给了 worker"这条形状事实 —— 都在重滚那一轮现量现填，本节不预填数字。
 
+#### 7.50.1 Task 7 Step 1–2：本地车道验收（2026-10-07，**线上未动**）
+
+**结论先说**：`deploy/scripts/acceptance/cgroup_acceptance.py` 从五条扩到**九条**（新增
+⑥ 内存超预算 ⇒ 分配者 SIGKILL、⑦ 任务预算 ⇒ 内核 EAGAIN、⑧ 超上限建箱 ⇒ 具名 400、
+⑨ `memory.peak`/`pids.current` 与声明一致），在本地 compose 多节点车道上 **GREEN 连跑三次
+`ok: true`（9/9，退出码 0）**，RED 两档（`off` 车道 / 混版本车道）逐条具名失败；退出码非 0。
+**本节只写本地读数**：k0s 重滚（Step 3）与线上复验（Step 4）**等待授权**，一个字没写。
+
+**车道形状**（`-p n83p2`，宿主端口 **3400**；用户那套 live 栈 `compose`/3100 全程未动，k0s 一个
+pod 都没碰）：`deploy/compose/docker-compose.multinode.yml` + 三份 override（都在 gitignored 的
+`tmp/` 下）。相对清单的差别：`E2B_SANDBOX_CGROUP=required`、`E2B_SANDBOX_NOTIFY_RATE_LIMIT=0`、
+`E2B_EXECUTOR=sandlock`、`E2B_PER_SANDBOX_UID=true`、`E2B_NODE_DISK_MB=400000`（Docker VM 整盘已用
+~111 GB）、`E2B_NODE_PROCESSES=1024`，外加两个**验收专用**的 knob：控制面
+`E2B_MAX_TOTAL_CPU_PERCENT=1600`（清单是 400%＝四个 1 核箱；⑥⑦ 的"同节点邻居"要靠把别处填满来
+逼出同节点，见下）与 `E2B_DEFAULT_MAX_PROCESSES=137`（**故意不是出厂的 256**：⑨ 拿容器里读到的
+这条声明去比对内核的 `pids.max`，写死 256 就会变成一句空话）。镜像：本分支现构建的
+`e2b-sandlock-worker:n83p2`（本机 Docker VM 是 `linux/amd64`，所以镜像按 amd64 构建）与
+`e2b-sandlock-agent:n83p2`；命令：
+
+```bash
+docker build -f deploy/docker/Dockerfile.agent -t e2b-sandlock-agent:n83p2 .
+docker compose -p n83p2 -f deploy/compose/docker-compose.multinode.yml -f tmp/task7/override-required.yml \
+    build control-plane worker-1 worker-2 worker-3
+docker compose -p n83p2 -f deploy/compose/docker-compose.multinode.yml -f tmp/task7/override-required.yml up -d
+tmp/venv/bin/python deploy/scripts/acceptance/cgroup_acceptance.py \
+    --api-url http://127.0.0.1:3400 --api-key local-key --internal-key internal-key \
+    --internal-url http://control-plane:3000 --nodes worker-1,worker-2,worker-3 \
+    --worker-exec-template 'docker exec -i n83p2-{node}-1 bash -lc'
+```
+
+**GREEN（`required`）的 ⑥⑦⑧⑨ 读数**（三跑一致；括号里是另一跑的取值，两跑都 `ok: true`）
+
+| 检查 | 读数 |
+|---|---|
+| ⑥ 内存墙杀分配者 | `memory.max = memory.high = 67108864`（＝声明的 64 MiB，逐字）；箱内 `python3` 触到上限 ⇒ 被测进程 **SIGKILL**（`{"hog_exit": 137}`，另一跑是命令本身带 `Killed`，见"坑"）；箱子自己 `memory.events`：`oom_kill=1`、`oom_group_kill=0`（D3：只有分配者死）、`memory.peak = 67108864`（＝上限）、杀掉之后箱子仍答 `echo box-alive`；同节点邻居 5 次往返 min **31.9 ms** ≤ 上限 92.4 ms（安静档 30.8 ms） |
+| ⑦ 任务预算回 EAGAIN | `pids.max = 137` ＝车道声明；fork 炸弹在箱内 **129 次 fork 后 `errno=11`（EAGAIN）**；`pids.current` 峰值 **137**（＝`pids.max`）而同一刻 `cgroup.procs = 134 < 137` ⇒ 是**内核**那堵墙（它数线程）而不是中介的进程计数器；`pids.events.max=1`；同节点邻居 min **29.8 ms** ≤ 94.4 ms |
+| ⑧ 超上限 ⇒ 具名 400 | `cpuCount 8` ⇒ `400` + `cpuCount 8 exceeds this node's per-sandbox maximum (2)`；`memoryMB 8193` ⇒ `400` + `memoryMB 8193 exceeds this node's per-sandbox maximum (2048)`；**贴着上限**的 `cpuCount 2` ⇒ `201`（否则"一律拒绝"也能过）→ `DELETE 204`。两条上限都是从 worker 容器里读的 `E2B_MAX_SANDBOX_*` 反推，不是写死的 2 |
+| ⑨ peak 与任务单位 | `memory.max = memory.high = 268435456`（＝声明 256 MiB）、`pids.max = 137`（＝车道声明，容器内读）；箱内扣住 64 MiB ⇒ `memory.peak = 72564736` ∈ [64 MiB, `memory.max`]（另一跑 73560064）；`pids.current` 稳态：只有壳+python **8**、再加 2 个线程 **10**、再加 1 个 fork 子进程 **9** ⇒ **Δ=2（两个线程）与 Δ=1（一个进程）逐字相等**（Task 5 探针那条"2 线程 + 1 进程 = 3"的同一单位；每条读数 9 个采样点全同值） |
+
+**RED 一档：`off` 车道**（同一份 override，只把 `E2B_SANDBOX_CGROUP` 翻成 `off`，重建三台 worker）：
+⑨ 条里的 **⑥⑦⑨ 逐条具名失败**（"no sbx_<id> cgroup … 没有 `memory.max`/`pids.max`/`memory.peak` 可读"），
+①–⑤ 照 Phase 1 那样全 FAIL（`measuredCpuPercent` 回到 ~400% 那一档、沙箱没有 cgroup），
+**⑧ 仍是 PASS 且这是对的**：请求侧的上限读的是心跳里的 `sandboxCeiling`，`off` 车道照带（R11）——
+它**不可能**被这个开关弄红。同一条 `off` 车道上手工跑同一支 hog：箱子也是 `exit=0 / {"hog_exit": 137} / stderr=Killed`
+—— 所以"超预算"两档**都会杀**，Phase 2 变的不是"会不会杀"，而是**谁在杀**（内核）与**账覆盖谁**；
+差别在于 `off` 那档**没有任何 cgroup 与内核计数**可读（这就是 ⑥⑦⑨ 在那档具名失败的原因）。
+
+**RED 二档：混版本车道（R12）**（`down -v` 重开，三台 worker 换成 **Phase 2 之前**的镜像
+`…/e2b-sandlock-worker:0.1.0-1049-g5dde329-20261006-102253`——实测该镜像里既没有 `sandboxCeiling`
+也没有 `E2B_MAX_SANDBOX_*`；控制面仍是本分支的构建）：**⑧ 具名失败**，读数正是这条窗口的定义——
+贴着上限的请求答 **`503 node worker-2 cannot size a sandbox: it has not reported its per-sandbox
+cpuCount maximum`**（具名 503），而"离谱的超限请求"（`cpuCount 8` / `memoryMB 8193`）答的是
+`503 No resources available`（没有上限可查 ⇒ 落到准入那一道，节点装不下 8 核）；⑥⑦⑨ 同档具名失败
+（`sized create answered 503: …cpuCount maximum`），①–⑤ 直接在建箱处拒绝。**这条窗口既是 ⑧ 的 RED，
+也是 Step 3 上线顺序（先 worker 后控制面）的现场证据**：节点记录里存过上限之后，旧 worker 的心跳
+**不会**把它抹掉（`apply_sandbox_ceiling` 只写不删），所以混版本只在"记录从没拿到上限"的节点上咬人
+——本题那档是 `down -v` 之后由旧 worker **首次注册**造出来的。
+
+**两条本车道实测的坑（供 Step 3/4 带上）**
+
+1. **OOM 杀一次可能把 route-B 槽位的控制流一起带走，worker 会重建实例** ⇒ `sbx_<id>` 目录被
+   重建、内核计数**归零**。证据：控制面日志 `oom_kill grew from 0 to 1 …`（Task 5 的可见性成立），
+   而同一个箱子的目录在几秒后读到 `oom_kill: 0`、`memory.peak` 只剩 4 MB。**验收脚本因此改成
+   "边跑边采样取峰值"**（⑥/⑦ 都在探针跑动期间每 0.3–0.4 s 读一次），否则这条检查会随重建随机变红
+   （实测：一次 9/9 里 ⑥ 就是被这个弄红的）；重建本身作为 `memory_events_counter_reset` 记在报告里。
+2. **邻居盒子不是"再建一个"就有**：`rank_candidates` 按剩余容量打分，新箱**故意**避开已经有一个箱的
+   节点 ⇒ 三节点车道上"同节点邻居"要靠把别的节点**填满**才出现（节点 200%＝两个 1 核箱；清单的全局
+   上限 400% 正好卡在四个箱，所以验收把控制面的 `E2B_MAX_TOTAL_CPU_PERCENT` 抬到 1600 才够填）。
+   填出来的多余箱子是真箱子（有真读数），随该检查一起释放；写死"建 3 个试试"会随调度位置随机变红。
+
+**下一步（等授权，不预填）**：Step 3 = 重建镜像 + 两段式重滚（先 `off` 滚完冒烟 → 再翻
+`required`，顺序见 R12）并线上复验 ⑥⑦⑧；Step 4 = 本节末尾这份记录：重滚的版本号、线上 ⑥⑦⑧⑨ 的
+读数、混版本窗口的实际时长、以及"k8s pod 层真的把 `memory`/`pids` 委派给了 worker"这条形状事实。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版
