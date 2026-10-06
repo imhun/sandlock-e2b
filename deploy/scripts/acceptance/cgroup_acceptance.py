@@ -386,13 +386,12 @@ WANTED = (
     "E2B_SANDBOX_CGROUP",
     "E2B_CGROUP_MOUNT",
     "E2B_SANDBOX_NOTIFY_RATE_LIMIT",
-    # N83 phase 2 / Task 7: the *declaration* check 9 compares the kernel's
-    # ``pids.max`` against. The control plane is the face that declares it
-    # (``E2B_DEFAULT_MAX_PROCESSES`` -> ``record.max_processes`` ->
-    # ``pids.max``); the worker carries the same value on this lane so the run
-    # can read the declaration from inside the deployment it is measuring,
-    # instead of hard-coding a number that a future lane would silently
-    # invalidate. Unset (the field is absent) is a *named* failure in check 9.
+    # N83 phase 2 / Task 7: the deployment-wide per-sandbox task default, read
+    # as a **secondary** datum only. Checks 7/9 take their declared number from
+    # the worker's own record for the box (``_runtime/<id>/sandbox.json``),
+    # because the shipped manifests never set this key and a check that needs
+    # it to be set is the environment satisfying the check; when a lane does
+    # set it, the report shows whether the two agree.
     "E2B_DEFAULT_MAX_PROCESSES",
     # ... and the three per-sandbox ceilings check 8's expected refusal text is
     # built from: the worker reports these in its heartbeat, the control plane
@@ -692,6 +691,65 @@ def read_limits(shell: WorkerShell, node: str, cgroup_path: str) -> dict:
         _LIMITS_SCRIPT.replace("__CGROUP_PATH__", json.dumps(cgroup_path))
     )
     return shell.json(node, script)
+
+
+#: The worker's *own* per-sandbox runtime record, read inside the worker
+#: container: ``<state base>/_runtime/<id>/sandbox.json`` (``envd_service/
+#: runtime/registry.py``: ``_record_path`` / ``sandbox_record_path``, the same
+#: file the worker's own runtime reads back). The create's payload was applied
+#: into it, so its ``max_processes`` is **what this box was declared** -- the
+#: number checks 7/9 compare the kernel's ``pids.max`` against. The base is
+#: resolved exactly as ``gateway_common.paths.resolve_state_base`` does:
+#: ``E2B_STATE_BASE`` when set (the k8s manifests sink the tree root), the
+#: workspace base otherwise; both candidates are tried. Only the fields this
+#: check reads are projected out of the record -- it also holds the sandbox's
+#: access token, which has no business in an acceptance report.
+_RECORD_SCRIPT = r"""
+import json, os, pathlib
+
+sandbox_id = __SANDBOX_ID__
+WANTED = ("sandbox_id", "max_processes", "memory_mb", "cpu_percent", "disk_mb", "state")
+roots = []
+for name in ("E2B_STATE_BASE", "E2B_WORKSPACE_BASE"):
+    value = (os.environ.get(name) or "").strip()
+    if value and value not in roots:
+        roots.append(value)
+candidates = [
+    pathlib.Path(root) / "_runtime" / sandbox_id / "sandbox.json" for root in roots
+]
+out = {
+    "sandbox_id": sandbox_id,
+    "bases": roots,
+    "candidates": [str(path) for path in candidates],
+}
+for path in candidates:
+    if path.is_file():
+        out["path"] = str(path)
+        raw = json.loads(path.read_text())
+        out["record"] = {key: raw[key] for key in WANTED if key in raw}
+        break
+print(json.dumps(out))
+"""
+
+
+def read_worker_record(shell: WorkerShell, node: str, sandbox_id: str) -> dict:
+    """This sandbox's own record, as the hosting worker wrote it.
+
+    A missing record is a named refusal, never a default: the declared number
+    is the whole point of the comparison it feeds.
+    """
+    if not _SANDBOX_ID_RE.match(sandbox_id):
+        raise Refusal(f"refusing to interpolate a non-sandbox id: {sandbox_id!r}")
+    script = "python3 - <<'PY'\n%s\nPY" % (
+        _RECORD_SCRIPT.replace("__SANDBOX_ID__", json.dumps(sandbox_id))
+    )
+    payload = shell.json(node, script)
+    if not payload.get("record"):
+        raise Refusal(
+            f"the worker on {node} holds no runtime record for {sandbox_id} "
+            f"(tried {payload.get('candidates')})"
+        )
+    return payload
 
 
 #: A process that touches fresh anonymous memory until the kernel takes it out.
@@ -1008,27 +1066,31 @@ def main() -> int:
         boxes.append((sandbox, {"declared": declared}))
         return sandbox, declared
 
-    def declared_processes(node: str) -> int:
-        """The lane's per-sandbox task declaration, as a container sees it.
+    def declared_processes(node: str, sandbox_id: str) -> tuple[int, dict]:
+        """What **this box** was declared, from the worker's own record.
 
-        Check 9 compares the kernel's ``pids.max`` with this number, so the
-        number has to come from the deployment rather than from this file: the
-        control plane declares it (``E2B_DEFAULT_MAX_PROCESSES`` ->
-        ``record.max_processes`` -> the create payload -> ``pids.max``) and the
-        lane carries the same key on the workers so the run can read it inside
-        the container it is measuring. A lane that does not declare it is a
-        **named refusal**, never a hard-coded fallback -- a fallback is exactly
-        what would make the comparison vacuous.
+        Checks 7/9 compare the kernel's ``pids.max`` with this number, so it
+        has to be the value the create actually agreed to -- not the script's
+        idea of it and not a deployment-wide env. The worker holds exactly that
+        in ``<state base>/_runtime/<id>/sandbox.json`` (``max_processes``,
+        written when the create's payload was applied, and the same file the
+        worker's own runtime reads back), so the comparison runs
+        request -> worker record -> kernel: the same three-way shape checks
+        6/9 already use for memory via ``GET /sandboxes/{id}``.
+
+        The lane's ``E2B_DEFAULT_MAX_PROCESSES`` (when a lane sets it at all)
+        is reported beside it as a *secondary* datum and is never the source:
+        a shipped manifest that does not declare it must still be measurable.
         """
-        observed = report["lane"]["worker_env"].get(node, {}).get("observed", {})
-        value = (observed.get("E2B_DEFAULT_MAX_PROCESSES") or {}).get("value")
-        if not isinstance(value, str) or not value.strip().isdigit() or int(value) < 1:
+        info = read_worker_record(shell, node, sandbox_id)
+        record = info.get("record") or {}
+        value = record.get("max_processes")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise Refusal(
-                f"the lane does not declare E2B_DEFAULT_MAX_PROCESSES inside {node} "
-                f"(read {value!r}), so check 9 has no declaration to compare the "
-                "kernel's pids.max against"
+                f"the worker's record for {sandbox_id} carries no usable "
+                f"max_processes (read {value!r}) in {info.get('path')}"
             )
-        return int(value)
+        return value, info
 
     def declared_ceiling(node: str, key: str, unit: int) -> int:
         """One dimension of the node's per-sandbox ceiling, read in-container.
@@ -1046,6 +1108,22 @@ def main() -> int:
                 "check 8 cannot know which ceiling the refusal should quote"
             )
         return int(value) // unit
+
+    def lane_declared_processes(node: str):
+        """The lane's ``E2B_DEFAULT_MAX_PROCESSES``, or ``None``.
+
+        **Secondary only** (see ``declared_processes``): reported so a reader
+        can see whether the deployment's env agrees with the worker's record,
+        never used as the number the kernel's ``pids.max`` is compared against
+        -- the shipped manifests do not declare it, and a check whose reading
+        depends on an env the lane happens to set is the environment
+        satisfying the check.
+        """
+        observed = report["lane"]["worker_env"].get(node, {}).get("observed", {})
+        value = (observed.get("E2B_DEFAULT_MAX_PROCESSES") or {}).get("value")
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value)
+        return None
 
     def neighbour_on(node: str, *, label: str, memory_mb: int, cpu_count: int = 1):
         """A second sandbox on ``node`` -- the neighbour half of checks 6/7.
@@ -1107,7 +1185,6 @@ def main() -> int:
         *,
         threads: int,
         procs: int,
-        quiet: int,
         window_s: float = 8.0,
     ) -> dict:
         """Run the holder with N threads / N forked children, and read the box.
@@ -1117,15 +1194,16 @@ def main() -> int:
         matters is what it reaches with the extra tasks present, not what it is
         after they exit.
 
-        Waits for the box to come back to ``quiet`` first: the previous
-        holder's own processes (a forked child lives 10 s) and the plumbing of
-        the command that just finished can still be draining, and a task
-        counted here would be read as part of *this* holder's unit (measured:
-        an unsettled baseline read 9 instead of 8, which turns the two-thread
-        delta into 1).
-
-        The *steady* minimum -- after this holder's own plumbing has settled --
-        is what the unit is read from; the peak is kept for the record.
+        The unit is read as the **difference between two same-shape holders**
+        (no extras / two threads / one forked process), so the command's own
+        plumbing -- and anything still draining from the previous holder --
+        cancels out. Do not read an absolute number instead: measured, the box
+        does not return to its quiet idle count between holders (idle 6, the
+        next holder's steady window 8), so an absolute reading would be a
+        statement about the plumbing. The *steady* minimum of this holder's
+        window is used (the first seconds still carry that plumbing's
+        transient); the peak and the pre-holder reading are kept for the
+        record.
         """
         holder: dict = {}
 
@@ -1135,14 +1213,7 @@ def main() -> int:
                 timeout=180,
             )
 
-        settled = False
-        deadline = time.monotonic() + 25
-        while time.monotonic() < deadline:
-            probe = read_limits(shell, node, cgroup)
-            if probe["pids_current"].isdigit() and int(probe["pids_current"]) == quiet:
-                settled = True
-                break
-            time.sleep(0.5)
+        pre_holder = read_limits(shell, node, cgroup)
         thread = threading.Thread(target=run_holder, daemon=True)
         thread.start()
         started = time.monotonic()
@@ -1167,8 +1238,8 @@ def main() -> int:
         return {
             "threads": threads,
             "forked_processes": procs,
-            "settled_to_quiet": settled,
-            "quiet_pids_current": quiet,
+            "pre_holder_pids_current": pre_holder["pids_current"],
+            "pre_holder_cgroup_procs": pre_holder["cgroup_procs"],
             "steady_pids_current": min(steady) if steady else None,
             "steady_samples": steady,
             "peak_pids_current": peak_tasks,
@@ -1346,7 +1417,9 @@ def main() -> int:
                     "the kernel"
                 )
             note_box(forker, fork_node, fork_cgroup)
-            declared_tasks = declared_processes(fork_node)
+            declared_tasks, declared_record = declared_processes(
+                fork_node, forker.sandbox_id
+            )
             before = read_limits(shell, fork_node, fork_cgroup)
             neighbour, neighbour_cgroup = neighbour_on(
                 fork_node, label="fork-neighbour", memory_mb=_HOG_MEMORY_MB
@@ -1412,6 +1485,9 @@ def main() -> int:
                     "neighbour keeps its round trip"
                 ),
                 declared_processes=declared_tasks,
+                declared_processes_source=declared_record.get("path"),
+                worker_record=declared_record.get("record"),
+                lane_env_declared_processes=lane_declared_processes(fork_node),
                 pids_max_before=before["pids_max"],
                 forks=forks,
                 errno=errno_read,
@@ -1493,12 +1569,16 @@ def main() -> int:
                 and (cpu_body or {}).get("message") == expected_cpu
                 and mem_status == 400
                 and (mem_body or {}).get("message") == expected_mem
-                and ok_status == 201,
+                and ok_status == 201
+                # ... and the boundary box is really gone: a leak here would
+                # spend a node's whole ceiling for the rest of the run.
+                and delete_status == 204,
                 criterion=(
                     "cpuCount/memoryMB past the node's per-sandbox ceiling answer "
                     "exactly 400 with the message that quotes that ceiling, and a "
                     "request *at* the ceiling is accepted (201); a node that has not "
-                    "reported a ceiling answers the named 503 instead (R12)"
+                    "reported a ceiling answers the named 503 instead (R12); and the "
+                    "boundary box's DELETE answers 204"
                 ),
                 ceiling_source=f"E2B_MAX_SANDBOX_* read inside {ceiling_node}",
                 cpu_ceiling=cpu_ceiling,
@@ -1534,7 +1614,7 @@ def main() -> int:
                 )
             note_box(box, node, cgroup)
             declared_memory_bytes = int(declared["memoryMB"]) * 1024 * 1024
-            declared_tasks = declared_processes(node)
+            declared_tasks, declared_record = declared_processes(node, box.sandbox_id)
             limits = read_limits(shell, node, cgroup)
             holder = box.commands.run(
                 "cat > alloc.py <<'PYEOF'\n"
@@ -1553,16 +1633,9 @@ def main() -> int:
                 if peak >= _PEAK_ALLOC_BYTES:
                     break
             holder.wait()
-            quiet = int(limits["pids_current"])
-            baseline = hold_reading(
-                box, node, cgroup, threads=0, procs=0, quiet=quiet
-            )
-            two_threads = hold_reading(
-                box, node, cgroup, threads=2, procs=0, quiet=quiet
-            )
-            one_process = hold_reading(
-                box, node, cgroup, threads=0, procs=1, quiet=quiet
-            )
+            baseline = hold_reading(box, node, cgroup, threads=0, procs=0)
+            two_threads = hold_reading(box, node, cgroup, threads=2, procs=0)
+            one_process = hold_reading(box, node, cgroup, threads=0, procs=1)
             thread_delta = (
                 two_threads["steady_pids_current"] - baseline["steady_pids_current"]
             )
@@ -1590,13 +1663,15 @@ def main() -> int:
                 declared_memory_mb=declared["memoryMB"],
                 declared_memory_bytes=declared_memory_bytes,
                 declared_processes=declared_tasks,
+                declared_processes_source=declared_record.get("path"),
+                worker_record=declared_record.get("record"),
+                lane_env_declared_processes=lane_declared_processes(node),
                 memory_max=limits["memory_max"],
                 memory_high=limits["memory_high"],
                 pids_max=limits["pids_max"],
                 peak_after_alloc=peak,
                 peak_alloc_bytes=_PEAK_ALLOC_BYTES,
                 pids_current_idle=limits["pids_current"],
-                pids_current_quiet=quiet,
                 pids_current_holder_threads0_processes0=baseline,
                 pids_current_holder_threads2_processes0=two_threads,
                 pids_current_holder_threads0_processes1=one_process,
