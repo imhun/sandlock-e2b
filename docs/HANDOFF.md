@@ -396,8 +396,12 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   root 或 CAP_SETUID/SETGID/CHOWN。
 - **容量/成本进文档**：`docs/production-deployment-requirements.md` 新增 §2.4
   （`E2B_UID_POOL_SIZE` = 并发沙箱上限、多 worker 必须不重叠段、每沙箱多一棵
-  **不计入** `max_memory`/`max_disk` 的 supervise 进程树、uid 只在支持属主的文件系统上有意义、
+  supervise 进程树、uid 只在支持属主的文件系统上有意义、
   显式 `false` 才回到共享 uid 1000 形态），compose 里同段注释。
+  **2026-10-06 更新（N83 Phase 2）**：那棵 supervise 树不再"不计入" —— 它与载荷同在一个
+  `sbx_<id>` cgroup ⇒ **CPU、内存、任务数三项都计入**沙箱额度（只有磁盘仍不计，`max_disk` 是树），
+  真 cgroup v2 读数见 `.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-3-report.md`
+  （`pids.current=3` = 2 线程 + 1 进程在 `task-5-report.md`）。
 - **翻默认翻出来的三处，全部改掉**：
   1. 5 条启动日志单测（quota 系列）原本钉死「非 root worker 的 WARNING 列表」，
      现在多一条 E3.2 披露 ⇒ 改成 `_uid_disclosure()`（root 档 []、非 root 档恰好那条），

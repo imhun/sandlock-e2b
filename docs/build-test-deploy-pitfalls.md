@@ -460,12 +460,17 @@ netns 开关与 `E2B_NET_BIND_INJECT` 都在 `deploy/stack/docker-compose.prod.y
 ## D. 探针方法论（沙箱内观测）
 
 **D1. 沙箱内 `/proc` 是虚拟化的**：`ps` 看不到进程、`/proc/net/tcp`/`/proc/self/ns/net` 可能 EPERM。
-替代：`socket.if_nameindex()` 看网卡（判别 netns）、读 `/proc/meminfo` 看内存账本、
+替代：`socket.if_nameindex()` 看网卡（判别 netns）、读 `/proc/meminfo` 看内存账本**（只在 `E2B_SANDBOX_CGROUP=off` 车道；`required` 上 `MemFree` 不跟账本走，见 D2）**、
 从 **worker 容器** 的 `/proc/net/tcp` 看监听端口。
 
-**D2. 判断"谁吃了内存"就读箱内 `/proc/meminfo` 的 `MemFree`**（`= 上限 − ledger`），
-不要用 RSS/`statm` 反推：sandlock 记的是**匿名映射预留**（线程的 glibc arena 一次 64 MiB，
-不 touch 也算）。单位成本可用"同一条命令前后各读一次账本"测出来（见 §2.4.9）。
+**D2. 判断"谁吃了内存"就读箱内 `/proc/meminfo` 的 `MemFree`**（`= 上限 − ledger`）——
+**这条只在 `E2B_SANDBOX_CGROUP=off` 车道上成立**：出厂清单跑的 `required` 上中介账本已退役，
+`MemFree` 恒等于全额（`MemTotal`/`sysinfo` 仍报声明额度），内存由沙箱自己 cgroup 的
+`memory.high`/`memory.max` 强制（先节流、撑不住 SIGKILL 分配者），撞墙由 `memory.events` 的
+`oom_kill` 记下来并随心跳上报（`memory.peak`/`pids.current` 是 Task 7 ⑨ 的验收项；真 cgroup v2
+读数见 `.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-3-report.md` / `task-5-report.md`）。
+`off` 上仍然不要用 RSS/`statm` 反推：sandlock 记的是**匿名映射预留**（线程的 glibc arena 一次
+64 MiB，不 touch 也算）。单位成本可用"同一条命令前后各读一次账本"测出来（见 §2.4.9）。
 
 **D3. 沙箱内普通命令连自己的 loopback 会被策略拒绝（`ConnectionRefused`）**——
 这不是 netns 的问题，别拿它当指标（两种形态都一样）。
