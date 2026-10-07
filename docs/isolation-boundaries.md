@@ -9,11 +9,14 @@
 
 | 命名空间 | 开关 | 谁创建 | 买到什么 |
 |---|---|---|---|
-| **userns** | 形态自带（`E2B_PER_SANDBOX_UID`） | route B 槽位的子进程自己 `unshare(CLONE_NEWUSER)` | 身份翻译：**箱内 uid 0 ↔ 宿主侧沙箱池 uid** |
+| **userns** | 形态自带（`E2B_PER_SANDBOX_UID`） | own identity 槽位的子进程自己 `unshare(CLONE_NEWUSER)` | 身份翻译：**箱内 uid 0 ↔ 宿主侧沙箱池 uid** |
 | **pidns** | `E2B_PID_NS`（部署清单全开，代码默认 `false`） | 建箱的 `clone3` 一次带 `NEWUSER\|NEWPID`（N80 之前是 fork 的中间进程） | 箱内看不见宿主与其他沙箱的 pid |
 | **netns** | `E2B_ENABLE_NET_ISOLATION` + `E2B_FD_INJECT_CONNECT`（**必须成对**） | fork | 箱内只有 `lo`；出口由 supervisor 代连 |
 
 ## 1. userns：身份翻译，不是隔离
+
+> **旧称 route B（2026-10 按本质改名）**：这套机制现在的名字是 **own identity**（选型：这份工作以谁的 uid 在
+> 宿主上发生），承载它的进程池叫 **slot**，身份怎么授予叫 **identity grant**。历史文档与发版记录保留旧名。
 
 每个沙箱一个用户命名空间，映射**只有一条**：箱内 `uid 0` ↔ 宿主侧**这个沙箱自己的池 uid**
 （fork 的 F18 自映射）。于是：
@@ -28,10 +31,10 @@
 1. worker fork 一个子进程，子进程自己 `unshare(CLONE_NEWUSER)` 并向控制面报
    `{sandbox_id, pid}` —— 它**不知道也不需要知道** uid；
 2. 控制面按自己记录里的 `sandbox → host_uid` 查出 uid，指令**本节点 agent** 写
-   `uid_map`/`gid_map`（[../envd_service/slot_identity.py](../envd_service/slot_identity.py)）；
+   `uid_map`/`gid_map`（[../envd_service/identity_grant.py](../envd_service/identity_grant.py)）；
 3. 子进程轮询 `setresuid(X)` 直到成功，再 exec `sandlock-supervise`。
 
-这也是为什么 route B 的槽位身份只能是 `agent-grant`：worker 自己既没有 `CAP_SETUID`，
+这也是为什么 own identity 的槽位身份只能是 `agent-grant`：worker 自己既没有 `CAP_SETUID`，
 也不该拥有"给一个进程安上任意身份"的能力。补充组在 `as_uid` 写 gid 映射时被
 `setgroups=deny` 关掉，所以槽位进程保留的是 worker 的补充组（与旧路径一致）。
 
@@ -48,7 +51,7 @@
 `clone3(CLONE_NEWUSER|CLONE_NEWPID|…)` 同时给出两者（N80 之前由中间进程先 unshare userns、
 再 unshare pidns；两个进程角色的分工与现场读数见 [§4](#4-进程结构一个二进制两个进程角色)）。
 这也是 2026-09-16 那个缺陷的位置：当时的中间进程只认"特权 remap"
-和"自身身份"两种映射，route-B 箱在 pid_ns 下会掉回宿主槽位 uid（`id -u` = 21000），
+和"自身身份"两种映射，own-identity 箱在 pid_ns 下会掉回宿主槽位 uid（`id -u` = 21000），
 修法是让它按与 `confine_child` 同一套三选一挑映射（fork `5b16855`）。
 
 **代价**：pid_ns 打开后 fork 要拦 stat 族（`newfstatat`/`statx`/`faccessat`/`readlinkat`…）。

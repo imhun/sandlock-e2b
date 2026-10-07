@@ -61,7 +61,7 @@ CP API → 选节点 → HTTP 调 envd (_provision_remote)
   `health.sock` 才绕过去）。C1 的全部设计意图就是**让 worker 能完成特权动作**。
 - 还有一批路径 worker **完全自主**触发，控制面根本不在链路上：
   `_startup_uid_reconcile` / `_startup_reconcile_once`（worker 启动时扫盘回收孤儿）、
-  `checkpoint_store` 镜像目录回收、`route_b.py` 策略文档、`volumes.py` 卷切片建立/删除。
+  `checkpoint_store` 镜像目录回收、`own_identity.py` 策略文档、`volumes.py` 卷切片建立/删除。
 
 所以「这些特权操作应该由控制面触发」**今天不是事实**；它是 C3 要达成的**目标**。
 
@@ -102,7 +102,7 @@ worker 的进程树里，worker 的 fd 穿过这次 execve 原样到达槽位。
 ### 2.2 唯一真实依赖：**谁当父进程**
 
 worker 不只是"起"槽位，它还**管**槽位，而这一段是彻底的父子进程语义
-（`envd_service/route_b.py` 的 `W1SlotPool`）：
+（`envd_service/own_identity.py` 的 `W1SlotPool`）：
 
 | 用途 | 调用 | 为什么绑父进程 |
 |---|---|---|
@@ -206,7 +206,7 @@ signal number"*），由 supervisor 去杀它自己的孩子。
 | 2 | 属主交棒（`uid_pool.apply_sandbox_ownership`） | **CP**（或以 X 建立后直接消失） | |
 | 3 | 卷切片（`volumes.py`） | **CP** | CP **今天就已经在建卷根**（`control_plane/api/volumes.py`） |
 | 4 | 检查点镜像目录（`checkpoint_store`） | 拆两半：**建**归 CP，**GC** 归 CP 巡检 | |
-| 5 | route-B 策略文档（`route_b.py`） | **CP**（见 §4.3 —— 这一条比看上去重要） | |
+| 5 | own-identity 策略文档（`own_identity.py`） | **CP**（见 §4.3 —— 这一条比看上去重要） | |
 | 6 | 沙箱 secret 注入（`executors/sandlock.py`） | **CP** | CP 已经管 `_secrets` |
 | 7 | 孤儿回收（`uid_pool.reconcile`） | **CP**（须重新设计，见 §5.2） | |
 | 8 | 迁移导入 tar 解包 | **CP** | |
@@ -521,7 +521,7 @@ agent 看得全（不只自己名下）、被攻破也不构成"说谎"（它本
 
 #### 6. 策略文档 / 身份参数的权威来源 —— **在 (d) 之后已经变形，需要重述**
 
-**问题**：原 §4.3 的想法是"把 route-B 策略文档从 worker 上移到 CP 写"。**(d) 之后这条要重述**：
+**问题**：原 §4.3 的想法是"把 own-identity 策略文档从 worker 上移到 CP 写"。**(d) 之后这条要重述**：
 worker 不再 setuid，它是**自己** `exec sandlock-supervise --policy <P> --uid X` —— 也就是说
 **X 和 P 仍然由 worker 提供**。
 
@@ -1525,8 +1525,8 @@ agent 不仅能读写沙箱文件，还能**直接向沙箱注入命令**。
 **`path` 传输看起来更干净（没有新连接），但它正是 transport 1 被造出来取代的那个形态。**
 `docs/HANDOFF.md` 有一整节：
 
-> ## ⚡ route-B transport 1：token 从 argv 消失（2026-09-09，SL-10 闭口 / fork F17）
-> …route-B 槽位的凭证现在是**一条继承来的 unix 描述符**，argv 里没有 `--token`，
+> ## ⚡ own-identity transport 1：token 从 argv 消失（2026-09-09，SL-10 闭口 / fork F17）
+> …own-identity 槽位的凭证现在是**一条继承来的 unix 描述符**，argv 里没有 `--token`，
 > `/tmp` 里也没有注册 socket（`sun_path` 108 字节约束随之消失）。
 
 促使它被造的是一次**实测**：`/proc/<pid>/cmdline` 是 **0444 且不走 ptrace 门**（只有 `environ`
@@ -1539,7 +1539,7 @@ agent 不仅能读写沙箱文件，还能**直接向沙箱注入命令**。
 用 `RegisteredPathChannel::bind_with_token(name, peer_uid, token)`。）
 
 `path` 传输还有一条初稿没看到的成本：`_registry_sock_path` 返回的是
-**`/tmp/sandlock-ctl-<uid>-registry/…`** —— **pod 本地、硬编码，不走 `E2B_ROUTE_B_TMP_ROOT`**
+**`/tmp/sandlock-ctl-<uid>-registry/…`** —— **pod 本地、硬编码，不走 `E2B_SLOT_TMP_ROOT`**
 （那个变量指的是 NAS 上的槽位文档；worker manifest 里也没有 `/tmp` 挂载）。agent 起的槽位会在
 **agent pod 的 `/tmp`** 建 socket，**worker 根本看不见** ⇒ 它**也必须**新增一条 hostPath 共享路径：
 **它并没有省掉共享路径，只是换了一条。**
@@ -1820,11 +1820,11 @@ file-capability 二进制整段删除），所以现在要说清楚**回退面�
 
 | 想退回到 | 怎么退 | 代价 |
 |---|---|---|
-| **Task 2 的"槽位身份不走 agent"**（`E2B_SLOT_IDENTITY=spawn`） | **只能整批 revert（清单 + 镜像）** | `spawn` 现在是 `RouteBConfig`/`from_settings` 双双按名字拒绝的取值；它要的 `e2b-slot-spawn` 也早已不在 worker 镜像里（N52 连它的 Python 侧 `helpers.slot_spawner` 都删了）。要退就得退到含那个二进制与 `_spawn_slot` 的版本 |
+| **Task 2 的"槽位身份不走 agent"**（`E2B_IDENTITY_GRANT=spawn`） | **只能整批 revert（清单 + 镜像）** | `spawn` 现在是 `OwnIdentityConfig`/`from_settings` 双双按名字拒绝的取值；它要的 `e2b-slot-spawn` 也早已不在 worker 镜像里（N52 连它的 Python 侧 `helpers.slot_spawner` 都删了）。要退就得退到含那个二进制与 `_spawn_slot` 的版本 |
 | **Task 4 的"文件操作不走 agent"**（`E2B_PRIV_HELPER_TRANSPORT=exec`） | **只能整批 revert（清单 + 镜像）** | N52 起 `exec` 不再是可取值（`TRANSPORTS` 只剩 `auto`/`agent`），启动自检具名拒绝；worker 侧的 broker 实现与 `E2B_PRIV_HELPERS` 旋钮已删，出厂镜像也没有 `/var/lib/e2b-priv/` |
 | **C1 的"节点 broker 做特权动作"**（`E2B_PRIV_HELPER_TRANSPORT=socket`） | **不再是原地可切的开关** | 代码路径已删（`TRANSPORTS` 不含 `socket`），DaemonSet 清单也删了。要退回这个形状只能**整批 revert 到 C1 那一版**（清单 + 镜像 + 那个 DaemonSet） |
 
-⇒ **一句话**：C3 留下的两个"形态开关"（`E2B_SLOT_IDENTITY`、`E2B_PRIV_HELPER_TRANSPORT`）
+⇒ **一句话**：C3 留下的两个"形态开关"（`E2B_IDENTITY_GRANT`、`E2B_PRIV_HELPER_TRANSPORT`）
 现在都只接受**出厂那一种形态**（`agent-grant` / `auto|agent`），三个旧形态（`spawn`、`exec`、
 `socket`）全部是**具名拒绝**而不是可切值 —— 它们都**只能整批 revert（清单 + 镜像）**，且都要把
 已经删掉的 file-capability 二进制一起带回来。盘上的数据不受影响：树仍是
@@ -1892,7 +1892,7 @@ file-capability 二进制整段删除），所以现在要说清楚**回退面�
     （token 就在它可见的 argv 里）**同样被拒**；结论是「**已闭口（SL-10）**」，同时保留一句
     「**这仍是必须记录的暴露面**：任何一次 `ps`/coredump/审计日志都会把 token 落到别人眼前，
     且 `--peer-uid` 一放宽就立刻变成真漏洞」。
-  - `docs/HANDOFF.md` 的同名节（《route-B transport 1：token 从 argv 消失》，2026-09-09，
+  - `docs/HANDOFF.md` 的同名节（《own-identity transport 1：token 从 argv 消失》，2026-09-09，
     SL-10 闭口 / fork F17）—— 含那条**被实测推翻的初版判断**（"跨 uid 读 cmdline 需要 ptrace 权限"
     → `cmdline` 0444 且不走该门），以及"worker 崩溃 ⇒ 通道 EOF ⇒ 槽位自收口"这条**已被依赖**的性质。
   - 实测探针 `deploy/scripts/acceptance/rb_token_probe.py`。

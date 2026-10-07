@@ -55,7 +55,7 @@
 
 #### 1.1.1 探针实测（2026-09-13，`docs/reports/task-cowprobe-report.md`）：**今天根本用不了**
 
-route-B 给了"每沙箱一个常驻 supervise 实例"之后，"`max_disk` 是不是终于可用了"值得实测一次。结论是**不能用**，
+own-identity 给了"每沙箱一个常驻 supervise 实例"之后，"`max_disk` 是不是终于可用了"值得实测一次。结论是**不能用**，
 而且不是口径问题，是**能不能激活 + 强制点在哪**：
 
 1. **在 E2B 形态下压根不激活。** `max_disk` 确实落到了 builder，serve 路径也确实走建分支的代码，

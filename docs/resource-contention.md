@@ -250,9 +250,9 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
   时间增量**（cgroup v2 `cpu.stat` 的 `usage_usec` 差，或该沙箱进程组的 `/proc/<pid>/stat`
   utime+stime 差），把"这段时间确实在烧 CPU"并进 `sandboxActivity` 上报。
   覆盖盲点 2；代价小，不需要新通道。
-* **选项 ii（完整）**：再加上**每沙箱的网络计数**（route-B 槽位的 netns 里
+* **选项 ii（完整）**：再加上**每沙箱的网络计数**（own-identity 槽位的 netns 里
   `/sys/class/net/*/statistics`，或按 pid 聚合），覆盖盲点 1 与 3。代价是要给每个沙箱定位网络命名
-  空间（route-B 槽位天然有；route-A/in-process 形态没有独立 netns，只能按 pid 聚合，精度差）。
+  空间（own-identity 槽位天然有；in-process/in-process 形态没有独立 netns，只能按 pid 聚合，精度差）。
 * **选项 iii（不补）**：接受现状，把上面这张表写进对外文档（"空闲 = 没有经过平台的请求"），
   并建议长任务型沙箱调高阈值或提高 priority。
 
@@ -310,7 +310,7 @@ E2B_CREATE_QUEUE_MAX=100             # 排队上限（满 → 429 + retry-after�
    heartbeat 循环）会采；combined 形态（控制面与 worker 同进程）今天不采 —— 它本来也不是
   产能形态，且它的空闲判定与驱逐在同一个进程里，等真有人用再补。
 2. **ii（每沙箱网络计数）留到真有人用纯 egress / 沙箱互访型长任务时**：那时才需要给每个
-   沙箱定位网络命名空间（route-B 槽位天然有；route-A/in-process 只能按 pid 聚合，精度差）。
+   沙箱定位网络命名空间（own-identity 槽位天然有；in-process/in-process 只能按 pid 聚合，精度差）。
 3. **不论做到哪一步，都把语义写进对外文档**：空闲 = "没有经过平台的请求 + 没有在烧 CPU
    （做完 i 之后）"，长任务型沙箱仍建议调高阈值或提高 priority。
    **已写入** §3.1 的"空闲的对外口径"与 §4 第 4 条（2026-09-25）。
@@ -360,7 +360,7 @@ headroom 已关闭在 E2B 侧（FUP #3）：默认箱从 512 MiB 提到 1 GiB
 （`E2B_DEFAULT_MEMORY_MB`），fork 逻辑未改动。
 
 **口径更新（2026-10-06，N83 Phase 1 每沙箱 cgroup 落地之后）**：上面这套记账按**进程属主
-uid** 汇总，而 route-B 槽位的 `sandlock-superv` 与它管的载荷**同 uid** —— "这段 CPU 是谁烧的"
+uid** 汇总，而 own-identity 槽位的 `sandlock-superv` 与它管的载荷**同 uid** —— "这段 CPU 是谁烧的"
 在 cgroup 之前靠 uid 归属，在 cgroup 之后**多了一层内核口径**：supervisor 现在跑在沙箱**自己的**
 `sbx_<id>` 子树里，它的 CPU 既照旧计入这条 uid 汇总（活动判定与 Phase 0 的 `measuredCpuPercent`
 口径都没变），又和载荷一起被同一个 `cpu.max` 节流。也就是说，**"沙箱自己烧了多少"与"沙箱被

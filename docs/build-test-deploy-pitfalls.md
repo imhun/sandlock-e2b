@@ -31,7 +31,7 @@
 **A4. 新增 fork 策略字段要改全，漏一处报错各不同。**
 清单：builder 字段 + 方法 + `Default`、`Sandbox` 的 `From<&Builder>`、`validate()`、`unsupported` 列表、
 `POLICY_FIELDS`（**按字典序**）、示例 policy JSON、supervise 解析 + 回读校验、FFI 函数 + 头、
-python `_sdk.py`（`_b_*` + `_HANDLED_FIELDS` + 应用点）、E2B `route_b.py::_POLICY_FIELDS`、执行器 kwargs。
+python `_sdk.py`（`_b_*` + `_HANDLED_FIELDS` + 应用点）、E2B `own_identity.py::_POLICY_FIELDS`、执行器 kwargs。
 对应报错：`POLICY_FIELDS must be sorted` / `example policy must cover every manifest field` /
 `policy contains unknown field(s)` / `AttributeError: 'SimpleNamespace' object has no attribute …`（测试桩）。
 
@@ -87,7 +87,7 @@ docker buildx build --builder multiarch --platform linux/amd64 \
 
 父仓曾经还有一份**副本** `third_party/sandlock-wheel-builder/`（`Dockerfile` + `cargo-config.toml`
 + `zigcc`，其中后两个与 fork 的**逐字节相同**）。它 2026-09-09 就被标 SUPERSEDED（出的 wheel 不带
-`sandlock-supervise`，install 正常但 route B 静默拒绝起槽位 —— `build-sandlock-wheels.sh` 头部记着
+`sandlock-supervise`，install 正常但 own identity 静默拒绝起槽位 —— `build-sandlock-wheels.sh` 头部记着
 这次实测），**2026-09-30 已删除**：两份几乎相同的配方正是"下一个人照着错的那份跑"的来源，而
 `tests/unit/test_one_sandlock_wheel_recipe.py` 现在钉住"父仓里不许再出现第二份"。
 
@@ -222,9 +222,9 @@ wheel 是 09-20 的（含 N25 的 `max_file_size`），`tests/unit` 因此红 31
 `docker build -f deploy/docker/Dockerfile.test-runner -t e2b-sandlock-test:latest .`
 
 **B8. 两个测试文件共用同一段 uid 池 ⇒ 后一个文件里只看得见 `exit 127`。**
-route-B 每个 uid 只租**一个活槽位**（"W1 recycles a uid only by restarting its process,
+own-identity 每个 uid 只租**一个活槽位**（"W1 recycles a uid only by restarting its process,
 never by sharing it"）；若两个文件用同一段，第二个文件建箱时槽位还被前一个文件的沙箱占着，
-命令回 127、**原因只在 stderr**（`route-B uid N already has a live slot`）。
+命令回 127、**原因只在 stderr**（`own-identity uid N already has a live slot`）。
 做法：每个测试文件用自己的 uid 段（`test_shared_volume_relative_cwd` 现在用 22000），
 且控制面与 worker 必须配**同一段**——OBS-9 之后 uid 由控制面分配、worker 只做范围校验，
 只配 worker 会得到 `500 uid 10000 is outside this worker's pool`。
@@ -242,7 +242,7 @@ volume mount 会**原样透传**这个数（`single_file_ceiling_bytes` 靠它�
 
 **B6. 冷 lane 首次建箱 `428 warm_required`。**
 原因：每条 lane 都是新容器、`E2B_TEST_TMP_ROOT` 容器原生，镜像缓存不持久。
-做法：按 428 的提示带 `X-Sandbox-Id` 走幂等建箱（`tests/contract/test_nonroot_route_b.py` 的新用例是范例），
+做法：按 428 的提示带 `X-Sandbox-Id` 走幂等建箱（`tests/contract/test_nonroot_own_identity.py` 的新用例是范例），
 或重跑一次（第二次已预热）。
 
 **B7. 内存/形态契约不要写死。**
@@ -263,7 +263,7 @@ volume mount 会**原样透传**这个数（`single_file_ceiling_bytes` 靠它�
 （脚本自己会大声警告，别把警告当噪音跳过。）
 
 **B11. "箱内 `id -u` = 0"不能单独当形态证据。**
-原因：pid_ns 关着时这条同样成立（route-B 自映射本来就把客人做成 root），所以拿它当 pid_ns 的
+原因：pid_ns 关着时这条同样成立（own-identity 自映射本来就把客人做成 root），所以拿它当 pid_ns 的
 验收时会得到假绿。做法：配对一条只有该形态才成立的观测 —— 例如 `kill(<宿主 pid>, 0)`：
 自有 pid ns 里是 `ESRCH`，共享宿主 pid ns 里是 `EPERM`（探针 `deploy/scripts/acceptance/pidns-shape-probe.py`）。
 
@@ -364,7 +364,7 @@ fail closed** 并点出架构名（错的号会伪装成 seccomp 问题，见上
 **B15. checkpoint 落盘踩的两个"形态"坑（2026-09-25，都是同一件事的两个面）。**
 两者都是**只在集群上才会出现**的：本机的 fork 套件要么用静态 helper、要么跑在 root 上。
 
-1. **写图的进程是沙箱自己的 uid，不是 worker 的。** route-B 下 slot 以沙箱的池 uid 跑
+1. **写图的进程是沙箱自己的 uid，不是 worker 的。** own-identity 下 slot 以沙箱的池 uid 跑
    （实测 `host_uid=10001`，slot 进程 `uid=10001`，worker 是 root）。所以图所在的目录必须能
    被那个 uid 写：我们第一版按设计写成"worker 0700"（`_runtime/<id>/checkpoint`），结果是
    引擎**捕获成功、保存失败** `checkpoint save failed: … Permission denied`。

@@ -361,6 +361,17 @@ BARE_NAME_ALLOWANCES = {
         "（载体 C 由控制面直接送指令，不再有票据端点）：两份建箱计划都在叙述"
         "这次删除，不是在让人去跑它"
     ),
+    # route B -> own_identity 改名（2026-10-07）：三份**冻结目录**（docs/
+    # superpowers/plans、docs/reports 之外的历史）与发版记录
+    # docs/deploy-clusters.md 里引用的旧文件名。这些目录记的是当时的事实
+    # （见 docs/superpowers/plans/2026-10-06-route-b-rename-to-own-identity.md
+    # 的「历史文档不改」），所以按名引用的是**改名之前**的那个文件，而不是
+    # 让人今天去跑一个不存在的脚本。
+    "route_b.py": "改名前的模块（现 own_identity.py）；docs/superpowers、docs/security-audit 里的历史计划引它",
+    "slot_identity.py": "改名前的模块（现 identity_grant.py）；docs/deploy-clusters.md 的发版记录引它",
+    "test_nonroot_route_b.py": "改名前的用例（现 test_nonroot_own_identity.py）；历史审计/计划在引它",
+    "test_route_b_slot_pool.py": "改名前的用例（现 test_own_identity_slot_pool.py）；改名计划在叙述这次改名",
+    "test_sandlock_executor_route_b.py": "改名前的用例（现 test_sandlock_executor_own_identity.py）；历史审计/计划在引它",
 }
 
 #: The k0s white-box audit docs list their one-off probes as an *index* (a table

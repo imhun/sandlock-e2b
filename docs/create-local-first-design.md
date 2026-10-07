@@ -201,7 +201,7 @@ n = 10 个命名空间 + 8 个快照 id + 2 个节点）。命令见 §7.3。
 |---|---|---|
 | 沙箱树 | 8 GiB | `E2B_NODE_DISK_MB=8192` 的调度额度（8 × 1 GiB） |
 | 镜像解包缓存 | 4 GiB | 实测 3.8 G，上限 `E2B_IMAGE_CACHE_MAX_BYTES` |
-| 本节点 state（Task 4） | ≪ 1 G | `.creating`/disk-stats/route-B/uid 池本地件，都是小文件 |
+| 本节点 state（Task 4） | ≪ 1 G | `.creating`/disk-stats/own-identity/uid 池本地件，都是小文件 |
 | **合计** | **≈ 12 GiB** | 占 68–75 GiB 空闲的 **16%** |
 
 **如果把快照仓也放本地（本计划不这么做，但这是 75 G 那道题的正解）**：

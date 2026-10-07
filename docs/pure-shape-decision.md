@@ -57,8 +57,8 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
 **C. 让这个形态变成显式选择（fail closed 默认）**
 不修能力，先修"默认"：没有 rootfs 时**拒绝建箱**（给出可读原因），除非运维显式设置
 （例如 `E2B_ALLOW_PURE_SHAPE=1`）—— 平台自己的 gate B 改成显式设置它。
-这与本仓库既有的做法一致（SL-1 的路径中介"建箱前拒绝且没有降级档"、route-B "强开而前置
-不满足 ⇒ 建箱报错，不静默退 route-A"）。
+这与本仓库既有的做法一致（SL-1 的路径中介"建箱前拒绝且没有降级档"、own-identity "强开而前置
+不满足 ⇒ 建箱报错，不静默退 in-process"）。
 *代价*：几乎没有（一个开关 + 一段文档 + lane 里那一处显式设置）；*收益*：把"默认部署下
 一不小心就落到无中介形态"这件事**变成一次显式决定**。它**不修** pure 形态本身的三个缺口。
 
@@ -87,7 +87,7 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
    的核心验收一次通过：原先 `xfail(strict=True)` 的
    `tests/security/escape/test_path_surface_inotify.py::test_pure_shape_inotify_still_reaches_the_host_root`
    变成正向断言通过（宿主目录被拒 + 无事件泄漏，沙箱自己的 workspace 仍可 watch）。
-   代价与前置也随之确定：**pure 形态从此需要 route B 槽位**（否则中介以 euid 0 跑被
+   代价与前置也随之确定：**pure 形态从此需要 own identity 槽位**（否则中介以 euid 0 跑被
    SL-1 守卫拒 → fail closed，与既有纪律一致），因此**第一步是把 29 条假定"纯形态不中介"
    的测试迁移过来**（清单与证据见 backlog N15 行：8 个 security 文件里直接构造
    `SandlockExecutor` 的用例改用 `route_b_sandbox(None, None)`、选择矩阵那条改成"自动上
@@ -138,12 +138,12 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
 * **ceiling 要写回 `kwargs`**：`_policy_ceiling` 的 dict 在形状分支**之前**就建好了（镜像形态靠
   `fs_readable` 含 `/` 恰好绕开这条检查），只改局部变量是死代码 ⇒ per-exec cwd 被 fork 拒
   （`exec params exceed the instance policy ceiling`）。
-* **凭据文件跟读者走**：route-B 槽位以**沙箱的 uid**运行，而 E2B 原先把 http-auth 的 secret 写成
+* **凭据文件跟读者走**：own-identity 槽位以**沙箱的 uid**运行，而 E2B 原先把 http-auth 的 secret 写成
   `0600 root` ⇒ 槽位读不到，策略校验直接失败（`invalid sandbox: credential file … Permission
   denied`）。现在 chown 给 `host_uid`（文件仍 `0600`）；这不是暴露 —— 它落在沙箱所有 fs 授权
   之外（镜像形态在 rootfs 之外，pure 形态在 `can_read` 白名单之外）。
 
-路由选择：`_route_b_decline_reason` 的 `mediation_shape` 现在对**所有**形状为真（`auto` 到处上
+路由选择：`_own_identity_decline_reason` 的 `mediation_shape` 现在对**所有**形状为真（`auto` 到处上
 槽位，因为中介必须以沙箱自己的 uid 跑，T5）；`_in_process_mediation_is_refused` 同理不再对 pure
 短路。拿不到槽位且中介只能以 root 跑时**照样 fail closed**（SL-1），不再有"共享 uid 的 root
 worker + pure"这条能跑但不中介的路。
@@ -285,7 +285,7 @@ worker 自己的两个入口 + 把 restore stub 指到树外"那一版（`tmp/k0
 **其他"pure 根 = `/`"的命中怎么处置**（Task 14 Step 1 的全仓扫描，逐条都在这里落定）：产品
 docstring（`envd_service/executors/sandlock.py` 的 `_chroot_root`/`_view_cwd`）与
 `envd_service/config.py` 的字段注释都已经按两形态写；`tests/security/conftest.py`、
-`tests/security/escape/test_path_surface_inotify.py`、`tests/contract/test_route_b_executor.py`
+`tests/security/escape/test_path_surface_inotify.py`、`tests/contract/test_own_identity_executor.py`
 里的注释按产品默认写（`E2B_PURE_ROOTFS` 未设 = `synth`；`tests/security/conftest.py` 已改成照
 `Settings` 解析，不再自带一份形状规则）；`docs/HANDOFF.md` 顶部那段与
 `docs/superpowers/plans/2026-09-10-*` 是**带日期的留档**，按"不改写历史记录"的纪律不动。

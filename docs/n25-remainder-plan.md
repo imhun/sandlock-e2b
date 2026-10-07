@@ -75,7 +75,7 @@
 `deploy/scripts/build-and-push.sh` 重建并推送，`deploy/k8s-k0s/apply.sh` 滚动两个 worker +
 控制面，全部换成该版本（pod 的 `.status.containerStatuses[0].image` 逐条核对）。这一次的镜像
 **带上了「修复那 10 个失败」那一轮的代码改动**，其中唯一影响运行时的是一条真 bug 修复：
-`PrivHelpers.slot_spawner()` 现在接受 N25 的 `events_fd`（非 root 生产形态原来会在起 route-B
+`PrivHelpers.slot_spawner()` 现在接受 N25 的 `events_fd`（非 root 生产形态原来会在起 own-identity
 槽位时 `TypeError`）。
 
 | 项 | 证据 |

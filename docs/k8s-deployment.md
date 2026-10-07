@@ -35,7 +35,7 @@
 | `k8s-k0s/gateway-nodeport.yaml` | Service `gateway-nodeport`（**NodePort 31907** → 3000） | **只在自建集群的 overlay 里**：托管集群由 SLB/ingress 承担同一角色，这里没有 LB，所以用固定 NodePort 给集群外一个不漂的入口（访问方式见 `deploy/k8s-k0s/README.md`） |
 | ~~`priv-broker.yaml`~~ —— **已删除（C3 Task 7）** | 曾是 DaemonSet `e2b-priv-broker`（每节点一个 **root** 容器）+ socket hostPath + 3 个 init | **C1 特权外置**：`chown`/`rm`/`walk` 由它经 unix socket `/run/e2b-broker/broker.sock` 做（所以 worker pod 里没有 root）。**C3 Task 7 连同 socket 形态与 `wait-for-broker` 闸门一起退役**：同一批动作现在在 `c3-agent.yaml` 的面 B（见下一行），它的两个属主 init 与 `image-cache-init` 也搬到了那个 pod；本文里凡出现 `priv-broker.yaml` / `ds/e2b-priv-broker` 的步骤都已作废（历史保留）。（整份退役前的清单见 git 历史；能力集与客户端的对照见 `docs/c3-privilege-relocation.md` §14.5） |
 | `c3-agent.yaml` | DaemonSet `e2b-c3-agent`（**每节点一个**、**两个容器**、pod 级 `hostPID: true`）+ NetworkPolicy | **C3 的特权收敛**：面 A `agent` 是**独立镜像** `e2b-sandlock-agent`（`USER 65534:65534` + BND `SETUID/SETGID`）—— CP 把「哪个沙箱、哪个 uid、哪个 pid」发过来，它用宿主 `/proc` 把容器 pid 反查成宿主 pid 再写一次 `uid_map`；面 B `maint` 是 **root** + C1 的三条 cap（`chown`/`dac_override`/`fowner`），**Task 4 片 B 起装上了载荷**：与面 A 同一个服务，听**自己的端口 49986**（D22 —— 两个容器共享 pod netns，同端口会 `EADDRINUSE`；file op 送到 65534 的面 A 上则每个 chown 在 NAS 上 `EPERM`）。入口只允许 control-plane pod（NetworkPolicy，**两个端口**）；它与 `priv-broker` 一样**在基线里**（它的 PVC claim 与 hostPath 都是基线已有的）。**Task 5 加了 initContainer `storage-init`**（root，与面 B 同一理由）：把控制面 pod 里那份 `image-cache-init` 接过来，并按裁定 D24 把 `_volumes`（及 `_volumes/_meta`）**非递归、幂等**地交给 65534 |
-| `worker.yaml` | worker StatefulSet（2 副本 `e2b-worker-0/1`）+ headless Service + PDB | 非 root，且 **Task 4 片 B 起显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（CP 的可信身份来源读的就是 pod spec；只靠镜像 `USER` 会被读成"未知"）；**没有任何 `add`**，且 **`drop: [ALL]`**（BND 空集，字面成立 —— 镜像里的 file-capability 二进制已移出；早先省掉整个 `capabilities:` 块其实是继承了 runtime 默认 BND，收口评审改成显式 drop）；`E2B_PRIV_HELPER_TRANSPORT=agent`（文件操作与槽位身份都走每节点的 agent）+ `E2B_SLOT_IDENTITY=agent-grant` + `Localhost` seccomp profile；**没有 initContainer**（C1 那个 `wait-for-broker` 闸门已由 C3 Task 7 随 `socket` 形态一起退役） |
+| `worker.yaml` | worker StatefulSet（2 副本 `e2b-worker-0/1`）+ headless Service + PDB | 非 root，且 **Task 4 片 B 起显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（CP 的可信身份来源读的就是 pod spec；只靠镜像 `USER` 会被读成"未知"）；**没有任何 `add`**，且 **`drop: [ALL]`**（BND 空集，字面成立 —— 镜像里的 file-capability 二进制已移出；早先省掉整个 `capabilities:` 块其实是继承了 runtime 默认 BND，收口评审改成显式 drop）；`E2B_PRIV_HELPER_TRANSPORT=agent`（文件操作与槽位身份都走每节点的 agent）+ `E2B_IDENTITY_GRANT=agent-grant` + `Localhost` seccomp profile；**没有 initContainer**（C1 那个 `wait-for-broker` 闸门已由 C3 Task 7 随 `socket` 形态一起退役） |
 | ~~`autoscaler.yaml`~~ —— **已删除（2026-09-30）** | 曾是 autoscaler（SA/Role/RoleBinding + Deployment），直接 scale `e2b-worker` | 现在它是 **control-plane 里的一个任务**（`control_plane/autoscaler_service.py`，`E2B_AS_ENABLED=true`，`E2B_AS_MIN/MAX_REPLICAS=2/16`，`E2B_AS_K8S_KIND=statefulset`）；它的 Role 两条规则并进了 `control-plane.yaml` 的 Role，那份 `E2B_AS_INTERNAL_API_KEY` 连同 Deployment 一起删掉（循环读的是进程内函数，不再是 HTTP 客户端）。形状与理由见 `docs/SCALING.md` §6.4 |
 | `seccomp-installer.yaml` | ConfigMap `sandlock-worker-seccomp` + DaemonSet `seccomp-installer` | 把 `deploy/seccomp/sandlock-worker.json` 写到**每个节点的** `/var/lib/kubelet/seccomp/sandlock-worker.json` |
 
@@ -152,7 +152,7 @@ kubectl -n $NS set image ds/seccomp-installer installer=<REGISTRY>/byteplan/e2b-
 ⚠ **`e2b-c3-agent` 是 worker 的上游，且与 `e2b-worker` 是两个不同的仓库**。Task 4 片 B 之后
 `/var/lib/e2b-priv/e2b-maint` 只在 **agent 镜像**里（worker 镜像不再含它，判据 2/15）：
 
-* `e2b-c3-agent` 是 worker 的**上游**（`E2B_SLOT_IDENTITY=agent-grant`，Task 4 起文件操作也走它），
+* `e2b-c3-agent` 是 worker 的**上游**（`E2B_IDENTITY_GRANT=agent-grant`，Task 4 起文件操作也走它），
   它的两个容器（`agent` 面 A / `maint` 面 B）用同一个 tag —— 上面那行显式写两次，免得只改了一个；
 * 它的 `maint` 面还有 broker 的两个属主 init 搬过来后的职责（建平台自己的根、把两个镜像缓存交给
   65534，C3 Task 7 从 `e2b-priv-broker` 接手），所以把它指到 worker 镜像同样不行：
@@ -191,7 +191,7 @@ kubectl -n $NS rollout status sts/e2b-worker
 | 低端口 sysctl | 已撤 | **已撤**（2026-09-17，N5 的配套） | 两边都没有了；顺带关掉了「pod 内任何进程都能绑低端口」这个与沙箱无关的口子 |
 | pid_ns | **开**（2026-09-16 全量） | **开**（2026-09-17 对齐，N10 关闭） | 一致：`kill(pid,0)` 不再是同 pod 进程的存在性探针 |
 | 沙箱身份 | 每沙箱独立 host uid（两 worker 用不重叠段 10000/11000） | 每沙箱独立 host uid（段默认相同，但**共用一个 base ⇒ 共用一个分配器**：`uid_pool.acquire` 先 flock `<base>/.uid_pool.lock`，再按全部 `sandbox.json` + 预约标记重算空闲集 ⇒ 副本之间**不会**发同一个 uid） | 已验（§13）：真集群上 4 个沙箱分布在两个副本、磁盘读出的宿主 uid 互不相同。**前置是锁跨节点**（NAS 上只有 NFSv4.0 成立），autoscaler 上限 2026-09-17 起放开到 16 |
-| route B（槽位） | 每沙箱一个 `sandlock-supervise --uid <槽位>` | **C3 起（Task 3 + Task 4 片 B）**：worker fork + unshare 后把 `{sandbox_id, pid}` 报给 CP，CP 校验后带 uid 指令本节点的 **agent 面 A**（`E2B_SLOT_IDENTITY=agent-grant`，`E2B_PRIV_HELPER_TRANSPORT=agent`）——worker 与 agent 里都不需要 file-capability 二进制；worker 侧显式 pin 的 `runAsUser/runAsGroup` 是"这个 worker 是谁"的可信答案（D21 选项 1） | 一致；worker 的 `SETUID`/`SETGID`（以及 compose 侧那两条 `CHOWN`/`DAC_OVERRIDE`）已随镜像里的二进制一起撤掉，**worker 的 BND 是空集**（判据 2/15） |
+| own identity（槽位） | 每沙箱一个 `sandlock-supervise --uid <槽位>` | **C3 起（Task 3 + Task 4 片 B）**：worker fork + unshare 后把 `{sandbox_id, pid}` 报给 CP，CP 校验后带 uid 指令本节点的 **agent 面 A**（`E2B_IDENTITY_GRANT=agent-grant`，`E2B_PRIV_HELPER_TRANSPORT=agent`）——worker 与 agent 里都不需要 file-capability 二进制；worker 侧显式 pin 的 `runAsUser/runAsGroup` 是"这个 worker 是谁"的可信答案（D21 选项 1） | 一致；worker 的 `SETUID`/`SETGID`（以及 compose 侧那两条 `CHOWN`/`DAC_OVERRIDE`）已随镜像里的二进制一起撤掉，**worker 的 BND 是空集**（判据 2/15） |
 | 配额 | stack 内 quota-agent（`E2B_QUOTA_AGENT_URL`），XFS prjquota 已开 | **无 agent → 降级**（无 per-sandbox 磁盘硬限，一条 WARNING）。⚠ **compose 停用后（2026-09-18）这是 k8s 主线上唯一缺的实能力**，见 §20 | 口径写在 §2.4.4；这台集群的共享卷是**托管 NAS**，agent 必须跑在 NFS 服务端 ⇒ 落不下来；真要硬限得换方案（§20） |
 | seccomp | 容器 `seccomp=<deploy/seccomp/sandlock-worker.json>`（compose 直接引用文件） | `Localhost` profile + DaemonSet 安装器 | 语义相同；k8s 多了"每节点装文件"这一步（§2） |
 | 卷 | 命名卷 `sandbox-shared`（宿主 XFS，支持 prjquota） | RWX PVC（NFS/CephFS） | XFS 项目配额只在 XFS 上；NFS 走 agent 那套 |
@@ -213,13 +213,13 @@ kubectl -n $NS rollout status sts/e2b-worker
 
 worker 侧关键 env（语义见 `deploy/stack/.env.example` 的同名键）：
 `E2B_WORKSPACE_BASE`、`E2B_IMAGE_CACHE_DIR/MAX_BYTES/EVICT_MIN_AGE_S/OWNER_UID`、
-`E2B_ROUTE_B_TMP_ROOT`（C3 Task 4 片 B 起**CP 也要设**：`scope-slot-document` 的路径由 CP 推导，两侧必须逐字一致；
+`E2B_SLOT_TMP_ROOT`（C3 Task 4 片 B 起**CP 也要设**：`scope-slot-document` 的路径由 CP 推导，两侧必须逐字一致；
 值今天在 `E2B_NODE_STATE_BASE` 之下 —— N57 / Task 4 把它从 `E2B_STATE_BASE` 搬到了节点本地，
 因为写者与读者都只在本节点）、`E2B_PRIV_HELPER_TRANSPORT=agent`（**C3 出厂形态**：worker 一个特权二进制都不 exec）、
-`E2B_SLOT_IDENTITY=agent-grant`、
+`E2B_IDENTITY_GRANT=agent-grant`、
 `E2B_NODE_{MEMORY_MB,CPU_PERCENT,DISK_MB,PROCESSES}`（容量声明，autoscaler 与调度都看它）。
 （`E2B_PRIV_HELPER_SOCKET` **已不在 worker env 里**：C3 Task 7 把它连同 `socket` 形态与 broker 一起退役了。）
-控制面侧新增/改动：`E2B_C3_AGENT_MAINT_PORT=49986`（面 B 端口）、`E2B_ROUTE_B_TMP_ROOT`、以及
+控制面侧新增/改动：`E2B_C3_AGENT_MAINT_PORT=49986`（面 B 端口）、`E2B_SLOT_TMP_ROOT`、以及
 `E2B_IMAGE_CACHE_DIR=/var/lib/e2b-images` + `E2B_IMAGE_OCI_DIR=/var/lib/e2b-sandboxes/_images`（**拆分**：
 前者只是 CP 用来推导 `chown-secret` 的路径字符串，必须与 worker 的节点本地缓存逐字一致；后者是模板 OCI tar
 的目录，必须留在共享卷 —— 见 `docs/production-deployment-requirements.md` §2.7.1）。
@@ -609,9 +609,9 @@ aarch64 lane 的共享 netns 套件（`deploy/scripts/arm-lane/guest-prep.sh`，
 
 ```bash
 kubectl -n sandlock get pods -o wide
-kubectl -n sandlock logs sts/e2b-worker | grep -E "seccomp self-check|route-B instance ready"
+kubectl -n sandlock logs sts/e2b-worker | grep -E "seccomp self-check|own-identity instance ready"
 #   seccomp self-check: filter mode active, user namespaces allowed    ← 自检通过
-#   route-B instance ready … uid=<池位> … guest-uid=uid-0-in-userns    ← 槽位起来了
+#   own-identity instance ready … uid=<池位> … guest-uid=uid-0-in-userns    ← 槽位起来了
 kubectl -n sandlock get pods -l app=e2b-worker \
   -o jsonpath='{range .items[*]}{.metadata.name}{" restarts="}{.status.containerStatuses[0].restartCount}{"\n"}{end}'
 ```
@@ -633,7 +633,7 @@ python3 deploy/scripts/multinode_smoke.py
 | 客人身份 | 箱内 `id -u` + 宿主侧落盘文件属主 | `0` / 池内 uid（不是 0） |
 | pid ns（N10 开启后） | 箱内 `kill(1,0)`：`ok`=pid 1 是自己；`EPERM`=容器 init，即共享 pid ns | 开启后 `ok`；另可探一个容器内外来 pid，期望 `ESRCH` |
 | netns（N5 开启后） | 箱内 `socket.if_nameindex()` 只见 `lo` | 开启后只有 lo |
-| 槽位 | worker 日志 `route-B instance ready` 的 `guest-uid=uid-0-in-userns` | 每箱一条 |
+| 槽位 | worker 日志 `own-identity instance ready` 的 `guest-uid=uid-0-in-userns` | 每箱一条 |
 | 端口带水位 | `GET /nodes`（`X-API-Key`）里 `mcpPortsInUse`/`mcpPortsCapacity` | 随 MCP 沙箱数涨落；接近 4535 才需要动作（§2.9） |
 | 配额 | 有 agent 时：`/detect` 的 `prjquota`；`/report` 每项目 `hard_blocks` | 无 agent（本清单默认）时是**降级**，只有一条启动 WARNING |
 
@@ -658,7 +658,7 @@ python3 deploy/scripts/multinode_smoke.py
 2026-09-17 在这台集群上实测：**沙箱数据面在此不可验证**，两条硬前置都不满足 ——
 `landlock_create_ruleset(VERSION)` 返回 **ENOSYS**（`sandlock.landlock_abi_version()` = -1，
 Landlock 要 5.13+），且 `user.max_user_namespaces = 0` ⇒ `unshare -U` 直接 ENOSPC
-（非特权 userns 被关，per-sandbox uid / route-B 槽位同样不成立）。
+（非特权 userns 被关，per-sandbox uid / own-identity 槽位同样不成立）。
 因此 §6 的 B（应用冒烟）、C（形态证据）、逃逸套件、网络清单、配额、N13 的多副本树归属
 **一项都做不了**；沙箱侧验收仍须在有 Landlock 的机器（compose 那台 ABI 8）上进行。
 
@@ -692,7 +692,7 @@ Landlock 要 5.13+），且 `user.max_user_namespaces = 0` ⇒ `unshare -U` 直�
 |---|---|---|
 | `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` | **≥ 6** | 权威判据，比看版本号可靠（Landlock 5.13+ 才有，ABI 6 要 6.12+） |
 | `uname -r` | ≥ 6.12（参考） | 同上 |
-| `user.max_user_namespaces` | **≠ 0** | ACK 上是 0：`unshare -U` → ENOSPC，per-sandbox uid / route-B 槽位一起失效 |
+| `user.max_user_namespaces` | **≠ 0** | ACK 上是 0：`unshare -U` → ENOSPC，per-sandbox uid / own-identity 槽位一起失效 |
 | `kernel.apparmor_restrict_unprivileged_userns` | 不为 `1`（或给 kubelet/containerd 配 AppArmor profile） | Ubuntu 24.04+ 会掐掉 userns；表现是**建箱报错**（`auto` 已 fail closed，不会静默降级） |
 
 > **换发行版不会影响这张表。** ACK 就是对照：同一批镜像在 k3s/k0s/kubeadm 上结果一样。
@@ -752,7 +752,7 @@ curl -sfL https://get.k3s.io | sh -
 | 步 | 判据 | 解绑 |
 |---|---|---|
 | 建集群 | 三个闸门判据达标；`kubectl get nodes` 全 Ready | —— |
-| §6 A | worker `seccomp self-check` + `route-B instance ready` 两条日志 | k8s 形态自检 |
+| §6 A | worker `seccomp self-check` + `own-identity instance ready` 两条日志 | k8s 形态自检 |
 | §6 B | `deployment_smoke.py` / `multinode_smoke.py` 全绿 | 应用层在 k8s 上首次真跑通 |
 | §6 C | 箱内 `id -u`=0 / 宿主落盘属主=池内 uid / 只见 `lo` / `kill(1,0)`=ok | N5/N10 在自建集群上复核（此前只验了清单，没验运行时） |
 | 多副本 | 2 worker + 共享 RWX；观察一个 pod 的 reconcile/GC 是否会动到另一个 pod 的活树 | **N13**（多副本形态首次验证） |
@@ -809,7 +809,7 @@ k0s 的 containerd socket（`/run/k0s/containerd.sock`）与 docker 的互不相
 | **F1** | **kubelet 的 seccomp 根不是固定路径**：它解析 Localhost profile 时用的是 `<kubelet --root-dir>/seccomp`。k0s 的 `--root-dir=/var/lib/k0s/kubelet`，而清单写的是 `/var/lib/kubelet/seccomp` | 实验：把 `probe-a.json` 只放 `/var/lib/kubelet/seccomp`、`probe-b.json` 只放 `/var/lib/k0s/kubelet/seccomp`，前者报 `cannot load seccomp profile "/var/lib/k0s/kubelet/seccomp/probe-a.json"`，后者 Running。**处置**：安装器的脚本/挂载/hostPath 三处参数化（`E2B_SECCOMP_ROOT`，默认仍是 kubeadm 路径），k0s overlay 一起改三处，并加了「三处必须一致」的用例 |
 | **F2** | **Deployment 的 pod 在 headless Service 下没有 per-pod DNS 名**，`E2B_NODE_ADDRESS: http://$(POD_NAME).worker-headless...` 永远解析不了（`docs/SCALING.md` §8.1 的设计来自 compose，那里靠 Docker 内嵌 DNS 解析容器名） | EndpointSlice 里 endpoint 的 `hostname` 为空（hostname 来自 `pod.spec.hostname`，Deployment 不设），`Sandbox.create()` 全部报 `502: Node ... unavailable: [Errno -2] Name or service not known`。**处置**：地址改用 pod IP（`fieldRef: status.podIP`），pod 重启后重新注册即更新 |
 | **F3** | **跨节点 pod 流量被云网络拦掉**（kube-router 不做封装，跨节点包带的是 `10.244.x`）。两个独立机制叠加：① ENI 的**「源/目的地址检查」**只放行源/目的属于本实例的报；② 安全组规则是 **`172.16.0.0/12` 全通**，而 `172.16.0.0/12 = 172.16–172.31`，**不含 pod 网段 `10.244.0.0/16`** | 干净复测（上一轮的「零收包」是抓包过滤器被 `.140` 上 compose redis 的 `172.19.0.2:6379` 流量填满导致的假象，已纠正）：<br>• `.94 → .140` **自身 IP**：到达（`.140` eth0 抓到 echo request）——节点链路正常，与「172.16/12 全通」一致；<br>• 入包二层源 MAC 是 `ee:ff:ff:ff:ff:ff`，不是 `.94` 的真实 MAC `00:16:3e:6f:a2:a4` ⇒ VPC **代理 ARP、按 IP 转发**；<br>• `.94 → 10.244.1.6 / 10.244.1.1`：不到达；<br>• **`.94 → 172.18.94.250`**（手动加在 `.140` eth0 上、也在 172.16/12 内、但非平台分配）：**也不到达** ⇒ 这不是安全组能解释的，ENI 检查存在；<br>• `.140` 用**外来源** `10.244.1.1` ping `.94` 自身 IP：包离开 `.140` 网卡，`.94` 抓包 **0 个**（`.94` 的入向规则只授权 172.16/12，而源是 `10.244.x`）。<br>**处置（两条路）**：<br>**A. 保留原生路由**：安全组加 `10.244.0.0/16`（或 `10.0.0.0/8`）放行 + 关掉两块 ENI 的源/目的地址检查；因为该 VPC 是「代理 ARP + 按 IP 转发」，**很可能还需要给 pod 网段加 VPC 自定义路由**（下一步指向对应 ENI），否则路由器查不到 `10.244.x`；<br>**B. 不动云配置**：把 CNI 换成带封装的（k0s `network.provider: calico` + `calico.mode: vxlan`，或 ipip），节点间只出现 `172.18.x`（已在放行范围内）。**这条已实测可行**：手工建 VXLAN(UDP/4789) 与 IP-in-IP(proto 4) 隧道，两节点双向 ping 均 0% 丢包、亚毫秒（`deploy/scripts/acceptance/overlay-probe.sh`）。代价：多一层封装、MTU 要降、Pod 网段重建。<br>未修之前多副本与冒烟都跑不了（见 §10.4） |
-| **F4** | **网络文件系统 + 非 root worker 做不了 chown**：c1/route B 要把沙箱树交给池 uid（`0770 owner=<沙箱 uid> group=<worker gid>`），这一步由镜像里带 `cap_chown` 的 broker 执行——但 **CAP_CHOWN 不过网**，NFS 只看 AUTH_SYS 凭据里的 uid，而「把文件让给别的 uid」只有 root 能做 | 实测：worker（uid 65534，broker `cap_chown,cap_dac_override=ep`）`chown 10000:65534` → `Operation not permitted`；同一挂载上 root 做同样 chown → 成功。**处置**：worker 以 `runAsUser: 0` + `runAsGroup: 65534` 跑（保留 worker 组才能进出 `0770 group=<worker gid>` 的沙箱树）。**这条不是 k0s 特有**：基线的「非 root worker + RWX PVC」组合在任何 NFS/CephFS 上都不成立，只在本地盘（compose 命名卷）上成立；已升级为**基线显式约束**，门槛与复核时机见 `docs/production-deployment-requirements.md` §5.4(b)。**✅ 已作废（C1 wave 2，2026-09-27）：** root 归基线的 `e2b-priv-broker` DaemonSet，worker 不再 `runAsUser: 0` —— `chown`/`rm`/`walk` 经 unix socket 交给它，新口径与判据见本文 §24 与 `docs/production-deployment-requirements.md` §5.4(b)；上面这条"处置"（给 worker 加 root）**保留作历史，不要再照做** |
+| **F4** | **网络文件系统 + 非 root worker 做不了 chown**：c1/own identity 要把沙箱树交给池 uid（`0770 owner=<沙箱 uid> group=<worker gid>`），这一步由镜像里带 `cap_chown` 的 broker 执行——但 **CAP_CHOWN 不过网**，NFS 只看 AUTH_SYS 凭据里的 uid，而「把文件让给别的 uid」只有 root 能做 | 实测：worker（uid 65534，broker `cap_chown,cap_dac_override=ep`）`chown 10000:65534` → `Operation not permitted`；同一挂载上 root 做同样 chown → 成功。**处置**：worker 以 `runAsUser: 0` + `runAsGroup: 65534` 跑（保留 worker 组才能进出 `0770 group=<worker gid>` 的沙箱树）。**这条不是 k0s 特有**：基线的「非 root worker + RWX PVC」组合在任何 NFS/CephFS 上都不成立，只在本地盘（compose 命名卷）上成立；已升级为**基线显式约束**，门槛与复核时机见 `docs/production-deployment-requirements.md` §5.4(b)。**✅ 已作废（C1 wave 2，2026-09-27）：** root 归基线的 `e2b-priv-broker` DaemonSet，worker 不再 `runAsUser: 0` —— `chown`/`rm`/`walk` 经 unix socket 交给它，新口径与判据见本文 §24 与 `docs/production-deployment-requirements.md` §5.4(b)；上面这条"处置"（给 worker 加 root）**保留作历史，不要再照做** |
 | **F5** | **NAS 的锁语义决定多副本能不能成立**：uid 池靠 `flock(<base>/.uid_pool.lock)` 在副本之间排他 | 三种挂载实测：v3+服务端锁 → flock/fcntl 全 `ESTALE`；v3+`nolock`（`.140` 现用参数）→ 锁正常但**只在单机内有效**；**v4.0 → 跨节点互斥成立**（`.94` 持锁时 `.140` 抢锁被挡）。另：这台 NAS 只支持 v4.0，`vers=4.1/4.2` 客户端直接 `EPROTONOSUPPORT`。**处置**：PV 用 `vers=4.0`，不要 `nolock` |
 | **F6** | **卷根必须对 worker 可写**：worker 直接在卷根下建 `sbx_*`（compose 的约定是 `1777`），而新供给的 RWX 卷通常是 `root:root 0755` | 第一个 `Sandbox.create()` 直接 `[Errno 13] Permission denied: '/var/lib/e2b-sandboxes/sbx_<id>'`。**处置**：worker 加 `workspace-root-init`（只动卷根自身的模式，不动下面的沙箱树），修完**校验**属主/模式并在修不动时报一次性修法——与 `image-cache-init` 同一套路 |
 | **F7** | **worker 的 node id 是 pod 名**，每次重建都是新节点：死节点的预留永不回收，fleet 视图累积僵尸 | ~~一次会话内换了 6 个 pod 名 …~~ **✅ 已收口（2026-09-18，§15）**：worker 换成 **StatefulSet**（`e2b-worker-0/1`，跨重启稳定），删掉 pod 后同名回来、126 秒内文件 API 恢复、路由未变、记录仍在；`kubectl -n sandlock get statefulset e2b-worker` = 2/2。原证据留档： → `/internal/nodes` 出现 6 个 `unhealthy` 僵尸，其中一条还挂着 1024 MB 预留（`deployment_smoke.py` 的「kill 后预留归零」断言因此失败）。另：心跳在 `register` 之前会打一条 `404`（compose 是 `204`），无害但会误导。**原判「未解」现已不成立**：要稳定 id 得换 StatefulSet，而当时的 autoscaler 按 Deployment scale —— 两处都已在 §15 落地（worker 换 StatefulSet；autoscaler 加 `E2B_AS_K8S_KIND=statefulset` 与 `statefulsets{,/scale}` RBAC） |
@@ -1121,7 +1121,7 @@ compose 栈与这台 k0s 集群都指到它（`0.1.0-350-…` 是 **2026-09-18 �
 ### 14.1 这个窗口管什么
 
 `E2B_NODE_HEARTBEAT_TIMEOUT` 决定「多久没心跳就把节点当作没了」，而「没了」会让它名下的
-**活沙箱**被 `reap_unhealthy`（E6.1）当孤儿回收、route-B 槽位被释放。所以它不只是活性判据，
+**活沙箱**被 `reap_unhealthy`（E6.1）当孤儿回收、own-identity 槽位被释放。所以它不只是活性判据，
 还是一条**误判就杀活沙箱**的线 —— 这就是当初把它从默认 15 秒抬到 300 秒的原因。
 
 300 秒是为 N18 抬的：worker 当时在**事件循环上**解冷镜像 rootfs，阿里云 NAS 上实测 61 秒
@@ -1893,7 +1893,7 @@ worker 侧三条克制：只在**实质下降**时下发（默认 4 MiB 步长�
 
 #### 22.5.4 边界（都是设计选择，不是缺陷）
 
-* **只有 chroot（route-B）形态有这条通道**：pure 形态根本不 trap `openat`（`chroot_path_syscalls()`
+* **只有 chroot（own-identity）形态有这条通道**：pure 形态根本不 trap `openat`（`chroot_path_syscalls()`
   只在 chroot 形态进计划表），所以没有可登记的 fd。E2B worker 走的就是 chroot 形态。
 * **打开→写完→关闭都落在同一个采样间隔内的 fd 会被漏掉**（默认 100 ms）。这一格不影响正确性，
   只是"早"变成"晚"：那些字节仍由文件系统 walk 记到。
@@ -1965,7 +1965,7 @@ worker 侧三条克制：只在**实质下降**时下发（默认 4 MiB 步长�
 
 ```
 sandlock-supervise: fdinfo read failed: /proc/35/fdinfo/5: No such file or directory
-route-B slot …: watch state {'bytes': 0, 'dropped': 0, 'watching': 0}   ← 每一个 tick 都是 0
+own-identity slot …: watch state {'bytes': 0, 'dropped': 0, 'watching': 0}   ← 每一个 tick 都是 0
 ```
 
 两个 worker 累计 **1515 个 tick 全是 `watching: 0`** —— 也就是说这条 push 通道
@@ -2255,7 +2255,7 @@ phase 1 `1683 passed, 6 skipped, 1 xfailed`，phase 2（uid 65534 + broker）`51
 | `test_quota_agent_client` ×1 / `test_migration_volume_quota` ×2 | 是上面两条的**连带**（428/500 改变了全局状态与告警顺序），修完自动转绿 | — |
 
 **顺带抓到一个真 bug（非 root 生产形态）**：`PrivHelpers.slot_spawner()` 没有接 N25 新增的
-`events_fd` ⇒ 非 root worker（compose 的生产形态，`user: 65534`）起 route-B 槽位时
+`events_fd` ⇒ 非 root worker（compose 的生产形态，`user: 65534`）起 own-identity 槽位时
 `TypeError: … unexpected keyword argument 'events_fd'`，沙箱命令回 127。根路径
 （`route_b._spawn_slot`）有参数、broker 路径没有，快步单测也覆盖不到 —— 是**两阶段 lane 的
 phase 2** 抓出来的。现在两条路径同形（`--events-fd` + `pass_fds` 一并传递），并补了两条
@@ -2601,7 +2601,7 @@ C 原来的口径是"任何单个文件不得超过**整棵树**的预算"（免
 | 层 | 落点 |
 |---|---|
 | fork | `crates/sandlock-core/src/dirty.rs`：写意图路径的**父目录**集合，上限 4096，超了置 `overflow`（上层改走整树 walk）；打点在 `handle_chroot_open` 的写意图分支与 `handle_chroot_write` 里 —— **不是** handler 链上的新 builtin（chroot 的写 handler 以 `ReturnValue` 短路，链后面的 handler 根本看不到） |
-| 导出 | in-process 走 FFI `sandlock_instance_drain_dirty_dirs`；route-B（生产形态）走 slot 的 `dirty_dirs` verb。两者都是**新增**符号/动词，调用方能力探测 |
+| 导出 | in-process 走 FFI `sandlock_instance_drain_dirty_dirs`；own-identity（生产形态）走 slot 的 `dirty_dirs` verb。两者都是**新增**符号/动词，调用方能力探测 |
 | worker | `DirLedger`：每目录 own bytes + 总量，只替换被报脏的子树；`E2B_DISK_ENFORCE_DIRTY`（默认关，清单里开） |
 
 **两条边界（缺一不可，第二条是第一轮实测抓出来的）**：
@@ -2654,7 +2654,7 @@ worker 同时打印每轮用了哪条路，避免"功能其实是空转"看不�
 两个理由，缺一不可：
 
 * **平台状态不在沙箱走得出来的那条路上**：真根形态下沙箱从自己的树往上走一步到
-  `<export>/workspaces`；平台的文件（记录、命令日志、checkpoint 镜像、route-B 槽位、
+  `<export>/workspaces`；平台的文件（记录、命令日志、checkpoint 镜像、own-identity 槽位、
   uid 池的锁与预约）现在是它的**兄弟**，不在那条路的尽头。
 * **迁移是秒级的**：`rename(2)` 的边界是**挂载点**，`workspaces/` 与 `state/` 与旧位置
   在同一个挂载里，所以每一棵树都是一次元数据改名（checkpoint 镜像 GiB 级，整树拷贝
@@ -2698,7 +2698,7 @@ kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
 
 > **这一步测的是 N27 当天的两项改动；清单里另有两处此后又动过，照下面的清单改之前先读本框。**
 > N58 把控制面的迁移暂存 subPath 从 `workspaces/_migrate` 提到了 export 根的 `_migrate`；
-> N57 / Task 4 把 worker 的 `E2B_ROUTE_B_TMP_ROOT` 从 `E2B_STATE_BASE` 挪到了
+> N57 / Task 4 把 worker 的 `E2B_SLOT_TMP_ROOT` 从 `E2B_STATE_BASE` 挪到了
 > `E2B_NODE_STATE_BASE`（节点本地）。所以下面第 3、4 条的**字符串**是 N27 当天的值，今天回退
 > 要在**当前**清单上做等价动作。另：本节的回退只退 N27；Task 3 的介质翻转（树在节点本地盘）
 > 有自己的一套（判据 + 四条 env + 一个数据步骤），见 `docs/deploy-clusters.md` §7.33.5 ——
@@ -2717,7 +2717,7 @@ deploy/scripts/migrate-state-base.sh --rollback --apply           # 真的退回
 
 1. `deploy/k8s/worker.yaml` 与 `deploy/k8s/control-plane.yaml` 里撤掉 `E2B_STATE_BASE`；
 2. 它们的 `E2B_WORKSPACE_BASE` 回到 `/var/lib/e2b-sandboxes`（树根上浮一级）；
-3. worker 的 `E2B_ROUTE_B_TMP_ROOT` 回到 `/var/lib/e2b-sandboxes/.route-b`；
+3. worker 的 `E2B_SLOT_TMP_ROOT` 回到 `/var/lib/e2b-sandboxes/.route-b`；
 4. 撤掉控制面那两个新 subPath（`workspaces/_migrate`、`state`）；
 5. `deploy/k8s-k0s/apply.sh` 再起 worker。
 
@@ -2838,9 +2838,9 @@ root 读 uid 65534 的文件本来就有权限。这与 §23 的 N27 迁移不�
 > C1 时代的回退姿势是"把 worker 切回 `E2B_PRIV_HELPER_TRANSPORT=socket`（broker 还在服务）或
 > `exec`（镜像里还有 file-capability 二进制）"。**现在连 `exec` 也被启动自检具名拒绝** ——
 > `E2B_PRIV_HELPER_TRANSPORT` 只接受 `auto|agent`，`exec`/`socket` 进 `RETIRED_TRANSPORTS`；
-> 二进制也早已不在 worker 镜像里。**`E2B_SLOT_IDENTITY=spawn` 这把也不是"原地可切"**：它要的
+> 二进制也早已不在 worker 镜像里。**`E2B_IDENTITY_GRANT=spawn` 这把也不是"原地可切"**：它要的
 > `e2b-slot-spawn` 同样是被移出 worker 镜像的那个 file-capability 二进制（`helpers.slot_spawner`），
-> 没有它 `privileged_starter` 为假、route B 直接不可用 —— 与 `socket` 那把一样，**得配含
+> 没有它 `privileged_starter` 为假、own identity 直接不可用 —— 与 `socket` 那把一样，**得配含
 > file-capability 二进制的 worker 镜像**。所以现在盘上没有"翻一个 env 就回到从前"的杠杆：要回到
 > "没有 agent 也行"的形状，就得**清单 + 镜像一起**退到 C1 那一版（`e2b-priv-broker` DaemonSet、
 > 它的 `e2b-maint serve`、以及 worker 的 `socket` transport —— 三样都已从清单与源码删除，

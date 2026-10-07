@@ -314,7 +314,7 @@ A 入口  →  B-1 沙箱代码（fork + envd）  →  B-2 部署配置  →  �
 SDK → CP: API key（401/429 配额与限流）
      → 调度选节点、预留配额、登记记录
      → worker: X-Internal-Key + 节点身份校验 → 建 0770 目录、挂卷、按需解包 rootfs
-     → 首条命令触发 route B：fork → unshare(CLONE_NEWUSER) → 报 {sandbox_id, pid}
+     → 首条命令触发 own identity：fork → unshare(CLONE_NEWUSER) → 报 {sandbox_id, pid}
      → CP 按自己的记录查 uid → 指令本节点 agent 面 A 写 uid_map
      → setresuid(池内 uid) → exec sandlock-supervise
 ```

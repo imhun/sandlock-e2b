@@ -51,7 +51,7 @@ xfs_quota -x -c "state" /        # 应显示 Project quota enabled
 > 回退：`mount -o remount,noquota /` + 还原 fstab。XFS 的 quota 挂载选项
 > 支持在线切换，无持久副作用。
 
-## 2.4 每沙箱 host uid（E3.2）与 route-B 槽位（2026-09-09 起为默认开）
+## 2.4 每沙箱 host uid（E3.2）与 own-identity 槽位（2026-09-09 起为默认开）
 
 `E2B_PER_SANDBOX_UID` 现在默认 **true**：每个沙箱从池里拿一个独立 host uid，
 workspace 的属主 = 该沙箱 uid、**属组 = worker 的 effective gid**、模式 **`0770`**
@@ -59,12 +59,12 @@ workspace 的属主 = 该沙箱 uid、**属组 = worker 的 effective gid**、�
 「加强安全」，而是另外两件事的地基：
 
 - 共享卷的跨租户保护靠真实 DAC（1777+sticky），需要写者身份互不相同；
-- chroot（镜像 rootfs）形态的 route-B `sandlock-supervise` 槽位就以该 uid 运行
-  （`E2B_ROUTE_B` 默认 `auto`），路径中介的代打开由此落在沙箱自己身上（T5）。
+- chroot（镜像 rootfs）形态的 own-identity `sandlock-supervise` 槽位就以该 uid 运行
+  （`E2B_OWN_IDENTITY` 默认 `auto`），路径中介的代打开由此落在沙箱自己身上（T5）。
 
 **2026-09-11（Track F / Task F1）：非 root worker 是目标形态。** 出厂清单的
 `user: "65534:65534"`（compose）与镜像自带的 `USER 65534`（k8s pod 不覆盖
-`runAsUser`）现在同样能拿到 per-sandbox host uid 与 route-B 槽位。机制不再是
+`runAsUser`）现在同样能拿到 per-sandbox host uid 与 own-identity 槽位。机制不再是
 worker 自己 `setuid`——uid 65534 的进程 `CapEff=0`，`setuid(X)` 必 EPERM——而是 exec
 镜像里两个带 **file capabilities** 的**编译型** broker（file caps 对 `#!` 脚本不生效）：
 
@@ -86,7 +86,7 @@ F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack �
 > - 能力矩阵四档全部通过：`root + 默认 caps`、`root + 仅 SYS_ADMIN`、
 >   `root + 仅 SETUID,SETGID`、`uid 65534 + SETUID,SETGID` ——
 >   `unshare(CLONE_NEWUSER)` 成功且 `uid_map`/`gid_map` 写入成功；
-> - 本地 lane 跑 `tests/contract/test_route_b_executor.py` = `14 passed`，槽位日志
+> - 本地 lane 跑 `tests/contract/test_own_identity_executor.py` = `14 passed`，槽位日志
 >   `guest-uid=uid-0-in-userns`（含 SYS_ADMIN 与 `PROD_DROP_CAPS=SYS_ADMIN` 两种形态一致）。
 >
 > 真正的门槛在**容器运行时**：Docker 默认 seccomp 档把 `unshare` 放在
@@ -134,7 +134,7 @@ F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack �
 两者共用一份校验模块（`c3_agent/priv/priv_common.c`）：uid 池范围、根白名单、参数
 形状各只有一处实现，避免「其中一份忘了检查」。**（2026-09-30，N52）**：这两个二进制
 **只在 agent 镜像里**，且 `e2b-slot-spawn` 已不再被任何东西启动 —— 槽位身份由 agent
-写 `uid_map` 授予（`E2B_SLOT_IDENTITY=agent-grant`，唯一取值）。worker 侧再也没有
+写 `uid_map` 授予（`E2B_IDENTITY_GRANT=agent-grant`，唯一取值）。worker 侧再也没有
 `spawner`、没有 `exec` transport、没有 `E2B_PRIV_HELPERS` 旋钮；**职责分工（c1 之后，
 现由 agent 承担）**：`chown` 由 `e2b-maint` 执行（worker 是 `0770` 的**属组**而不是属主，
 自己 chown 不了）；`rm`/`walk` 同样在 agent 那侧 —— 沙箱自建的 `0700` 子目录、
@@ -144,12 +144,12 @@ F1 探针当时判"userns 需要 `CAP_SYS_ADMIN`"，那是在**本机 OrbStack �
 worker 的 `E2B_PRIV_HELPER_TRANSPORT` 只认 `auto|agent`（两者同义：文件步骤交给
 每节点 agent），`exec`/`socket` 是启动期**具名拒绝**；没有 agent 又不是 root 的 worker
 保持进程内 E5.1 形态并打一条 WARNING。非 root 形态的
-`E2B_ROUTE_B_TMP_ROOT` 必须在 agent 可作用的根之下（compose 设 `/var/lib/e2b-sandboxes/.route-b`；
+`E2B_SLOT_TMP_ROOT` 必须在 agent 可作用的根之下（compose 设 `/var/lib/e2b-sandboxes/.route-b`；
 k8s 设 `deploy/k8s/worker.yaml` 里的 `/var/lib/e2b-sandboxes/state/.route-b`，N27 把它挪进了 state base）：
 槽位 policy/program 文档靠 agent 归到该槽位 uid（`0440`，
 owner=worker 以便 W1 重启重写），否则会退化成 world-readable（策略文档带 egress
 proxy 凭据）。**root worker 形态保持现状**（root 自己有这些
-能力，route-B 继续用 `setpriv` 起槽位）。
+能力，own-identity 继续用 `setpriv` 起槽位）。
 
 **为什么 worker 需要访问工作区（数据面所有者）**：files API、watcher、命令日志写入、
 快照（`copytree`）、导出/迁移、生命周期回收**全部在 worker 进程里**跑，而且必须对
@@ -159,7 +159,7 @@ proxy 凭据）。**root worker 形态保持现状**（root 自己有这些
 `runAsGroup`），worker 因此以自己的身份读写，而不需要 broker 代读每一个字节。
 
 **跨沙箱隔离由什么保证**：沙箱以 `uid X / gid X` 运行且**清空 supplementary groups**
-（route-B 槽位由 broker `setgroups([])`，进程内 userns 路径是 `setgroups=deny`），
+（own-identity 槽位由 broker `setgroups([])`，进程内 userns 路径是 `setgroups=deny`），
 而 `0770` 的"other"位是 0、属组是 worker 的 gid≠X ⇒ 另一个沙箱既进不去目录也读不到
 文件：这仍然是**一条普通的内核 DAC 判定**（契约里既有真沙箱（uid Y）的 list/write/rm
 被拒，也有 `setpriv --reuid Y --regid Y --clear-groups` 的裸内核复核，外加"带上 worker
@@ -202,33 +202,33 @@ worker 永远拿不到别人的 `0600`），所以它必须作为**明确的客�
 GREEN：两者都是 `403` + 逐字文案）。
 
 follow-up（一句，仍未做）：若将来出现"worker 必须**读成功**沙箱自建 `0600` 文件"的需求，走
-**该沙箱自己的 route-B 槽位**读回（槽位就是 uid X、本来就能读自己的文件），槽位不可用时仍
+**该沙箱自己的 own-identity 槽位**读回（槽位就是 uid X、本来就能读自己的文件），槽位不可用时仍
 按上表返回明确的"不可读"（`403`），不得退化成空体或 500。
 
 要求与影响（逐条对照）：
 
 | 项 | 说明 |
 |---|---|
-| 权限 | 分三层，**照抄会多给特权**（2026-09-10 实测，逐项见 §2.4.1）：**沙箱侧最小集 = `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`**；`CAP_DAC_OVERRIDE` 是**管理面**兜底需要（升级前遗留的 root 属主树、`1777` 卷根；c1 之后租户树是 `0770`、worker 走属组，日常数据面不再需要它）；`CAP_SYS_ADMIN` **在出厂镜像与清单形态下 worker 已不需要**（共享卷 bind 由 A4 删除、配额改由 quota-agent 提供、低端口 sysctl 由容器 spec 声明；代码里仍有两条非部署默认的路径需要它，见 §2.4.1 的限定），也**不是 E3.2 / route B 的前置**；`CAP_SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。非 root worker 现在靠**每节点 agent**（`E2B_PRIV_HELPER_TRANSPORT=agent`）建 uid 池并走 route B —— 非 root 是**目标形态**；F1 的两个 file-capability broker 与 `E2B_PRIV_HELPERS` 旋钮已在 N52（2026-09-30）删除。既不是 root、也没有 agent 的 worker 才自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1）、启动打一条 WARNING。**C1（2026-09-27）之后 k8s 基线就是这个非 root 形态**，**C3（Task 3 + Task 4 片 B）后 worker 显式 pin `runAsUser: 65534`/`runAsGroup: 65534`**（CP 的可信来源读的就是 pod spec；只靠镜像 `USER` 会被读成"未知"⇒ 不记身份、文件 op 具名 503），且**文件操作与槽位身份都由每节点一个 agent 代做**（`E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_SLOT_IDENTITY=agent-grant`，见 §5.4(b)）：worker 镜像**不再含** `/var/lib/e2b-priv/`，worker 的 BND 因此是**空集**；C1 的 `e2b-priv-broker` DaemonSet 曾保留到 Task 7 并改跑 **agent 镜像**（`e2b-maint` 只在那儿），**C3 Task 7 已把它退役**。**历史（已作废）**：2026-09-25 那轮审计写的是"线上实际是 root"（worker 自己 `runAsUser: 0` 读 NFS 上的树），那条口径已经被 C1 取代。 |
+| 权限 | 分三层，**照抄会多给特权**（2026-09-10 实测，逐项见 §2.4.1）：**沙箱侧最小集 = `CAP_SETUID`+`CAP_SETGID`+`CAP_CHOWN`**；`CAP_DAC_OVERRIDE` 是**管理面**兜底需要（升级前遗留的 root 属主树、`1777` 卷根；c1 之后租户树是 `0770`、worker 走属组，日常数据面不再需要它）；`CAP_SYS_ADMIN` **在出厂镜像与清单形态下 worker 已不需要**（共享卷 bind 由 A4 删除、配额改由 quota-agent 提供、低端口 sysctl 由容器 spec 声明；代码里仍有两条非部署默认的路径需要它，见 §2.4.1 的限定），也**不是 E3.2 / own identity 的前置**；`CAP_SYS_PTRACE` 只在走进程内 `RunAs` 时才需要。非 root worker 现在靠**每节点 agent**（`E2B_PRIV_HELPER_TRANSPORT=agent`）建 uid 池并走 own identity —— 非 root 是**目标形态**；F1 的两个 file-capability broker 与 `E2B_PRIV_HELPERS` 旋钮已在 N52（2026-09-30）删除。既不是 root、也没有 agent 的 worker 才自动关闭 uid 池并保持「固定身份 + Landlock」（E5.1）、启动打一条 WARNING。**C1（2026-09-27）之后 k8s 基线就是这个非 root 形态**，**C3（Task 3 + Task 4 片 B）后 worker 显式 pin `runAsUser: 65534`/`runAsGroup: 65534`**（CP 的可信来源读的就是 pod spec；只靠镜像 `USER` 会被读成"未知"⇒ 不记身份、文件 op 具名 503），且**文件操作与槽位身份都由每节点一个 agent 代做**（`E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_IDENTITY_GRANT=agent-grant`，见 §5.4(b)）：worker 镜像**不再含** `/var/lib/e2b-priv/`，worker 的 BND 因此是**空集**；C1 的 `e2b-priv-broker` DaemonSet 曾保留到 Task 7 并改跑 **agent 镜像**（`e2b-maint` 只在那儿），**C3 Task 7 已把它退役**。**历史（已作废）**：2026-09-25 那轮审计写的是"线上实际是 root"（worker 自己 `runAsUser: 0` 读 NFS 上的树），那条口径已经被 C1 取代。 |
 | 容量 | 并发沙箱数受 `E2B_UID_POOL_SIZE` 约束（默认 1000，起始 `E2B_UID_POOL_START=10000`）；池满即建箱失败。多 worker 共用同一 workspace 时必须配**互不重叠**的段。 |
 | 进程/内存 | chroot 形态每沙箱多一棵 supervise 进程树（supervise + sandlock-init + 停车 M0）。**它落在沙箱自己的 `sbx_<id>` cgroup 里**（N83 Phase 1，2026-10-06）⇒ **CPU、内存、任务数三项都计入沙箱额度**（与载荷同一个 `cpu.max`/`memory.high`/`memory.max`/`pids.max`）：CPU 与内存正是"洪泛花自己的额度"的由来（Phase 2 / Task 3），`max_processes` 里它也占任务（`pids.max` 数的是**任务数、含线程**；真 cgroup v2 上量到 `pids.current=3` = 2 线程 + 1 进程，见 Task 5）—— "平台自己的进程不在预算里、supervise 仍占 1"这条旧口径到此更新；**只有磁盘仍不计入**（`max_disk` 是树，只覆盖载荷；本阶段的"不做"表：cgroup v2 没有空间配额）。容量表按「N 沙箱 = N 额外进程」重算。 |
-| 回收 | route-B 代次的结束由 envd 生命周期（TTL/idle eviction/删除 → `executor.close()`）决定，不再依赖 core 的 15 min idle；槽位进程退出前该 uid 不会被再次租出（W1）。 |
+| 回收 | own-identity 代次的结束由 envd 生命周期（TTL/idle eviction/删除 → `executor.close()`）决定，不再依赖 core 的 15 min idle；槽位进程退出前该 uid 不会被再次租出（W1）。 |
 | 文件系统 | uid 只对**支持属主的存储**有意义：repo 的 virtiofs bind 挂载上 chown 是 no-op，生产请用容器原生 / XFS（本项目门禁把 workspace 放 `/var/lib/e2b-sandboxes` 的 XFS+prjquota 上）。 |
-| 关掉它 | 显式 `E2B_PER_SANDBOX_UID=false` 回到旧的共享 uid（1000）形态：**pure（无 base image）形态照常跑**；**chroot 形态在 root worker 上会被 fork 直接拒绝建箱**（沙箱 host uid 1000 ≠ 中介 euid 0 ⇒ `in-process path mediation refused: … Run sandlock-supervise as uid 1000 (route B)`，见下条）。非 root worker 不受影响（沙箱就用 worker 自己的 euid，中介身份与沙箱身份同一个）。降级逃生门已不存在：E2B 2026-09-10 不再请求它，fork B3 2026-09-11 把字段连 API 一起删除（详见下条）。 |
-| 删档的后果（终态，B3 2026-09-11） | **「特权进程内中介 + 路径中介 + 非 0 host uid」只剩 route B 一条路**。fork 把 `mediation_run_as` 档位整体删除（枚举/字段/builder/FFI 导出/CLI flag/`--policy` wire 键/Python 取值/`stats` 计数），拒绝文本如今只给一个修法：`in-process path mediation refused: … Run sandlock-supervise as uid <N> (route B)`。因此 **root worker + chroot（image-rootfs）形态要能建箱，以下四条硬前置必须同时成立**：① 安装的 wheel 带 `sandlock/bin/sandlock-supervise`（fork F17/B3 之后的 wheel；`_route_b_decline` 会点名缺哪条）；② `E2B_ROUTE_B` 不为 `off`（`auto`/`on`，`on` 时失败是硬报错、`auto` 时回落进程内）；③ `E2B_PER_SANDBOX_UID=true`（否则根本没有 per-sandbox host uid 可租）；④ worker 的 uid 段（`E2B_UID_POOL_START`/`SIZE`）与其他共用同一 workspace 的 worker **不重叠**，且池未满。任一条不成立 ⇒ 该 chroot 建箱失败，并打一条 ERROR 说明「为什么没有槽位、怎么修」（容器实测钉在 `tests/security/test_template_isolation.py::test_in_process_chroot_is_refused_without_a_slot`）。**没有兜底**：既不会退回进程内代打开（那会把文件属主写成 worker = T5），也没有降级档可开。非 root worker（E5.1，中介就是它自己的 euid）与 **pure 形态（无 chroot/COW/fs_deny/policy_fn 的 per-uid RunAs）不受影响** —— 拒绝是条件触发的，这两条组合不构成拒绝，也不会打这条 ERROR。 |
-| **CAP_SYS_PTRACE**（进程内 RunAs 才有） | 内核要求「给子进程写 `uid_map`」除 `CAP_SETUID` 外还要对该子进程的 **ptrace 访问权**。实测 `--cap-drop ALL`：只补 `SYS_ADMIN` ⇒ 每个建箱都挂在 `sandlock_create failed`；只再补 `SYS_PTRACE` 即通。**route B 不需要它**（槽位自己就是那个 uid，自映射 `0 -> euid` 无需特权）。root worker + 非 chroot 形态开 E3.2 时，worker 启动会打 WARNING（`PER_UID_NO_PTRACE_WARNING`）说明缺哪条 cap、怎么修。 |
+| 关掉它 | 显式 `E2B_PER_SANDBOX_UID=false` 回到旧的共享 uid（1000）形态：**pure（无 base image）形态照常跑**；**chroot 形态在 root worker 上会被 fork 直接拒绝建箱**（沙箱 host uid 1000 ≠ 中介 euid 0 ⇒ `in-process path mediation refused: … Run sandlock-supervise as uid 1000 (own identity)`，见下条）。非 root worker 不受影响（沙箱就用 worker 自己的 euid，中介身份与沙箱身份同一个）。降级逃生门已不存在：E2B 2026-09-10 不再请求它，fork B3 2026-09-11 把字段连 API 一起删除（详见下条）。 |
+| 删档的后果（终态，B3 2026-09-11） | **「特权进程内中介 + 路径中介 + 非 0 host uid」只剩 own identity 一条路**。fork 把 `mediation_run_as` 档位整体删除（枚举/字段/builder/FFI 导出/CLI flag/`--policy` wire 键/Python 取值/`stats` 计数），拒绝文本如今只给一个修法：`in-process path mediation refused: … Run sandlock-supervise as uid <N> (own identity)`。因此 **root worker + chroot（image-rootfs）形态要能建箱，以下四条硬前置必须同时成立**：① 安装的 wheel 带 `sandlock/bin/sandlock-supervise`（fork F17/B3 之后的 wheel；`_own_identity_decline` 会点名缺哪条）；② `E2B_OWN_IDENTITY` 不为 `off`（`auto`/`on`，`on` 时失败是硬报错、`auto` 时回落进程内）；③ `E2B_PER_SANDBOX_UID=true`（否则根本没有 per-sandbox host uid 可租）；④ worker 的 uid 段（`E2B_UID_POOL_START`/`SIZE`）与其他共用同一 workspace 的 worker **不重叠**，且池未满。任一条不成立 ⇒ 该 chroot 建箱失败，并打一条 ERROR 说明「为什么没有槽位、怎么修」（容器实测钉在 `tests/security/test_template_isolation.py::test_in_process_chroot_is_refused_without_a_slot`）。**没有兜底**：既不会退回进程内代打开（那会把文件属主写成 worker = T5），也没有降级档可开。非 root worker（E5.1，中介就是它自己的 euid）与 **pure 形态（无 chroot/COW/fs_deny/policy_fn 的 per-uid RunAs）不受影响** —— 拒绝是条件触发的，这两条组合不构成拒绝，也不会打这条 ERROR。 |
+| **CAP_SYS_PTRACE**（进程内 RunAs 才有） | 内核要求「给子进程写 `uid_map`」除 `CAP_SETUID` 外还要对该子进程的 **ptrace 访问权**。实测 `--cap-drop ALL`：只补 `SYS_ADMIN` ⇒ 每个建箱都挂在 `sandlock_create failed`；只再补 `SYS_PTRACE` 即通。**own identity 不需要它**（槽位自己就是那个 uid，自映射 `0 -> euid` 无需特权）。root worker + 非 chroot 形态开 E3.2 时，worker 启动会打 WARNING（`PER_UID_NO_PTRACE_WARNING`）说明缺哪条 cap、怎么修。 |
 
 ### 2.4.1 特权最小集（2026-09-10 实测：非特权容器 + 真 fork wheel + 真槽位；`SYS_ADMIN` 行 = 终态，A6 迁出 + A7 门禁固化，2026-09-11）
 
 | capability | 作用在哪 | 摘掉的实测后果 |
 |---|---|---|
-| `SETUID` + `SETGID` | 把 route-B 槽位起在该沙箱的 host uid 上（`setpriv --reuid X --regid X --clear-groups`） | 租不到槽位 ⇒ chroot 形态被 fork 拒绝建箱（见上「删档的后果」行） |
+| `SETUID` + `SETGID` | 把 own-identity 槽位起在该沙箱的 host uid 上（`setpriv --reuid X --regid X --clear-groups`） | 租不到槽位 ⇒ chroot 形态被 fork 拒绝建箱（见上「删档的后果」行） |
 | `CHOWN` | workspace/slice 交给该沙箱 uid，属组 = worker 的 gid、模式 `0770`（fix round 1 / c1）；uid 回收时再 chown 回来 | E3.2 的属主前提不成立（非 root 形态由 `e2b-maint` 代做） |
 | `DAC_OVERRIDE` | **兜底**：worker 的属组访问够不到的树 —— 沙箱自建 `0700` 子目录、`1777` 卷根、升级前遗留的 root 属主目录（`e2b-maint rm/walk`）。c1 之后 files API / watcher / 命令日志 / 快照 / 删除租户树都走 worker 自己的属组权限，不经 broker | 旧 `0700` 模型下：`PermissionError: …/sbx_a/workspace`、对账与共享卷持久化用例 4 failed / 4 error；新模型下日常路径已不需要它 |
-| `SETUID`+`SETGID`（**BND**；C1 之后 k8s 基线只剩这两条，**C3 Task 4 片 B 后是空集**） | 非 root worker 的这两条 cap 只出现在容器 **bounding set** 里，不落到 worker 进程：`capabilities.add` 对非 root 不产生 `CapEff`（实测 `--user 65534 --cap-add SETUID` 仍 `CapEff=0`），它们唯一的作用是给 file-capability 二进制「开闸」——**file caps 必须是 BND 的子集，否则连 exec 都 EPERM**（实测 rc=126）。`chown`/`rm`/`walk` 与槽位身份在 C1/C3 里先后被移出 worker pod：C1（2026-09-27）把文件三步交给每节点一个 **root** 的 `e2b-priv-broker` DaemonSet（unix socket），**C3 Task 4 片 B 把文件三步与槽位身份都交给每节点的 agent**（`E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_SLOT_IDENTITY=agent-grant`），并把那两个二进制从 **worker 镜像**移出（只留在 `Dockerfile.agent`）⇒ **worker 的 BND 是空集**，声明一并删除。**历史**：C1 之前 worker 的 BND 是四条；C1 到 Task 4 之间是两条。 | 缺任一条（回退镜像/回退形态下）⇒ file-capability 二进制的 exec 被内核拒绝（`Operation not permitted`）。**另：`--cap-drop ALL` 必须跟 `--cap-add`**（单独 drop ALL ⇒ BND=0），**绝不能加 no-new-privileges**（实测 NNP=1 时 file caps 被忽略：`setgroups/setgid/setuid: Operation not permitted`，C3 里会让 agent 面 A 的 `as_uid` 静默失效） |
+| `SETUID`+`SETGID`（**BND**；C1 之后 k8s 基线只剩这两条，**C3 Task 4 片 B 后是空集**） | 非 root worker 的这两条 cap 只出现在容器 **bounding set** 里，不落到 worker 进程：`capabilities.add` 对非 root 不产生 `CapEff`（实测 `--user 65534 --cap-add SETUID` 仍 `CapEff=0`），它们唯一的作用是给 file-capability 二进制「开闸」——**file caps 必须是 BND 的子集，否则连 exec 都 EPERM**（实测 rc=126）。`chown`/`rm`/`walk` 与槽位身份在 C1/C3 里先后被移出 worker pod：C1（2026-09-27）把文件三步交给每节点一个 **root** 的 `e2b-priv-broker` DaemonSet（unix socket），**C3 Task 4 片 B 把文件三步与槽位身份都交给每节点的 agent**（`E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_IDENTITY_GRANT=agent-grant`），并把那两个二进制从 **worker 镜像**移出（只留在 `Dockerfile.agent`）⇒ **worker 的 BND 是空集**，声明一并删除。**历史**：C1 之前 worker 的 BND 是四条；C1 到 Task 4 之间是两条。 | 缺任一条（回退镜像/回退形态下）⇒ file-capability 二进制的 exec 被内核拒绝（`Operation not permitted`）。**另：`--cap-drop ALL` 必须跟 `--cap-add`**（单独 drop ALL ⇒ BND=0），**绝不能加 no-new-privileges**（实测 NNP=1 时 file caps 被忽略：`setgroups/setgid/setuid: Operation not permitted`，C3 里会让 agent 面 A 的 `as_uid` 静默失效） |
 | `CHOWN`+`DAC_OVERRIDE`（**只在 agent 那一侧**，C3 Task 4 片 B 起） | `e2b-maint` 的 `chown`/`rm`/`walk` 要的两条 cap。`exec` 形态（历史 compose 侧，现只剩测试车道）把它们补进 worker 的 **BND** 给 file-capability 二进制开闸；k8s 基线的 `E2B_PRIV_HELPER_TRANSPORT=agent` 把它们**移出 worker**：C3 Task 4 片 B 起是 agent 面 B（`deploy/k8s/c3-agent.yaml` 的 `maint` 容器，`runAsUser: 0`、`capabilities.add: [CHOWN, DAC_OVERRIDE, FOWNER]`、`E2B_C3_AGENT_PORT=49986`；**C3 Task 7 之后它是这台节点上唯一的 root 组件**），worker 的 BND 因此是空集 | `agent` 形态下 worker 少了它们不影响任何东西（C1 的 `socket` 形态同样如此，但那个形态已退役）（`e2b-maint` 不在 worker 容器里 exec），但**必须**在 agent 面 B / broker 容器上：它虽然以 uid 0 跑、实际还持有运行时的默认 root 能力集（`capabilities.add` 是在默认集之上追加），所以清单里先写 `drop: [ALL]` 再逐条 `add` —— **2026-09-27 第三次上线已实测 `CapEff=0x0b` = 恰好这三条**（`chown`/`rm`/`walk` 都在这个集合下现场验过，证据见 `docs/deploy-clusters.md` §7.3；`SETUID`/`SETGID` 已随 `setpriv` 探针一起撤掉，探针改连**容器私有**的健康 socket）。`E2B_C3_AGENT_MAINT_URL`/`_MAINT_PORT` 未配置时，compose 的每个文件 op 具名 503（**不回落面 A**：那会让 NAS 上每个 chown 都 EPERM） |
 | `SYS_ADMIN` | **出厂镜像与清单形态下，worker 侧不需要它**（A6 迁出，A7 固化）。全库只剩一处用途，且不在 worker 上：`deploy/stack/docker-compose.prod.yml` 的 **quota-agent** 服务（`profiles: ["quota"]`）执行 `xfs_quota -x` —— 内核按 effective `CAP_SYS_ADMIN` 门控（§2.4.3）。worker 侧原来那三处：① 共享卷 `mount --bind` 进 workspace —— **A4 删 bind**（卷视图 = 请求路径决定的符号链接）+ **A5 补祖先穿透位**；② 直接执行 `xfs_quota -x` —— **A6** 改由 quota-agent 提供（worker 只发 HTTP，`E2B_QUOTA_AGENT_URL` 即开关）；③ 写 namespaced sysctl（`ip_unprivileged_port_start`）—— **A6** 改由容器 spec 声明（compose `sysctls:` / `docker --sysctl`；k8s 是 **pod 级** `spec.template.spec.securityContext.sysctls`；`NET_BIND_SERVICE` 对非 root pod **不足以**覆盖 `:53`，实测见 §2.4.3）——**2026-09-26 起** `deploy/compose` 的 prod/multinode 示例与本地池已不再声明窗口（见 §2.4.3 末）。⚠️ **限定**：代码里仍有两条非部署默认的路径需要它 —— 合体节点（`E2B_ENABLE_LOCAL_NODE` 默认 **true**：控制面在进程内自建卷配额；W4 起它的 `via_agent` **跟随** envd 的开关 —— `E2B_QUOTA_AGENT_URL` 存在就走 agent（§2.4.3/§2.4.4），所以只有**没配 agent** 的合体节点才在控制面进程里本地直连、才需要它）与 legacy `E2B_ENABLE_NETNS=true`（运行时写 `net.ipv4.ip_forward` + iptables）；这两条在**出厂镜像**里也跑不起来（无 `xfs_quota`/`sysctl`/`iptables`，实测镜像 `command -v` 全 MISSING），所以「不需要」只在镜像 + 清单形态下成立 | 摘掉它的后果**只剩配额降级**：quota-agent 未配置/不可达 ⇒ 建箱与挂卷照常、无 per-sandbox 磁盘硬限 + 一条 WARNING。共享卷不再是理由 —— A4/A5 的契约（`tests/contract/test_shared_volume_relative_cwd.py` 等 36 条）+ 13 条穿透单测在**无 `SYS_ADMIN`** lane 三连绿（`tmp/a4-final-step4-run{1,2,3}.log`）；A7 起整份套件也在**无 `SYS_ADMIN`** 下全绿：`PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh` = `1075 passed, 3 skipped, 0 failed`（`tmp/a7-nosa.log`，cap 探针 `CapEff 0xa02c35fb → 0xa00c35fb`）。A6 的配额 lane（同形状，无 `SYS_ADMIN`）：agent 形态 `tmp/a6-agent.log` = `107 passed`；降级形态 `tmp/a6-degrade.log` = `29 passed, 5 errors`（5 个 error 是 XFS prjquota 门用例被 `E2B_TEST_STRICT_SKIPS=1` 显式暴露；A7 起 `tests/unit/test_xfs_project_quota_agent.py` 不再被 deselect，见 §2.5） |
-| `SYS_PTRACE` | 只服务**进程内 RunAs**（父进程给子进程写 `uid_map` 需要对该子进程的 ptrace 访问权） | 非 route-B 的 per-uid 沙箱每个建箱挂在 `sandlock_create failed`；route B 完全不需要 |
+| `SYS_PTRACE` | 只服务**进程内 RunAs**（父进程给子进程写 `uid_map` 需要对该子进程的 ptrace 访问权） | 非 own-identity 的 per-uid 沙箱每个建箱挂在 `sandlock_create failed`；own identity 完全不需要 |
 
 **另一条路线（设计定稿、未实施）**：不走"每节点 root broker"，而是让池 uid **亲手创建**每一个属于
 沙箱的 inode，把 `chown` 换成"以 X 创建"，从而把数据面里的 uid 0 也消掉。它把 `CAP_CHOWN` 换成更宽的
@@ -274,14 +274,14 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
 
 三条实测口径（`e2b-sandlock-test` 容器，`--cap-drop ALL` + 指定 capset）：
 
-- 无 `SYS_ADMIN`、无 `SYS_PTRACE` 下跑 route-B + chroot 沙箱：
+- 无 `SYS_ADMIN`、无 `SYS_PTRACE` 下跑 own-identity + chroot 沙箱：
   `created=true, guest_uid="0", mknod_rc="mknod-rc=1", blk_node_left=false, file_owner=21710`
   —— 建箱成功、客体内仍是 uid 0、**造不出也不会残留块设备节点**、写出文件属主就是该沙箱 host uid。
-- worker 持 `SYS_ADMIN` 时读 route-B 槽位的 `/proc/<pid>/status`：`uid 21710, CapEff=0`
+- worker 持 `SYS_ADMIN` 时读 own-identity 槽位的 `/proc/<pid>/status`：`uid 21710, CapEff=0`
   —— **一个 cap 都没有**：`setpriv` 降 uid 会清空 effective/permitted 集，E2B 也不用
   `--ambient-caps` 往下传。所以「worker 有 SYS_ADMIN」不会顺着中介进程进入租户路径；
   它的作用域是 worker→宿主，不是沙箱→宿主。
-- 同一探针里进程内后端（`E2B_ROUTE_B=off` 的 chroot、以及 pure 形态的 per-uid 沙箱）在无
+- 同一探针里进程内后端（`E2B_OWN_IDENTITY=off` 的 chroot、以及 pure 形态的 per-uid 沙箱）在无
   `SYS_PTRACE` 时挂在 `sandlock_instance_launch failed`，补上 ptrace 即通 —— 与 F18 的
   `PER_UID_NO_PTRACE_WARNING` 同源。
 - **F1（2026-09-11）非 root 形态端到端**：uid 65534 容器 +
@@ -291,7 +291,7 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
   跨 uid 删除被拒（`rm: cannot remove … Operation not permitted`）、跨 uid 改写被拒
   （`touch: cannot touch … Permission denied`）、沙箱内 `pwd`/`pwd -P` 都是 `/home/user`、
   槽位 `/proc/<pid>/status` 是 `CapEff=0`。逐条原始输出见 `tmp/f1/f1-e2e.log` +
-  `tests/contract/test_nonroot_route_b.py`（该文件同时加进 `test-prod-shaped.sh` 的
+  `tests/contract/test_nonroot_own_identity.py`（该文件同时加进 `test-prod-shaped.sh` 的
   unprivileged phase）。
 
 > ✅ **backlog #25 已收口（A4/A5/A6）**：上面那条「没有 `SYS_ADMIN` ⇒ 共享卷退化成不可用的
@@ -308,7 +308,7 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
 | 检查项 | 实测 | 判定 |
 |---|---|---|
 | §2.4.1 的沙箱侧最小集 | root，`SETUID`/`SETGID`/`CHOWN`/`DAC_OVERRIDE` 都在默认集里 | 满足 |
-| wheel 具备 route-B 语言面 | `sandlock_supervise_connect_fd` = **False**、`sandlock/bin/sandlock-supervise` **不存在**（`setpriv` 在、Landlock ABI 6） | **不满足** |
+| wheel 具备 own-identity 语言面 | `sandlock_supervise_connect_fd` = **False**、`sandlock/bin/sandlock-supervise` **不存在**（`setpriv` 在、Landlock ABI 6） | **不满足** |
 | 多 worker uid 段不重叠 | `worker-1`/`worker-2` 共用同一 `sandbox-shared` 卷，两边都没设 `E2B_UID_POOL_START` ⇒ 都从 10000 起 | **不满足** |
 | 存储支持属主 / 配额 | 卷是 xfs ✓，但挂载选项是 `noquota`，且镜像内 `xfs_quota: not found` | 部分（配额仍降级） |
 | 非特权 userns（F18 自映射前置） | kernel 6.12，`user.max_user_namespaces=30519` | 满足 |
@@ -325,7 +325,7 @@ cap**」。因此 broker 必须落在沙箱不可达的路径，且路径本身�
 `e2b-priv-broker` DaemonSet（`deploy/k8s/priv-broker.yaml`，**C3 Task 7 已退役**）；
 **Task 4 片 B 起同一件事由每节点的 agent 面 B 做**（`deploy/k8s/c3-agent.yaml` 的 `maint` 容器，
 `runAsUser: 0`、听 49986），worker 侧声明 `E2B_PRIV_HELPER_TRANSPORT=agent` +
-`E2B_SLOT_IDENTITY=agent-grant`（没有 `socket` 回退了 —— 那个值现在被启动自检具名拒绝）。所以**网络文件系统上 worker 也保持非 root**：
+`E2B_IDENTITY_GRANT=agent-grant`（没有 `socket` 回退了 —— 那个值现在被启动自检具名拒绝）。所以**网络文件系统上 worker 也保持非 root**：
 它现在**显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（C3 的 CP 读 pod spec 取可信身份），
 **没有任何 `add`、只有 `drop: [ALL]`**（BND 空集，字面成立 —— 收口评审把"省掉整块"改成显式 drop，
 否则继承的是 runtime 默认 BND），需要 euid 0 的只有 agent 面 B（C1 的 broker 已由 C3 Task 7 退役）。
@@ -335,7 +335,7 @@ worker 自己跑 `runAsUser: 0` + `runAsGroup = <worker gid>`（overlay 的 `wor
 
 ### 2.4.2 共享卷路径的可穿越性（证据来自 A0/A3 探针实测，A5 沿用）
 
-沙箱的路径中介以**沙箱自己的 host uid** 打开卷的宿主路径（route-B 槽位 / RunAs），
+沙箱的路径中介以**沙箱自己的 host uid** 打开卷的宿主路径（own-identity 槽位 / RunAs），
 所以从 `/` 到卷视图的**每一级目录**都必须对该 uid 有 **o+x（可穿过）**；卷根自己的
 `1777` 不够。**祖先不可穿过 ⇒ 卷视图整体不可用（绝对与相对同命）**：中介把
 `/workspace/<rel>` 解析回宿主卷路径后逐级打开，缺哪级就死在哪级，沙箱里只看到一句
@@ -507,14 +507,14 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 | syscall | 默认档 | unconfined | 判定 |
 |---|---|---|---|
 | `pidfd_getfd` | `EPERM` | `EBADF` | **profile 拦**：sandlock 用它取子进程的 seccomp-notif fd（`sandbox.rs::dup_child_fd`），缺它沙箱建不起来 |
-| `unshare(CLONE_NEWUSER)` | `EPERM` | `ok` | **profile 拦**：per-sandbox host uid（E3.2）、route-B F18 自映射、`net_isolation`、`pid_ns` 都靠它 |
+| `unshare(CLONE_NEWUSER)` | `EPERM` | `ok` | **profile 拦**：per-sandbox host uid（E3.2）、own-identity F18 自映射、`net_isolation`、`pid_ns` 都靠它 |
 | `unshare(NEWNET/NEWPID/NEWNS)` | `EPERM` | `EPERM` | **内核 capability 拒的，不是 seccomp**（容器无 `SYS_ADMIN`） |
 | `pidfd_open`、`process_vm_readv/writev`、`seccomp(SET_MODE_FILTER)`、`setgroups`、`ptrace` | 放行 | 放行 | 默认档本来就够，无需补白 |
 | `mount`、`keyctl`、`bpf`、`clone3` | `EPERM`/`EPERM`/`EPERM`/`ENOSYS` | `ENOENT`/`EINVAL`/`EINVAL`/`EINVAL` | 保持拒绝不动（不需要） |
 
 端到端（真实建箱 + 执行命令）：默认档 ❌ 建箱失败；默认档 + **仅** `pidfd_getfd` ✅；
 默认档 + **仅** `unshare` ❌；两条齐（或 unconfined）✅。⇒ `pidfd_getfd` 是基线必需，
-`unshare` 是命名空间类路径必需；当前 `E2B_PER_SANDBOX_UID` 默认开且 route-B 槽位在用，
+`unshare` 是命名空间类路径必需；当前 `E2B_PER_SANDBOX_UID` 默认开且 own-identity 槽位在用，
 **所以两条都要**。
 
 **安全边界（该收敛的关键前提）**：沙箱**不继承**这份放宽 —— 沙箱内
@@ -587,7 +587,7 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 `docker-compose.test.yml` 的测试镜像（要跑 loop/XFS/mount 依赖的那批门禁）。
 
 **本地可验证（2026-09-15 更正）**：先前记的"本机内核（OrbStack）写 `uid_map` 一律 EPERM"
-**是错的**。本地 lane 用上线同款形态跑 `tests/contract/test_route_b_executor.py` 实测
+**是错的**。本地 lane 用上线同款形态跑 `tests/contract/test_own_identity_executor.py` 实测
 `14 passed`，槽位日志报 `guest-uid=uid-0-in-userns`（含 `SYS_ADMIN` 与
 `PROD_DROP_CAPS=SYS_ADMIN` 两种形态都一样）⇒ **本机就能建 userns 并完成 F18 自映射**。
 卡住早期探针的是**容器的 seccomp 档**（Docker 默认档把 `unshare` 挂在 `CAP_SYS_ADMIN`
@@ -810,7 +810,7 @@ inode 命中映射表）复制 fd 做端口复核 + 照旧给每个被监视 fd 
 
 E2B 侧开关：`E2B_NET_BIND_INJECT`（默认 `true`，`envd_service/config.py`），经
 `factory.py` → `SandlockExecutor(bind_inject=...)` → 策略里出现 `net_bind_inject`（
-`route_b.py` 的 wire 字段白名单同步加了这个键）。回滚只需把该变量设为 `false` 并重建 worker
+`own_identity.py` 的 wire 字段白名单同步加了这个键）。回滚只需把该变量设为 `false` 并重建 worker
 镜像/重启，策略立刻回到主机监听器映射。
 
 **上线实测（2026-09-16，随 `0.1.0-297-g15d4726` 发布，worker-2 仍是唯一 netns 节点）**：
@@ -1061,9 +1061,9 @@ E2B_REGISTRY_MIRRORS=registry-1.docker.io=127.0.0.1:5080 \
 ### 2.4.10 pid_ns：开关、形态与代价（2026-09-16）
 
 **E2B 侧已接上开关但默认关闭**：`E2B_PID_NS`（`envd_service/config.py`，默认 `false`）→
-`factory.py` → `SandlockExecutor(pid_ns=...)` → 策略里的 `pid_ns`（`route_b.py` 的 wire 字段表
+`factory.py` → `SandlockExecutor(pid_ns=...)` → 策略里的 `pid_ns`（`own_identity.py` 的 wire 字段表
 本来就有）。lane 也透传该变量（`E2B_PID_NS=1 ./deploy/scripts/test-prod-shaped.sh ...`），
-所以两种形态都能跑门禁。**阻断项（route-B 自映射）与代价（stat 族拦截）本轮都已闭环**，
+所以两种形态都能跑门禁。**阻断项（own-identity 自映射）与代价（stat 族拦截）本轮都已闭环**，
 剩下的是灰度/默认值这个部署决策（N3）：形态正确性见 2.4.10.1，代价见 2.4.10.2。
 
 > **（2026-09-27 更新）**：**"默认值"这条今天仍未拍板切换** —— `E2B_PID_NS` 的**代码默认仍是 `false`**
@@ -1086,15 +1086,15 @@ user.is_some() && real_uid != 0` ⇒ `write_id_maps(real_uid, real_gid, 0, 0)`�
 之后 userns 由**中间进程**在最终 fork 之前创建（非特权 `CLONE_NEWPID` 必须先有自己的 userns），
 `confine_child` 的 userns 整块被 `if !pid_ns` 跳过 —— 而中间进程原来只认两种映射（特权 remap ⇒
 `0 -> RunAs`，由父进程经握手管道写；其余 ⇒ `real_uid -> real_uid`），**没有第三种自映射分支**
-（`crates/sandlock-core/src/sandbox.rs` 的 pid-ns 中间进程段）。所以 route-B 箱在 pid_ns 下起来
+（`crates/sandlock-core/src/sandbox.rs` 的 pid-ns 中间进程段）。所以 own-identity 箱在 pid_ns 下起来
 就是宿主槽位 uid：`E2B_PID_NS=1` 实测 `id -u` = `21000`（契约测试
-`tests/contract/test_nonroot_route_b.py::test_route_b_restores_guest_root_with_and_without_pid_ns`
+`tests/contract/test_nonroot_own_identity.py::test_route_b_restores_guest_root_with_and_without_pid_ns`
 钉的就是这条，此前它按设计是红的）。
 
 修法（fork `5b16855`）：中间进程按 `confine_child` 的同一套三选一挑映射 —— `userns_self_map`
 且请求身份就是自己且非 root ⇒ `0 -> euid`，特权 remap ⇒ `RunAs` 对，其余 ⇒ 自身身份。两份
 uid/gid map 的写者从此不会再漂移。fork 侧新增回归用例
-`test_pid_ns::pid_ns_self_map_restores_guest_root`（非 root 相位 = uid 65534，正好是 route-B
+`test_pid_ns::pid_ns_self_map_restores_guest_root`（非 root 相位 = uid 65534，正好是 own-identity
 槽位形态）：修前 RED（`id -u` = 65534），修后 GREEN；且断言宿主侧落盘文件仍属槽位 uid。
 fork 全门禁在该 tip 复跑全绿（core_lib 848 / core_integ 543(+1) / ffi 104 / cli 97 /
 supervise 43 / supervise_cost 3 / python 465 + 根相位 oci 157 / supervise_root 4 /
@@ -1104,7 +1104,7 @@ mediation_2uid 9），wheel 按同 tip 重建（manifest `5b16855`）。
 
 | 观测 | `E2B_PID_NS` 未设 | `E2B_PID_NS=1`（修前） | `E2B_PID_NS=1`（修后） |
 |---|---|---|---|
-| route-B 箱内 `id -u` | `0` ✅ | `21000` ❌ | **`0` ✅** |
+| own-identity 箱内 `id -u` | `0` ✅ | `21000` ❌ | **`0` ✅** |
 | 宿主侧文件属主 | 槽位 uid ✅ | 槽位 uid | **槽位 uid ✅** |
 | ready 行 `guest-uid` | `uid-0-in-userns` | （箱起不来语义） | **`uid-0-in-userns`** |
 | 箱内 `kill(<worker pid>, 0)` | `EPERM`（共享 pid ns） | — | **`ESRCH`（自有 pid ns，真开了）** |
@@ -1116,7 +1116,7 @@ mediation_2uid 9），wheel 按同 tip 重建（manifest `5b16855`）。
 **邻接契约与两相位**：`E2B_PID_NS=1` 下按 `-k 'route_b or pid_ns'` 跑完 lane 的两个相位
 （`tmp/pidns-e2b-both-phases.log`）——相位 1（root worker + 槽位池）**86 passed / 0 failed**、
 相位 2（uid 65534 worker + file-cap brokers）**34 passed / 0 failed**，说明开启 pid_ns 不会碰坏
-route B 的邻接面（槽位池、跨 uid 拒绝、池化 uid 建箱、非 root worker 的 in-process 中介）。
+own identity 的邻接面（槽位池、跨 uid 拒绝、池化 uid 建箱、非 root worker 的 in-process 中介）。
 
 #### 2.4.10.2 代价：部署形态下测不到增量，裸形态 +85 µs/次（2026-09-16）
 
@@ -1127,8 +1127,8 @@ lane，只差 `E2B_PID_NS`（探针 `deploy/scripts/acceptance/pidns-cost-probe.
 
 | 形态 / 负载（ms / 5000 次，表内为 c 次跑） | `open`（对照，未拦） | `stat` | `access` | `readlink` |
 |---|---|---|---|---|
-| route-B 部署形，pid_ns 关 | 2003 | 992 | 1002 | 1032 |
-| route-B 部署形，pid_ns 开 | 2004 | 992 | 1002 | 999 |
+| own-identity 部署形，pid_ns 关 | 2003 | 992 | 1002 | 1032 |
+| own-identity 部署形，pid_ns 开 | 2004 | 992 | 1002 | 999 |
 | 裸形（CLI，无 chroot 中介），pid_ns 关 | 1229 | **5.9** | **2.9** | **3.8** |
 | 裸形（CLI，无 chroot 中介），pid_ns 开 | 1253 | **445** | **395** | **427** |
 
@@ -1136,7 +1136,7 @@ lane，只差 `E2B_PID_NS`（探针 `deploy/scripts/acceptance/pidns-cost-probe.
 
 1. **部署形态里测不到 pid_ns 的增量**：中位数差值与对照组 `open` 的抖动同号同量级（±1%，
    ≤2 µs/次），三个热 syscall 逐次跑有正有负。机理不是"拦得便宜"，而是**这些 syscall 在
-   route-B 里本来就已经进 supervisor**：route-B 始终带 chroot 路径中介，`chroot_path_syscalls()`
+   own-identity 里本来就已经进 supervisor**：own-identity 始终带 chroot 路径中介，`chroot_path_syscalls()`
    里就有同样这五个（`seccomp_plan.rs`），pid_ns 只是往已经在的拦截点里多加一个 handler。
 2. 部署形态里这些调用**本来就贵**：约 200 µs/次，是 chroot 中介的既有成本（与 pid_ns 无关；
    同一张表里 `open`+`close` 一对约 400 µs/次，同为中介成本）；pid_ns 不改变这个量级。
@@ -1178,7 +1178,7 @@ lane，只差 `E2B_PID_NS`（探针 `deploy/scripts/acceptance/pidns-cost-probe.
 | `sleep & wait` 退码 / 自信号 | `wait_rc=0` / `self_rc=0` | `wait_rc=0` / `self_rc=0` |
 | 客人写的文件宿主侧属主 | `10000`（池内槽位 uid） | `11000`（worker-2 池内槽位 uid） |
 
-`id -u` 两列都是 0（route-B 自映射本来就把客人做成 root），所以**判形态的是最后三列**：
+`id -u` 两列都是 0（own-identity 自映射本来就把客人做成 root），所以**判形态的是最后三列**：
 自有 pid ns 才可能让 pid 1 属于自己、让 `$$` 落在个位数。
 
 **性能**：`deploy/scripts/acceptance/mcp-3way.py`（netns 那次用的同一支探针，`tmp/pidns-canary-mcp.log`）稳态每请求
@@ -1340,10 +1340,10 @@ pure 形态从此依赖真根（也就是依赖上面的 seccomp 档）；`E2B_P
 - **phase 2：`--user 65534:65534` 的无特权 worker 跑法**（`UNPRIVILEGED_PHASE=0` 可跳）：
   上面那条「生产形」lane 仍是 **root**（只是把 cap 削到部署等价集），而
   `docker-compose.prod.yml` 真正写的是 `user: "65534:65534"` —— 那是**第三种形态**：
-  没有 `CAP_SETUID` ⇒ uid 池自动关、租不到 route-B 槽位、沙箱就用 worker 自己的 euid
+  没有 `CAP_SETUID` ⇒ uid 池自动关、租不到 own-identity 槽位、沙箱就用 worker 自己的 euid
   （E5.1），路径中介留在进程内。删掉 `mediation_run_as` 降级档之后，这一形态
   必须自己站出来跑一遍：`tests/security/test_template_isolation.py` +
-  `tests/security/test_sandlock_isolation.py` + 两份 route-B/policy 单测，
+  `tests/security/test_sandlock_isolation.py` + 两份 own-identity/policy 单测，
   实测 `47 passed / 1 skipped / 0 failed`（唯一的 skip 是那条「euid 0 才谈得上被拒」
   的钉桩）。phase 2 用 `python:3.11-slim` 作基镜像（`PHASE2_BASE_IMAGE` 可改）：
   本地构建的 `python-mcp:3.14` 镜像在 registry 镜像站的白名单外，且它的 rootfs
@@ -2112,7 +2112,7 @@ worker 走的是 **agent 形态**（`E2B_QUOTA_AGENT_URL` 是开关，`.env` 里
 
 **(a) 存储选型门槛（硬，N13/F5）：多副本 worker 共用一份 `E2B_WORKSPACE_BASE` 时，`<base>/.uid_pool.lock` 上的 `flock` 必须跨节点互斥。** 否则两个副本会各自把同一个 uid 发给不同沙箱，E3.2 的每沙箱 uid 隔离会在无人察觉的情况下失效——这不是"降级"，是**静默失效**。本集群实测（`deploy/k8s-k0s/storage-nas.yaml:18-24`）：**只有 NFSv4.0 成立**；`NFSv3 + 服务端锁` 在这台 NAS 的客户端上直接 `ESTALE`；`NFSv3 + nolock` 的锁**只是本机锁**（同机互斥、跨机不互斥）。跨节点**没有 CAS 原语**，因此任何分布式单飞（uid 分配、TTL 扫描、快照拷贝认领、限流窗口）只能实现为"**锁 + 记录**"，不能依赖 `O_EXCL` 之类的原子性假设。各节点的挂载选项（`vers`、`nolock`、`sec`）**必须一致**；**换 NAS 或换挂载参数时必须随部署复核这一条**。它同时是 `replicas ≥ 2` 的前置条件——不是可选优化。
 
-**(b) 基线约束（F4，C3 Task 7 定稿）：需要 root 的那一步在**每节点 agent 的面 B** 上，不在 worker 上 —— worker 非 root 与存储类型无关。** 当 workspace/volume 落在**网络文件系统**（NFS/CephFS/…）上时，建箱/回收要把沙箱树交给池里的 uid（`0770 owner=<sandbox uid> group=<worker gid>`，E3.2），这一步必须由 **euid 0** 做，而且这台节点上**只有** `deploy/k8s/c3-agent.yaml` 的面 B 有那个 euid 0（`maint` 容器，`runAsUser: 0`，听 49986）。worker pod 里没有任何 root 容器：它**显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（Task 4 片 B —— CP 的可信身份来源读的就是 pod spec 的这两个值）、`E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_SLOT_IDENTITY=agent-grant`，且**不声明任何 capability**（BND 空集）。为什么非要 euid 0：这一步由带 `cap_chown` 的 `e2b-maint` 执行，而 **`CAP_CHOWN` 不过网**——NFS 服务端只读 AUTH_SYS 凭据里的 uid，不看你客户端的能力；实测（2026-09-17，原始记录曾是 `deploy/k8s/priv-broker.yaml` 的文件头）：uid 65534 的进程做 `chown 10000:65534` **EPERM**（连自己拥有的文件也让不出去），同一挂载上 root 做同样的事成功（`deploy/scripts/acceptance/c2-p0-probe.sh` 的 `B4-broker-chown-verb=OK` 与它同口径）。并且必须**保留 worker 的 gid** 作为属组 —— 这不是可选项：**worker（65534）只靠组位进出 `0770 group=<worker gid>` 的沙箱树**（它没有任何有效 cap、本地也没有 DAC 覆盖）。**但没有必要把"uid 0 也没有越权"当成理由**：2026-09-28 的 C2 P0 探针实测（见下面那段）说反了 —— 服务端把 uid 0 当特权。安全代价是 worker 成为**可信中介**（沙箱仍跑在自己的池 uid 下，隔离模型不变），前提是导出允许 root 访问（`no_root_squash`）。
+**(b) 基线约束（F4，C3 Task 7 定稿）：需要 root 的那一步在**每节点 agent 的面 B** 上，不在 worker 上 —— worker 非 root 与存储类型无关。** 当 workspace/volume 落在**网络文件系统**（NFS/CephFS/…）上时，建箱/回收要把沙箱树交给池里的 uid（`0770 owner=<sandbox uid> group=<worker gid>`，E3.2），这一步必须由 **euid 0** 做，而且这台节点上**只有** `deploy/k8s/c3-agent.yaml` 的面 B 有那个 euid 0（`maint` 容器，`runAsUser: 0`，听 49986）。worker pod 里没有任何 root 容器：它**显式 pin `runAsUser: 65534` / `runAsGroup: 65534`**（Task 4 片 B —— CP 的可信身份来源读的就是 pod spec 的这两个值）、`E2B_PRIV_HELPER_TRANSPORT=agent`、`E2B_IDENTITY_GRANT=agent-grant`，且**不声明任何 capability**（BND 空集）。为什么非要 euid 0：这一步由带 `cap_chown` 的 `e2b-maint` 执行，而 **`CAP_CHOWN` 不过网**——NFS 服务端只读 AUTH_SYS 凭据里的 uid，不看你客户端的能力；实测（2026-09-17，原始记录曾是 `deploy/k8s/priv-broker.yaml` 的文件头）：uid 65534 的进程做 `chown 10000:65534` **EPERM**（连自己拥有的文件也让不出去），同一挂载上 root 做同样的事成功（`deploy/scripts/acceptance/c2-p0-probe.sh` 的 `B4-broker-chown-verb=OK` 与它同口径）。并且必须**保留 worker 的 gid** 作为属组 —— 这不是可选项：**worker（65534）只靠组位进出 `0770 group=<worker gid>` 的沙箱树**（它没有任何有效 cap、本地也没有 DAC 覆盖）。**但没有必要把"uid 0 也没有越权"当成理由**：2026-09-28 的 C2 P0 探针实测（见下面那段）说反了 —— 服务端把 uid 0 当特权。安全代价是 worker 成为**可信中介**（沙箱仍跑在自己的池 uid 下，隔离模型不变），前提是导出允许 root 访问（`no_root_squash`）。
 
 **C3 Task 7 之后，"需要 root 的那一步在哪"这个形状只写在一处**（`deploy/k8s/c3-agent.yaml` 的面 B），因此要复核的也不再是"三处同源"，而是**两处必须一起走**：
 
@@ -2213,7 +2213,7 @@ kubectl -n sandlock get statefulset e2b-worker -o jsonpath='{.spec.template.spec
 #       （渲染结果已由 tests/unit/test_worker_manifest_permissions.py 钉住）
 
 kubectl -n sandlock get sts e2b-worker -o jsonpath='{.spec.template.spec.containers[0].env}'; echo
-# 通过：E2B_PRIV_HELPER_TRANSPORT=agent、E2B_SLOT_IDENTITY=agent-grant
+# 通过：E2B_PRIV_HELPER_TRANSPORT=agent、E2B_IDENTITY_GRANT=agent-grant
 #       （E2B_PRIV_HELPER_SOCKET **已不存在**：C3 Task 7 把 `socket` 形态与它的 broker 一起退役了）
 
 kubectl -n sandlock get ds 2>&1 | grep e2b-priv-broker || echo "没有 e2b-priv-broker（C3 Task 7 起）"

@@ -33,7 +33,7 @@
    同时它让**被掩盖的一拍窗口显形**：同一条命令里"写静态二进制→立刻执行"现在报
    **ETXTBSY**，隔一拍（`sleep 1`）就正常——这条以前被 EACCES 挡在前面，看不见。
 
-## 1. 实测（prod-shaped lane，root worker + route B 槽位；**下表是 §7 修复之前**）
+## 1. 实测（prod-shaped lane，root worker + own identity 槽位；**下表是 §7 修复之前**）
 
 探针 `deploy/scripts/acceptance/probe_n35_exec_gate.py`（每条腿独立 executor、逐条命令 30 s 超时），
 lane 入口 `deploy/scripts/acceptance/n35-lane.sh`，日志 `tmp/k0s/n35-chroot{,2..6}.log`、`tmp/k0s/n35-pure.log`。
@@ -590,7 +590,7 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
 4. **`init` 的 exec 路径读了两遍 errno —— 已定位并已修（2026-09-23，fork `f1fecba`）**。
 
    **现象**：`deploy/scripts/test-prod-shaped.sh` phase 1 有两条红 ——
-   `test_route_b_executor.py::test_missing_binary_exits_127_through_the_slot` 与
+   `test_own_identity_executor.py::test_missing_binary_exits_127_through_the_slot` 与
    `test_sandbox_lifecycle_rebuild.py::test_nonexistent_binary_exits_127_with_no_output`，
    钉的是"缺失的可执行文件＝退出码 127 且**没有任何输出**"。实测拿到的却是
    `sandlock-init: exec "/nonexistent-e2b-bin" failed (errno 13)`。
@@ -607,7 +607,7 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
    （`realroot.rs:114`），而 `note("exec …")` 就在 `execvp` **之前**、且只在 trace 开时调用 ——
    它先把 trace 文件开了一遍（TRACE 单元被初始化），`record_failure` 于是不再 open、也就不会
    改 errno。实测矩阵（同一 phase-1 形状，只改这一个环境变量，脚本 `deploy/scripts/acceptance/phase1-probe2.sh`）：
-   * **未设** → `test_route_b_executor.py` **1 failed / 13 passed**（errno 13）；
+   * **未设** → `test_own_identity_executor.py` **1 failed / 13 passed**（errno 13）；
    * 设成任意值（`/workspace/tmp/...`、`/tmp/...`，甚至**空字符串**）→ **14 passed**。
 
    **不是本轮 N35 引入**：把工作树切到本轮之前的 `0021a9f`（`git worktree`，同容器同形状）跑同样
@@ -620,12 +620,12 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
    值（同文件里 chdir 分支本来就是这么写的，只有 exec 这条把诊断插在了中间）。修完实测：
    * fork 门禁里那条 FUP-26 用例 **RED(`errno 13` vs 期望 40) → GREEN**；
    * E2B 侧两条契约在 phase-1 形状、**trace 未设**（= 线上默认）下 **2 failed → 16 passed**
-     （`tests/contract/test_route_b_executor.py` 整个文件）；
+     （`tests/contract/test_own_identity_executor.py` 整个文件）；
    * phase 1 全档 **1711 passed / 2 failed → 1714 passed / 6 skipped / 4 xfailed / 0 failed**；
      phase 2 `51 passed / 1 skipped`；`E2B_REAL_ROOT=1` 的 `tests/security` `45 passed / 1 skipped /
      1 xfailed`（wheel 重建，manifest HEAD=`f1fecba07d93…`）。
 
-   **新钉的用例**：`tests/contract/test_route_b_executor.py::
+   **新钉的用例**：`tests/contract/test_own_identity_executor.py::
    test_the_missing_binary_contract_survives_the_diagnostic_trace` —— 同一形状下**把 trace 开与
    关各跑一遍**，都要求 `(127, b"", b"")`，这样契约不再依赖跑它的人有没有恰好设这个变量
    （N35 的 lane 默认就设，正是它把这个差异盖住的原因）。
@@ -778,7 +778,7 @@ limitation"，因为 bundle 形态带 chroot）正好印证：文件形态一样
 |---|---|---|---|
 | **A. execve stub（现状）** | 一个 freestanding 静态二进制：exec 提供干净地址空间，stub 自己铺区域，supervisor `process_vm_writev` 写页 | **否**（要能 exec 到它 + 要一条 Landlock 执行授权） | 需要 stub 可达 + 固定基址 + 按架构维护；这正是 §11 要修的 |
 | **B. 不 exec，进程内恢复载荷** | 复用已有的 `in_child_main: Option<fn()>`（OCI 的沙箱内 init 就走它："run this function in-process instead of `execve`-ing a workload … **nothing is exec'd, so Landlock has no execution to authorize**"） | **是**（无 exec ⇒ 无路径、无执行授权） | 地址空间是"fork 自 supervisor 的脏镜像"（tokio/缓冲/libc 全在），要自己证明能清到与镜像一致（现有的 stray-mapping 断言是为 stub 立的，得另立等价证明）；fd 表也**不再**由 exec+CLOEXEC 自动清零，要显式关干净再按原编号重开 |
-| **C. 旧 ptrace 注入引擎** | 外部 ptrace 附着到沙箱里一个 parked launcher，直接写镜像 | 是（不 exec 额外二进制） | **已明确放弃**：launcher 的 text/heap/stack 会留在恢复后的地址空间里且可达（`test_restore.rs` 的 stray-mapping 断言就是钉这个）；还要处理"何时停住它"的竞态与 route-B 下的 ptrace 权限 |
+| **C. 旧 ptrace 注入引擎** | 外部 ptrace 附着到沙箱里一个 parked launcher，直接写镜像 | 是（不 exec 额外二进制） | **已明确放弃**：launcher 的 text/heap/stack 会留在恢复后的地址空间里且可达（`test_restore.rs` 的 stray-mapping 断言就是钉这个）；还要处理"何时停住它"的竞态与 own-identity 下的 ptrace 权限 |
 | **D. userfaultfd 按需分页**（原设计） | stub 建 uffd，按缺页惰性供给 | 否（仍要 stub） | **被否**：uffd 在默认黑名单、seccomp 单向 ⇒ 等于把众所周知的利用原语永久授给每个恢复过的沙箱；`UFFD_USER_MODE_ONLY` 还服务不了内核态缺页。变体（init 在锁前建 uffd、以 fd 交给 stub、只用 ioctl）能绕开策略问题，但复杂度更高且仍需 stub |
 | **E. CRIU** | 外部工具：注入 parasite 代码 + 写内存 + 跳转（`restore_blob.rs` 的注释直接引了它的 restart 修复做法） | 是（不 exec 我们的 stub） | 大依赖 + 需要特权/ptrace + 要在本架构（per-sandbox userns/Landlock/seccomp）里做一遍适配；好处是 socket/连接类资源和跨版本经验比自研强 |
 | **F. 不重建（冻结/续跑）** | 没有②③：SIGSTOP/cgroup freezer 冻住整棵树，"恢复"= SIGCONT | — | **零成本但沙箱必须还活着**：不能跨机、不能跨 worker 重启、占用内存；这就是 E2B 今天 `paused` 的语义 |
@@ -809,7 +809,7 @@ tokio + 堆，无法与镜像区域解耦。**可行的形态是**：supervisor 
 
 1. **sweep 规模**：`MAX_SWEEP 256` / `resume::MAX_SWEEP_ENTRIES` 是照 exec 形态定的；fork 形态
    下 glibc + tokio 的映射可能上百条，要实测并把上限当契约写死（超限必须报错，不能静默漏 unm）。
-2. **多线程 fork**：子进程是 supervisor 的 fork（route B 的 supervisor 带 tokio/事件泵）。fork
+2. **多线程 fork**：子进程是 supervisor 的 fork（own identity 的 supervisor 带 tokio/事件泵）。fork
    只保留调用线程，**别的线程持有的锁会冻结在锁住状态** ⇒ 载荷必须"零分配、不取锁"（现在的 stub
    天生如此；`init/mod.rs::child_fail` 的注释也写着"glibc 的堆在这条单线程回路上是 fork 安全的"）。
 3. **fd 表不再免费清零**：`execve` + `CLOEXEC` 是白送的一步；mmap 路线要自己关掉 supervisor 的

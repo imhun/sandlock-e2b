@@ -278,7 +278,7 @@ fix round 1 的原始记录（保留，供对照）：
 > 解决（见「09-03 续」块），而**生产**上那条按 2026-09-27 的 O1 复核是 **NAS（nfs4）上结构上
 > 不可得**、不是配置漏项（`docs/open-issues.md` O1 行）。
 
-- **线上升级未做**：现网 worker 仍是旧 wheel（无 route-B 语言面）+ 两个 worker 的 uid 段
+- **线上升级未做**：现网 worker 仍是旧 wheel（无 own-identity 语言面）+ 两个 worker 的 uid 段
   重叠 ⇒ 升级顺序「先前面的镜像、后代码」与自检见下面「特权最小集实测 + 线上就绪审计」块。
 - **fork 的 3 个 commit 仍未 push**（连同 F17/F18 的 6 个）。
 - `tests/contract/test_volume_quota.py` 里那条**降级路径**用例在无 XFS 的 lane 进不来
@@ -321,14 +321,14 @@ init 控制通道是 `SOCK_STREAM`：一次 `recvmsg` 可并入多帧，而内�
   `pgid_entry_survives_leader_exit_with_live_member` 类用例在无 init 容器里必红；本轮 fork
   门禁统一加 `--init`（tini 作 pid1）后稳定绿（红档 `f15-gate-nonroot-r1.log` 另含一条
   cow 并行偶发，单测/串行/两次并行复跑全绿，与 F15 无因果）。
-- **T5 前置更新**：本条修复与 T5/F16 无关（F16 仍是 route-B worker 侧 Python 接入面，
+- **T5 前置更新**：本条修复与 T5/F16 无关（F16 仍是 own-identity worker 侧 Python 接入面，
   见本计划 Task 9）；T5 xfail 保持。
 
-## ⚡ F16（2026-09-08）：route-B worker 侧语言客户端（fork `6571c36` / wheel `6571c36` 产物）
+## ⚡ F16（2026-09-08）：own-identity worker 侧语言客户端（fork `6571c36` / wheel `6571c36` 产物）
 
 registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的 worker 面
 此前只有 Rust（`channel_request_with_fds` 不带 fd 的 `connect_and_request` 之上没有
-语言绑定），envd（E2B）当不了 route-B worker。F16 新增：
+语言绑定），envd（E2B）当不了 own-identity worker。F16 新增：
 
 - **C ABI**：`sandlock_supervise_connect(path, token, err, err_msg)` /
   `sandlock_supervise_request(h, verb, args_json, fds, n_fds, err, err_msg)`（返回
@@ -345,7 +345,7 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   驱动：X 的 exec 建文件宿主属主 == X、自 chmod 生效；Y 的 exec 对该文件
   rm/chmod 均 EPERM（1777+sticky 真语义）。python 档 +1（455，
   `test_supervise_channel.py` 同 uid exec-with-fds 往返）。剩余 T5 动作 =
-  envd 接线 + route-B supervise 部署（选 W1/W2）+ 摘 xfail（main backlog #5）。
+  envd 接线 + own-identity supervise 部署（选 W1/W2）+ 摘 xfail（main backlog #5）。
 - **门禁/产物**：fork 11 档全绿（core_lib 841 / core_integ 534 / ffi 101 / cli 100 /
   supervise 42 / supervise_cost 3 / cli_build 0 / python 455；oci 150 /
   supervise_root 4 / mediation_2uid 10；`third_party/sandlock/tmp/sdd/f16-gate-*.log`）；
@@ -380,13 +380,13 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
   gate B `987 passed / 3 skipped / 0 failed`（`tmp/final-e2b-gate-b.log`）——含
   oci_registry/snapshot/provision 新单测与既有快照 fork/模板构建契约回归。
 - **仍未做（需用户决策/环境）**：#4（网关启动失败 SDK 可见性 = 产品决策）、
-  #5 剩余（envd route-B 接线 = 先选 W1/W2 槽位模型）、T1/O1–O3（真实 XFS/部署窗口）、
+  #5 剩余（envd own-identity 接线 = 先选 W1/W2 槽位模型）、T1/O1–O3（真实 XFS/部署窗口）、
   fork Task 10/11（推送/PR/ACR 需授权）。
 
 ## ⚡ E3.2 成为部署默认（2026-09-09 晚，per-sandbox host uid 默认开）
 
 `E2B_PER_SANDBOX_UID` 默认 **false → true**。意义：有特权的 worker 从此自动给每个沙箱
-一个独立 host uid，于是 chroot（镜像 rootfs）形态的 **route-B 槽位也自动生效**（`auto`
+一个独立 host uid，于是 chroot（镜像 rootfs）形态的 **own-identity 槽位也自动生效**（`auto`
 档四条件里最后一条前置补齐）；共享卷的跨租户保护靠真 DAC 成立。
 
 - **不动现网行为**：非 root worker（现网 compose `user: "65534:65534"`、k8s 无
@@ -408,19 +408,19 @@ registered-path 槽位（`--serve-path NAME --token T [--peer-uid UID]...`）的
      两档都精确；
   2. `test_sandbox_lifecycle_rebuild` 手工 register（没有 host_uid）与「有 per-sandbox
      uid 却没分配」的新默认冲突 ⇒ 显式钉 `per_sandbox_uid=False`（它测的是 exec 失败语义），
-     并补 route-B 版对照契约 `test_missing_binary_exits_127_through_the_slot`（实测槽位
+     并补 own-identity 版对照契约 `test_missing_binary_exits_127_through_the_slot`（实测槽位
      同样 exit 127 且无输出，与进程内一致）；
   3. `test_pure_shape_workspace_ownership` 原本硬编码属主 1000 ⇒ 改成形状无关但同样精确：
      目录与沙箱写出的文件同属一个身份、非 root、0700（chown 而非放开权限），
      且该 uid 必须是 worker 记录里的 host_uid 或旧共享档的 1000。
 - **PTY 契约顺手变严**：`test_pty_sandlock` 旧断言钉「四种交错顺序之一」，既没证明
-  resize 到达子进程，也会被合法的另一交错绊倒（route-B 下 shell 的「无控制终端」banner
+  resize 到达子进程，也会被合法的另一交错绊倒（own-identity 下 shell 的「无控制终端」banner
   与首个提示符 `# `/`$ ` 位置不同）。改成「每一片恰好出现一次」+ `stty size`→`40 120`
   的到达证明，两档（进程内 / 槽位）都过。
-- **⚠️ 实测出一个语义差异，未擅自改（要用户拍）**：route-B 沙箱**内**不再是 root
+- **⚠️ 实测出一个语义差异，未擅自改（要用户拍）**：own-identity 沙箱**内**不再是 root
   （in-process 是「ns 内 root、宿主为 X」；槽位本来就是 X，core 因此不建 userns、
   不映射 `0 → X`）。文件属主/T5 两侧一致，差别在客体内 `apt-get`/`chown`/bind :80
-  这类用法。要在 route B 复原 in-guest root，fork 侧让槽位自 `unshare(CLONE_NEWUSER)`
+  这类用法。要在 own identity 复原 in-guest root，fork 侧让槽位自 `unshare(CLONE_NEWUSER)`
   + 写 `0 X 1` 即可（可行性已实测：`deploy/scripts/acceptance/unprivileged_userns_probe.py` 以 uid 21850
   成功映射，`in-ns euid: 0`）。见计划文档「实现期的修正」#7。
 - **门禁（终态，默认开之后）**：gate A `1057 passed / 3 skipped / 0 failed`
@@ -438,7 +438,7 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
 
 1. **拒绝文本变了**：`mediation_run_as=caller refused: …`（旧）⇒
    `in-process path mediation refused: mediation would run as euid 0 while the
-   sandbox's host uid is <N>; … Run sandlock-supervise as uid <N> (route B)`。
+   sandbox's host uid is <N>; … Run sandlock-supervise as uid <N> (own identity)`。
    末尾那句「or pass mediation_run_as=supervisor …」不存在了；按文本匹配的调用方
    要改（`route_b`/executor 的 disclosure 与 E2B 用例已同步）。
 2. **ABI 破坏**：导出符号 164→163，`.so`/wheel 必须同批更新（`wheels/fork/` 当时换成
@@ -450,23 +450,23 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
 3. **`route_b.supervise_policy_document()` 的 drop-guard 删除**：该键已不在
    `SUPERVISE_POLICY_FIELDS`（与 fork `policy.rs::POLICY_FIELDS` 逐名相等，53→52），
    所以 ceiling 若还带它会被**按名拒绝**（fail-closed），而不是被静默丢掉。
-4. root worker + chroot 形态的四条硬前置（wheel 带 supervise、`E2B_ROUTE_B≠off`、
+4. root worker + chroot 形态的四条硬前置（wheel 带 supervise、`E2B_OWN_IDENTITY≠off`、
    `E2B_PER_SANDBOX_UID=true`、uid 段不重叠）见
    `docs/production-deployment-requirements.md` §2.4「删档的后果（终态）」。
 
 `envd_service/executors/sandlock.py::_mediation_run_as()` 与两处 ceiling 里的
 `mediation_run_as` 键一并删除：E2B 不再请求 fork 的 `supervisor` 降级档，
 「特权进程内中介 + 路径中介 + 非 0 host uid」这一组合从此**只剩 fork 的 fail-closed
-拒绝**（`mediation_run_as=caller refused: ... Run sandlock-supervise as uid X (route B)`），
+拒绝**（`mediation_run_as=caller refused: ... Run sandlock-supervise as uid X (own identity)`），
 不再静默留下 supervisor 属主的沙箱文件（T5/SL-1）。
 
-- **一个决策点**：`_route_b_selected() -> bool` 改成 `_route_b_decline_reason() -> str | None`。
+- **一个决策点**：`_route_b_selected() -> bool` 改成 `_own_identity_decline_reason() -> str | None`。
   原先各条静默缩退分支（无 host uid / 起不了槽位 / 老 wheel 无 fd 客户端 / 缺 supervise
   二进制）现在返回**同一句话**，强开（`on`/`SLOTS>0`）时仍然 `raise RuntimeError`
   （route A/B 是部署决策，绝不静默降级），日志与 disclosure 只是把它原文引用。
 - **新形态 disclosure**：`_disclose_mediation_shape()` 在建箱前打**一条**（每进程一次）
   ERROR，说明「chroot 沙箱跑在进程内而不是槽位上（原因…）、fork 会拒绝建箱、怎么修
-  （保持 `E2B_PER_SANDBOX_UID` + `E2B_ROUTE_B=auto/on`，或 launcher / 外部槽位池）」。
+  （保持 `E2B_PER_SANDBOX_UID` + `E2B_OWN_IDENTITY=auto/on`，或 launcher / 外部槽位池）」。
   它先问 `_in_process_mediation_is_refused()`（对齐 fork 的 `mediation_remap_is_refused`：
   F6.1 C 档 + F14「非 root 但持 `CAP_SETUID`/`CAP_SETGID` 的文件能力 launcher 同样算特权
   中介」）——**非 root worker 的中介就是沙箱自己的 euid，那条组合不构成拒绝**，照打会在
@@ -479,7 +479,7 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
   上面那条 disclosure。**已修（fork B1 `656bb31` + fix round 1 `f5e1edd`）**：两个入口
   按 supervise 侧已有的 `err_msg` out 参把失败原因带出来（`sandlock_create_with_err` /
   `sandlock_instance_launch_with_err`），Python 面抛
-  `RuntimeError("sandlock_create failed: <core 文本>")`，点名 `route B` 与 host uid；
+  `RuntimeError("sandlock_create failed: <core 文本>")`，点名 `own identity` 与 host uid；
   评审补的两条与运维相关：新 SDK 配旧 `.so` 会**点名报错**（不再是 `AttributeError`
   被吞成「sandlock 不可用」而静默去掉约束）；**fix round 2**：`auto` 与 `sandlock` 遇上
   「装了但坏」一律 fail closed（抛带原因的 `RuntimeError`，建箱失败），只有「包不存在」
@@ -492,13 +492,13 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
   上面那条 disclosure 保留作第二道说明。
 - **容器实测（首次有测试在真槽位上跑完整 chroot + `fs_denied` 链）**：
   `tests/security/test_template_isolation.py` 三条 chroot 用例全部重写为走生产路径
-  （pooled host uid + `E2B_ROUTE_B=auto` + `await executor.start()`）：
+  （pooled host uid + `E2B_OWN_IDENTITY=auto` + `await executor.start()`）：
   ① `test_image_rootfs_execution` 往 rootfs 里放一个只有该镜像才有的标记文件，
   沙箱内 `cat /template-marker.txt` 精确读回 `IN_IMAGE_ROOTFS`（runner 本身也是 Debian 系，
   os-release 分不出「读的是镜像还是宿主」，标记文件可以）；
   ② `test_..._cannot_reach_host_filesystem` 用**真的**在宿主上 `mkdtemp` 出来的目录做探针
   ⇒ `HOST_HIDDEN`；③ `test_in_process_chroot_is_refused_without_a_slot`：
-  `E2B_ROUTE_B=off` 的 root worker 建箱被拒 + disclosure 那条 ERROR 必须出现 +
+  `E2B_OWN_IDENTITY=off` 的 root worker 建箱被拒 + disclosure 那条 ERROR 必须出现 +
   **对照组**（同 worker、同 host uid、同镜像，只去掉 chroot）正常起箱
   （客体内 `id -u`=0、宿主属主=沙箱 uid）⇒ 证据落在中介规则上，而不是
   「这台 runner 什么都建不出来」。
@@ -549,10 +549,10 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
 
 ## ⚡ 特权最小集实测 + 线上就绪审计（2026-09-10，会话收尾）
 
-这一段的结论已经把 §2.4 的权限口径改掉了（老口径把 `SYS_ADMIN` 写成 E3.2/route-B 前置，
+这一段的结论已经把 §2.4 的权限口径改掉了（老口径把 `SYS_ADMIN` 写成 E3.2/own-identity 前置，
 实测不成立）。**新会话要动特权或上线，先读这里。**
 
-### 1. route-B 真正需要的 cap（非特权容器 + 真 fork wheel + 真槽位实测）
+### 1. own-identity 真正需要的 cap（非特权容器 + 真 fork wheel + 真槽位实测）
 
 | cap | 谁用 | 摘掉的实测后果 |
 |---|---|---|
@@ -560,12 +560,12 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
 | `CHOWN` | workspace chown 0700 给该 uid、回收时 chown 回来 | E3.2 属主前提不成立 |
 | `DAC_OVERRIDE` | **管理面**穿租户 0700 目录树：孤儿对账 `os.walk`、删除 `rmtree`、配额扫描 | `PermissionError: …/sbx_a/workspace`；对账 + 卷持久化 4 failed / 4 error |
 | `SYS_ADMIN` | ~~① 共享卷 `mount --bind`~~（A4 删 bind、A5 补穿透位）~~② 直接 `xfs_quota -x`~~（A6：改由 quota-agent 提供）~~③ 写 namespaced sysctl~~（A6：改由容器 spec 声明 —— compose `sysctls:`、k8s **pod 级** `securityContext.sysctls`；`NET_BIND_SERVICE` 对非 root pod 不足以覆盖 `:53`，见 `deploy/k8s/worker.yaml` 实测注释） | **出厂镜像与清单形态下 worker 不再需要它**（A6/A7 收口；限定见本文件顶部 ⚡ 块与 §2.4.1：合体节点 / legacy netns 两条非默认路径仍需）。摘掉它现在的后果只剩「配额降级」（agent 未配置/不可达 ⇒ 无 per-sandbox 硬限 + WARNING，建箱/挂卷照常）；沙箱侧 confine / 中介 / 设备节点围栏照常。删 bind 之前的实测是「只掉 4 条共享卷用例」（`cannot bind volume … failed mount system call.; keeping the workspace symlink`）。终态口径见 `docs/production-deployment-requirements.md` §2.4.1/§2.4.3（A6 证据 `tmp/a6-agent.log`、`tmp/a6-degrade.log`、`tmp/a6-full-gate.log`） |
-| `SYS_PTRACE` | 只服务**进程内** `RunAs` | 进程内 per-uid 沙箱挂在 `sandlock_create failed`；route B 不需要 |
+| `SYS_PTRACE` | 只服务**进程内** `RunAs` | 进程内 per-uid 沙箱挂在 `sandlock_create failed`；own identity 不需要 |
 
 三条对照数据（原始输出，别只信表格）：
 
 - `--cap-drop ALL` + `CHOWN,DAC_OVERRIDE,FOWNER,KILL,SETGID,SETUID,SETPCAP,SYS_CHROOT,MKNOD`
-  （**没有** `SYS_ADMIN`、**没有** `SYS_PTRACE`）跑 route-B + chroot 沙箱：
+  （**没有** `SYS_ADMIN`、**没有** `SYS_PTRACE`）跑 own-identity + chroot 沙箱：
   `{"created": true, "guest_uid": "0", "mknod_rc": "mknod-rc=1", "blk_node_left": false,
   "file_owner": 21710}` —— 建箱成功、客体内 root、块设备节点造不出也不残留、属主正确。
 - worker 持 `SYS_ADMIN` 时读槽位 `/proc/<pid>/status`：`{"uid": 21710, "eff": []}`
@@ -589,7 +589,7 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
 `CapEff=0xa82425fb`（默认集 + `SYS_ADMIN`，无 `SYS_PTRACE`）。逐项：
 
 - 沙箱侧最小集（SETUID/SETGID/CHOWN/DAC_OVERRIDE）——**满足**（默认集里都有）。
-- wheel 的 route-B 语言面——**不满足**：`sandlock_supervise_connect_fd` = False、
+- wheel 的 own-identity 语言面——**不满足**：`sandlock_supervise_connect_fd` = False、
   `sandlock/bin/sandlock-supervise` 不存在（`setpriv` 在、Landlock ABI 6）。
 - uid 段不重叠——**不满足**：`worker-1`/`worker-2` 共用 `sandbox-shared` 卷，两边都没设
   `E2B_UID_POOL_START` ⇒ 都会从 10000 起。
@@ -602,7 +602,7 @@ skip 逐条核过：全是「Linux / root / docker / `--perf` / 设备能力」�
 「删档的后果」那一格：**必须先用带新 wheel 的镜像 `build-and-push`，再升代码**，顺序反了
 「镜像 rootfs 沙箱全部建不出来」；同一次变更里把两个 worker 的 uid 段拆开。
 升级后自检：`./deploy/scripts/smoke-prod-worker.sh` + worker 日志里应出现
-`route-B instance ready … guest-uid=uid-0-in-userns|host-uid=<该沙箱 uid>`。
+`own-identity instance ready … guest-uid=uid-0-in-userns|host-uid=<该沙箱 uid>`。
 
 ### 3. 本会话完成清单（提交已在 `main`，fork 子模块未动）
 
@@ -637,7 +637,7 @@ phase 2 `47/1/0`、macOS `989/84/0`、`tests/unit` `736/10`。临时文件清理
 
 ## ⚡ guest root 复原 + 设备节点收紧 + 非特权测试 lane（2026-09-10，fork F18）
 
-上一块留下的「route-B 沙箱内不再是 root」按**对齐**处理；顺手把对齐换来的能力收住；
+上一块留下的「own-identity 沙箱内不再是 root」按**对齐**处理；顺手把对齐换来的能力收住；
 并按要求把容器测试从 `--privileged` 换成贴近生产权限的一 lane —— 结果挖出一条被
 `--privileged` 藏了很久的生产要求。
 
@@ -659,13 +659,13 @@ phase 2 `47/1/0`、macOS `989/84/0`、`tests/unit` `736/10`。临时文件清理
   没人看见）。内核对「写别人进程的 `uid_map`」除了 `CAP_SETUID` 还要求对该进程的 ptrace
   访问权。实测矩阵（`--cap-drop ALL` + Docker 默认集）：只加 `SYS_ADMIN` ⇒ 每个建箱挂在泛化的
   `sandlock_create failed`；**只**再加 `SYS_PTRACE` ⇒ 全通；加 `MKNOD` 而不加 ptrace ⇒ 仍挂。
-  反过来 **route B 一条 cap 都不需要**（槽位自映射）：同 lane 下 route-B 槽位池 + executor
+  反过来 **own identity 一条 cap 都不需要**（槽位自映射）：同 lane 下 own-identity 槽位池 + executor
   契约 + T5 uid 契约 `35 passed`。E2B 侧因此加启动探测 + WARNING
   （`uid_pool.has_effective_cap(CAP_SYS_PTRACE)` → `PER_UID_NO_PTRACE_WARNING`），fork 侧
   把两条路径的权限差写进 `docs/supervise-identity-handoff.md` §7b。
 - **非特权「生产形」测试 lane**：新脚本 `deploy/scripts/test-prod-shaped.sh` ——
   `--cap-drop ALL` + 部署清单等价 cap（Docker 默认集 + `SYS_ADMIN` `SYS_PTRACE`
-  `NET_ADMIN`）+ `seccomp=unconfined`，root 跑（否则 E3.2/route B 根本不在场上）。
+  `NET_ADMIN`）+ `seccomp=unconfined`，root 跑（否则 E3.2/own identity 根本不在场上）。
   实测：Landlock（ABI 8）与非特权 userns 都不需要特权 ✅；**唯一造不出来的是 XFS prjquota
   暂存盘**（容器内 loop 不可用，`--cap-add SYS_ADMIN` + `--device /dev/loop-control` 也
   `failed to setup loop device`）⇒ 7 个配额文件显式 `--ignore`（`E2B_TEST_STRICT_SKIPS=1`
@@ -685,10 +685,10 @@ phase 2 `47/1/0`、macOS `989/84/0`、`tests/unit` `736/10`。临时文件清理
   `test_executor_command_runs_in_the_leased_generation`（**同时**钉客体内 0 与宿主侧属主 = 租到的
   uid —— 只钉一头另一头就能悄悄退化）、`_uid_disclosure()` 让 root/非 root 两种 runner 都保持精确断言。
 
-## ⚡ route-B transport 1：token 从 argv 消失（2026-09-09，SL-10 闭口 / fork F17）
+## ⚡ own-identity transport 1：token 从 argv 消失（2026-09-09，SL-10 闭口 / fork F17）
 
 上一块留的「要彻底闭口需 fork 提供 token-by-fd/env」按**给语言面补 transport 1（fd
-handoff）**实现：route-B 槽位的凭证现在是**一条继承来的 unix 描述符**，argv 里没有
+handoff）**实现：own-identity 槽位的凭证现在是**一条继承来的 unix 描述符**，argv 里没有
 `--token`，`/tmp` 里也没有注册 socket（`sun_path` 108 字节约束随之消失）。
 
 - **fork F17**（`e290059` + `f20d034` + `c0f7bf5`，未推送）：
@@ -710,8 +710,8 @@ handoff）**实现：route-B 槽位的凭证现在是**一条继承来的 unix �
     （fix 前后 `/proc/<stats.pid>/fd` 比对结果相同），所以这是护栏不是 bug 复现，
     已钉成 fork 用例。
 - **envd 侧**：`W1SlotPool` 默认 `transport="fd"`（`socketpair()` + `pass_fds` 同号交付
-  `--control-fd N --serve`）；新开关 `E2B_ROUTE_B_TRANSPORT=fd|path`、
-  `E2B_ROUTE_B_VERB_TIMEOUT_S`（默认 15 s，动词超时即退役会话 ⇒ 按死箱重启一次）；
+  `--control-fd N --serve`）；新开关 `E2B_SLOT_TRANSPORT=fd|path`、
+  `E2B_SLOT_VERB_TIMEOUT_S`（默认 15 s，动词超时即退役会话 ⇒ 按死箱重启一次）；
   池缓存键含 transport；`--peer-uid` 只在 `path` 形态相关。
   **白得的收口保证**：worker 崩溃 ⇒ 通道 EOF ⇒ 槽位按 `finish()` 异常收口自杀
   （registered 形态下 socket 比 worker 活得久）。
@@ -724,7 +724,7 @@ handoff）**实现：route-B 槽位的凭证现在是**一条继承来的 unix �
 - **踩到并修掉的构建链陷阱**：`deploy/scripts/build-sandlock-wheels.sh` 跑的是
   `third_party/sandlock-wheel-builder/Dockerfile` —— 那是 **F2b.5 之前**的旧配方，
   产出的 wheel **不含 `sandlock/bin/sandlock-supervise`**（本次实测 2.2 MB vs 正确 7.4 MB），
-  而且**退出码 0**：装上后 route-B 只会静默退回进程内后端。现该脚本改为委托
+  而且**退出码 0**：装上后 own-identity 只会静默退回进程内后端。现该脚本改为委托
   fork 的 `python/build-wheels.sh`（它同批 cross-build supervise、注入 wheel、
   写 HEAD 钉住的 `SHA256SUMS.supervise`，缺任何一件**就地报错**）。旧配方（E2B 侧的
   `third_party/sandlock-wheel-builder/`）先标 SUPERSEDED、后于 **2026-09-30 删除**：
@@ -736,27 +736,27 @@ handoff）**实现：route-B 槽位的凭证现在是**一条继承来的 unix �
   supervise_root 4 / mediation_2uid 10（全部「matches baseline」）。
   E2B（同一棵树 + 同一批 wheel）：gate A `1054 passed / 2 skipped / 0 failed`
   （`tmp/rb-f17r2-gate-a.log`）、gate B `1053 / 3 / 0`（`tmp/rb-f17r2-gate-b.log`）、
-  route-B 专题切片（槽位池 + executor 契约 + T5 + 两份单测）**`70 passed`**
+  own-identity 专题切片（槽位池 + executor 契约 + T5 + 两份单测）**`70 passed`**
   （`tmp/rb-f17-focused.log`）、macOS `977 passed / 75 skipped / 0 failed`
   （`tmp/rb-f17-macos2.log`）。r1 一轮（加 fd-client 守卫之前）在
   `tmp/rb-f17-gate-a.log` / `tmp/rb-f17-gate-b.log`，同样 0 failed。
 
-## ⚡ executor 全面走 supervise（2026-09-09，route-B 接线收口 / backlog #5）
+## ⚡ executor 全面走 supervise（2026-09-09，own-identity 接线收口 / backlog #5）
 
 chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-supervise` 槽位**上
 （euid == 该沙箱 host uid），路径中介不再是 root worker 进程 ⇒ T5（代打开文件属主
 变 root、1777+sticky per-uid 卷保护失效）在 E2B 侧构造性消失。
 `tests/contract/test_uid_permissions.py` 的 **strict xfail 已摘**。
 
-- **开关**：`E2B_ROUTE_B=auto|on|off` + `E2B_ROUTE_B_SLOTS`（>0 亦为强开信号）+
-  `E2B_ROUTE_B_TMP_ROOT`。`auto` 只在「root worker + `E2B_PER_SANDBOX_UID` + 已分配
+- **开关**：`E2B_OWN_IDENTITY=auto|on|off` + `E2B_MAX_SLOTS`（>0 亦为强开信号）+
+  `E2B_SLOT_TMP_ROOT`。`auto` 只在「root worker + `E2B_PER_SANDBOX_UID` + 已分配
   host_uid + chroot 形态 + wheel 带 supervise」成立时启用；显式 `on`/`SLOTS>0` 而前置
   不满足 ⇒ 建箱直接报错（route A/B 是部署决策，绝不静默降级）。
 - **实现**：`_build_instance_policy()` 拆出 `_policy_ceiling()`（kwargs）→
   `route_b.supervise_policy_document()`（`fs_mount` 转 `VIRT:HOST`、丢 `None` 与
   `mediation_run_as`、未知字段按名拒绝；字段表由单测与 fork
-  `policy.rs::POLICY_FIELDS` 逐名钉住，53 项）；`route_b.RouteBInstance` /
-  `RouteBExecProcess` 复刻 `SandboxInstance`/`ExecProcess` 面
+  `policy.rs::POLICY_FIELDS` 逐名钉住，53 项）；`route_b.OwnIdentityInstance` /
+  `OwnIdentityExecProcess` 复刻 `SandboxInstance`/`ExecProcess` 面
   （exec/wait_child/kill_child/update_network/shutdown），executor **只剩一条代码路径**；
   建槽/收槽走 `asyncio.to_thread`（不阻塞事件循环），`_CommandGate` 语义不变。
 - **实现期推翻的两条设计**（详见计划文档「实现期的修正」表）：
@@ -764,7 +764,7 @@ chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-s
   `/dev/null`，dash/bash 都会为它跑满一核；改成 `while :; do kill -STOP $$; done`
   （契约 `test_parked_main_program_costs_nothing` 钉「1 s 墙钟整棵槽位树 ≤2 tick」）。
   ② 槽位必须**按沙箱自己的 host uid 定向租用**（workspace 已按该 uid chown 0700，
-  换 uid 的槽位连自己沙箱目录都进不去）⇒ route-B 天然要求 per-sandbox uid；
+  换 uid 的槽位连自己沙箱目录都进不去）⇒ own-identity 天然要求 per-sandbox uid；
   uid 台账加锁、进程未确认退出前不归还 uid。
 - **另外三条硬约束**（都进了代码注释 + 部署检查表）：registered 槽位是**单线程串行
   accept** ⇒ `wait()` 先轮询宿主 pid 消失再发 `wait_child`（`CHILD_POLL_CAP_S` 兜底）；
@@ -774,7 +774,7 @@ chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-s
 - **踩到的环境坑（已在池里根治）**：scratch 根若为 0700（pytest `tmp_path`、
   umask 077 都会）则槽位读不到自己的 policy（`Permission denied`），而 policy 里有
   egress 代理口令/secret 路径 ⇒ 池现在强制 目录 0755/0711 + 文档 `0440 root:<uid>`。
-- **route-B 反而更强的一点**：`kill_child` 带信号号 ⇒ route-B 子进程
+- **own-identity 反而更强的一点**：`kill_child` 带信号号 ⇒ own-identity 子进程
   `supports_signal_pause=True`（SIGSTOP 真停，进程内后端仍 False/SIGKILL-only）。
 - **口径更正（重要，实测推翻本块上一版的一句结论）**：本块初版写「token 在 argv 里，
   但跨 uid 读 `/proc/<pid>/cmdline` 需要 ptrace 权限 ⇒ 租户读不到」—— **错的**。
@@ -788,16 +788,16 @@ chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-s
 - **顺带抓到 fork 一个真 bug（SL-9）**：F16 Python 客户端 `_take_err_msg` 的错误分支
   必坏（调用点传 `ctypes.byref(...)`，helper 却取 `.contents`）⇒ 任何 connect/transport
   失败抛 `AttributeError` 而不是 `SandlockError`，服务端错误文本全丢。
-  envd 侧已免疫：`RouteBInstance.request` 把 `SandlockError`/`OSError`/`AttributeError`
+  envd 侧已免疫：`OwnIdentityInstance.request` 把 `SandlockError`/`OSError`/`AttributeError`
   一并归类成 `SlotDeadError`（只放行服务端 `SandboxError`），单测
   `test_a_client_side_channel_failure_is_not_a_policy_refusal` 钉住。
   fork 侧修法（≈10 行 + 1 条回归用例）与影响见 `docs/sandlock-upstream-issues.md` SL-9。
 - ~~**仍未删**：`mediation_run_as='supervisor'` 降级档~~ ⇒ **已删（2026-09-10）**，
   前置（per-sandbox uid 成部署默认）在 09-09 晚已满足；后果与实测见下面「删档」块
   （`## ⚡ 删掉 supervisor 降级档（2026-09-10）`）。
-- **新增测试**：单测 `tests/unit/test_route_b_wiring.py`（28）+
-  `tests/unit/test_sandlock_executor_route_b.py`（23，FakePool/FakeChannel 注入，
-  macOS 可跑）；契约 `tests/contract/test_route_b_executor.py`（7，root+Linux 实跑：
+- **新增测试**：单测 `tests/unit/test_own_identity_wiring.py`（28）+
+  `tests/unit/test_sandlock_executor_own_identity.py`（23，FakePool/FakeChannel 注入，
+  macOS 可跑）；契约 `tests/contract/test_own_identity_executor.py`（7，root+Linux 实跑：
   子进程 uid、文件属主+自 chmod、停车零 CPU、PTY 尺寸回读、SIGSTOP/信号退出码 -1、
   close 后 uid 干净可复用、**单槽位并发命令不互堵**）。
 - **终态门禁（同一棵树复跑）**：gate A（chroot，base=python-mcp:3.14，concurrency=2、
@@ -805,32 +805,32 @@ chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-s
   本轮早先一次 `1047/2/0` 见 `tmp/rb-gate-a.log`，差额 = 中途新增的那条「单槽位多命令
   不互堵」契约）；gate B（pure）`1046 passed / 3 skipped / 0 failed`
   （`tmp/rb-gate-b.log`）；macOS `972 passed / 74 skipped / 0 failed`
-  （`tmp/rb-macos2.log`）；route-B 专题切片（槽位池 2 + executor 契约 7 + T5 4 +
-  两份 route-B 单测 51）容器实跑 `64 passed`（`tmp/rb-focused.log`，同一终态树）。
+  （`tmp/rb-macos2.log`）；own-identity 专题切片（槽位池 2 + executor 契约 7 + T5 4 +
+  两份 own-identity 单测 51）容器实跑 `64 passed`（`tmp/rb-focused.log`，同一终态树）。
   **T5 从此在两份门禁日志里都不再出现 xfail**。
   口径说明：gate A2/B 起跑后本树只发生过 **注释与一个未用 import 的删除**
   （`from dataclasses import …, field`），不动行为；macOS 全量与
   `tmp/rb-focused.log` 切片则直接跑在终态字节上 ⇒ 三份数字对终态 tip 都成立。
 - **性能（必录）**：租槽位只发生在每沙箱第一条命令 ——
-  in-process first-exec `10.63 ms` → route-B `57.11 ms`（+46 ms：spawn supervise +
+  in-process first-exec `10.63 ms` → own-identity `57.11 ms`（+46 ms：spawn supervise +
   launch 一代 + 等 registered channel），稳态 exec 无差异
   （warm p50 `4.29 → 4.35 ms`，n=20）；证据 `tmp/perf/route-b-first-exec.txt`。
-  另注意 route-B 的 `max_lifetime=None` + 常驻 M0 ⇒ core 的 15 min idle reclaim
+  另注意 own-identity 的 `max_lifetime=None` + 常驻 M0 ⇒ core 的 15 min idle reclaim
   不再触发，沙箱回收完全由 envd 生命周期（TTL/evict/`ctx.shutdown`→`close()`）驱动。
 
-## ⚡ envd route-B 接线起步（2026-09-09）：W1 槽位管理器 + envd 侧 T5 证据
+## ⚡ envd own-identity 接线起步（2026-09-09）：W1 槽位管理器 + envd 侧 T5 证据
 
 - **W1 已定**（沿用 2026-09-04 决策；窗口 = 同时在世槽数 N；W2 为可选升级）。
-- `envd_service/route_b.py`：`W1SlotPool` —— 固定不重叠 uid 段；`acquire` 挑空闲
+- `envd_service/own_identity.py`：`W1SlotPool` —— 固定不重叠 uid 段；`acquire` 挑空闲
   uid 并 spawn `sandlock-supervise --serve-path --token --peer-uid <worker> --program`
   （setpriv 包装，同 fork root 档形态；registry 按 uid 隔离），等 socket 出现；
   `release` 发 shutdown + 等退出 → uid 回池（W1 原地重启）；可注入 spawner 供生产
   launcher。
-- 契约 `tests/contract/test_route_b_slot_pool.py`（root + Linux 门控）**2 passed**
+- 契约 `tests/contract/test_own_identity_slot_pool.py`（root + Linux 门控）**2 passed**
   （容器实跑）：两个不同 uid 槽位经 `SuperviseChannel` exec —— X 建文件宿主属主 X、
   自 chmod 生效；Y 对该文件 rm/chmod 均 EPERM（1777+sticky 真语义）；W1 uid 复用/
   耗尽语义。这是 T5 在 envd 侧的硬证据（fork `mediation_2uid` B档 的 Python 复刻）。
-- **最终门禁（2026-09-09，route-B 基础落地后）**：macOS `921 passed / 67 skipped /
+- **最终门禁（2026-09-09，own-identity 基础落地后）**：macOS `921 passed / 67 skipped /
   0 failed`（`tmp/final2-macos.log`）、gate A `989 passed / 2 skipped /
   1 xfailed(T5) / 0 failed`（`tmp/final2-e2b-gate-a.log`；r1–r3 红 =
   `worker_nonroot` rootfs `/bin/echo` 缺失，VM 磁盘水位 ~91% 下的 docker export
@@ -1015,7 +1015,7 @@ aware 特权 remap gate），均未推送。三份计划文档状态 → ✅（f
 - **F14**：`privileged_userns`/C 档 gate 从 `euid==0` 升级为 effective-caps 判定
   （CapEff 含 `CAP_SETUID|CAP_SETGID`）；file-cap launcher（euid 非 0 + caps）
   以点名能力的新消息建箱前 fail-closed，不再落到暗示无 caps 的晚拒；root/无
-  caps/同 uid/route-B 不受影响；core_lib 827→828、mediation_2uid 8→9。
+  caps/同 uid/own-identity 不受影响；core_lib 827→828、mediation_2uid 8→9。
 - **fork 终态门禁（各任务逐轮全绿，最后一次 = 4d5f385 树）**：non-root
   core_lib 828 / core_integ 533 / ffi 100 / cli 98 / supervise 36 /
   supervise_cost 3 / cli_build 0 / python 454；root oci 144 / supervise_root 2 /
@@ -1066,11 +1066,11 @@ aware 特权 remap gate），均未推送。三份计划文档状态 → ✅（f
   副本未被 409 改回。断言全精确，无 substring。
 - **Ledger close-out**（`docs/task-backlog.md`）：FUP #1（`7a98755`+`aa844b7`）、
   #7（`8ac02a7`）、#8（`84e807f`）、#9（`710ddd2`）、#10（`beff30f`）、#12
-  （`0e15572`）→ ✅；#4（产品决策）、#5（route-B 前置）、#11（约定）⬜ open 并显式
+  （`0e15572`）→ ✅；#4（产品决策）、#5（own-identity 前置）、#11（约定）⬜ open 并显式
   标注；新增两条 G2 评审登记（#13 本地 snapshot fork × per-sandbox-uid uid 分配
   缺口、#14 快照剪枝启发边界风险）；FUP #6 / T3 ✅ 原样保留。快照剪枝边界同时在
   `control_plane/registry/snapshots.py::_prune_store` 留下 boundary note。
-- **Open-FUP 最终态**：仍 open 仅 #4（SDK 可见性，产品决策）、#5（T5 route-B 后摘
+- **Open-FUP 最终态**：仍 open 仅 #4（SDK 可见性，产品决策）、#5（T5 own-identity 后摘
   xfail）、#11（bisect 日志头纪律，约定）、#13/#14（G2 评审登记）；下方各历史块中
   的 FUP 编号列表以本块与 task-backlog 为准。**新增（2026-09-06 用户指示列入主要
   计划）**：fork **F12 — ProcessIndex 一 TGID 一 entry**（线程 tid 懒登记建模收口，
@@ -1079,7 +1079,7 @@ aware 特权 remap gate），均未推送。三份计划文档状态 → ✅（f
   + wheel → E2B 指针 bump + thread/gateway 探针 + full gate A/B 复跑。
   **再增（2026-09-06，C 类评估后按建议排入计划）**：fork **F13 — fs 写家族挂载
   保护收尾**（FUP-04 link 直击 + FUP-05 目录挂载点 rmdir + 断言精度，中优先，
-  ⬜ 计划中）与 **F14 — capability-aware 特权 remap gate**（FUP-22，route-B ③
+  ⬜ 计划中）与 **F14 — capability-aware 特权 remap gate**（FUP-22，own-identity ③
   部署前完成，⬜ 计划中）：fork 计划
   `third_party/sandlock/docs/fork-plan-2026-09-f13.md` /
   `third_party/sandlock/docs/fork-plan-2026-09-f14.md`；main 登记 task-backlog
@@ -1124,7 +1124,7 @@ Open-FUP 列表据此更新（最终态见顶部 ⚡ G3 块）：② fork F11、
 已关闭（thread-tid-keying fork 内部残余随 ② 登记，见 `docs/task-backlog.md`
 row 2）；① 远程 pause/resume 投递、⑥ pure-shape workspace 属主对齐（gate B trio）、
 ⑦–⑩、⑫ 已分别由 G1a/G2/G3 关闭（见 ⚡ G2 与顶部 ⚡ G3 块）；仍 open：④ 网关启动
-失败 SDK 可见性（产品决策）、⑤ T5 xfail route-B 后摘除、⑪ bisect 日志头纪律
+失败 SDK 可见性（产品决策）、⑤ T5 xfail own-identity 后摘除、⑪ bisect 日志头纪律
 （约定），外加 G2 评审登记 #13/#14（task-backlog 同号条目）。
 
 ## ⚡ G2（FUP #6 pure-shape workspace 属主对齐 + T3 快照自嵌套守卫，2026-09-06）
@@ -1203,7 +1203,7 @@ prune embedded store roots (T3)`。报告 `tmp/sdd/g2-ownership-snapshot-report.
 
 - 容器 full gate A：image-rootfs + netns + XFS + npm + strict（`E2B_BASE_IMAGE=python-mcp:3.14`，
   `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2`）→ 925 passed / 1 skipped / 1 xfailed /
-  0 failed / 0 error（282.69s）；唯一 xfail = T5（route-B 前置）；唯一 skip =
+  0 failed / 0 error（282.69s）；唯一 xfail = T5（own-identity 前置）；唯一 skip =
   `test_volume_quota.py:274`（XFS-degradation 互斥分支，历史每轮一致）。
 - 容器 full gate B：pure sandlock + netns + strict（`E2B_BASE_IMAGE=` 空）→
   921 passed / 3 skipped / **3 failed（pre-existing pure-shape trio，见下）** /
@@ -1227,7 +1227,7 @@ follow-ups」；最终态见顶部 ⚡ G3 块）**：① 远程 pause/resume 投
 ③ 网关 ledger headroom（E2B 侧已关闭，FUP #3）、⑥ pure-shape workspace 属主对齐
 （gate B trio）、⑦–⑩、⑫ —— 均 ✅ 已关闭（G1a/G2/G3，提交 hash 见 task-backlog
 同号条目；门禁 `tmp/g1-*`/`tmp/g2-*`/`tmp/g3-*.log`）；仍 open：④ 网关启动失败 SDK
-可见性（日志已落地，产品决策待定）、⑤ T5 xfail route-B 后摘除、⑪ bisect 日志头
+可见性（日志已落地，产品决策待定）、⑤ T5 xfail own-identity 后摘除、⑪ bisect 日志头
 纪律（约定），外加 G2 评审登记 #13/#14（task-backlog 同号条目）。
 
 Release note / 变更段（M4；fork 侧行为变化引用
@@ -1245,7 +1245,7 @@ Release note / 变更段（M4；fork 侧行为变化引用
   在跑 child 保旧策略，staleness 回报日志）；`denyOut`/default-allow 实例 live-immutable；
   放宽/模型翻转在 persist 前 HTTP 409；local apply 原子；remote push-then-persist 带既有
   transport-loss caveat。
-- pause 冻结 `ProcessManager` 命令组（网关不在命令组、不暂停）；T5 xfail 在 route-B
+- pause 冻结 `ProcessManager` 命令组（网关不在命令组、不暂停）；T5 xfail 在 own-identity
   supervise 部署前保持（属预期）。
 - per-sandbox 默认内存 512→1024 MiB（`E2B_DEFAULT_MEMORY_MB`）：网关 ledger headroom
   FUP 在 E2B 侧关闭——1 GiB 箱给网关 allocator reservations 与 450M MCP server 目标留出
@@ -2011,7 +2011,7 @@ sdk js+security）`803 passed / 53 skipped / 0 failed`**（此前 unit+contract
    - T5 chroot 形态下共享卷写入仍经 supervisor 归属（`fs_denied` 的代打开路径在
      chroot 里无法回避，见上）⇒ `test_volume_shared_rw_across_distinct_uids` 在该形态
      `xfail(strict=True)`，非 chroot 形态必须真通过（并新增断言
-     `written_by == ra.host_uid`，回归即红）。**仍开（唯一 xfail）**：route-B supervise
+     `written_by == ra.host_uid`，回归即红）。**仍开（唯一 xfail）**：own-identity supervise
      部署（euid == 沙箱 host uid）后摘除，见顶部 follow-up 列表。
 
 全开一次（镜像 rootfs + netns + XFS + npm + strict）：
@@ -2140,7 +2140,7 @@ cargo test -p sandlock-core --offline --test integration test_netns -- --test-th
 | `envd_service/process/logs.py` | 命令输出 JSONL 采集 |
 | `envd_service/runtime/image_resolver.py` | rootfs 解包、pull、registry login、digest 缓存 key |
 | `E2B_IMAGE_CACHE_DIR/_oci/` | 无 registry 时本地构建的 OCI layout tar + `.link` 侧车（resolver 优先读它） |
-| `third_party/sandlock/docs/e2b-integration.md` | sandlock 侧唯一事实源：已落地方案 / 待实施 P1–P8 / 未解决 SL-1（T5 摘除前置 route-B）/ 验证矩阵；T4 已于 2026-09-06 关闭（fork `upstream-pr/netns-free-clean`，M4 状态随 Task 11 收口） |
+| `third_party/sandlock/docs/e2b-integration.md` | sandlock 侧唯一事实源：已落地方案 / 待实施 P1–P8 / 未解决 SL-1（T5 摘除前置 own-identity）/ 验证矩阵；T4 已于 2026-09-06 关闭（fork `upstream-pr/netns-free-clean`，M4 状态随 Task 11 收口） |
 | `docs/sandlock-upstream-issues.md` | 编号映射索引（内容以上述 fork 文档为准） |
 | `third_party/sandlock/docs/{e2b-integration,sandlock-network-wildcard,netns-isolation-fd-injection,sandbox-level-cow,upstream-pr-netns-free}.md` | sandlock 侧全部方案与问题文档（E2B 撰写的部分已迁入 fork 仓库） |
 | `envd_service/gateway.py` | 路由缓存 + `/internal/routes/{id}/invalidate` |

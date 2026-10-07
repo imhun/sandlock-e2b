@@ -17,7 +17,7 @@
 |---|---|---|
 | 做法 | `e2b-maint` 从"file-capability 二进程"变成"一个最小的 root broker 服务"，动作与路径白名单一个字不改 | 建箱流程改成"每个属于沙箱的路径都由池 uid 亲手创建"，worker 不再 chown 任何东西 |
 | worker 容器 | 非 root（65534）；pod 里不再有 root 容器 | 非 root；**全链路**（含节点级 DaemonSet）都不再有 root |
-| 隔离模型 | 完全不变（per-sandbox uid + route B + `0770` 组位） | 完全不变 |
+| 隔离模型 | 完全不变（per-sandbox uid + own identity + `0770` 组位） | 完全不变 |
 | 改动面 | 1 个 broker 服务模式 + 1 个 transport + 1 个 DaemonSet | 1 个新 broker 原语（`e2b-as-uid`）+ 8 个位点改写 |
 | NFS 语义风险 | 零（还是 root 在 chown，已实测过的那条路） | **每个位点都要在 NAS 上重新验一遍**（粘滞位/组位/`0600` 都会咬人） |
 | 相对规模 | 1 周 | 3–5 周（含真机验收） |
@@ -58,7 +58,7 @@
 - "**以 X 的身份**执行 `mkdir`/`write`" ⇒ 服务端看到的凭据就是 X ⇒ 建出来的 inode 属主 = X ✔
 - "以 X 的身份执行 `chown`" ⇒ **不成立**：服务端拒绝非属主改属主（这正是今天必须 euid 0 的原因）
 
-所以 C2 的全部改动都是"把前者换掉后者"。这条链路已经在生产上被验证过：**route-B 槽位以沙箱 uid
+所以 C2 的全部改动都是"把前者换掉后者"。这条链路已经在生产上被验证过：**own-identity 槽位以沙箱 uid
 运行，沙箱自己写的文件宿主属主就是池 uid**（`docs/production-deployment-requirements.md` §5.4(b)
 的 T1 实测，`docs/reports/o1-t1-fleet-report.md`）。缺的不是能力，是"把这个形状推广到建箱的每一个位点"。
 
@@ -86,7 +86,7 @@ e2b-as-uid extract --uid X --gid G             --path D     # stdin = tar 流，
 
 > **落地前要先定的设计点（本文不臆断取舍）**：上面三个 verb 都是**创建型**。但 §6 H4 要求
 > **删除与记账**（`rm` / `walk`）也必须"以 X 身份"做 —— 要么补 4/5 个 verb（`rm`/`walk` 以 X 运行），
-> 要么复用"已经以 X 在跑的 route-B 槽位"来代劳。两条路的失败模式与审计面不同，要在写实施计划时
+> 要么复用"已经以 X 在跑的 own-identity 槽位"来代劳。两条路的失败模式与审计面不同，要在写实施计划时
 > 单列一节定死。
 >
 > **第二个设计点（2026-09-28 量出来的）**：池 uid **不能**把自己的目录 `chgrp` 到 worker 的组
@@ -113,7 +113,7 @@ e2b-as-uid extract --uid X --gid G             --path D     # stdin = tar 流，
    路径过 `priv_common.c` 的 `realpath` + 白名单、uid 必须落在池内、**且必须与树/记录的属主一致**
    （否则一个池 uid 就能删另一个沙箱的树 —— 这条要在实现时写死并有用例）。**实测支持**：`A2`
    （X 拆自己的树）= `OK`、`A4`（X 在粘滞父目录里删自己的条目）= `OK`。
-2. 借已经以 X 在跑的 **route-B 槽位**代劳。**不成立**：槽位跑在沙箱自己的 mount ns 里（`pivot_root`
+2. 借已经以 X 在跑的 **own-identity 槽位**代劳。**不成立**：槽位跑在沙箱自己的 mount ns 里（`pivot_root`
    之后宿主路径不可达），而且要删的树大多属于**已经死掉**的沙箱 —— 没有槽位可借。除非改 fork 暴露一条
    "宿主视角、以 X 身份"的通路，那是比 1 更大的改动。
 3. **去掉粘滞位**（`<workspaces>` 从 `1777` 变 `2777`），让 worker 用组位直接删树根。**实测支持**：
@@ -176,7 +176,7 @@ Sep-19 的记录、这些树没有记录）—— `uid_pool` 的孤儿回收只�
 | 2 | 属主交棒：`envd_service/uid_pool.py::apply_sandbox_ownership` | 递归 `chown` 给池 uid | 改成**校验**：walk 断言每个 entry 属主=X、目录 gid=worker gid、mode `0770`，不符即 fail closed 点名 —— ⚠ **这里的 "gid=worker gid" 是 2026-09-28 量出来的设计问题**：池 uid 自己 `chgrp` 到 worker 的组会 `EPERM`（§4 末、§7），所以这一位要么保留一次显式交棒，要么放弃组位模型 |
 | 3 | 卷切片：`envd_service/volumes.py`（卷根 `_chown_path(volume_root, host_uid)` 与 slice 建立） | worker 建 slice 再 chown；**卷根属主 = 当前挂载的那个沙箱** | `mkdir` 原语建 slice；卷根的 chown 直接删掉（`1777` 足够）⇒ **"卷根属主=首个挂载沙箱"这条语义废弃**，`tests/unit/test_volume_quota.py` 里那条 `root_st.st_uid` 断言要跟着改 |
 | 4 | 检查点镜像目录：`envd_service/runtime/checkpoint_store.py`（`_hand_to_sandbox`；`.checkpoints` gate 今天是 `os.chmod(root, 0o711)`） | worker 建 parent 再交属主 | `mkdir` 原语建；**`.checkpoints` 的 `0711` 对池 uid 不可写，要单独定策**（见 §8 风险 2） |
-| 5 | route-B 策略文档：`envd_service/route_b.py`（lease 文档由 worker 写） | worker 写 + `chgrp` 到 slot gid（NFS 上给非属组 `chgrp` 必被拒） | 用 `write` 原语写进 slot 自己的目录 |
+| 5 | own-identity 策略文档：`envd_service/own_identity.py`（lease 文档由 worker 写） | worker 写 + `chgrp` 到 slot gid（NFS 上给非属组 `chgrp` 必被拒） | 用 `write` 原语写进 slot 自己的目录 |
 | 6 | 沙箱 secret 文件：`envd_service/executors/sandlock.py` 的注入路径 | C1 wave 3 起走 broker chown（已修静默跳过） | 用 `write` 原语（"以 X 写"代替"写完再 chown"） |
 | 7 | 孤儿回收：`envd_service/uid_pool.py` 的 reconcile（把 stale 树 `_chown_tree` 回 worker） | 把 stale 树 chown 回 worker，uid 可复用 | 改成**删除**（池 uid 回收 + `rmtree`，以 X 身份 ⇒ §4.1 的 `rm --recursive` verb）；"chown 回 worker"在 NFS 上做不到。⚠ 今天的回收谓词是"属主 ∈ 池 且 无记录"，**属主 0 的老树永远进不来**（§4.2 末）|
 | 8 | 迁移导入：`envd_service/agent.py` 的 tar 解包（`tar.extractall`）与 `align_shared_uid_workspace` | worker 解 tar | `extract` 原语；`align_shared_uid_workspace` 按形态保留 |
@@ -185,12 +185,12 @@ Sep-19 的记录、这些树没有记录）—— `uid_pool` 的孤儿回收只�
 
 ## 6. 硬限制（产品语义层面，绕不过去）
 
-先把结论说清楚：**物理上没有"做不到"这回事**（NFS 上"以池 uid 身份创建"是可用的，route-B 槽位
+先把结论说清楚：**物理上没有"做不到"这回事**（NFS 上"以池 uid 身份创建"是可用的，own-identity 槽位
 今天就在这么干），但有 4 条硬约束。
 
 **H1：必须"以 X 身份创建"，所以 C2 需要"能成为 X"的能力。**
 只有三条实现：新加一个 file-capability broker（`cap_setuid,cap_setgid`，就是今天
-`e2b-slot-spawn` 的模式）、把这一步塞进**已经以 X 运行的 route-B 槽位**（fork 改动，不新增任何
+`e2b-slot-spawn` 的模式）、把这一步塞进**已经以 X 运行的 own-identity 槽位**（fork 改动，不新增任何
 能力）、或者换掉存储。**必须说破的事实**：C2 不是"减小权限面"，是"换一种权限"——它把
 `CAP_CHOWN` 换成 `CAP_SETUID`（更宽）。它真正换来的是**数据面里不存在 uid 0 进程**。
 
@@ -205,8 +205,8 @@ Sep-19 的记录、这些树没有记录）—— `uid_pool` 的孤儿回收只�
 **H3："worker 要能写"与"只有 X 能读"在同一挂载上不可兼得。**
 沙箱是 `setgroups([])`，没有共享组可用；能力又不过网。所以给一个 inode 定权限时只有两个选项：
 X 私有（worker 完全碰不到，要改只能通过"以 X 身份"的原语整体重写），或者放开组位/其它位
-（那就等于放开给所有读者）。这条直接顶死一个现有需求：route-B 策略文档的注释写着"owner 必须留在
-worker，因为它要在 W1 重启后改写 lease"（`envd_service/route_b.py`）。所以这里必须**二选一**：走
+（那就等于放开给所有读者）。这条直接顶死一个现有需求：own-identity 策略文档的注释写着"owner 必须留在
+worker，因为它要在 W1 重启后改写 lease"（`envd_service/own_identity.py`）。所以这里必须**二选一**：走
 "X 私有"就得每次通过原语以 X 重写（策略文档、secret 都是这一类）；走"放开组位"就是 §4.2 选的
 setgid 方案 —— worker 靠组位直接读写（`F3` 实测），代价是 worker 作为可信中介能读树里的一切
 （这也是今天的姿态：树里 `0755`/`0644` 的条目本来就近乎对所有读者开放）。**§4.2 选的是后者**；
@@ -332,6 +332,6 @@ gid" 依然成立，但理由要读对**：它服务的是 **worker（65534，�
   要复核就按 §7 的两行命令重跑）。
 - **源码锚点**（§5 的位点，按函数名而不是行号引用，行号会漂）：
   `envd_service/uid_pool.py::apply_sandbox_ownership`、`envd_service/volumes.py`、
-  `envd_service/runtime/checkpoint_store.py::_hand_to_sandbox`、`envd_service/route_b.py`、
+  `envd_service/runtime/checkpoint_store.py::_hand_to_sandbox`、`envd_service/own_identity.py`、
   `envd_service/executors/sandlock.py`、`envd_service/agent.py`、`control_plane/api/sandboxes.py`、
   `c3_agent/priv/priv_common.c`。
