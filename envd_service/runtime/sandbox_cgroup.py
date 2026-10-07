@@ -369,7 +369,7 @@ def _path_is_there(path: Path) -> bool:
 
 
 def check_policy_ceiling(policy: SandboxCeiling, *, mount: Path) -> SandboxCeiling:
-    """D5b: cross-check the configured per-sandbox ceiling against the kernel's.
+    """D5b: cross-check the handed-down per-sandbox ceiling against the kernel's.
 
     The policy is the one the **control plane** handed down (ruling R17: its
     own ``E2B_MAX_SANDBOX_*``, arriving in the register/heartbeat answer --
@@ -761,8 +761,9 @@ class SandboxCgroups:
         **declared** sizes -- the control plane's ``cpuPercent``/``memoryMB``/
         ``maxProcesses``, travelling unchanged from the worker's own record.
         ``None`` for either of the last two is "the caller did not declare this
-        dimension": the worker's per-sandbox ceiling is then written, which is
-        a bound and the only value in sight that nobody had to invent.
+        dimension": the per-sandbox ceiling this worker holds (the handed-down
+        policy) is then written, which is a bound and the only value in sight
+        that nobody had to invent.
 
         Before anything is created, all three are checked against the policy
         ceiling injected into this handle (R3, the worker's second gate -- the
@@ -876,7 +877,7 @@ class SandboxCgroups:
         memory_mb: int | None,
         max_processes: int | None,
     ) -> tuple[str, str]:
-        """R3's second gate: the declared sizes vs this worker's own ceiling.
+        """R3's second gate: the declared sizes vs the handed-down ceiling.
 
         The ceiling is the one in hand -- the control plane's own policy,
         handed down and read through ``envd_service.route_b.policy_ceiling_for``

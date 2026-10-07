@@ -40,7 +40,8 @@ N83 phase 2 (Task 3) adds the *writing* half: ``setup()`` enables ``memory`` and
 ``pids`` beside ``cpu`` (same drain, same EBUSY rule), and ``attach()`` writes
 ``memory.high``/``memory.max``/``pids.max`` beside ``cpu.max`` -- each one read
 back **verbatim** -- with a second, worker-side defense gate (R3) that refuses a
-declared size above the worker's own ``E2B_MAX_SANDBOX_*`` ceiling by name.
+declared size above the per-sandbox ceiling the control plane handed down
+(``E2B_MAX_SANDBOX_*`` on the control plane, adopted by the worker) by name.
 """
 
 from __future__ import annotations
@@ -71,10 +72,10 @@ from envd_service.agent import start_cgroup_lane
 #: pid there (``self-placement``), so the tests use the process's real pid.
 SELF_PID = os.getpid()
 
-#: The worker's own per-sandbox ceiling (``E2B_MAX_SANDBOX_*``) for the cases
-#: that build a handle by hand: generous enough that a declared size below it is
-#: the interesting shape. The R3 defense gate compares against *this*, never
-#: against the kernel (plan ruling R3).
+#: The per-sandbox ceiling for the cases that build a handle by hand: the value
+#: the control plane hands down (its own ``E2B_MAX_SANDBOX_*``, ruling R17), and
+#: generous enough that a declared size below it is the interesting shape. The
+#: R3 defense gate compares against *this*, never against the kernel (ruling R3).
 POLICY_CEILING = SandboxCeiling(cpu_percent=400, memory_mb=4096, processes=1024)
 
 
@@ -581,7 +582,7 @@ def test_release_refuses_a_path_escaping_sandbox_id(tmp_path: Path) -> None:
 # is deliberately left alone, so an over-budget sandbox does not take its
 # neighbours in the same box (or the parent container) with it. Every write is
 # read back verbatim, and the second gate (R3) compares a *declared* size
-# against the worker's ``E2B_MAX_SANDBOX_*`` ceiling -- never against a kernel
+# against the handed-down ``E2B_MAX_SANDBOX_*`` ceiling -- never against a kernel
 # read: no clamping, no silently running smaller.
 
 
@@ -702,13 +703,13 @@ def test_release_removes_a_box_that_carried_all_three_limits(tmp_path: Path) -> 
     assert box.exists() is False
 
 
-def test_attach_refuses_a_declared_size_above_the_worker_ceiling(
+def test_attach_refuses_a_declared_size_above_the_handed_down_ceiling(
     tmp_path: Path,
 ) -> None:
     """R3's second gate compares the declared size with the handed-down ceiling.
 
     The control plane already refused an oversized request (Task 2); this is
-    the worker's own defense -- no clamp, no "run smaller silently", and
+    the worker-side gate -- no clamp, no "run smaller silently", and
     nothing half-built is left behind for a size this worker will not promise.
     The ceiling is the *control plane's* (ruling R17), adopted by the worker and
     pushed into the live handle.
