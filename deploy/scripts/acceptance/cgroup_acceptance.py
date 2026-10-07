@@ -245,27 +245,45 @@ _N82_BASELINE = {"ops_per_s": 18149, "cores_on_worker_pod": 1.02}
 _NEIGHBOUR_RTT_FACTOR = 3.0
 _NEIGHBOUR_RTT_FLOOR_MS = 50.0
 
-#: The notification cap's signature in the N82 probe. With the cap on, the
-#: supervisor sleeps out what is left of the second once its window is spent,
-#: so single ops land in the hundreds of milliseconds and the probe's stall
-#: counter (a round whose worst op crossed 20 ms) fires about once a second --
-#: N82 read **40 stalls in 51 rounds** (the capped ``off`` lane reads the same
-#: shape). Off, it does not fire at all (N82's uncapped leg: 18149 op/s, 0
-#: stalls; N83's local lane: 9794 op/s, 0 stalls). One round in four is well
-#: clear of both, so that is the line check 3 draws.
+#: The notification cap's signature in the N82 probe, in **two dimensions**.
+#: With the cap on, the supervisor sleeps out what is left of the second once its
+#: window is spent, so a round's worst single op lands in the *hundreds of
+#: milliseconds* and the probe's stall counter (a round whose worst op crossed
+#: 20 ms) fires about once a second -- N82 read **40 stalls in 51 rounds** with a
+#: worst op of 772-784 ms. Off, neither happens (N82's uncapped leg: 18149 op/s,
+#: 0 stalls; N83's local lane: 9794 op/s, 0 stalls; the ``required`` lane today:
+#: 1 stall in 342 rounds, worst ~24 ms).
+#:
+#: The counter alone is not enough (2026-10-07): an op that simply *saturates the
+#: sandbox's own core* stalls on **every** round while its worst op stays around
+#: 25 ms -- `clone` reads 16/16 rounds with 0.99 ms mean ops, i.e. a CPU-bound
+#: op, not a capped one. So the line has two sides, an order of magnitude clear
+#: of both readings.
 _CAPPED_STALL_SHARE = 0.25
+_CAPPED_STALL_US = 200_000
 
 
-def flood_is_capped(stalls: int | None, rounds: int | None) -> bool:
+def flood_is_capped(
+    stalls: int | None, rounds: int | None, max_stall_us: int | None
+) -> bool:
     """Does this flood still show the notification cap's stall signature?
 
-    ``True`` for an unread flood as well (``None`` or too few rounds): not
+    Both dimensions are required: the counter must fire on more than a quarter
+    of the rounds **and** the worst op must be in the hundreds of milliseconds.
+    A CPU-bound op fails the second test even though it stalls every round.
+
+    ``True`` for an unread flood as well (``None``, or too few rounds): not
     having looked is not evidence of an uncapped one, and check 3's verdict is
     about the reading.
     """
-    if stalls is None or rounds is None or rounds < 4:
+    if (
+        stalls is None
+        or rounds is None
+        or rounds < 4
+        or max_stall_us is None
+    ):
         return True
-    return stalls > rounds * _CAPPED_STALL_SHARE
+    return stalls > rounds * _CAPPED_STALL_SHARE and max_stall_us > _CAPPED_STALL_US
 
 
 #: The nine checks a complete run owes a verdict on: phase 1's five (plan Task
@@ -2093,7 +2111,16 @@ def main() -> int:
             # what the clients achieved, `stalls`/`rounds` say whether the cap
             # was in effect (see `flood_is_capped`).
             ops_per_s = stalls = rounds = None
+            max_stall_us = None
             for line in output.splitlines():
+                if line.startswith("STALL "):
+                    match = re.search(r"op_us=(\d+)", line)
+                    if match:
+                        worst = int(match.group(1))
+                        max_stall_us = (
+                            worst if max_stall_us is None else max(max_stall_us, worst)
+                        )
+                    continue
                 if not line.startswith("DONE "):
                     continue
                 fields = dict(
@@ -2127,6 +2154,9 @@ def main() -> int:
                 "ops_per_s": ops_per_s,
                 "stalls": stalls,
                 "rounds": rounds,
+                # The worst single op the probe saw. The cap's signature is the
+                # counter *and* this magnitude; see `flood_is_capped`.
+                "max_stall_us": max_stall_us,
                 "elapsed_s": round(elapsed, 1),
                 "sandbox_id": sandbox_id,
                 "node_id": node,
@@ -2254,7 +2284,9 @@ def main() -> int:
             # ... and the cap really was off while it ran: a *capped* flood is
             # not "a flood inside the quota", it is the cap doing the bounding,
             # and the cgroup would look innocent either way.
-            and not flood_is_capped(alone["stalls"], alone["rounds"])
+            and not flood_is_capped(
+                alone["stalls"], alone["rounds"], alone["max_stall_us"]
+            )
             and contested["peak_cores"] is not None
             and contested["peak_cores"] <= 1.15 * quota_cores
             # The flood must actually have run in the binding harness: a

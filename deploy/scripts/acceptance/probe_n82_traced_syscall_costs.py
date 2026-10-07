@@ -14,7 +14,7 @@
     export E2B_API_KEY=...
     python deploy/scripts/acceptance/probe_n82_traced_syscall_costs.py --op openclose --seconds 40
 
-    --op 取 openclose | close | mmap | clone | clone3 | getdents | uname | chdir | stat | getpid
+    --op 取 openclose | close | mmap | clone | clone3 | cloneraw | getdents | uname | chdir | stat | getpid
     （`stat` 是 N81 之后的对照：应当 0 停顿、几十万 op/s；`getpid` 是纯循环对照。）
 
 `clone` 是 N83 Phase 2 Task 4 加进来的那一支（R7）：没有它，退通知表就只量得到 mmap
@@ -27,6 +27,11 @@ Task 4 里**都没有退**（理由见 `seccomp_plan.rs`）。
 答 `ECHILD`，必须带 `__WCLONE` 才收得到（形状与三处对照见
 `deploy/scripts/acceptance/probe_clone3_wait_shape.py`）—— 所以这一支的 `one()` 里
 reap 用的是 `wait4(..., __WCLONE)`，不是 `os.waitpid()`。
+
+**`cloneraw` 是 N86 的第三个臂**（2026-10-07）：`clone` 那支跑的是 `os.fork()`，而
+CPython 的 fork 在**子进程**里还要跑一遍 after-fork 记账（线程状态、注册的 at-fork 钩子）
+才轮到 `os._exit`；`cloneraw` 用裸 `clone(2)`（amd64 nr 56）+ `wait4(flags=0)`，把
+"CPython 的 fork 包装"与"syscall 路径"分开（读数见 N86 行）。
 """
 
 from __future__ import annotations
@@ -95,6 +100,19 @@ INNER = dedent(
             if pid == 0:
                 os._exit(0)
             os.waitpid(pid, 0)
+        elif OP == "cloneraw":
+            # Legacy clone(2), amd64 nr 56, with exit_signal = SIGCHLD: the same
+            # shape as `clone3` above but through the old syscall. Isolates
+            # CPython's os.fork() bookkeeping from the kernel path.
+            ctypes.set_errno(0)
+            rc = _LIBC.syscall(
+                56, ctypes.c_ulonglong(_SIGCHLD), ctypes.c_void_p(0),
+                ctypes.c_void_p(0), ctypes.c_void_p(0), ctypes.c_void_p(0),
+            )
+            if rc == 0:
+                os._exit(0)
+            if rc > 0:
+                _LIBC.wait4(rc, None, 0, None)
         elif OP == "clone3":
             _clone3_once()
         elif OP == "getdents":
