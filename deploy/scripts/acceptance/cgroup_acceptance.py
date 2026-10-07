@@ -272,16 +272,19 @@ def flood_is_capped(
     of the rounds **and** the worst op must be in the hundreds of milliseconds.
     A CPU-bound op fails the second test even though it stalls every round.
 
-    ``True`` for an unread flood as well (``None``, or too few rounds): not
-    having looked is not evidence of an uncapped one, and check 3's verdict is
-    about the reading.
+    ``True`` for an unread flood as well (``None``, or too few rounds, or a
+    counter that fired but whose magnitude never got parsed): not having looked
+    is not evidence of an uncapped one, and check 3's verdict is about the
+    reading. The one asymmetry is a counter of **zero**: then there is no
+    magnitude to read *by construction* (the probe prints a STALL line only for
+    a round that crossed 20 ms), and the flood is uncapped by every reading
+    there is.
     """
-    if (
-        stalls is None
-        or rounds is None
-        or rounds < 4
-        or max_stall_us is None
-    ):
+    if stalls is None or rounds is None or rounds < 4:
+        return True
+    if stalls == 0:
+        return False
+    if max_stall_us is None:
         return True
     return stalls > rounds * _CAPPED_STALL_SHARE and max_stall_us > _CAPPED_STALL_US
 

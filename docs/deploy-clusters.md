@@ -3383,10 +3383,11 @@ tmp/venv/bin/python deploy/scripts/acceptance/cgroup_acceptance.py \
 | wheel 重建并钉到 `5eda94d`（`SHA256SUMS.supervise` 的 HEAD 一致） | ✅ |
 | 本地车道读数（`off` 车道 + 出厂默认 5000，新 wheel `6853e846…`）：无映射形状 `openclose` **5075** / `uname` 5098 op/s（各 1 条/op ⇒ N82 ① 的收益保住） | ✅ |
 | `build-and-push.sh` → 版本 `0.1.0-1134-g1b99eeb-20261007-214216`，镜像内容核对过（新 push 的 worker 里 `sandlock-supervise` sha256 = `SHA256SUMS.supervise` 的 x86_64 行） | ✅ |
-| `open-cluster-tunnel.sh` → **失败**：`ssh: connect to host 172.18.74.236 port 22: Operation timed out`（20:19 那次还能连、12 s 建好；21:4x 起不可达）。`cluster-guard` 因此拒绝渲染/apply（`server 127.0.0.1:16443 refused`） | ❌ 阻塞 |
-| 线上两段式 apply + 9/9 复验 + 带映射形状读数 | ❌ 未做（等通道） |
+| `open-cluster-tunnel.sh` 第一次**失败**：`ssh: connect to host 172.18.74.236 port 22: Operation timed out`（20:19 还能连、12 s 建好；21:4x–22:0x 不可达），`cluster-guard` 因此拒绝渲染/apply | ⚠️ 一度阻塞（网络恢复后 22:02 重开成功） |
+| 两段式 apply（22:02:20 第一批 → 22:02:48 CP+agent 收敛 → 22:02:48 第二批 → **22:03:00** worker `rolling update complete 2 pods`）+ 幂等重放与预热（三处 `cached=true`） | ✅ |
+| 线上复验 `cgroup_acceptance.py`：**`ok: true`，9/9，`elapsed 239.6 s`**（`tmp/n84-notify/online-n88b.json`）：第 ③ 条单跑 **29019 op/s**、**0/581 轮停顿**、峰值 **1.041 核**、`nr_throttled_delta +353`；四路并发 23726 op/s、1.063 核、`nr_throttled` 203；第 ⑨ 条 `thread_delta 2 / process_delta 1 / process_count_delta 1 / thread_process_delta 0` | ✅ |
 
-**恢复步骤**（通道一回来照这条走，顺序与 §7.53 相同）：
+**（已执行的）恢复步骤**（顺序与 §7.53 相同）：
 
 ```bash
 deploy/scripts/open-cluster-tunnel.sh && export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"

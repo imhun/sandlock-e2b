@@ -75,8 +75,15 @@ def test_an_unread_flood_is_not_evidence_of_an_uncapped_one() -> None:
     assert flood_is_capped(stalls=None, rounds=51, max_stall_us=800_000) is True
     assert flood_is_capped(stalls=0, rounds=None, max_stall_us=800_000) is True
     assert flood_is_capped(stalls=0, rounds=3, max_stall_us=800_000) is True
-    # An unread *amplitude* is the same kind of not-evidence.
+    # An unread *amplitude* with a counter that fired is the same kind of
+    # not-evidence...
     assert flood_is_capped(stalls=40, rounds=51, max_stall_us=None) is True
+    # ...but a counter of zero has no magnitude to read *by construction* (the
+    # probe prints a STALL line only for a round that crossed 20 ms): that is the
+    # best reading there is, not a missing one. Measured online 2026-10-07: the
+    # `required` lane's own check-3 run read 0 stalls / 594 rounds and this line
+    # was the one thing that failed.
+    assert flood_is_capped(stalls=0, rounds=594, max_stall_us=None) is False
 
 
 def test_the_line_sits_between_the_two_signatures() -> None:
