@@ -27,7 +27,10 @@ PAYLOAD = (
 
 DUMP = r"""
 set -e
-d=$(ls -td /pod-cgroup/*/sbx_* 2>/dev/null | head -1)
+# The mount is narrowed differently per lane: k8s points /pod-cgroup at the
+# pod dir (so the boxes are one level down under the container cgroup),
+# compose at the worker's own parent. Try both shapes.
+d=$(ls -td /pod-cgroup/*/sbx_* /pod-cgroup/sbx_* 2>/dev/null | head -1)
 [ -n "$d" ] || { echo "no sbx_* cgroup"; exit 1; }
 echo "cgroup=$d"
 echo "pids.current=$(cat $d/pids.current 2>/dev/null) cgroup.procs=$(tr '\n' ' ' < $d/cgroup.procs)"
@@ -42,6 +45,11 @@ done
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--nodes",
+        default="worker-1,worker-2,worker-3",
+        help="node ids to look for the sandbox on (compose: worker-N; k8s: e2b-worker-N)",
+    )
     parser.add_argument(
         "--container-template",
         default="docker exec -i {node}-1 bash -lc",
@@ -69,7 +77,7 @@ def main() -> int:
         time.sleep(args.hold_s)
         # The sandbox lives on one of the three workers; ask each until the
         # cgroup is there.
-        for node in ("worker-1", "worker-2", "worker-3"):
+        for node in [n.strip() for n in args.nodes.split(",") if n.strip()]:
             argv = args.container_template.format(node=node).split()
             out = subprocess.run(argv + [DUMP], capture_output=True, text=True)
             if out.returncode == 0 and "cgroup=" in out.stdout:

@@ -76,10 +76,15 @@ E2B 侧 `deploy/scripts/acceptance/probe_n82_traced_syscall_costs.py`、k0s（�
   **读数**：`test_netlink_virt` **15/0**；整套门禁 `core_lib 941/0`（= 刷新后的基线）、
   `core_integ 575/0`、`ffi 104/0`；`cli` 相位红但是**既有问题**（`kernel_enforced_limits` 的
   CLI 参数定义，见 open-issues N87，与本次无关）。
-- [ ] **T4**：`build-sandlock-wheels.sh` 重建 wheel + 重钉 `SHA256SUMS.supervise`，
-  本地 compose 车道跑第 1/2 条读数（RED→GREEN 都留）。
-- [ ] **T5**：发版（先控制面后 worker，同 §7.52 的顺序）+ 线上复跑第 1/2 条 + N82 探针全套
-  （`--op {openclose,close,mmap,uname,chdir,getdents,stat,clone}`）。
+- [x] **T4**：`build-sandlock-wheels.sh` 重建 wheel + 重钉 `SHA256SUMS.supervise`（HEAD `8239839`），
+  本地 compose 车道跑第 1/2 条读数。
+  **读数（`off` 车道 + 出厂默认 5000，只换 wheel；`31fde3a0…` = 新 `sandlock-supervise`）**：
+  `--op uname` 5088 → **5086**（对照不动）；`--op openclose` **2573 → 5081**（×1.98 ⇒ 恰好少了
+  `close` 那一条通知）。`--op close` 那支没跑：它每 op 1000 开 + 1000 关，限流开时一轮 2000 个 op
+  跑不完一个 sane 窗口（这也是 N82 表里它只有"每条 1 次"这个笼统读数的原因）。
+- [x] **T5**：发版（先控制面后 worker，同 §7.52 的顺序）+ 线上复跑 + 两支探针 —— 全文见
+  `docs/deploy-clusters.md` §7.53。**线上第 ③ 条单跑 17100 → 29574 op/s**（同一支探针、
+  同一车道），9/9 全过。
 
 ## 风险与回退
 
