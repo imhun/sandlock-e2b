@@ -24,6 +24,8 @@ node reports the same number and Σ double-counts (control-plane manifest,
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from control_plane.config import Settings
@@ -214,6 +216,52 @@ def test_without_a_provider_zero_keeps_todays_meaning(workspace) -> None:
     _create(registry)
     _create(registry)
     assert registry.count() == 3
+
+
+def test_a_non_positive_sum_is_never_adopted_as_a_budget(workspace, caplog) -> None:
+    """Task 11, minor 7: the derived number gets the explicit branch's test.
+
+    The explicit branch above only takes a value it can see is positive
+    (``configured > 0``); the derived branch used to pass the sum straight into
+    the ledger, so a non-positive one -- an embedder's row that reported ``0``,
+    or a negative nothing in the registration path rejects -- would reach a
+    ladder whose consumers read "not positive" as "this dimension is not
+    policed". "Not a budget" and "no budget" are the same answer here, so the
+    non-positive sum takes the documented "nothing to derive from" path (see
+    ``_fleet_limits``): ``0`` in this dict, said out loud, with the refusal left
+    to placement by name and to each sandbox's own per-sandbox ceiling.
+    """
+    registry = SandboxRegistry(_settings())
+    registry.set_fleet_totals_provider(
+        _summing_provider(memory=-5, cpu=0, disk=10240, processes=100)
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        limits = registry._fleet_limits()
+
+    # A budget is a positive number or this ladder's own ``0`` -- never a
+    # negative, and never a silent ``0`` that reads like a deliberate policy.
+    assert limits == {"memory": 0, "cpu": 0, "processes": 100, "disk": 10240}
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "control_plane.registry.manager"
+    ] == [
+        "fleet totals: the registered healthy nodes sum to -5 for memory, which "
+        "is not a positive total, so E2B_MAX_TOTAL_MEMORY_MB does not police "
+        "memory (a non-positive total is not a budget; a create in this state is "
+        "still bounded by the node ladder and by each sandbox's own ceiling)",
+        "fleet totals: the registered healthy nodes sum to 0 for cpu, which is "
+        "not a positive total, so E2B_MAX_TOTAL_CPU_PERCENT does not police cpu "
+        "(a non-positive total is not a budget; a create in this state is still "
+        "bounded by the node ladder and by each sandbox's own ceiling)",
+    ]
+
+    # The create is admitted (this ladder polices nothing on those two dims) and
+    # the nonsense sum was booked nowhere: the reservation is the standard one.
+    _create(registry)
+    assert registry.global_reserved()["memory"] == 512
+    assert registry.global_reserved()["processes"] == 64
 
 
 def test_the_disk_budget_is_never_derived(workspace) -> None:

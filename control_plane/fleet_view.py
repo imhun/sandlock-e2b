@@ -35,6 +35,8 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+from control_plane.registry.manager import cores_from_percent
+
 
 def active_sandbox_count(state: Any) -> int:
     """The count ``GET /internal/fleet/metrics`` reports as ``activeSandboxes``.
@@ -66,9 +68,17 @@ def fleet_metrics_payload(state: Any) -> dict[str, Any]:
     records = registry.list()
     active_by_node: Counter[str] = Counter(r.node_id for r in records)
 
+    # The *create* default in the ledger's own units. Memory/disk/processes are
+    # kept 1:1, but the cpu ledger books **percent** while ``cpuCount`` is
+    # cores -- one multiplication apart, exactly like a sandbox record's own
+    # reservation (`SandboxRecord.cpu_count * 100`, N84). Reading
+    # ``E2B_DEFAULT_CPU_PERCENT`` raw here made this view disagree with the
+    # ledger for any default that is not a whole number of cores (250% booked
+    # 300%, but both of the numbers below said 250%). Same function, one answer.
+    default_cpu_percent = cores_from_percent(settings.default_cpu_percent) * 100
     dims = {
         "memory": ("reserved_memory_mb", "total_memory_mb", settings.default_memory_mb),
-        "cpu": ("reserved_cpu_percent", "total_cpu_percent", settings.default_cpu_percent),
+        "cpu": ("reserved_cpu_percent", "total_cpu_percent", default_cpu_percent),
         "disk": ("reserved_disk_mb", "total_disk_mb", settings.default_disk_mb),
         "processes": (
             "reserved_processes",
@@ -157,7 +167,7 @@ def fleet_metrics_payload(state: Any) -> dict[str, Any]:
         "workspaceDisk": workspace_disk,
         "standardSandboxDims": {
             "memory": settings.default_memory_mb,
-            "cpu": settings.default_cpu_percent,
+            "cpu": default_cpu_percent,
             "disk": settings.default_disk_mb,
             "processes": settings.default_max_processes,
         },

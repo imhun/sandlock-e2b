@@ -291,6 +291,119 @@ async def test_an_unknown_promise_keeps_the_fleet_question_quiet(make_apps):
     assert resp.json() == {"code": 503, "message": "No resources available"}
 
 
+def _small_and_unhealthy_big(*, big_draining: bool) -> NodeRegistry:
+    """Two nodes whose promises differ, with the big one out of the picture.
+
+    ``worker-small`` is healthy and promises 2 cores per sandbox; ``worker-big``
+    promises 8 and is either **quiet** (past the heartbeat window, i.e. it may
+    come back) or **draining** (on its way out, so it will not). Both promises
+    are the row's own ``sandbox_*_max``, exactly what the fleet question reads.
+    """
+    nodes = NodeRegistry()
+    nodes.register(
+        node_id="worker-small",
+        address="http://worker-small:49983",
+        total_memory_mb=8192,
+        total_cpu_percent=200,
+        total_disk_mb=10240,
+        total_processes=2048,
+        sandbox_ceiling={"cpuPercent": 200, "memoryMB": 2048, "processes": 1024},
+    )
+    nodes.register(
+        node_id="worker-big",
+        address="http://worker-big:49983",
+        total_memory_mb=8192,
+        total_cpu_percent=800,
+        total_disk_mb=10240,
+        total_processes=2048,
+        sandbox_ceiling={"cpuPercent": 800, "memoryMB": 8192, "processes": 2048},
+    )
+    if big_draining:
+        nodes.set_draining("worker-big", True)
+        assert nodes.get("worker-big").draining is True
+    else:
+        # Quiet for a minute: not "this machine cannot host it", just "no
+        # heartbeat right now". Past both windows (health and placement).
+        nodes.get("worker-big").heartbeat_at -= 60.0
+        assert [n.node_id for n in nodes.list(healthy_only=True)] == ["worker-small"]
+    return nodes
+
+
+async def test_a_size_only_a_quiet_node_could_host_is_a_retryable_503(
+    make_apps,
+) -> None:
+    """Task 11, minor 2: a heartbeat window is not a verdict about the machine.
+
+    ``worker-big`` is only *quiet*; it still promises 8 cores per sandbox and it
+    may come back, so the 4-core create is not the caller's mistake -- it is a
+    "no capacity right now". Placement refuses it (no healthy node can take it)
+    and the fleet question has to stay quiet, or the caller is told its request
+    is permanently impossible while a machine that could run it is merely
+    unreachable. Before the fix this answered ``400 cpuCount 4 exceeds this
+    node's per-sandbox maximum (2)`` -- the healthy node's number, read as a
+    verdict about the whole fleet.
+    """
+    nodes = _small_and_unhealthy_big(big_draining=False)
+    control, _envd = make_apps(
+        control_settings=_settings(enable_local_node=False),
+        control_kwargs={"nodes_registry": nodes},
+    )
+    async with _client(control) as client:
+        resp = await _create(client, cpuCount=4)
+
+    assert resp.status_code == 503
+    assert resp.json() == {"code": 503, "message": "No resources available"}
+    # Nothing was left behind on the healthy node.
+    assert nodes.get("worker-small").reserved_cpu_percent == 0
+
+
+async def test_a_size_only_a_draining_node_could_host_is_the_named_400(make_apps):
+    """The other half of the same rule: draining promises are dead promises.
+
+    A draining node will not take new work again, so a size only it could host
+    *is* impossible, and the refusal names the fleet's real ceiling -- the
+    healthy node's own 2 cores.
+    """
+    nodes = _small_and_unhealthy_big(big_draining=True)
+    control, _envd = make_apps(
+        control_settings=_settings(enable_local_node=False),
+        control_kwargs={"nodes_registry": nodes},
+    )
+    async with _client(control) as client:
+        resp = await _create(client, cpuCount=4)
+
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "code": 400,
+        "message": "cpuCount 4 exceeds this node's per-sandbox maximum (2)",
+    }
+
+
+async def test_a_size_no_node_could_host_quotes_the_fleets_real_promise(
+    make_apps,
+) -> None:
+    """The number in that 400 is the most generous promise the fleet made.
+
+    A permanent refusal is only honest if it speaks for *every* machine that
+    could still take work: 16 cores is above both promises, and the number the
+    client is told to come down to is ``worker-big``'s 8 -- not the healthy
+    node's 2, which would understate what this fleet can ever host.
+    """
+    nodes = _small_and_unhealthy_big(big_draining=False)
+    control, _envd = make_apps(
+        control_settings=_settings(enable_local_node=False),
+        control_kwargs={"nodes_registry": nodes},
+    )
+    async with _client(control) as client:
+        resp = await _create(client, cpuCount=16)
+
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "code": 400,
+        "message": "cpuCount 16 exceeds this node's per-sandbox maximum (8)",
+    }
+
+
 async def test_the_landed_nodes_ceiling_is_the_one_quoted(make_apps):
     """A fleet whose nodes disagree still gets a truthful message: the number is
     the landed node's promise, and its reservation goes straight back.
@@ -372,7 +485,13 @@ async def test_a_node_whose_process_promise_is_below_the_default_cannot_size_wor
     make_apps,
 ):
     """The third dimension on the same rule: the deployment's own per-sandbox
-    default must fit the node's promise, or the node cannot size work."""
+    default must fit the node's promise, or the node cannot size work.
+
+    The number is the **deployment's** (``E2B_DEFAULT_MAX_PROCESSES``), not the
+    request's -- ``maxProcesses`` is not a create field -- so the refusal has to
+    say so; a client reading "64 maxProcesses exceed …" would go looking for a
+    field it never sent (Task 11, minor 3).
+    """
     control, _envd = make_apps(
         control_settings=_settings(max_total_processes=8192, max_sandbox_processes=32)
     )
@@ -383,7 +502,9 @@ async def test_a_node_whose_process_promise_is_below_the_default_cannot_size_wor
     assert resp.json() == {
         "code": 503,
         "message": (
-            "the sandbox's 64 maxProcesses exceed node local's per-sandbox "
-            "maximum (32)"
+            "node local's per-sandbox maximum for processes is 32, below the "
+            "64 tasks this deployment's per-sandbox default asks for; "
+            "maxProcesses is not a create field, so the number comes from the "
+            "deployment (E2B_DEFAULT_MAX_PROCESSES), not from this request"
         ),
     }

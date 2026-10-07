@@ -21,13 +21,20 @@ Everything else -- the cheap precheck, the bounded wait for exactly one
 delegated directory, the drain readback, ``cpu.max``, the ``/proc`` placement
 check, the idempotent release -- is the real code path.
 
-N83 phase 2 (Task 1) adds the *ceiling* half: the configured per-sandbox
-policy (``E2B_MAX_SANDBOX_*``, defaulting to the node's own total -- never 0,
-never infinity) and the kernel read of the worker's own container cgroup
-(``cpu.max``/``memory.max``), cross-checked at worker startup (D5b). The cases
-at the bottom of this file pin the three mistakes Review Focus §1 names: an
-unset ceiling read as "unlimited", a policy ceiling above the kernel's, and a
-kernel that sets no ceiling at all (the compose lane's measured shape).
+N83 phase 2 (Task 1) adds the *ceiling* half. Its **owner** is the control
+plane (ruling R17, 2026-10-07): the per-sandbox policy is its own
+``E2B_MAX_SANDBOX_*``, resolved per node when it is stamped (explicit value >
+that node's own reported total > the create default -- never 0), and handed
+**down** in every register/heartbeat answer. The worker no longer reads those
+envs at all; it *adopts* the hand-down
+(``envd_service.agent.adopt_sandbox_ceiling``), and before one arrives it has
+no ceiling -- which means no create, never an unbounded run (the kernel read of
+its own container cgroup, ``cpu.max``/``memory.max``, is cross-checked against
+the hand-down **at adoption time**, D5b, not at worker startup). The cases at
+the bottom of this file pin the three mistakes Review Focus §1 names: a
+hand-down that never arrived read as "unlimited", a policy ceiling above the
+kernel's, and a kernel that sets no ceiling at all (the compose lane's measured
+shape).
 
 N83 phase 2 (Task 3) adds the *writing* half: ``setup()`` enables ``memory`` and
 ``pids`` beside ``cpu`` (same drain, same EBUSY rule), and ``attach()`` writes
@@ -1475,6 +1482,55 @@ def test_a_permission_error_is_named_by_the_read_not_by_the_rmdir(
         "the sweep already cached still reach the control plane)"
     ]
     assert box.exists() is False
+
+
+def test_release_still_tears_the_box_down_when_it_cannot_even_be_looked_at(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Item 4 (Task 11): "unreadable" is not "absent", and it is not a leak.
+
+    ``if not target.exists(): return False`` used to decide both from the same
+    call, and Python 3.12's ``Path.exists()`` re-raises ``EACCES`` (earlier
+    versions silently answer ``False``). So a box whose directory could not be
+    looked at was reported as ``release-rmdir: could not rmdir …`` -- a step
+    that had not run yet -- and the teardown ended there: ``cgroup.kill`` was
+    never written and the ``rmdir`` was never attempted, with nothing in the
+    worker to reclaim the leftover ``sbx_*`` directory afterwards.
+
+    Now the probe is an explicit ``stat`` that separates the two facts, the
+    unreadable case is one named WARNING (sandbox id + path + underlying
+    error), and the teardown still finishes: the box is gone and ``release``
+    answered ``True``.
+    """
+    cg, _parent, proc_root = _live_cgroups(tmp_path)
+    box = _attach_box(cg, proc_root, "alpha", 4242)
+    real_stat = Path.stat
+
+    def refusing(self: Path, *args: object, **kwargs: object):
+        if self == box:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", refusing)
+
+    with caplog.at_level(logging.WARNING):
+        assert cg.release(sandbox_id="alpha") is True
+
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == sandbox_cgroup.__name__
+    ] == [
+        f"cgroup release: sandbox alpha: cgroup-refusal release-stat: {box} "
+        "(Permission denied); tearing the box down anyway -- nothing in this "
+        "worker reclaims a leftover sbx_* directory, so a box left standing "
+        "here is a permanent leak"
+    ]
+    # ``Path.stat`` is the faked call here, so the absence is read with the
+    # real one (and the box really is gone, not merely unreadable).
+    assert os.path.exists(box) is False
 
 
 def test_the_sampler_reports_only_the_boxes_that_hit_a_wall(tmp_path: Path) -> None:

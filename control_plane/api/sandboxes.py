@@ -206,16 +206,24 @@ def _size_refusal(check: _SizeCeiling, *, node_id: str) -> OfficialError:
 
     The client's own two fields are a ``400``: the request cannot be satisfied
     as written, and a retry that keeps asking for the same size will keep
-    failing. ``maxProcesses`` is not a request field (the number is the
-    deployment's own per-sandbox default), so a node that cannot host it cannot
-    size work at all -- ``503``, naming the node.
+    failing. The ceiling itself is printed in the create's own unit (cores for
+    ``cpuCount``, converted from the percent a node record keeps).
+
+    ``maxProcesses`` is not a request field (the number is the deployment's own
+    per-sandbox default), so a node that cannot host it cannot size work at all
+    -- ``503``, naming the node *and* saying where the number came from: a
+    client that cannot change it has to be told that it is the deployment's
+    default, not something it asked for.
     """
     shown = _ceiling_text(check.field, check.ceiling)
     if check.field == "maxProcesses":
         return OfficialError(
             503,
-            f"the sandbox's {check.value} maxProcesses exceed node {node_id}'s "
-            f"per-sandbox maximum ({shown})",
+            f"node {node_id}'s per-sandbox maximum for processes is {shown}, "
+            f"below the {check.value} tasks this deployment's per-sandbox "
+            "default asks for; maxProcesses is not a create field, so the "
+            "number comes from the deployment (E2B_DEFAULT_MAX_PROCESSES), not "
+            "from this request",
         )
     return OfficialError(
         400,
@@ -267,11 +275,27 @@ def _fleet_size_refusal(
     consulted, and the deployed lanes cap one sandbox at exactly that total --
     so without this question an over-ceiling request is answered "No resources
     available", which reads as "retry when the fleet is quieter" and never will
-    be true. It fires only when **no** healthy node's promise allows the size,
-    so the number it prints is the most generous promise in the fleet (never a
-    number from a machine that would have taken the sandbox), and a node whose
-    promise is still unknown (``0``) keeps it quiet: an unknown ceiling is not
-    proof that nobody could host the size.
+    be true. It fires only when **no** node's promise allows the size, so the
+    number it prints is the most generous promise in the fleet (never a number
+    from a machine that would have taken the sandbox), and a node whose promise
+    is still unknown (``0``) keeps it quiet: an unknown ceiling is not proof
+    that nobody could host the size.
+
+    ``nodes`` is the caller's **non-draining** fleet -- unhealthy ones included
+    (Task 11, minor 2). "Unhealthy" is a heartbeat window, not a statement about
+    the machine: a node that is merely quiet right now carries a promise that
+    may well come back, so a size only *it* could host must not be answered with
+    this permanent ``400``. Ruling out a size here means "no node that could
+    still take work, once it is reachable again, can host it", which is what a
+    client can act on. Draining nodes stay out for the opposite reason: they are
+    on their way out and will not take new work again, so their promise is dead.
+
+    Feeding the caller's set unchanged is also what keeps one implementation of
+    the per-dimension question: the alternative (ask the healthy set for a
+    ``400``, then answer ``503`` when some larger unhealthy promise exists) is
+    the same rule spelled twice, and its ``400`` would quote a healthy-only
+    number -- telling a client "2" while another machine in the fleet promises
+    "8".
     """
     values = {"cpuCount": cpu_count, "memoryMB": memory_mb, "maxProcesses": processes}
     for field, attribute, unit in _SIZE_CEILING_FIELDS:
@@ -1386,10 +1410,14 @@ async def _create_sandbox_attempt(
         # 不在这里问一次，客户端只会拿到"No resources available"（像是"等会儿
         # 再来试试"），而那个答案永远不会变真。问的是**节点记录里上报的上限**
         # （不是控制面自己的 Settings，那份在这一步可能描述的是别的机器）。
+        # 问的节点集合是**除 draining 外的全部**（含暂时不健康的）：健康与否只是
+        # 一个心跳窗口，不是对那台机器的判断 —— 只喂健康节点的话，"只有一台暂时
+        # 不健康的机器装得下"会被答成永久 400（Task 11 minor 2）。draining 排除是
+        # 反向理由：它不会再接新活，承诺已经作废（`_fleet_size_refusal` 的 docstring）。
         size_refusal = _fleet_size_refusal(
             [
                 record
-                for record in request.app.state.nodes.list(healthy_only=True)
+                for record in request.app.state.nodes.list()
                 if not record.draining
             ],
             cpu_count=cpu_count,

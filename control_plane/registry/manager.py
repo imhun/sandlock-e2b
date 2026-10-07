@@ -1069,7 +1069,35 @@ class SandboxRegistry:
                 )
                 limits[dimension] = 0
                 continue
-            limits[dimension] = int(derived.get(dimension, 0))
+            # The same positivity test the explicit branch above makes, applied
+            # to the *derived* number (Task 11, minor 7). A sum that is not a
+            # positive total is not a budget: it must never be handed to the
+            # ledger as one, because this ladder's consumers read "not positive"
+            # as "this dimension is not policed" -- the one reading that would
+            # turn a nonsense row into a spendable amount. So it takes the same
+            # documented path as "nothing to derive from": 0 here, and the
+            # refusal belongs to placement (which names it) and to the
+            # per-sandbox ceiling every box still carries. Lower down is not
+            # possible: this function returns numbers, not refusals, and the
+            # reason a fleet with *no* node steps aside is the same reason (see
+            # the docstring) -- a ledger that refuses for a reason it cannot
+            # name would also break the shapes that drive it without placement.
+            total = int(derived.get(dimension, 0))
+            if total > 0:
+                limits[dimension] = total
+                continue
+            logger.debug(
+                "fleet totals: the registered healthy nodes sum to %s for %s, "
+                "which is not a positive total, so %s does not police %s (a "
+                "non-positive total is not a budget; a create in this state is "
+                "still bounded by the node ladder and by each sandbox's own "
+                "ceiling)",
+                total,
+                dimension,
+                env_name,
+                dimension,
+            )
+            limits[dimension] = 0
         limits["disk"] = int(getattr(self._settings, "max_total_disk_mb", 0) or 0)
         return limits
 

@@ -342,6 +342,32 @@ def read_sandbox_events(directory: Path) -> dict[str, int]:
     }
 
 
+def _path_is_there(path: Path) -> bool:
+    """``path`` exists, decided by an explicit ``stat`` and never by ``exists()``.
+
+    The same split :func:`_event_counters` makes for a counter file, for the
+    same reason: Python 3.12's ``Path.exists()`` re-raises ``EACCES`` (and
+    earlier versions silently answer ``False`` for it), so it cannot tell
+    "absent" from "I am not allowed to look" -- two facts a teardown must not
+    confuse, because one means "a previous retire already removed this box" and
+    the other means "there is still a box here that nobody else will reclaim".
+
+    ``False`` means *absent*. A path that is there but cannot be looked at is a
+    named :class:`CgroupRefusal` carrying the underlying error; each caller
+    decides what to do with that (``release`` logs it by name and finishes the
+    teardown anyway).
+    """
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise CgroupRefusal(
+            f"cgroup-refusal release-stat: {path} ({exc.strerror or exc})"
+        ) from exc
+    return True
+
+
 def check_policy_ceiling(policy: SandboxCeiling, *, mount: Path) -> SandboxCeiling:
     """D5b: cross-check the configured per-sandbox ceiling against the kernel's.
 
@@ -948,14 +974,32 @@ class SandboxCgroups:
         account has nothing to count), and a box that hit nothing keeps no entry
         -- "the count grew" is the event, and this method is called for every
         sandbox that ever lived.
+
+        **"Absent" and "unreadable" are two different answers** (Task 11, minor
+        4). ``Path.exists()`` cannot tell them apart -- Python 3.12 re-raises
+        ``EACCES`` from it, and earlier versions answer ``False`` -- so both
+        probes here go through :func:`_path_is_there`. An unreadable box is not
+        an absent one: it is logged as one named WARNING and the teardown still
+        runs to its end, because the leak rule above has no exception for "I
+        could not look at it".
         """
         self._validate_sandbox_id(sandbox_id)
         parent = self._require_parent()
         target = parent / f"{_SANDBOX_PREFIX}{sandbox_id}"
         events: dict[str, int] = {}
         try:
-            if not target.exists():
-                return False
+            try:
+                if not _path_is_there(target):
+                    return False
+            except CgroupRefusal as exc:
+                logger.warning(
+                    "cgroup release: sandbox %s: %s; tearing the box down "
+                    "anyway -- nothing in this worker reclaims a leftover "
+                    "sbx_* directory, so a box left standing here is a "
+                    "permanent leak",
+                    sandbox_id,
+                    exc,
+                )
             try:
                 events = read_sandbox_events(target)
             except CgroupRefusal as exc:
@@ -970,7 +1014,22 @@ class SandboxCgroups:
                     exc,
                 )
             kill = target / "cgroup.kill"
-            if kill.exists():
+            try:
+                has_kill = _path_is_there(kill)
+            except CgroupRefusal as exc:
+                # Same rule one step down: not knowing whether a kill file is
+                # there is not proof there is none, but it is not a reason to
+                # stop either -- the ``rmdir`` below is the step that has to
+                # succeed either way, and it names itself if it cannot.
+                logger.warning(
+                    "cgroup release: sandbox %s: %s; skipping the kill and "
+                    "finishing the teardown -- the directory has to come off "
+                    "either way, and nothing else reclaims it",
+                    sandbox_id,
+                    exc,
+                )
+                has_kill = False
+            if has_kill:
                 # Write-only (mode 0200) on a real cgroupfs: no readback is possible.
                 try:
                     kill.write_text("1")

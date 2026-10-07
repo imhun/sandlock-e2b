@@ -111,7 +111,8 @@ three of the defaults are compose-only):
 * ``--api-url`` / ``--api-key``: the E2B API (and gateway) endpoint + key.
 * ``--internal-url``: the control plane's **internal** API as reachable *from
   inside a worker container* (compose: ``http://control-plane:3000``; k8s: the
-  control-plane Service, e.g. ``http://e2b-control-plane.sandlock.svc:3000``).
+  control-plane Service, i.e. ``http://control-plane.sandlock.svc:3000`` --
+  ``e2b-control-plane`` is the NetworkPolicy's name, not the Service's).
   It is only ever called from inside a worker (node-scoped endpoint + source-IP
   second factor), so a host-side value would be wrong even if it resolved.
 * ``--internal-key``: the ``X-Internal-Key`` the worker holds
@@ -173,17 +174,25 @@ It prints one JSON object (every reading, plus ``ok``) and exits non-zero when
 any check fails.
 
 A full k0s run -- all five lane flags, with the internal URL and both keys
-taken from that cluster (never from this lane's defaults):
+taken from that cluster (never from this lane's defaults). The control-plane
+node is **looked up**, not spelled out: the control plane is a two-replica
+Deployment, so its pods are named ``control-plane-<replicaset>-<pod>`` and any
+name written here by hand would rot into a ``kubectl exec`` NotFound the first
+time the Deployment rolled -- which check 8 reports as
+``lane.control_plane_env.error``, i.e. a tooling red that reads like a platform
+failure. Every replica runs the same pod spec, so either one answers with the
+same ``E2B_MAX_SANDBOX_*``:
 
     python3 deploy/scripts/acceptance/cgroup_acceptance.py \\
         --api-url "$E2B_API_URL" \\
         --api-key "$E2B_API_KEY" \\
-        --internal-url http://e2b-control-plane.sandlock.svc.cluster.local:3000 \\
+        --internal-url http://control-plane.sandlock.svc.cluster.local:3000 \\
         --internal-key "$E2B_INTERNAL_API_KEY" \\
         --nodes e2b-worker-0,e2b-worker-1 \\
         --worker-exec-template 'kubectl -n sandlock exec {node} -c worker -- bash -lc' \\
         --control-plane-exec-template 'kubectl -n sandlock exec {node} -c control-plane -- bash -lc' \\
-        --control-plane-node e2b-control-plane-0
+        --control-plane-node "$(kubectl -n sandlock get pod -l app=control-plane \\
+            -o jsonpath='{.items[0].metadata.name}')"
 
 ``--control-plane-exec-template`` has to be passed on any lane whose
 control-plane container is not the compose default (``docker exec -i
@@ -1018,7 +1027,12 @@ def main() -> int:
     parser.add_argument(
         "--control-plane-node",
         default=os.environ.get("N83_ACC_CP_NODE", "control-plane"),
-        help="the name '{node}' takes in --control-plane-exec-template",
+        help=(
+            "the name '{node}' takes in --control-plane-exec-template (compose: "
+            "the container name, the default; k8s: the control-plane *pod*, which "
+            "is a Deployment pod named control-plane-<rs>-<pod> -- look it up with "
+            "'kubectl -n sandlock get pod -l app=control-plane')"
+        ),
     )
     parser.add_argument(
         "--nodes",
