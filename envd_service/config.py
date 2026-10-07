@@ -477,7 +477,7 @@ class Settings:
     # worker stays on the in-process path in ``auto``/``off`` and fails loudly
     # in ``on`` (route A vs route B is a deployment decision, never a silent
     # downgrade -- docs/supervise-identity-handoff.md §8).
-    route_b: str = field(
+    own_identity: str = field(
         default_factory=lambda: os.getenv("E2B_ROUTE_B", "auto").lower()
     )
     # Maximum live slots. W1 recycle semantics: one uid = one supervise

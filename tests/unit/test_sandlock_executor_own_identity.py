@@ -6,8 +6,8 @@ about what the executor puts on the wire: which uid is leased, which policy
 document the generation gets, how each ``start``/``update_network``/``close``
 maps to a verb, and that closed/dead recovery restarts the slot instead of
 silently falling back to the in-process mediator. The real two-uid evidence is
-``tests/contract/test_route_b_slot_pool.py``; the executor running end-to-end
-against a real slot is ``tests/contract/test_route_b_executor.py``.
+``tests/contract/test_own_identity_slot_pool.py``; the executor running end-to-end
+against a real slot is ``tests/contract/test_own_identity_executor.py``.
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ from pathlib import Path
 import pytest
 
 import envd_service.executors.sandlock as sl
-import envd_service.route_b as rb
+import envd_service.own_identity as rb
 from envd_service.executors.base import ExecConfig
-from envd_service.route_b import RouteBConfig, SlotDeadError, SlotHandle
+from envd_service.own_identity import OwnIdentityConfig, SlotDeadError, SlotHandle
 from gateway_common.network import NetworkUpdateConflictError
 
 WORKSPACE = "/var/lib/e2b-sandboxes/sbx_route_b/workspace"
@@ -211,7 +211,7 @@ def _route_b_capable(monkeypatch, tmp_path):
     rb.reset_slot_pools()
 
 
-def _config(**over) -> RouteBConfig:
+def _config(**over) -> OwnIdentityConfig:
     cfg = {
         "mode": "auto",
         "slots": 0,
@@ -226,10 +226,10 @@ def _config(**over) -> RouteBConfig:
         "identity_reporter": lambda *args: {},
     }
     cfg.update(over)
-    return RouteBConfig(**cfg)
+    return OwnIdentityConfig(**cfg)
 
 
-def _executor(monkeypatch, *, route_b, base_image="python:3.11-slim",
+def _executor(monkeypatch, *, own_identity, base_image="python:3.11-slim",
               image_rootfs=ROOTFS, host_uid=HOST_UID, per_sandbox_uid=True, **over):
     """A chroot-shape executor (the mediation shape) unless overridden."""
     kwargs = {
@@ -246,7 +246,7 @@ def _executor(monkeypatch, *, route_b, base_image="python:3.11-slim",
         "allow_internet_access": False,
         "enable_network": False,
         "sandbox_id": "sbx_route_b",
-        "route_b": route_b,
+        "own_identity": own_identity,
     }
     kwargs.update(over)
     return sl.SandlockExecutor(**kwargs)
@@ -269,16 +269,16 @@ def _exec_cmd(cmd=None, **over) -> ExecConfig:
 @pytest.mark.parametrize(
     "case",
     [
-        pytest.param({"route_b": None, "want": False}, id="unconfigured"),
-        pytest.param({"route_b": _config(mode="off"), "want": False}, id="mode-off"),
-        pytest.param({"route_b": _config(mode="auto"), "want": True}, id="auto-chroot"),
+        pytest.param({"own_identity": None, "want": False}, id="unconfigured"),
+        pytest.param({"own_identity": _config(mode="off"), "want": False}, id="mode-off"),
+        pytest.param({"own_identity": _config(mode="auto"), "want": True}, id="auto-chroot"),
         # N15: the pure shape is mediated too -- host root, identity
         # translation -- so `auto` leases a slot for it exactly as it does for
         # the image shape. Keeping it in-process would run the mediation as the
         # mediator's uid, which is the T5 attribution the fork refuses.
         pytest.param(
             {
-                "route_b": _config(mode="auto"),
+                "own_identity": _config(mode="auto"),
                 "base_image": None,
                 "image_rootfs": None,
                 "want": True,
@@ -287,7 +287,7 @@ def _exec_cmd(cmd=None, **over) -> ExecConfig:
         ),
         pytest.param(
             {
-                "route_b": _config(mode="auto", slots=4),
+                "own_identity": _config(mode="auto", slots=4),
                 "base_image": None,
                 "image_rootfs": None,
                 "want": True,
@@ -296,7 +296,7 @@ def _exec_cmd(cmd=None, **over) -> ExecConfig:
         ),
         pytest.param(
             {
-                "route_b": _config(mode="on"),
+                "own_identity": _config(mode="on"),
                 "base_image": None,
                 "image_rootfs": None,
                 "want": True,
@@ -305,7 +305,7 @@ def _exec_cmd(cmd=None, **over) -> ExecConfig:
         ),
         pytest.param(
             {
-                "route_b": _config(mode="auto"),
+                "own_identity": _config(mode="auto"),
                 "per_sandbox_uid": False,
                 "host_uid": None,
                 "want": False,
@@ -313,7 +313,7 @@ def _exec_cmd(cmd=None, **over) -> ExecConfig:
             id="shared-uid",
         ),
         pytest.param(
-            {"route_b": _config(mode="auto"), "host_uid": None, "want": False},
+            {"own_identity": _config(mode="auto"), "host_uid": None, "want": False},
             id="no-host-uid",
         ),
     ],
@@ -321,7 +321,7 @@ def _exec_cmd(cmd=None, **over) -> ExecConfig:
 def test_route_b_selection_matrix(monkeypatch, case) -> None:
     shape = {k: v for k, v in case.items() if k != "want"}
     ex = _executor(monkeypatch, **shape)
-    assert ex._route_b_active is case["want"]
+    assert ex._own_identity_active is case["want"]
 
 
 def test_a_worker_without_a_reporter_stays_in_process_and_says_why(monkeypatch) -> None:
@@ -335,14 +335,14 @@ def test_a_worker_without_a_reporter_stays_in_process_and_says_why(monkeypatch) 
     """
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     sl.SandlockExecutor._mediation_shape_disclosed = False
-    ex = _executor(monkeypatch, route_b=_config(mode="auto", identity_reporter=None))
-    assert ex._route_b_active is False
-    assert "needs the control-plane reporter" in ex._route_b_decline
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto", identity_reporter=None))
+    assert ex._own_identity_active is False
+    assert "needs the control-plane reporter" in ex._own_identity_decline
     assert "mediation_run_as" not in ex._policy_ceiling()
     # ...and the shape that *has* one is the production one: an unprivileged
     # worker with no broker leases slots.
-    engaged = _executor(monkeypatch, route_b=_config(mode="auto"))
-    assert engaged._route_b_active is True
+    engaged = _executor(monkeypatch, own_identity=_config(mode="auto"))
+    assert engaged._own_identity_active is True
 
 
 def test_forced_route_b_without_a_reporter_fails_loudly(monkeypatch) -> None:
@@ -353,7 +353,7 @@ def test_forced_route_b_without_a_reporter_fails_loudly(monkeypatch) -> None:
         r"the control-plane reporter",
     ):
         _executor(
-            monkeypatch, route_b=_config(mode="on", identity_reporter=None)
+            monkeypatch, own_identity=_config(mode="on", identity_reporter=None)
         )
 
 
@@ -367,9 +367,9 @@ def test_agent_grant_engages_route_b_without_root_or_a_broker(monkeypatch) -> No
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     engaged = _executor(
         monkeypatch,
-        route_b=_config(mode="auto", identity_reporter=lambda *a: {}),
+        own_identity=_config(mode="auto", identity_reporter=lambda *a: {}),
     )
-    assert engaged._route_b_active is True
+    assert engaged._own_identity_active is True
 
 
 def test_forced_route_b_without_a_host_uid_fails_loudly(monkeypatch) -> None:
@@ -378,7 +378,7 @@ def test_forced_route_b_without_a_host_uid_fails_loudly(monkeypatch) -> None:
         match=r"^route B was requested \(E2B_ROUTE_B=on / E2B_ROUTE_B_SLOTS>0\) "
         r"but no per-sandbox host uid",
     ):
-        _executor(monkeypatch, route_b=_config(mode="on"), host_uid=None)
+        _executor(monkeypatch, own_identity=_config(mode="on"), host_uid=None)
 
 
 def test_an_old_wheel_without_the_fd_client_falls_back(monkeypatch) -> None:
@@ -386,11 +386,11 @@ def test_an_old_wheel_without_the_fd_client_falls_back(monkeypatch) -> None:
     transport-1 client. `auto` keeps the in-process backend rather than
     silently downgrading to a token-in-argv registered lease; a forced request
     says what to rebuild."""
-    import envd_service.route_b as route_b_mod
+    import envd_service.own_identity as route_b_mod
 
     monkeypatch.setattr(route_b_mod, "fd_client_available", lambda: False)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
-    assert ex._route_b_active is False
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
+    assert ex._own_identity_active is False
     with pytest.raises(
         RuntimeError,
         match=(
@@ -398,7 +398,7 @@ def test_an_old_wheel_without_the_fd_client_falls_back(monkeypatch) -> None:
             r"sandlock wheel has no sandlock_supervise_connect_fd"
         ),
     ):
-        _executor(monkeypatch, route_b=_config(mode="on"))
+        _executor(monkeypatch, own_identity=_config(mode="on"))
 
 
 def test_missing_supervise_binary_keeps_the_in_process_backend(
@@ -407,8 +407,8 @@ def test_missing_supervise_binary_keeps_the_in_process_backend(
     monkeypatch.setattr(
         rb, "default_supervise_bin", lambda: tmp_path / "not-installed"
     )
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
-    assert ex._route_b_active is False
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
+    assert ex._own_identity_active is False
 
 
 def test_the_ceiling_carries_no_mediation_tier_for_the_slot(monkeypatch) -> None:
@@ -417,7 +417,7 @@ def test_the_ceiling_carries_no_mediation_tier_for_the_slot(monkeypatch) -> None
     all (fork B3 deleted it), so a ceiling that carried it is refused by name
     rather than silently dropped -- a slot must never be told to mediate as
     anyone but itself, since its mediator already *is* the sandbox uid."""
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     ceiling = ex._policy_ceiling()
     assert "mediation_run_as" not in ceiling
     assert ceiling["uid"] == HOST_UID == ceiling["gid"]
@@ -437,7 +437,7 @@ def test_the_cgroup_lane_reaches_the_fork_policy(monkeypatch) -> None:
     wire -- not ``false``, but no key at all, because that lane's document has
     to stay byte-for-byte the one it was before either field existed.
     """
-    off = _executor(monkeypatch, route_b=_config(mode="auto"), notify_rate_limit=5000)
+    off = _executor(monkeypatch, own_identity=_config(mode="auto"), notify_rate_limit=5000)
     assert "kernel_enforced_limits" not in off._policy_ceiling()
     off_doc = rb.supervise_policy_document(off._policy_ceiling())
     assert "kernel_enforced_limits" not in off_doc
@@ -445,7 +445,7 @@ def test_the_cgroup_lane_reaches_the_fork_policy(monkeypatch) -> None:
 
     on = _executor(
         monkeypatch,
-        route_b=_config(
+        own_identity=_config(
             mode="auto", sandbox_cgroup="required", sandbox_cgroups=_HandleStub()
         ),
         notify_rate_limit=5000,
@@ -473,11 +473,11 @@ def test_an_unset_notify_cap_stays_unset_on_both_lanes(monkeypatch) -> None:
     did, whichever lane it is on -- ``E2B_SANDBOX_NOTIFY_RATE_LIMIT`` is not in
     either shipped manifest.
     """
-    for route_b in (
+    for own_identity in (
         _config(mode="auto"),
         _config(mode="auto", sandbox_cgroup="required", sandbox_cgroups=_HandleStub()),
     ):
-        ex = _executor(monkeypatch, route_b=route_b, notify_rate_limit=0)
+        ex = _executor(monkeypatch, own_identity=own_identity, notify_rate_limit=0)
         assert "notify_rate_limit" not in rb.supervise_policy_document(
             ex._policy_ceiling()
         )
@@ -492,7 +492,7 @@ async def test_first_exec_leases_this_sandbox_uid_with_the_full_ceiling(
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
 
     running = await ex.start(
         _exec_cmd(["/bin/sh", "-c", "echo hi"], env={"A": "1"})
@@ -537,7 +537,7 @@ async def test_shape_knobs_reach_the_slot_document(monkeypatch) -> None:
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
     ex = _executor(
         monkeypatch,
-        route_b=_config(mode="auto"),
+        own_identity=_config(mode="auto"),
         enable_net_isolation=True,
         fd_inject_connect=True,
         pid_ns=False,
@@ -567,7 +567,7 @@ async def test_mcp_gateway_exec_is_the_only_one_allowed_to_bind(monkeypatch) -> 
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     ex.set_mcp_bind_port(50006)
     await ex.start(_exec_cmd(["python", "-m", "mcp-gateway"]))
     await ex.start(_exec_cmd())
@@ -582,7 +582,7 @@ async def test_exec_params_travel_as_verb_args(monkeypatch) -> None:
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     await ex.start(
         _exec_cmd(["/bin/bash", "-lc", "pwd"], env={"FOO": "bar"}, cwd="")
     )
@@ -598,7 +598,7 @@ async def test_output_streams_and_exit_code_comes_from_wait_child(monkeypatch) -
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool(child_output=b"hello\n")
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     running = await ex.start(_exec_cmd(["/bin/echo"]))
     chunks = [
         (kind, data)
@@ -616,7 +616,7 @@ async def test_pty_command_gets_a_worker_side_master(monkeypatch) -> None:
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     running = await ex.start(
         _exec_cmd(["/bin/sh"], pty=True, rows=40, cols=120)
     )
@@ -638,7 +638,7 @@ async def test_a_dead_slot_is_leased_again_before_the_exec_retries(
     pool = FakePool()
     pool.replies["exec"] = SlotDeadError("route-B instance sbx_route_b is dead")
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     with pytest.raises(SlotDeadError, match="is dead"):
         await ex.start(_exec_cmd())
     assert len(pool.acquire_calls) == 2
@@ -683,7 +683,7 @@ async def test_slot_that_never_starts_is_restarted_once_then_reported(
 
     pool.acquire_sync = _dead_on_first
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     running = await ex.start(_exec_cmd())
     assert attempts == [HOST_UID, HOST_UID]
     assert running.pid == 5150
@@ -693,7 +693,7 @@ async def test_close_ends_the_generation_and_frees_the_uid(monkeypatch) -> None:
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     inst = ex._ensure_instance()
     assert ex.instance_handle is inst
     ex.close()
@@ -714,7 +714,7 @@ async def test_network_update_goes_to_the_slot_and_logs_staleness(
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
     ex = _executor(
         monkeypatch,
-        route_b=_config(mode="auto"),
+        own_identity=_config(mode="auto"),
         enable_network=True,
         network={"allowOut": ["198.18.0.99"]},
         allow_internet_access=True,
@@ -749,12 +749,12 @@ async def test_a_checkpoint_goes_to_the_slot_with_the_workers_own_path(
         "fds": 4,
     }
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     await ex.start(_exec_cmd())
 
     reply = ex.capture_checkpoint(image, "latest")
     # `exclude_main` rides every capture: this deployment's sessions run a park
-    # as their main child (see `RouteBInstance.capture_checkpoint`), so the
+    # as their main child (see `OwnIdentityInstance.capture_checkpoint`), so the
     # workload is the child beside it. Without the flag the engine refuses a
     # sandbox with anything running in it.
     assert pool.log[-1] == (
@@ -791,7 +791,7 @@ def test_a_capture_without_a_live_session_leases_nothing_to_find_out(
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
 
     reply = ex.capture_checkpoint("/var/lib/e2b-sandboxes/_runtime/x/checkpoint/latest")
 
@@ -816,7 +816,7 @@ async def test_a_refused_capture_carries_the_slots_own_words(monkeypatch) -> Non
         "checkpoint requires exactly one live child, found 2"
     )
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     await ex.start(_exec_cmd())
 
     reply = ex.capture_checkpoint("/var/lib/e2b-sandboxes/_runtime/x/checkpoint/latest")
@@ -832,7 +832,7 @@ def test_the_in_process_mediator_cannot_capture_and_says_which_shape_it_is(
 ) -> None:
     """No slot owns the process tree, so no verb can reach it (T5's shape)."""
     ROOTFS.mkdir(parents=True, exist_ok=True)
-    ex = _executor(monkeypatch, route_b=None)
+    ex = _executor(monkeypatch, own_identity=None)
 
     reply = ex.capture_checkpoint("/var/lib/e2b-sandboxes/_runtime/x/checkpoint/latest")
 
@@ -861,7 +861,7 @@ async def test_a_restore_leases_the_session_and_hands_over_the_image(monkeypatch
         "restore_skipped": [{"fd": 7, "path": "socket:[9]"}],
     }
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
 
     reply = ex.restore_checkpoint(image)
 
@@ -885,7 +885,7 @@ async def test_a_restore_a_slot_does_not_know_is_reported_not_crashed(
     pool = FakePool()
     pool.replies["restore"] = rb.SandboxError("unknown verb: restore")
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"))
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
 
     reply = ex.restore_checkpoint("/var/lib/e2b-sandboxes/_runtime/x/checkpoint/latest")
 
@@ -904,8 +904,8 @@ def test_in_process_chroot_shape_is_disclosed(monkeypatch, caplog) -> None:
 
     sl.SandlockExecutor._mediation_shape_disclosed = False
     with caplog.at_level(logging.ERROR, logger="envd_service.executors.sandlock"):
-        ex = _executor(monkeypatch, route_b=None)
-    assert ex._route_b_active is False
+        ex = _executor(monkeypatch, own_identity=None)
+    assert ex._own_identity_active is False
     messages = [r.message for r in caplog.records if r.levelno == logging.ERROR]
     assert len(messages) == 1, messages
     assert "runs in-process, not on a supervise slot" in messages[0]
@@ -915,8 +915,8 @@ def test_in_process_chroot_shape_is_disclosed(monkeypatch, caplog) -> None:
     # Disclosed once per process, and not at all when a slot is in use.
     caplog.clear()
     with caplog.at_level(logging.ERROR, logger="envd_service.executors.sandlock"):
-        _executor(monkeypatch, route_b=None)
-        _executor(monkeypatch, route_b=_config(mode="auto"))
+        _executor(monkeypatch, own_identity=None)
+        _executor(monkeypatch, own_identity=_config(mode="auto"))
     assert [r.message for r in caplog.records if r.levelno == logging.ERROR] == []
 
 
@@ -976,7 +976,7 @@ def test_the_refusal_predicate_tracks_the_forks_privilege_rule(
     monkeypatch.setattr(
         sl, "has_effective_cap", lambda bit: caps if bit in (6, 7) else False
     )
-    ex = _executor(monkeypatch, route_b=None, **case)
+    ex = _executor(monkeypatch, own_identity=None, **case)
     assert ex._in_process_mediation_is_refused() is want
 
 
@@ -1011,7 +1011,7 @@ async def test_the_declared_cpu_share_rides_the_lease_unclamped(monkeypatch) -> 
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
-    ex = _executor(monkeypatch, route_b=_config(mode="auto"), cpu_percent=200)
+    ex = _executor(monkeypatch, own_identity=_config(mode="auto"), cpu_percent=200)
 
     await ex.start(_exec_cmd(["/bin/true"]))
 
@@ -1034,7 +1034,7 @@ def test_an_in_process_sandbox_is_refused_when_the_cgroup_is_required(
     with pytest.raises(RuntimeError) as excinfo:
         _executor(
             monkeypatch,
-            route_b=_config(
+            own_identity=_config(
                 mode="auto",
                 identity_reporter=None,
                 sandbox_cgroup="required",
@@ -1059,7 +1059,7 @@ def test_an_in_process_sandbox_still_falls_back_when_the_cgroup_is_off(
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     ex = _executor(
         monkeypatch,
-        route_b=_config(mode="auto", identity_reporter=None, sandbox_cgroup="off"),
+        own_identity=_config(mode="auto", identity_reporter=None, sandbox_cgroup="off"),
     )
-    assert ex._route_b_active is False
-    assert ex._route_b_decline == NO_REPORTER_DECLINE
+    assert ex._own_identity_active is False
+    assert ex._own_identity_decline == NO_REPORTER_DECLINE

@@ -1,6 +1,6 @@
 """Probe: which shape did a route-B sandbox actually get?
 
-The pid_ns acceptance (`tests/contract/test_nonroot_route_b.py::
+The pid_ns acceptance (`tests/contract/test_nonroot_own_identity.py::
 test_route_b_restores_guest_root_with_and_without_pid_ns`) asserts `id -u` == 0,
 but that is also what the *default* (pid_ns off) shape reports -- so a green
 run is only evidence for pid_ns if the run really enabled it. This probe prints

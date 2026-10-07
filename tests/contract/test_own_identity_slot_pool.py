@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from envd_service.route_b import W1SlotPool, default_supervise_bin
+from envd_service.own_identity import W1SlotPool, default_supervise_bin
 from tests.security.conftest import sandlock_ready
 
 

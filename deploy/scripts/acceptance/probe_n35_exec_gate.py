@@ -103,7 +103,7 @@ ROOTFS_TOOL = "/usr/local/bin/n35_rootfs_tool"
 def build_executor(shape: str, grant: bool):
     """A sandbox built the way the worker builds one, plus the optional grant."""
     from envd_service.executors.sandlock import SandlockExecutor
-    from envd_service.route_b import RouteBConfig
+    from envd_service.own_identity import OwnIdentityConfig
 
     workspace = sandbox_tmpdir(suffix="-ws")
     chroot = shape == "chroot"
@@ -130,7 +130,7 @@ def build_executor(shape: str, grant: bool):
         extra_fs_writable=extra,
         pid_ns=pid_ns,
         sandbox_id=f"sbx_n35_{uuid.uuid4().hex[:8]}",
-        route_b=RouteBConfig(
+        own_identity=OwnIdentityConfig(
             mode="auto",
             uid_start=host_uid if host_uid is not None else SANDBOX_UID,
             uid_size=2,

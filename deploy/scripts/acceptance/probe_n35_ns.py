@@ -34,7 +34,7 @@ NS_KINDS = ("mnt", "user", "pid", "pid_for_children", "net", "ipc", "uts", "cgro
 
 def build_executor(shape: str):
     from envd_service.executors.sandlock import SandlockExecutor
-    from envd_service.route_b import RouteBConfig
+    from envd_service.own_identity import OwnIdentityConfig
 
     workspace = sandbox_tmpdir(suffix="-ws")
     chroot = shape == "chroot"
@@ -60,7 +60,7 @@ def build_executor(shape: str):
         allow_internet_access=False,
         enable_network=False,
         sandbox_id=f"sbx_ns_{uuid.uuid4().hex[:8]}",
-        route_b=RouteBConfig(
+        own_identity=OwnIdentityConfig(
             mode="auto",
             uid_start=host_uid if host_uid is not None else SANDBOX_UID,
             uid_size=2,
@@ -134,7 +134,7 @@ async def main_async() -> int:
     try:
         require_mediation_capable(executor)
         print(
-            "== shape=" + shape + " route_b_active=" + str(executor._route_b_active)
+            "== shape=" + shape + " route_b_active=" + str(executor._own_identity_active)
             + " real_root=" + str(executor._has_sandbox_root)
             + " id=" + token
         )

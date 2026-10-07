@@ -23,7 +23,7 @@ re-invented) and onto one target:
 | ``chown-volume-root`` | ``chown`` | ``<volume>`` |
 | ``remove-volume-slice`` | ``rm`` | ``<volume>/<id>`` |
 | ``chown-secret`` | ``chown`` | ``<image cache>/secrets/<id>/<name>.secret`` |
-| ``scope-slot-document`` | ``chown`` | ``<route-B root>/<uid>/<instance name>/<name>``, where the leaf comes from :func:`gateway_common.paths.route_b_instance_name` -- the **same** function the worker's executor names the slot with (ruling D20) |
+| ``scope-slot-document`` | ``chown`` | ``<route-B root>/<uid>/<instance name>/<name>``, where the leaf comes from :func:`gateway_common.paths.own_identity_instance_name` -- the **same** function the worker's executor names the slot with (ruling D20) |
 | ``remove-orphan-workspace`` | ``rm`` | ``<workspace base>/<id>`` (**self-heal only**, C3 Task 6): the tree the control plane's records claim nowhere. It is the one op with no record to derive a uid from -- that is its definition -- and the worker surface refuses it by name. |
 | ``materialize-tree`` | ``materialize`` | ``<workspace base>/<id>`` (+ the snapshot copy source and the per-sandbox volume slices). The **create path's** one privileged step, and the only row with **no caller surface at all**: the control plane derives it for itself (`control_plane/api/sandboxes.py::_materialize_remote`) and sends it to the node's agent directly, so no worker request can ever name it. The row lives here because this table is the complete list of what the platform may ask a node to do, and because :func:`derive_materialize` uses it for the root-check refusal. |
 
@@ -53,7 +53,7 @@ from typing import Any, Mapping
 from gateway_common.paths import (
     SNAPSHOT_PAYLOAD_TAR_NAME,
     is_reserved_platform_namespace,
-    route_b_instance_name,
+    own_identity_instance_name,
     sandbox_checkpoint_dir,
     sandbox_runtime_dir,
     snapshot_payload_dir,
@@ -250,7 +250,7 @@ def control_paths(state, settings) -> ControlPaths:
     node_state = getattr(settings, "node_state_base", None) or getattr(
         state, "node_state_base", None
     )
-    route_b = getattr(settings, "route_b_tmp_root", "") or ""
+    own_identity = getattr(settings, "route_b_tmp_root", "") or ""
     return ControlPaths(
         workspace_base=workspace_base,
         state_base=state_base,
@@ -259,7 +259,7 @@ def control_paths(state, settings) -> ControlPaths:
         if getattr(settings, "image_cache_dir", None)
         else None,
         shared_volume_root=Path(shared) if shared else None,
-        route_b_tmp_root=Path(route_b) if route_b else None,
+        route_b_tmp_root=Path(own_identity) if own_identity else None,
         volume_paths=volume_paths,
         volume_quota_mb=volume_quota_mb,
     )
@@ -650,7 +650,7 @@ def _slot_document(
     return (
         paths.route_b_tmp_root
         / str(host_uid)
-        / route_b_instance_name(sandbox_id)
+        / own_identity_instance_name(sandbox_id)
         / name
     )
 

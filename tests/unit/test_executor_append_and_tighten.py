@@ -119,7 +119,7 @@ def test_a_sink_failure_is_left_to_the_pump_that_owns_the_thread():
 
     executor.set_append_sink(explode)
     with pytest.raises(RuntimeError):
-        # The *pump* catches consumer failures (`RouteBInstance.start_event_pump`);
+        # The *pump* catches consumer failures (`OwnIdentityInstance.start_event_pump`);
         # this seam is deliberately transparent so that protection stays in one
         # place rather than being half-implemented twice.
         executor._on_slot_event({"event": "append", "bytes": 1})

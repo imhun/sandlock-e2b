@@ -10,7 +10,7 @@ fixed at instance creation (M4 D1-D3). Non-Linux hosts import nothing and
 The instance is either in-process (``sandlock.SandboxInstance``) or a
 route-B ``sandlock-supervise`` slot running as the sandbox's own host uid,
 where path mediation and DAC ownership are correct by construction
-(``envd_service/route_b.py``, backlog #5 / T5).
+(``envd_service/own_identity.py``, backlog #5 / T5).
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from pathlib import Path
 
 from gateway_common.errors import ConnectError, unimplemented
 from gateway_common.network import NetworkUpdateConflictError
-from gateway_common.paths import route_b_instance_name
+from gateway_common.paths import own_identity_instance_name
 from envd_service.executors.base import ExecConfig, Executor, RunningProcess
 from envd_service.process.stream_budget import (
     STREAM_LIMIT_DEFAULT,
@@ -46,9 +46,9 @@ from envd_service.uid_pool import (
     LEGACY_SHARED_UID,
     has_effective_cap,
 )
-from envd_service.route_b import (
-    RouteBConfig,
-    RouteBInstance,
+from envd_service.own_identity import (
+    OwnIdentityConfig,
+    OwnIdentityInstance,
     SandboxError,
     SlotDeadError,
     supervise_policy_document,
@@ -366,7 +366,7 @@ def _mkdir_traversable(path: Path, mode: int = 0o755) -> None:
     directory created here is a mount target or a root layer the sandbox's own
     uid traverses while owning none of them, so a ``0700`` one fails the bind
     (and the ``chdir``) with ``EACCES`` before the sandbox ever starts. Same
-    call as ``route_b._write_slot_documents``: create, then ``chmod`` each level
+    call as ``own_identity._write_slot_documents``: create, then ``chmod`` each level
     explicitly, because neither the ambient umask nor a private scratch root
     may decide the modes. Directories that already exist are left untouched --
     this must never widen the modes of something an image shipped. A tree that
@@ -819,13 +819,13 @@ class SandlockExecutor(Executor):
     instance stays ``None`` (D11).
 
     The instance has two interchangeable backends, chosen once per sandbox by
-    :meth:`_route_b_decline_reason`: the **in-process** ``sandlock.SandboxInstance``
+    :meth:`_own_identity_decline_reason`: the **in-process** ``sandlock.SandboxInstance``
     (the mediator is the worker process), or a **route-B** ``sandlock-supervise``
-    slot leased from :mod:`envd_service.route_b` (the mediator is a process
+    slot leased from :mod:`envd_service.own_identity` (the mediator is a process
     whose euid *is* this sandbox's host uid, so mediated path operations land
     with the sandbox's own ownership). Route B speaks the same
     ``exec``/``wait_child``/``kill_child``/``update_network``/``shutdown`` verb
-    surface through :class:`~envd_service.route_b.RouteBInstance`, which
+    surface through :class:`~envd_service.own_identity.OwnIdentityInstance`, which
     mirrors ``SandboxInstance`` -- everything below is one code path.
     """
 
@@ -865,7 +865,7 @@ class SandlockExecutor(Executor):
         fs_mounts: dict[str, str] | None = None,
         sandbox_id: str | None = None,
         pure_rootfs_dir: Path | str | None = None,
-        route_b: RouteBConfig | None = None,
+        own_identity: OwnIdentityConfig | None = None,
     ) -> None:
         self._workspace_dir = workspace_dir
         self._base_image = base_image
@@ -937,11 +937,11 @@ class SandlockExecutor(Executor):
         # sandbox's host uid). ``None`` / ``off`` keeps the in-process
         # instance; the decision itself is made once here because every input
         # (shape, uid, platform, starter privilege) is fixed at construction.
-        self._route_b = route_b
-        self._route_b_decline = self._route_b_decline_reason()
-        self._route_b_active = self._route_b_decline is None
-        if not self._route_b_active:
-            self._refuse_in_process_without_a_quota(self._route_b_decline)
+        self._own_identity = own_identity
+        self._own_identity_decline = self._own_identity_decline_reason()
+        self._own_identity_active = self._own_identity_decline is None
+        if not self._own_identity_active:
+            self._refuse_in_process_without_a_quota(self._own_identity_decline)
         # N25: consumer of the slot's pushed append events, installed by the
         # runtime context (`SandboxRuntimeContext`) right after construction.
         # ``None`` means the numbers keep coming from the filesystem alone.
@@ -1063,7 +1063,7 @@ class SandlockExecutor(Executor):
                     self.instance_name,
                 )
                 raise
-            if self._route_b_active:
+            if self._own_identity_active:
                 # Rebuilding here would spawn a supervise process on the event
                 # loop (this method is synchronous). Refuse instead: the
                 # executor's own policy copy stays untouched, so the record and
@@ -1360,7 +1360,7 @@ class SandlockExecutor(Executor):
           ``checkpoint`` arm, or a session whose live-child count is not exactly
           one. The engine's own sentence is carried through verbatim.
         """
-        if not self._route_b_active:
+        if not self._own_identity_active:
             return {
                 "captured": False,
                 "reason": (
@@ -1405,7 +1405,7 @@ class SandlockExecutor(Executor):
         cannot say so would report a sandbox that looks fine until its first
         read (D6).
         """
-        if not self._route_b_active:
+        if not self._own_identity_active:
             return {
                 "restored": False,
                 "reason": (
@@ -1506,16 +1506,16 @@ class SandlockExecutor(Executor):
         # derives the slot documents' directory from the same function, so a
         # slot the worker created is one the CP can address.
         sid = self._sandbox_id or Path(self._workspace_dir).name
-        return route_b_instance_name(sid)
+        return own_identity_instance_name(sid)
 
     # Warn-once switches for the shapes that decline a slot. The reason itself
-    # comes from `_route_b_decline_reason` -- one decision, quoted verbatim by
+    # comes from `_own_identity_decline_reason` -- one decision, quoted verbatim by
     # the disclosure below, so the message can never disagree with the rule.
-    _route_b_no_starter_warned = False
-    _route_b_no_fd_client_warned = False
+    _own_identity_no_starter_warned = False
+    _own_identity_no_fd_client_warned = False
     _mediation_shape_disclosed = False
 
-    def _route_b_decline_reason(self) -> str | None:
+    def _own_identity_decline_reason(self) -> str | None:
         """Why this sandbox does not run on a supervise slot, or None if it does.
 
         Route B needs a *per-sandbox host uid*: the slot process **is** that uid
@@ -1532,7 +1532,7 @@ class SandlockExecutor(Executor):
         route B and cannot get it fails loudly -- route A vs route B is a
         deployment decision, never a silent downgrade (§8).
         """
-        cfg = self._route_b
+        cfg = self._own_identity
         if cfg is None:
             return "the worker passed no route-B config (E2B_ROUTE_B_* unset)"
         if cfg.mode == "off":
@@ -1574,8 +1574,8 @@ class SandlockExecutor(Executor):
             )
             if forced:
                 raise RuntimeError("route B was requested but " + reason)
-            if not type(self)._route_b_no_starter_warned:
-                type(self)._route_b_no_starter_warned = True
+            if not type(self)._own_identity_no_starter_warned:
+                type(self)._own_identity_no_starter_warned = True
                 logger.warning(
                     "route B unavailable for sandbox_id=%s: %s; mediation stays "
                     "in-process, which for the chroot shape now fails closed "
@@ -1584,7 +1584,7 @@ class SandlockExecutor(Executor):
                     reason,
                 )
             return reason
-        from envd_service.route_b import default_supervise_bin, fd_client_available
+        from envd_service.own_identity import default_supervise_bin, fd_client_available
 
         if cfg.transport == "fd" and not fd_client_available():
             # The wheel predates fork F17: it can serve an fd handoff but the
@@ -1600,8 +1600,8 @@ class SandlockExecutor(Executor):
                     "route B was requested with transport=fd, but " + reason
                     + ": rebuild wheels/fork/ or set E2B_ROUTE_B_TRANSPORT=path"
                 )
-            if not type(self)._route_b_no_fd_client_warned:
-                type(self)._route_b_no_fd_client_warned = True
+            if not type(self)._own_identity_no_fd_client_warned:
+                type(self)._own_identity_no_fd_client_warned = True
                 logger.warning(
                     "route B unavailable for sandbox_id=%s: %s; not falling back to "
                     "the registered transport, whose token would sit in the slot's "
@@ -1641,7 +1641,7 @@ class SandlockExecutor(Executor):
         that says which rule fired and *why no slot was available* -- with the
         reason quoted from the very function that decided it.
         """
-        if self._route_b_active or type(self)._mediation_shape_disclosed:
+        if self._own_identity_active or type(self)._mediation_shape_disclosed:
             return
         if sandlock is None or not self._in_process_mediation_is_refused():
             return
@@ -1655,7 +1655,7 @@ class SandlockExecutor(Executor):
             "slot (E2B_ROUTE_B=auto/on), or run a privileged launcher or an "
             "external slot fleet.",
             self._sandbox_id or "-",
-            self._route_b_decline or "reason unavailable",
+            self._own_identity_decline or "reason unavailable",
         )
 
     def _in_process_mediation_is_refused(self) -> bool:
@@ -1734,9 +1734,9 @@ class SandlockExecutor(Executor):
         ``off`` (the default) answers ``False``, and a settings double that
         predates the field reads the same way route B's own default does.
         """
-        if self._route_b is None:
+        if self._own_identity is None:
             return False
-        mode = str(getattr(self._route_b, "sandbox_cgroup", "off") or "off")
+        mode = str(getattr(self._own_identity, "sandbox_cgroup", "off") or "off")
         return mode.strip().lower() == "required"
 
     def _notify_rate_limit_for_the_lane(self) -> int | None:
@@ -1766,7 +1766,7 @@ class SandlockExecutor(Executor):
             return None
         return self._notify_rate_limit or None
 
-    def _open_route_b_instance(self):
+    def _open_own_identity_instance(self):
         """Lease this sandbox's slot and wrap it in the instance shim.
 
         The ceiling travels as a full-field ``--policy`` document (the same
@@ -1775,7 +1775,7 @@ class SandlockExecutor(Executor):
         no main process, but launch-first is what brings the slot's session up
         and the generation ends when that process ends.
         """
-        cfg = self._route_b
+        cfg = self._own_identity
         document = supervise_policy_document(self._policy_ceiling())
         pool = slot_pool_for(cfg)
         uid = self._host_uid
@@ -1835,7 +1835,7 @@ class SandlockExecutor(Executor):
             # host uid. `unknown` means the wheel predates fork F18.
             handle.guest_uid or "unknown",
         )
-        instance = RouteBInstance(pool=pool, handle=handle, name=self.instance_name)
+        instance = OwnIdentityInstance(pool=pool, handle=handle, name=self.instance_name)
         # N25: start consuming the slot's pushed events. `False` means this
         # slot has no events channel (an older wheel, or the registered-path
         # transport), which costs acceleration only -- the accounting still
@@ -1871,7 +1871,7 @@ class SandlockExecutor(Executor):
         spawns a process and waits for its registered channel to answer, which
         takes the same lock on a worker thread.
         """
-        if self._route_b_active:
+        if self._own_identity_active:
             return await asyncio.to_thread(self._ensure_instance)
         with self._lifecycle_lock:
             return self._ensure_instance_locked()
@@ -1885,7 +1885,7 @@ class SandlockExecutor(Executor):
         """
         retire = self._retire_previous_instance
 
-        if self._route_b_active:
+        if self._own_identity_active:
             # Closing a route-B instance ends a *process* (shutdown verb +
             # reap), so it goes off the loop like the creation next to it.
             await asyncio.to_thread(retire, reason, previous)
@@ -1933,20 +1933,20 @@ class SandlockExecutor(Executor):
         """Creation core; caller must hold ``_lifecycle_lock``.
 
         A route-B instance needs the supervise binary and the native channel
-        client (checked by :meth:`_route_b_decline_reason`), not the in-process
+        client (checked by :meth:`_own_identity_decline_reason`), not the in-process
         ``SandboxInstance`` class, so the availability guard only applies to
         the in-process backend.
         """
         if self._instance is None and (
-            self._route_b_active or SandboxInstance is not None
+            self._own_identity_active or SandboxInstance is not None
         ):
             if self._instance_name is None:
                 self._instance_name = self._instance_name_for()
             # Route B: the "instance" is a supervise slot leased to this
             # sandbox, so the ceiling travels as a policy document and the
             # exec verbs cross the channel instead of the FFI.
-            if self._route_b_active:
-                self._instance = self._open_route_b_instance()
+            if self._own_identity_active:
+                self._instance = self._open_own_identity_instance()
             else:
                 policy = self._build_instance_policy()
                 try:
@@ -2448,7 +2448,7 @@ class SandlockExecutor(Executor):
 
         Consequence, stated where it is decided: a mediated sandbox needs the
         mediator to run as *the sandbox's own* uid, so the pure shape now wants
-        a route-B slot (`_route_b_decline_reason`); where it cannot have one the
+        a route-B slot (`_own_identity_decline_reason`); where it cannot have one the
         in-process path is refused rather than silently attributing the
         sandbox's writes to the mediator (SL-1, fail closed).
         """
@@ -3147,7 +3147,7 @@ class SandlockExecutor(Executor):
             # ``SandlockRunningProcess.kill``); a slot child takes the signal
             # number through ``kill_child``, so the pause/resume fallback may
             # use it (M4 D5 / FUP #8).
-            signal_pause_supported=self._route_b_active,
+            signal_pause_supported=self._own_identity_active,
         )
         if config.pty:
             # The removed in-sandbox bridge applied the requested window size

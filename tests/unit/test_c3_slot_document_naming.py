@@ -25,15 +25,15 @@ from pathlib import Path
 import pytest
 
 import envd_service.executors.sandlock as sl
-import envd_service.route_b as rb
+import envd_service.own_identity as rb
 from control_plane import file_ops
 from control_plane.file_ops import ControlPaths
 from envd_service.executors.base import ExecConfig
-from envd_service.route_b import RouteBConfig, W1SlotPool
-from gateway_common.paths import route_b_instance_name
+from envd_service.own_identity import OwnIdentityConfig, W1SlotPool
+from gateway_common.paths import own_identity_instance_name
 
 HOST_UID = 20007
-#: Longer than ``ROUTE_B_INSTANCE_NAME_MAX_BYTES``: the rule replaces it with
+#: Longer than ``OWN_IDENTITY_INSTANCE_NAME_MAX_BYTES``: the rule replaces it with
 #: ``sbx_<sha256[:16]>``, which is exactly the case a hand-written second copy
 #: of the rule gets wrong.
 LONG_ID = "sbx_" + "a" * 80
@@ -131,7 +131,7 @@ def _executor(sandbox_id: str, tmp_path: Path):
         allow_internet_access=False,
         enable_network=False,
         sandbox_id=sandbox_id,
-        route_b=RouteBConfig(
+        own_identity=OwnIdentityConfig(
             mode="auto",
             slots=0,
             uid_start=HOST_UID,
@@ -173,7 +173,7 @@ async def test_the_slot_directory_is_what_the_control_plane_derives(
 
     uid_dir = _route_b_root(tmp_path) / str(HOST_UID)
     created = sorted(entry.name for entry in uid_dir.iterdir())
-    assert created == [route_b_instance_name(sandbox_id)]
+    assert created == [own_identity_instance_name(sandbox_id)]
     slot_dir = uid_dir / created[0]
     assert sorted(entry.name for entry in slot_dir.iterdir()) == [
         "policy.json",

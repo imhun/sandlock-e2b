@@ -232,7 +232,7 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
     # whole story (it was already true of the worker's own CapEff; the caps
     # existed only to open the file-capability gate).
     #
-    # `tests/contract/test_nonroot_route_b.py` is deliberately not in the list
+    # `tests/contract/test_nonroot_own_identity.py` is deliberately not in the list
     # any more: a non-root worker has no route-B capability without the agent,
     # which is what that contract used to pin when the brokers supplied it.
     # shellcheck disable=SC2086
@@ -253,7 +253,7 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
         "$IMAGE" \
         pytest tests/security/test_template_isolation.py \
             tests/security/test_sandlock_isolation.py \
-            tests/unit/test_sandlock_executor_route_b.py \
+            tests/unit/test_sandlock_executor_own_identity.py \
             tests/unit/test_policy_mapping.py -q -p no:cacheprovider "$@"
         # ^ E2B_BASE_IMAGE is deliberately not inherited: `python-mcp:3.14` is a
         # locally built image that the registry mirrors refuse (403 not in the

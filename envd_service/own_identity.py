@@ -22,7 +22,7 @@ Three layers live here, and the split is deliberate:
   executor's policy-ceiling kwargs to the full-field ``--policy`` document,
   and :data:`PARKING_PROGRAM` is the generation's M0 (envd instances have no
   main-program concept, so the main process is a shell that stops itself);
-* :class:`RouteBInstance` / :class:`RouteBExecProcess` give the executor a
+* :class:`OwnIdentityInstance` / :class:`OwnIdentityExecProcess` give the executor a
   ``SandboxInstance``/``ExecProcess``-shaped client over the slot verbs, so
   ``SandlockExecutor`` keeps exactly one code path for both backends.
 
@@ -769,7 +769,7 @@ class W1SlotPool:
         # ``name`` is the per-instance directory leaf under ``<root>/<uid>/``.
         # The production caller is the executor's route-B acquire and it always
         # passes ``name=self.instance_name`` (``executors/sandlock.py``), which
-        # is ``gateway_common.paths.route_b_instance_name`` -- the same rule the
+        # is ``gateway_common.paths.own_identity_instance_name`` -- the same rule the
         # control plane derives the slot documents' path with. The ``rb-``
         # fallback exists only for a caller that names no instance (an embedder,
         # a test); it is never taken in production, and
@@ -1132,9 +1132,9 @@ class W1SlotPool:
             # otherwise have its *other* document handed to the agent under the
             # CP's path -- scope the wrong file, or refuse this one. Refusing by
             # name is the only shape that cannot silently do the wrong thing.
-            from gateway_common.paths import route_b_instance_name
+            from gateway_common.paths import own_identity_instance_name
 
-            expected = route_b_instance_name(sandbox_id)
+            expected = own_identity_instance_name(sandbox_id)
             # Both components: the leaf names the *instance*, and the directory
             # above it is the uid the slot was leased at (m-2). Comparing only
             # the leaf would accept a stale copy under another uid's directory --
@@ -1235,7 +1235,7 @@ class W1SlotPool:
         """Tear one slot down and return its uid. Idempotent.
 
         Both teardown entry points converge here: the sandbox lifecycle
-        releases by ``sandbox_id``, while a :class:`RouteBInstance` releases by
+        releases by ``sandbox_id``, while a :class:`OwnIdentityInstance` releases by
         the handle it holds -- and that handle outlives its ledger entry
         either way, so the second caller must neither warn nor double-kill.
         """
@@ -1460,7 +1460,7 @@ def supervise_policy_document(ceiling: dict) -> dict:
 # ------------------------------------------------------------------ instance shim
 
 
-class RouteBExecProcess:
+class OwnIdentityExecProcess:
     """A child of a route-B slot, shaped like the fork's ``ExecProcess``.
 
     The executor's ``SandlockRunningProcess`` only uses ``pid``,
@@ -1476,7 +1476,7 @@ class RouteBExecProcess:
     def __init__(
         self,
         *,
-        instance: "RouteBInstance",
+        instance: "OwnIdentityInstance",
         child_id: int,
         pid: int,
         argv: list[str],
@@ -1596,7 +1596,7 @@ class RouteBExecProcess:
                 pass
 
 
-class RouteBInstance:
+class OwnIdentityInstance:
     """``SandboxInstance``-shaped client for one route-B slot.
 
     ``exec`` / ``update_network`` / ``close`` mean the slot's verbs, so the
@@ -1969,7 +1969,7 @@ class RouteBInstance:
         extra_writable=None,
         bind_ports=None,
         max_file_size: int | None = None,
-    ) -> RouteBExecProcess:
+    ) -> OwnIdentityExecProcess:
         """Exec ``cmd`` on the slot with worker-side stdio (PIPED or PTY).
 
         ``stdio`` is accepted for signature compatibility with
@@ -2040,7 +2040,7 @@ class RouteBInstance:
             _close_fd(fd)
         slave_fd = None
 
-        return RouteBExecProcess(
+        return OwnIdentityExecProcess(
             instance=self,
             child_id=int(reply["child_id"]),
             pid=int(reply["pid"]),
@@ -2120,7 +2120,7 @@ _POOLS: dict[tuple, W1SlotPool] = {}
 
 
 def slot_pool_for(
-    config: "RouteBConfig",
+    config: "OwnIdentityConfig",
     *,
     channel_factory: Callable[[str, str], object] | None = None,
     supervise_bin: Path | None = None,
@@ -2172,7 +2172,7 @@ def slot_pool_for(
 
 
 @dataclass
-class RouteBConfig:
+class OwnIdentityConfig:
     """The worker-side route-B knobs resolved from :class:`Settings`.
 
     Built by the executor factory (unit tests construct the executor without
@@ -2246,7 +2246,7 @@ class RouteBConfig:
             raise ValueError(CGROUP_HANDLE_MISSING_ERROR)
 
     @classmethod
-    def from_settings(cls, settings) -> "RouteBConfig":
+    def from_settings(cls, settings) -> "OwnIdentityConfig":
         """Resolve from worker settings.
 
         Every field falls back to the ``Settings`` default, so a caller with a
@@ -2274,7 +2274,7 @@ class RouteBConfig:
             )
         slot_identity = raw_slot_identity
         return cls(
-            mode=str(getattr(settings, "route_b", "auto")).lower(),
+            mode=str(getattr(settings, "own_identity", "auto")).lower(),
             slots=int(getattr(settings, "route_b_slots", 0) or 0),
             uid_start=int(getattr(settings, "uid_pool_start", 10000)),
             uid_size=int(getattr(settings, "uid_pool_size", 1000)),

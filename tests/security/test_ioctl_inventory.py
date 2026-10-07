@@ -229,7 +229,7 @@ async def test_terminal_write_family_is_reachable(readings):
     Not a wish for the surface -- it is the thing that makes denying the write
     family untenable. `openpty` callers set termios and window size on the pty
     they just made, and this repo's own PTY endpoint does too
-    (`envd_service/route_b.py`, `envd_service/executors/local.py`). If a future
+    (`envd_service/own_identity.py`, `envd_service/executors/local.py`). If a future
     change made these unreachable, the blocklist would be the right answer again
     and this test is what would notice.
     """

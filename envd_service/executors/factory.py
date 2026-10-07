@@ -97,7 +97,7 @@ def _sandbox_cgroup_mode(settings) -> str:
     """``E2B_SANDBOX_CGROUP`` normalized the way route B reads it.
 
     ``getattr`` keeps a settings double that predates the N83 field on the old
-    behaviour, exactly like ``route_b.sandbox_cgroup_mode``; an unknown value is
+    behaviour, exactly like ``own_identity.sandbox_cgroup_mode``; an unknown value is
     not this function's to refuse (the worker's startup already refuses it by
     name), so only ``required`` is meaningful here.
     """
@@ -242,7 +242,7 @@ def create_executor(
             raise sandlock_unconfined_kernel_error(mode)
         else:
             from envd_service.executors.sandlock import SandlockExecutor
-            from envd_service.route_b import RouteBConfig
+            from envd_service.own_identity import OwnIdentityConfig
 
             if base_image:
                 image_rootfs = resolve_image_rootfs(
@@ -308,7 +308,7 @@ def create_executor(
                 extra_fs_writable=extra_fs_writable,
                 fs_mounts=fs_mounts,
                 sandbox_id=sandbox_id,
-                route_b=RouteBConfig.from_settings(settings),
+                own_identity=OwnIdentityConfig.from_settings(settings),
                 # SEC-K0S-003: the byte budget of the per-command output queue
                 # (0 in config = unlimited, repo convention).
                 stream_limit_bytes=(

@@ -51,7 +51,7 @@ REPO = Path(__file__).resolve().parents[2]
 #: words, spelled without the dot, are deliberately **not** matched: the E2B half
 #: has its own vocabulary now -- ``checkpoint``/``restore`` are the *slot verbs*
 #: it is supposed to call, ``restore_skipped`` is the wire key of the restore
-#: reply it is supposed to read (``route_b.RouteBInstance``), and the uid-pool
+#: reply it is supposed to read (``own_identity.OwnIdentityInstance``), and the uid-pool
 #: lifecycle legitimately says "restored sandboxes". Matching those would make
 #: the guard fire on exactly the shape it exists to require.
 FORBIDDEN = (".checkpoint(", "restore_interactive", ".restore_skipped(")

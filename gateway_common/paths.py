@@ -279,13 +279,13 @@ COMMAND_LOG_NAME = "command-logs.jsonl"
 CHECKPOINT_ROOT_NAME = ".checkpoints"
 
 #: How many bytes of a sandbox id may become a route-B **instance name**
-#: (:func:`route_b_instance_name`). Longer ids are replaced by their hash: a
+#: (:func:`own_identity_instance_name`). Longer ids are replaced by their hash: a
 #: filename is bounded by ``NAME_MAX``, and the name is also the slot's
 #: unix-socket path component in the registered transport.
-ROUTE_B_INSTANCE_NAME_MAX_BYTES = 64
+OWN_IDENTITY_INSTANCE_NAME_MAX_BYTES = 64
 
 
-def route_b_instance_name(sandbox_id: str) -> str:
+def own_identity_instance_name(sandbox_id: str) -> str:
     """The route-B **instance name** for a sandbox -- one rule, two consumers.
 
     It is the slot's identity in the pool (``W1SlotPool.acquire_sync``'s
@@ -299,12 +299,12 @@ def route_b_instance_name(sandbox_id: str) -> str:
     control plane and envd both already share (``gateway_common``), and both
     sides call it.
 
-    The >``ROUTE_B_INSTANCE_NAME_MAX_BYTES`` case is part of the rule, not an
+    The >``OWN_IDENTITY_INSTANCE_NAME_MAX_BYTES`` case is part of the rule, not an
     implementation detail of the worker: an id long enough to matter is replaced
     by ``sbx_<sha256(id)[:16]>``, and a control plane that did not know that
     would derive the wrong directory for exactly those sandboxes.
     """
-    if len(sandbox_id.encode()) <= ROUTE_B_INSTANCE_NAME_MAX_BYTES:
+    if len(sandbox_id.encode()) <= OWN_IDENTITY_INSTANCE_NAME_MAX_BYTES:
         return sandbox_id
     import hashlib
 

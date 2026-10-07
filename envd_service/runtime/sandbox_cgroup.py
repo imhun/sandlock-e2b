@@ -550,7 +550,7 @@ class SandboxCgroups:
         register/heartbeat answer, so it can change under a live process (a
         re-deploy that lowers it). The handle is process-wide and cached -- it
         is the object ``setup`` established the delegated parent on -- so a
-        change is applied **in place** (``envd_service.route_b`` calls this from
+        change is applied **in place** (``envd_service.own_identity`` calls this from
         the hand-down path); rebuilding the handle instead would abandon the
         parent every live ``sbx_<id>`` hangs under. ``None`` is legal and means
         "no ceiling in hand", which ``attach`` then refuses by name.
@@ -892,7 +892,7 @@ class SandboxCgroups:
         """R3's second gate: the declared sizes vs the handed-down ceiling.
 
         The ceiling is the one in hand -- the control plane's own policy,
-        handed down and read through ``envd_service.route_b.policy_ceiling_for``
+        handed down and read through ``envd_service.own_identity.policy_ceiling_for``
         (N83 phase 2 / R17) -- explicitly **not** the kernel read: the kernel's
         half is the hand-down cross-check's business, and a kernel that sets no
         limit is a legal lane where the policy is the only bound left.

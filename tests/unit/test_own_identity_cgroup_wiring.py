@@ -41,11 +41,11 @@ import pytest
 
 import envd_service.agent as node_agent
 import envd_service.executors.factory as factory_mod
-import envd_service.route_b as rb
+import envd_service.own_identity as rb
 from envd_service.config import Settings
 from envd_service.executors.local import LocalExecutor
 from envd_service.priv_helpers import PrivHelperError
-from envd_service.route_b import RouteBConfig, W1SlotPool
+from envd_service.own_identity import OwnIdentityConfig, W1SlotPool
 from envd_service.runtime.sandbox_cgroup import (
     CgroupRefusal,
     SandboxCeiling,
@@ -175,7 +175,7 @@ class FakeCgroups:
 
 def _settings(**overrides) -> SimpleNamespace:
     values = dict(
-        route_b="on",
+        own_identity="on",
         route_b_slots=0,
         uid_pool_start=20000,
         uid_pool_size=8,
@@ -298,7 +298,7 @@ def test_an_unknown_switch_value_is_refused_by_name() -> None:
         rb.sandbox_cgroups_for(settings)
     assert str(excinfo.value) == expected
     with pytest.raises(ValueError) as excinfo:
-        RouteBConfig.from_settings(settings)
+        OwnIdentityConfig.from_settings(settings)
     assert str(excinfo.value) == expected
 
 
@@ -307,13 +307,13 @@ def test_required_with_no_handle_is_refused_by_name() -> None:
 
     Fix round 1, review Finding 1. ``from_settings`` resolves both together, so
     the fail-open below is unreachable through the factory -- which is why the
-    check belongs here: ``RouteBConfig`` is built by hand in tests and by
+    check belongs here: ``OwnIdentityConfig`` is built by hand in tests and by
     embedders, and a live pool with ``required`` and no handle would attach
     nothing at all (``_attach_cgroup`` returns early on ``None``), running every
     sandbox without a quota while the switch says otherwise.
     """
     with pytest.raises(ValueError) as excinfo:
-        RouteBConfig(sandbox_cgroup="required")
+        OwnIdentityConfig(sandbox_cgroup="required")
     assert str(excinfo.value) == (
         "E2B_SANDBOX_CGROUP=required needs a SandboxCgroups handle: without "
         "one the pool attaches nothing and every sandbox runs without its "
@@ -323,10 +323,10 @@ def test_required_with_no_handle_is_refused_by_name() -> None:
     )
     # The other direction stays legal: a handle with the default ``off`` mode is
     # a caller's explicit hand-off, not the fail-open shape above.
-    assert RouteBConfig(sandbox_cgroups=FakeCgroups()).sandbox_cgroup == "off"
+    assert OwnIdentityConfig(sandbox_cgroups=FakeCgroups()).sandbox_cgroup == "off"
     # ...and the production shape is untouched: ``from_settings`` resolves the
     # switch and the handle together, so ``required`` still builds a fleet there.
-    resolved = RouteBConfig.from_settings(_settings(sandbox_cgroup="required"))
+    resolved = OwnIdentityConfig.from_settings(_settings(sandbox_cgroup="required"))
     assert resolved.sandbox_cgroup == "required"
     assert resolved.sandbox_cgroups is not None
 
@@ -404,7 +404,7 @@ def test_with_the_switch_off_nothing_touches_a_cgroup(
     monkeypatch.setattr(rb, "SandboxCgroups", Recording)
     monkeypatch.setattr(rb, "_spawn_slot_identity", lambda *a, **kw: FakeProcess())
     order: list = []
-    config = RouteBConfig.from_settings(_settings(sandbox_cgroup="off"))
+    config = OwnIdentityConfig.from_settings(_settings(sandbox_cgroup="off"))
     assert config.sandbox_cgroups is None
     config.identity_reporter = lambda sandbox_id, pid: {}
     pool = rb.slot_pool_for(config, channel_factory=_channel_factory(order))

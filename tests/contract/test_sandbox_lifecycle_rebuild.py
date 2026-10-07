@@ -114,13 +114,13 @@ async def test_nonexistent_binary_exits_127_with_no_output(workspace) -> None:
     # mediate (the legacy shared-uid shape on a root worker is refused now --
     # the fork will not attribute a sandbox's mediated writes to root). The
     # route-B counterpart of this contract is
-    # tests/contract/test_route_b_executor.py::test_missing_binary_exits_127_through_the_slot
+    # tests/contract/test_own_identity_executor.py::test_missing_binary_exits_127_through_the_slot
     from tests.security.conftest import SANDBOX_UID, sandbox_tmpdir
 
     settings = EnvdSettings(
         executor="sandlock",
         per_sandbox_uid=True,
-        route_b="on",
+        own_identity="on",
         route_b_tmp_root=sandbox_tmpdir(suffix="-route-b"),
         # The slot segment has to contain the uid the record carries (the
         # pool refuses a uid outside it, by name).

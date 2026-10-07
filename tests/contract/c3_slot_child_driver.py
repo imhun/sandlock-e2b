@@ -11,7 +11,7 @@ module is stdlib-only, so no worker image is needed):
 
 Modes (the test picks one):
 
-* ``production`` -- :func:`envd_service.route_b._spawn_slot_identity`, i.e. the
+* ``production`` -- :func:`envd_service.own_identity._spawn_slot_identity`, i.e. the
   worker's real starter: it builds ``child_argv`` for
   ``python -m envd_service.slot_identity``, passes the handshake descriptor and
   **returns only after the child's ``unshare`` byte**. This is the arm that
@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 
 from envd_service import slot_identity as si
-from envd_service.route_b import _spawn_slot_identity
+from envd_service.own_identity import _spawn_slot_identity
 
 #: A slot's line for the "it really got there" fact: the program the child
 #: ``execv``s after its identity lands. Nothing else about it is production --

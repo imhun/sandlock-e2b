@@ -153,7 +153,7 @@ def test_chroot_policy_sends_no_mediation_tier(monkeypatch, tmp_path) -> None:
     # default would refuse it in-process, and why route B exists.
     assert ceiling["fs_denied"] == ["/proc/kcore", "/sys"]
     assert ceiling["chroot"] == str(rootfs)
-    assert executor._route_b_active is False, (
+    assert executor._own_identity_active is False, (
         "no route-B config was passed here, so this is the disclosed shape"
     )
 

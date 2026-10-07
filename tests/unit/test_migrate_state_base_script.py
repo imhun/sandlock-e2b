@@ -366,14 +366,14 @@ def test_a_dry_run_plans_every_move_and_writes_nothing(
     lines = proc.stdout.splitlines()
     assert f"mode=plan root={export_root} dry_run=1" in lines
     runtime = _counts(export_root / "_runtime")
-    route_b = _counts(export_root / ".route-b")
+    own_identity = _counts(export_root / ".route-b")
     tree_a = _counts(export_root / "sbx_aaa")
     tree_b = _counts(export_root / "sbx_bbb")
     # The order is the brief's: the two state directories first (the platform's
     # own files hang off them), then the trees.
     assert [line for line in lines if line.startswith("MOVE ")] == [
         f"MOVE _runtime -> state/_runtime kind=state files={runtime[0]} dirs={runtime[1]} bytes={runtime[2]}",
-        f"MOVE .route-b -> state/.route-b kind=state files={route_b[0]} dirs={route_b[1]} bytes={route_b[2]}",
+        f"MOVE .route-b -> state/.route-b kind=state files={own_identity[0]} dirs={own_identity[1]} bytes={own_identity[2]}",
         f"MOVE sbx_aaa -> workspaces/sbx_aaa kind=tree files={tree_a[0]} dirs={tree_a[1]} bytes={tree_a[2]}",
         f"MOVE sbx_bbb -> workspaces/sbx_bbb kind=tree files={tree_b[0]} dirs={tree_b[1]} bytes={tree_b[2]}",
     ]

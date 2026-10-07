@@ -13,7 +13,7 @@ Requires a root worker + sandlock (the privileged S1.2 RunAs path).
 
 The image-rootfs (chroot) shape of the ownership assertions below is the T5
 regression suite: there mediation runs in a ``sandlock-supervise`` slot whose
-euid *is* the sandbox host uid (route B, ``envd_service/route_b.py``) instead
+euid *is* the sandbox host uid (route B, ``envd_service/own_identity.py``) instead
 of in the root worker process, so a mediated write lands owned by the sandbox
 in both shapes.
 """

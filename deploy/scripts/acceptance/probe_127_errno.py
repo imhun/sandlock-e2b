@@ -3,7 +3,7 @@
 The contract pins "missing binary -> exit 127 with no output"; in the phase-1
 shape the fork's execvp reports errno 13, and the FUP-26 line then lands on the
 guest's stderr. This probe reproduces the exact shape of
-tests/contract/test_route_b_executor.py::_executor (pure shape forced onto route
+tests/contract/test_own_identity_executor.py::_executor (pure shape forced onto route
 B) and asks the guest for an errno matrix: which paths are *searchable*, which
 answer ENOENT, and whether the matrix moves with SANLOCK_REALROOT_TRACE.
 
@@ -24,7 +24,7 @@ sys.path.insert(0, "/workspace")
 
 from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
-from envd_service.route_b import RouteBConfig
+from envd_service.own_identity import OwnIdentityConfig
 
 UID = 1000
 WORKSPACE = Path("/var/lib/e2b-test-runtime/probe-127")
@@ -116,7 +116,7 @@ def _executor() -> SandlockExecutor:
         allow_internet_access=False,
         enable_network=False,
         sandbox_id="sbx_probe_127",
-        route_b=RouteBConfig(mode="on", uid_start=UID, uid_size=2, tmp_root=scratch),
+        own_identity=OwnIdentityConfig(mode="on", uid_start=UID, uid_size=2, tmp_root=scratch),
     )
 
 

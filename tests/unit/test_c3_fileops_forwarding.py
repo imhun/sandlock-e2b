@@ -30,7 +30,7 @@ from control_plane.worker_identity_source import (
     NoWorkerIdentitySource,
     StaticWorkerIdentitySource,
 )
-from gateway_common.paths import route_b_instance_name
+from gateway_common.paths import own_identity_instance_name
 
 KEY_A = "key-node-a"
 ENDPOINT_A = NodeEndpoint("http://10.0.0.1:49983", "10.0.0.1")
@@ -112,15 +112,15 @@ class _C3Shape:
         self.state_base = workspace / "state"
         self.image_cache = workspace / "_images"
         self.shared_root = workspace
-        self.route_b = workspace / "state" / ".route-b"
-        for path in (self.workspace_base, self.state_base, self.image_cache, self.route_b):
+        self.own_identity = workspace / "state" / ".route-b"
+        for path in (self.workspace_base, self.state_base, self.image_cache, self.own_identity):
             path.mkdir(parents=True, exist_ok=True)
         self.settings = _settings(
             workspace_base=self.workspace_base,
             state_base=self.state_base,
             image_cache_dir=self.image_cache,
             shared_volume_root=str(self.shared_root),
-            route_b_tmp_root=str(self.route_b),
+            route_b_tmp_root=str(self.own_identity),
         )
         self.volumes = VolumeRegistry(workspace / "_volumes_base")
         self.volume = self.volumes.create(name=VOLUME_NAME)
@@ -150,7 +150,7 @@ class _C3Shape:
         # rule (D20) -- not ``rb-<id>``, which was this test's own copy of a
         # rule the worker never used.
         return (
-            self.route_b / str(UID_X) / route_b_instance_name(SANDBOX) / name
+            self.own_identity / str(UID_X) / own_identity_instance_name(SANDBOX) / name
         )
 
 

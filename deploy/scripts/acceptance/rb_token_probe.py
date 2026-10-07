@@ -2,7 +2,7 @@
 import asyncio, os, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, "/workspace")
-from envd_service.route_b import W1SlotPool
+from envd_service.own_identity import W1SlotPool
 from sandlock.supervise import SuperviseChannel
 
 SLOT_UID, OTHER_UID = 21500, 21501

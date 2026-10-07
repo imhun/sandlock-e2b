@@ -25,7 +25,7 @@ priv() { # $1 name, $2 log, $3.. command
 }
 
 echo "### focused mediated-chroot slice $(stamp)"
-priv f30-focused bash -c "cd /workspace && pytest tests/security/test_template_isolation.py tests/security/test_sandlock_isolation.py tests/contract/test_route_b_executor.py tests/contract/test_route_b_slot_pool.py tests/contract/test_uid_permissions.py tests/security/test_uid_isolation.py tests/security/test_worker_nonroot.py tests/unit/test_sandlock_executor_route_b.py tests/unit/test_policy_mapping.py tests/unit/test_route_b_wiring.py -q -p no:cacheprovider --tb=short > tmp/f30-focused.log 2>&1; echo FOCUSED-EXIT=\$? >> tmp/f30-focused.log; echo done > tmp/f30-focused.done"
+priv f30-focused bash -c "cd /workspace && pytest tests/security/test_template_isolation.py tests/security/test_sandlock_isolation.py tests/contract/test_own_identity_executor.py tests/contract/test_own_identity_slot_pool.py tests/contract/test_uid_permissions.py tests/security/test_uid_isolation.py tests/security/test_worker_nonroot.py tests/unit/test_sandlock_executor_own_identity.py tests/unit/test_policy_mapping.py tests/unit/test_own_identity_wiring.py -q -p no:cacheprovider --tb=short > tmp/f30-focused.log 2>&1; echo FOCUSED-EXIT=\$? >> tmp/f30-focused.log; echo done > tmp/f30-focused.done"
 wait_marker "$ROOT/tmp/f30-focused.done" focused
 
 echo "### gate A (chroot) $(stamp)"
@@ -55,7 +55,7 @@ docker run -d --name f30-prod2 --init --network host --user 65534:65534 \
     -e HOME=/tmp -e TMPDIR=/tmp -e E2B_HOST_PROJECT="$ROOT" -e E2B_TEST_STRICT_SKIPS=1 \
     -e E2B_BASE_IMAGE=python:3.11-slim \
     -v "$ROOT:/workspace" -w /workspace "$IMG" \
-    pytest tests/security/test_template_isolation.py tests/security/test_sandlock_isolation.py tests/unit/test_sandlock_executor_route_b.py tests/unit/test_policy_mapping.py -q -p no:cacheprovider --tb=short > /dev/null
+    pytest tests/security/test_template_isolation.py tests/security/test_sandlock_isolation.py tests/unit/test_sandlock_executor_own_identity.py tests/unit/test_policy_mapping.py -q -p no:cacheprovider --tb=short > /dev/null
 # phase 2 writes nothing to the repo (uid 65534 cannot), so capture its log
 while [ ! -f "$ROOT/tmp/f30-prod2.done" ]; do
     if ! docker ps --format '{{.Names}}' | grep -qx f30-prod2; then

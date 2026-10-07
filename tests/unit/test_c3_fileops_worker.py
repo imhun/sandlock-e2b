@@ -25,7 +25,7 @@ import pytest
 
 from envd_service import agent_fileops
 from envd_service.agent_fileops import AgentFileOps, AgentFileOpsError
-from gateway_common.paths import route_b_instance_name
+from gateway_common.paths import own_identity_instance_name
 
 CP_URL = "http://control-plane:3000"
 NODE = "e2b-worker-0"
@@ -480,13 +480,13 @@ def test_the_slot_documents_are_scoped_by_the_agent(
     tmp_path: Path, install_stub
 ) -> None:
     """The brief's landmine: the policy carries the egress-proxy credentials."""
-    from envd_service.route_b import W1SlotPool
+    from envd_service.own_identity import W1SlotPool
 
     # The leaf the worker really creates is the shared rule's answer (D20); this
     # test is about which *op* carries the scoping, and the leaf it names is the
     # one the peer pin in ``test_c3_slot_document_naming`` compares against the
     # CP's derivation.
-    document = tmp_path / "10007" / route_b_instance_name(SANDBOX) / "policy.json"
+    document = tmp_path / "10007" / own_identity_instance_name(SANDBOX) / "policy.json"
     document.parent.mkdir(parents=True)
     document.write_text("{}", encoding="utf-8")
     stub = install_stub(_RecordingStub())
@@ -506,10 +506,10 @@ def test_a_refused_scoping_does_not_fall_back_to_a_world_readable_document(
     credentials (the brief calls this out by file and line). In the agent shape
     a refusal is the end of the line.
     """
-    from envd_service.route_b import W1SlotPool
+    from envd_service.own_identity import W1SlotPool
 
     root = tmp_path / "slots"
-    leaf = route_b_instance_name(SANDBOX)
+    leaf = own_identity_instance_name(SANDBOX)
     document = root / "10007" / leaf / "policy.json"
     document.parent.mkdir(parents=True)
     document.write_text("{}", encoding="utf-8")

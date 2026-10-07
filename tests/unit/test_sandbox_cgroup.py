@@ -1871,7 +1871,7 @@ def test_the_off_lane_samples_nothing_at_all(monkeypatch: pytest.MonkeyPatch) ->
     test would pass even if the off lane did build a handle. The list is what
     makes the assertion able to fail.
     """
-    from envd_service import route_b
+    from envd_service import own_identity
 
     monkeypatch.setenv("E2B_SANDBOX_CGROUP", "off")
     built: list[dict] = []
@@ -1883,7 +1883,7 @@ def test_the_off_lane_samples_nothing_at_all(monkeypatch: pytest.MonkeyPatch) ->
         def sample_events(self) -> dict[str, dict[str, int]]:
             return {"alpha": dict(BOX_EVENTS)}
 
-    monkeypatch.setattr(route_b, "SandboxCgroups", _Handle)
+    monkeypatch.setattr(own_identity, "SandboxCgroups", _Handle)
 
     assert node_agent.sample_sandbox_events(Settings()) == {}
     assert built == []
@@ -1894,7 +1894,7 @@ def test_the_sampler_goes_through_the_process_wide_handle(
 ) -> None:
     """The heartbeat's sampler resolves the *one* handle ``setup`` established
     and ``attach`` wrote through -- never a second object with its own view."""
-    from envd_service import route_b
+    from envd_service import own_identity
 
     monkeypatch.setenv("E2B_SANDBOX_CGROUP", "required")
     monkeypatch.setenv("E2B_CGROUP_MOUNT", str(tmp_path / "pod"))
@@ -1907,7 +1907,7 @@ def test_the_sampler_goes_through_the_process_wide_handle(
         def sample_events(self) -> dict[str, dict[str, int]]:
             return {"alpha": dict(BOX_EVENTS)}
 
-    monkeypatch.setattr(route_b, "SandboxCgroups", _Handle)
+    monkeypatch.setattr(own_identity, "SandboxCgroups", _Handle)
 
     assert node_agent.sample_sandbox_events(Settings()) == {"alpha": BOX_EVENTS}
     assert len(seen) == 1

@@ -303,7 +303,7 @@ def _container_kernel_limits(settings: Settings) -> SandboxCeiling | None:
     The read that has to be strict is the one behind an already-handed-down
     policy (:func:`adopt_sandbox_ceiling`, D5b), and that one is unchanged.
     """
-    from envd_service.route_b import sandbox_cgroup_mode
+    from envd_service.own_identity import sandbox_cgroup_mode
 
     if sandbox_cgroup_mode(settings) == "off":
         return None
@@ -551,7 +551,7 @@ def adopt_sandbox_ceiling(settings: Settings, payload: Any) -> SandboxCeiling | 
         # have been adopted -- either way the answer is already on this
         # process, and re-answering it must not re-log it.
         return _HANDED_DOWN_CEILING
-    from envd_service.route_b import (
+    from envd_service.own_identity import (
         sandbox_cgroup_mode,
         update_sandbox_cgroup_ceiling,
     )
@@ -2224,7 +2224,7 @@ def sample_sandbox_events(settings: Settings) -> dict[str, dict[str, int]]:
     the handle, so a box that was killed *and* torn down between two sweeps
     still reaches the control plane.
     """
-    from envd_service.route_b import sandbox_cgroups_for
+    from envd_service.own_identity import sandbox_cgroups_for
 
     try:
         handle = sandbox_cgroups_for(settings)
@@ -2265,7 +2265,7 @@ def start_cgroup_lane(
 
     An *unknown* switch value is the one thing refused here, by name: a typo
     must not read as "off" (that is a whole fleet without a quota while looking
-    configured). See :func:`envd_service.route_b.sandbox_cgroup_mode`.
+    configured). See :func:`envd_service.own_identity.sandbox_cgroup_mode`.
 
     N83 phase 2 / D5b's cross-check ("the control plane promised 4 GiB, this
     container has 2") is **not** made here any more. Under ruling R17 the
@@ -2281,7 +2281,7 @@ def start_cgroup_lane(
     unset and resolves the process-wide one from ``settings``, and tests inject
     a double.
     """
-    from envd_service.route_b import sandbox_cgroup_mode, sandbox_cgroups_for
+    from envd_service.own_identity import sandbox_cgroup_mode, sandbox_cgroups_for
 
     mode = sandbox_cgroup_mode(settings)
     if mode == "off":
@@ -3613,7 +3613,7 @@ def _write_disk_stats(
     reads this file is the slot process, whose euid is the sandbox's host uid
     (10000+) while the worker writes as 65534 -- so the modes cannot be left to
     the ambient umask. They are the same rules the slot documents follow
-    (``route_b._write_slot_documents``): directories traversable by name
+    (``own_identity._write_slot_documents``): directories traversable by name
     (``0711``, listable by nobody) and the file itself world-readable
     (``0644``) -- these numbers are what the sandbox is *shown*, so there is
     nothing to scope. Measured 2026-10-01: with the runtime directory at its

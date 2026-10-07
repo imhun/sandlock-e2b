@@ -120,7 +120,7 @@ def test_the_skeleton_is_traversable_and_0755_under_umask_077(tmp_path: Path) ->
     ``mkdir(mode=...)`` is masked by the umask -- under ``umask 077`` a request
     for ``0o755`` yields ``0o700`` -- and these directories are not owned by the
     sandbox's own uid, so a ``0700`` one fails the bind with ``EACCES`` before
-    the sandbox ever starts (``route_b.py`` makes the same call for the slot
+    the sandbox ever starts (``own_identity.py`` makes the same call for the slot
     documents). The build therefore runs under ``umask 077`` on purpose: a
     ``0o755`` assertion under the default umask proves nothing.
     """

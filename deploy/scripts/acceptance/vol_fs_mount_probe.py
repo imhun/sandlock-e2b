@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, "/workspace")
 from envd_service.executors.base import ExecConfig  # noqa: E402
 from envd_service.executors.sandlock import SandlockExecutor  # noqa: E402
-from envd_service.route_b import RouteBConfig  # noqa: E402
+from envd_service.own_identity import OwnIdentityConfig  # noqa: E402
 from envd_service.runtime.image_resolver import resolve_image_rootfs  # noqa: E402
 from tests.security.conftest import SANDBOX_UID, make_sandbox_visible  # noqa: E402
 
@@ -108,7 +108,7 @@ async def run_case(
         sandbox_id=f"sbx_volprobe_{label}",
         extra_fs_writable=[str(vol)],
         fs_mounts=mounts,
-        route_b=RouteBConfig(mode="auto", uid_start=UID, uid_size=2, tmp_root=SCRATCH),
+        own_identity=OwnIdentityConfig(mode="auto", uid_start=UID, uid_size=2, tmp_root=SCRATCH),
     )
     try:
         running = await ex.start(
@@ -138,7 +138,7 @@ async def run_case(
     report(
         case=label,
         perms=perms,
-        route_b_active=ex._route_b_active,
+        route_b_active=ex._own_identity_active,
         alias=alias,
         exit=code,
         steps=steps,

@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, "/workspace")
 from envd_service.executors.base import ExecConfig  # noqa: E402
 from envd_service.executors.sandlock import SandlockExecutor  # noqa: E402
-from envd_service.route_b import RouteBConfig  # noqa: E402
+from envd_service.own_identity import OwnIdentityConfig  # noqa: E402
 from tests.security.conftest import SANDBOX_UID, sandbox_tmpdir  # noqa: E402
 
 UID = 21700
@@ -42,7 +42,7 @@ def build(base_image, rootfs, host_uid, mode):
         allow_internet_access=False,
         enable_network=False,
         sandbox_id=f"sbx_probe_{mode}_{host_uid}",
-        route_b=RouteBConfig(
+        own_identity=OwnIdentityConfig(
             mode=mode,
             uid_start=host_uid or UID,
             uid_size=2,
@@ -125,7 +125,7 @@ async def main():
 
     # 1) route B + chroot（形态就是线上的形态）
     ex, ws = build("python:3.11-slim", rootfs, UID, "auto")
-    report(case="routeb-selected", route_b_active=ex._route_b_active, decline=ex._route_b_decline)
+    report(case="routeb-selected", route_b_active=ex._own_identity_active, decline=ex._own_identity_decline)
     await run_case("routeB+chroot", ex, ws)
     ex.close()
 

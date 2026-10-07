@@ -1,6 +1,6 @@
 """RED/GREEN check for the slot-stderr drain (N35 side quest).
 
-Same writer shape as tests/unit/test_route_b_wiring.py::
+Same writer shape as tests/unit/test_own_identity_wiring.py::
 test_a_talkative_slot_stderr_cannot_wedge_its_writer, run twice:
 
 * RED   -- the pre-fix shape (a ``SlotStderrDrain`` that never reads). The
@@ -20,7 +20,7 @@ import threading
 
 sys.path.insert(0, "/workspace")
 
-import envd_service.route_b as rb
+import envd_service.own_identity as rb
 
 LINE = "x" * 255  # 255 + "\n" = 256 bytes, so the 8 KiB tail is 32 lines
 LINES = 400  # 102 400 bytes, past the 65 536-byte pipe
@@ -63,7 +63,7 @@ def _mutant() -> bool:
 
 
 def _shipped() -> bool:
-    rb = importlib.reload(importlib.import_module("envd_service.route_b"))
+    rb = importlib.reload(importlib.import_module("envd_service.own_identity"))
     proc = _writer()
     drain = rb.SlotStderrDrain(proc)
     try:

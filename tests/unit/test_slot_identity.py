@@ -33,12 +33,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-import envd_service.route_b as rb
+import envd_service.own_identity as rb
 import envd_service.slot_identity as si
 import envd_service.worker_identity as wi
 from envd_service.config import Settings
 from envd_service.priv_helpers import PrivHelperError, request_identity
-from envd_service.route_b import RouteBConfig, W1SlotPool
+from envd_service.own_identity import OwnIdentityConfig, W1SlotPool
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONTROL_PLANE_URL = "http://control-plane:3000"
@@ -94,7 +94,7 @@ class FakeChannel:
 
 def _settings(**overrides) -> SimpleNamespace:
     values = dict(
-        route_b="on",
+        own_identity="on",
         route_b_slots=0,
         uid_pool_start=20000,
         uid_pool_size=8,
@@ -122,21 +122,21 @@ def test_the_only_slot_identity_mode_left_is_agent_grant(
     bare = _settings()
     del bare.slot_identity  # an embedder's settings object, not the worker's
     monkeypatch.setenv("E2B_SLOT_IDENTITY", "agent-grant")
-    assert RouteBConfig.from_settings(bare).slot_identity == "agent-grant"
+    assert OwnIdentityConfig.from_settings(bare).slot_identity == "agent-grant"
     # The worker's own resolved setting wins over the environment.
     assert (
-        RouteBConfig.from_settings(_settings(slot_identity="agent-grant")).slot_identity
+        OwnIdentityConfig.from_settings(_settings(slot_identity="agent-grant")).slot_identity
         == "agent-grant"
     )
     # Anything else -- including the retired `spawn` -- is named, not guessed.
     for retired in ("spawn", "something-else"):
         monkeypatch.setenv("E2B_SLOT_IDENTITY", retired)
         with pytest.raises(PrivHelperError) as excinfo:
-            RouteBConfig.from_settings(bare)
+            OwnIdentityConfig.from_settings(bare)
         assert "must be 'agent-grant'" in str(excinfo.value)
         assert "retired" in str(excinfo.value)
     with pytest.raises(ValueError) as excinfo:
-        RouteBConfig(slot_identity="spawn")
+        OwnIdentityConfig(slot_identity="spawn")
     assert "retired" in str(excinfo.value)
 
 
@@ -146,12 +146,12 @@ def test_agent_grant_needs_a_reporter_rather_than_root(
     """The whole point of the mode: no root, no broker -- only the CP."""
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     assert (
-        RouteBConfig(slot_identity="agent-grant", identity_reporter=lambda *a: {})
+        OwnIdentityConfig(slot_identity="agent-grant", identity_reporter=lambda *a: {})
         .privileged_starter
         is True
     )
     assert (
-        RouteBConfig(slot_identity="agent-grant").privileged_starter is False
+        OwnIdentityConfig(slot_identity="agent-grant").privileged_starter is False
     ), "without a reporter the child could never be granted an identity"
 
 
@@ -166,7 +166,7 @@ def test_the_pool_never_gets_a_broker_spawner(monkeypatch: pytest.MonkeyPatch) -
     """
     monkeypatch.setenv("E2B_CONTROL_PLANE_URL", CONTROL_PLANE_URL)
     monkeypatch.setenv("E2B_NODE_ID", NODE_ID)
-    agent_grant = RouteBConfig.from_settings(
+    agent_grant = OwnIdentityConfig.from_settings(
         _settings(slot_identity="agent-grant")
     )
     assert agent_grant.spawner is None

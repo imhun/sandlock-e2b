@@ -8,8 +8,8 @@ unit doubles:
 
 * ``deploy/scripts/acceptance/rb_token_probe.py`` -- what leaks when the
   channel token travels in ``supervise``'s argv (run on a live lane);
-* ``tests/contract/test_route_b_slot_pool.py`` -- the two-uid sticky-directory
-  case (run in the privileged lane),
+* ``tests/contract/test_own_identity_slot_pool.py`` -- the two-uid
+  sticky-directory case (run in the privileged lane),
 
 and neither builds its pool with a cgroup handle, so nothing in either file
 applies a quota at all. A reader who saw ``acquire(...)`` with no sizes would
@@ -27,7 +27,7 @@ about the box they ask for. A declared size is read either as an integer
 literal or as a module-level integer constant, so a probe may name its own
 numbers (``memory_mb=DECLARED_MEMORY_MB``) and still be pinned to the value
 the deployment actually sells. Other hand-built pools in the unit suites
-(``tests/unit/test_route_b_wiring.py`` and friends) are doubles for this
+(``tests/unit/test_own_identity_wiring.py`` and friends) are doubles for this
 module's own wiring, and are not part of this batch.
 """
 
@@ -44,7 +44,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 #: cannot silently shrink to zero files.
 _PROBE_FILES = (
     _REPO_ROOT / "deploy/scripts/acceptance/rb_token_probe.py",
-    _REPO_ROOT / "tests/contract/test_route_b_slot_pool.py",
+    _REPO_ROOT / "tests/contract/test_own_identity_slot_pool.py",
 )
 
 #: The k0s ceiling -- ``E2B_MAX_SANDBOX_MEMORY_MB`` / ``_PROCESSES`` on that

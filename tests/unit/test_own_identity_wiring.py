@@ -4,7 +4,7 @@ Everything here runs off-Linux: the slot *spawner* and the channel are
 injected, so the assertions cover what the executor will actually put on the
 wire (policy document, verb arguments, stdio descriptor hygiene) rather than
 the native supervise binary. The real two-uid evidence lives in
-``tests/contract/test_route_b_slot_pool.py``.
+``tests/contract/test_own_identity_slot_pool.py``.
 """
 
 from __future__ import annotations
@@ -17,11 +17,11 @@ from pathlib import Path
 
 import pytest
 
-import envd_service.route_b as rb
-from envd_service.route_b import (
+import envd_service.own_identity as rb
+from envd_service.own_identity import (
     PARKING_PROGRAM,
     PARKING_SCRIPT,
-    RouteBInstance,
+    OwnIdentityInstance,
     SlotDeadError,
     SlotHandle,
     W1SlotPool,
@@ -264,7 +264,7 @@ def test_parking_program_stops_instead_of_spinning():
     dies the instant anything resumes it after a stray TERM/HUP/INT/QUIT/USR1/
     USR2/PIPE (measured in the frozen image: exit 143 on SIGCONT after SIGTERM).
     The signal-immunity and re-stop behaviour is asserted against a live shell
-    in ``tests/contract/test_route_b_executor.py``; this pin keeps the exact
+    in ``tests/contract/test_own_identity_executor.py``; this pin keeps the exact
     argv from drifting."""
     assert PARKING_SCRIPT == (
         "trap '' TERM HUP INT QUIT USR1 USR2 PIPE; "
@@ -454,7 +454,7 @@ def test_the_tail_the_drain_kept_is_what_a_dead_slot_reports():
 
 def test_slot_pools_are_cached_per_transport(tmp_path, monkeypatch):
     """A registered fleet and an fd-handoff fleet must never share a ledger."""
-    from envd_service.route_b import RouteBConfig, reset_slot_pools, slot_pool_for
+    from envd_service.own_identity import OwnIdentityConfig, reset_slot_pools, slot_pool_for
 
     monkeypatch.setattr(
         rb, "default_supervise_bin", lambda: tmp_path / "sandlock-supervise"
@@ -469,12 +469,12 @@ def test_slot_pools_are_cached_per_transport(tmp_path, monkeypatch):
         # key*, so the grant itself is a no-op stand-in.
         identity_reporter=lambda *a: {},
     )
-    fd_pool = slot_pool_for(RouteBConfig(**base, transport="fd"))
-    path_pool = slot_pool_for(RouteBConfig(**base, transport="path"))
+    fd_pool = slot_pool_for(OwnIdentityConfig(**base, transport="fd"))
+    path_pool = slot_pool_for(OwnIdentityConfig(**base, transport="path"))
     assert fd_pool is not path_pool
     assert fd_pool.transport == "fd" and path_pool.transport == "path"
     assert (
-        slot_pool_for(RouteBConfig(**base, transport="fd")) is fd_pool
+        slot_pool_for(OwnIdentityConfig(**base, transport="fd")) is fd_pool
     ), "an identical config must reuse the cached fleet"
     reset_slot_pools()
 
@@ -608,7 +608,7 @@ async def test_stale_socket_is_removed_before_the_spawn(tmp_path, caplog):
     sock.parent.mkdir(parents=True, exist_ok=True)
     sock.touch()
     pool, spawned, log, channels = _pool(tmp_path, transport="path")
-    with caplog.at_level("WARNING", logger="envd_service.route_b"):
+    with caplog.at_level("WARNING", logger="envd_service.own_identity"):
         handle = await pool.acquire("sbx_stale", {}, uid=20000)
     assert handle.uid == 20000
     assert any(
@@ -667,7 +667,7 @@ async def test_release_falls_back_to_kill_when_shutdown_is_refused(tmp_path, cap
     handle = await pool.acquire("sbx_a", {}, uid=20000)
     handle.process = stubborn
     pool.channel_factory = _refusing
-    with caplog.at_level("WARNING", logger="envd_service.route_b"):
+    with caplog.at_level("WARNING", logger="envd_service.own_identity"):
         await pool.release("sbx_a")
     assert stubborn.killed == 1
     assert any(
@@ -704,7 +704,7 @@ def _instance(tmp_path, replies=None, log=None):
         channel_factory=_factory,
         identity_reporter=lambda *a: {},
     )
-    inst = RouteBInstance(pool=pool, handle=handle, channel_factory=_factory)
+    inst = OwnIdentityInstance(pool=pool, handle=handle, channel_factory=_factory)
     return inst, log, handle
 
 
@@ -865,7 +865,7 @@ def test_wait_polls_liveness_before_the_slot_blocking_verb(tmp_path, monkeypatch
     inst._channel.dups = []
     states = iter([True, True, False])
     monkeypatch.setattr(
-        rb.RouteBExecProcess, "_child_alive", lambda self: next(states)
+        rb.OwnIdentityExecProcess, "_child_alive", lambda self: next(states)
     )
     assert proc.wait().exit_code == 0
     assert log[-1][0] == "wait_child"
@@ -886,7 +886,7 @@ def test_wait_maps_every_non_code_exit_to_minus_one(tmp_path, monkeypatch):
         )
         proc = inst.exec(["/bin/true"], 1)
         inst._channel.dups = []
-        monkeypatch.setattr(rb.RouteBExecProcess, "_child_alive", lambda self: False)
+        monkeypatch.setattr(rb.OwnIdentityExecProcess, "_child_alive", lambda self: False)
         assert proc.wait().exit_code == expected
         # Idempotent: a second wait replays the cached result, no extra verb.
         before = len(log)

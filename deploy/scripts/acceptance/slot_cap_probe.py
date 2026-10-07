@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, "/workspace")
 from envd_service.executors.base import ExecConfig  # noqa: E402
 from envd_service.executors.sandlock import SandlockExecutor  # noqa: E402
-from envd_service.route_b import RouteBConfig, slot_pool_for  # noqa: E402
+from envd_service.own_identity import OwnIdentityConfig, slot_pool_for  # noqa: E402
 from tests.security.conftest import sandbox_tmpdir  # noqa: E402
 
 UID = 21710
@@ -40,7 +40,7 @@ async def main():
         workspace_dir=str(ws), base_image="python:3.11-slim", image_rootfs=rootfs,
         host_uid=UID, per_sandbox_uid=True, memory_mb=512, cpu_percent=100, disk_mb=1024,
         max_processes=64, max_open_files=4096, allow_internet_access=False, enable_network=False,
-        sandbox_id="sbx_slotcaps", route_b=RouteBConfig(
+        sandbox_id="sbx_slotcaps", own_identity=OwnIdentityConfig(
             mode="auto", uid_start=UID, uid_size=2, tmp_root=Path("/tmp/rb-probe-scratch")),
     )
     running = await ex.start(ExecConfig(cmd=["/bin/sh", "-c", "sleep 20 & echo $"], env={}, cwd=str(ws), stdin_enabled=False))
@@ -48,7 +48,7 @@ async def main():
     async for kind, chunk in running.output():
         if kind == "stdout":
             out += chunk
-    pool = slot_pool_for(ex._route_b)
+    pool = slot_pool_for(ex._own_identity)
     slot = pool.slot("sbx_slotcaps")
     stats = await ex._ensure_instance_async()
     print(json.dumps({

@@ -23,6 +23,6 @@ docker run --rm --init --network host --user 65534:65534 \
     python -m pytest -q -p no:cacheprovider \
         tests/security/test_template_isolation.py \
         tests/security/test_sandlock_isolation.py \
-        tests/unit/test_sandlock_executor_route_b.py \
+        tests/unit/test_sandlock_executor_own_identity.py \
         tests/unit/test_policy_mapping.py \
-        tests/contract/test_nonroot_route_b.py > "$log" 2>&1
+        tests/contract/test_nonroot_own_identity.py > "$log" 2>&1

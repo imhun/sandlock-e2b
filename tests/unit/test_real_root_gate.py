@@ -28,15 +28,15 @@ import pytest
 
 import envd_service.executors.sandlock as sl
 from envd_service.executors.base import ExecConfig
-from envd_service.route_b import RouteBConfig
+from envd_service.own_identity import OwnIdentityConfig
 
 WORKSPACE = "/var/lib/e2b-sandboxes/sbx_real_root/workspace"
 ROOTFS = Path("tmp/unit-real-root-rootfs")
 HOST_UID = 20007
 
 
-def _config() -> RouteBConfig:
-    return RouteBConfig(mode="off", uid_start=HOST_UID, uid_size=2, tmp_root="/tmp/unit-rb")
+def _config() -> OwnIdentityConfig:
+    return OwnIdentityConfig(mode="off", uid_start=HOST_UID, uid_size=2, tmp_root="/tmp/unit-rb")
 
 
 def _executor(**over) -> sl.SandlockExecutor:
@@ -54,7 +54,7 @@ def _executor(**over) -> sl.SandlockExecutor:
         "allow_internet_access": False,
         "enable_network": False,
         "sandbox_id": "sbx_real_root",
-        "route_b": _config(),
+        "own_identity": _config(),
     }
     kwargs.update(over)
     return sl.SandlockExecutor(**kwargs)

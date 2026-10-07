@@ -527,8 +527,8 @@ def lane_main(args: argparse.Namespace) -> int:
         )
         try:
             print(
-                f"LANE route_b_active={executor._route_b_active} "
-                f"decline={executor._route_b_decline} "
+                f"LANE route_b_active={executor._own_identity_active} "
+                f"decline={executor._own_identity_decline} "
                 f"has_root={executor._has_sandbox_root} "
                 f"chroot={executor._chroot_root}"
             )

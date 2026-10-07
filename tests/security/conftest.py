@@ -257,7 +257,7 @@ def route_b_sandbox(
     hand-builds a shape the deployment does not have.
     """
     from envd_service.executors.sandlock import SandlockExecutor
-    from envd_service.route_b import RouteBConfig
+    from envd_service.own_identity import OwnIdentityConfig
 
     # N14 S5: one shape. The pure skeleton (N16) is the only pure root and the
     # real root (mount ns + pivot_root) is the only root. This helper used to
@@ -284,7 +284,7 @@ def route_b_sandbox(
         allow_internet_access=False,
         enable_network=False,
         sandbox_id=f"sbx_slot_{next(_slot_serial)}",
-        route_b=RouteBConfig(
+        own_identity=OwnIdentityConfig(
             mode="auto" if with_route_b else "off",
             uid_start=host_uid if host_uid is not None else SANDBOX_UID,
             uid_size=2,
@@ -336,9 +336,9 @@ def require_mediation_capable(executor) -> None:
     skip: that shape *is* the deployment. Asserting anyway where a create cannot
     happen would let an ``exit_code != 0`` check pass vacuously.
     """
-    if not executor._route_b_active and executor._in_process_mediation_is_refused():
+    if not executor._own_identity_active and executor._in_process_mediation_is_refused():
         pytest.skip(
             "this worker can neither lease a route-B slot nor be accepted by the "
-            f"fork's in-process mediation ({executor._route_b_decline}); needs a "
+            f"fork's in-process mediation ({executor._own_identity_decline}); needs a "
             "root worker plus the wheel's sandlock-supervise binary"
         )

@@ -125,8 +125,8 @@ async def test_in_process_chroot_is_refused_without_a_slot(caplog):
     with caplog.at_level(logging.ERROR, logger="envd_service.executors.sandlock"):
         executor, workspace = route_b_sandbox(IMAGE, rootfs, with_route_b=False)
     try:
-        assert executor._route_b_active is False
-        assert executor._route_b_decline == "E2B_ROUTE_B=off"
+        assert executor._own_identity_active is False
+        assert executor._own_identity_decline == "E2B_ROUTE_B=off"
         disclosed = [
             record.getMessage()
             for record in caplog.records
@@ -190,7 +190,7 @@ async def test_unprivileged_worker_still_mediates_the_chroot():
 
     executor, workspace = route_b_sandbox(IMAGE, rootfs, host_uid=None)
     try:
-        assert executor._route_b_active is False
+        assert executor._own_identity_active is False
         assert executor._in_process_mediation_is_refused() is False
         code, out, err = await run_sh(
             executor, str(workspace), "id -u; cat /template-marker.txt"

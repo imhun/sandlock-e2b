@@ -136,7 +136,7 @@ def _keep_inheritable(fds: Sequence[int]) -> None:
 class SlotProcess:
     """The slot's child, in place of the ``Popen`` this used to return.
 
-    Only the surface ``route_b`` uses: ``pid``, ``stderr``, ``poll()``,
+    Only the surface ``own_identity`` uses: ``pid``, ``stderr``, ``poll()``,
     ``wait(timeout)`` and ``kill()``. ``wait`` raises
     :class:`subprocess.TimeoutExpired` exactly as ``Popen.wait`` does, so the
     shutdown path keeps its shape.

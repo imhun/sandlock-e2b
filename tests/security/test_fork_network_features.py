@@ -93,7 +93,7 @@ def _route_b_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExec
     root.
     """
     from envd_service.config import Settings as EnvdSettings
-    from envd_service.route_b import RouteBConfig
+    from envd_service.own_identity import OwnIdentityConfig
     from envd_service.uid_pool import apply_sandbox_ownership
     from tests.security.conftest import _lane_identity_reporter
 
@@ -103,7 +103,7 @@ def _route_b_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExec
     EnvdSettings(  # the shape the worker resolves at startup, named here too
         per_sandbox_uid=True,
         workspace_base=base,
-        route_b="on",
+        own_identity="on",
         uid_pool_start=pooled_uid,
         uid_pool_size=1,
         route_b_tmp_root=scratch,
@@ -124,7 +124,7 @@ def _route_b_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExec
         enable_network=True,
         network=None,
         sandbox_id="sbx_identity_probe",
-        route_b=RouteBConfig(
+        own_identity=OwnIdentityConfig(
             mode="on",
             uid_start=pooled_uid,
             uid_size=1,
@@ -338,7 +338,7 @@ async def test_sandbox_child_runs_unprivileged():
         assert out.decode().strip() == "0 0"
         # The identity came from a route-B slot leased at the pooled uid (not
         # from an in-process fallback that would leave the worker's identity).
-        assert executor._route_b_active is True
+        assert executor._own_identity_active is True
         assert executor._instance._handle.uid == POOLED_UID
 
         # Host-side half of the identity: written in the sandbox, owned by the

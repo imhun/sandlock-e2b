@@ -1,6 +1,6 @@
 """The SandlockExecutor driving a real supervise slot (route B, end to end).
 
-``tests/contract/test_route_b_slot_pool.py`` proves the slot pool and the
+``tests/contract/test_own_identity_slot_pool.py`` proves the slot pool and the
 Python channel client work at two distinct uids;
 ``tests/contract/test_uid_permissions.py`` proves the mediated-write ownership
 through the HTTP/worker surface. This file is the layer in between: the
@@ -36,9 +36,9 @@ import pytest
 
 from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
-from envd_service.route_b import (
+from envd_service.own_identity import (
     PARKING_SCRIPT,
-    RouteBConfig,
+    OwnIdentityConfig,
     reset_slot_pools,
     slot_pool_for,
 )
@@ -131,7 +131,7 @@ def _executor(workspace: Path, sandbox_id: str) -> SandlockExecutor:
         allow_internet_access=False,
         enable_network=False,
         sandbox_id=sandbox_id,
-        route_b=RouteBConfig(
+        own_identity=OwnIdentityConfig(
             mode="on",
             uid_start=UID,
             uid_size=2,
@@ -169,7 +169,7 @@ async def test_executor_command_runs_in_the_leased_generation(workspace) -> None
     """
     ex = _executor(workspace, "sbx_rbe_id")
     try:
-        assert ex._route_b_active is True
+        assert ex._own_identity_active is True
         running = await ex.start(
             _config(
                 [
@@ -190,7 +190,7 @@ async def test_executor_command_runs_in_the_leased_generation(workspace) -> None
         # The mediator itself: the slot process runs as the leased uid, not as
         # root -- what makes the ownership above a DAC fact instead of a
         # mediation artifact.
-        slot = slot_pool_for(ex._route_b).slot("sbx_rbe_id")
+        slot = slot_pool_for(ex._own_identity).slot("sbx_rbe_id")
         assert slot is not None
         status = Path(f"/proc/{slot.process.pid}/status").read_text()
         uid_line = [line for line in status.splitlines() if line.startswith("Uid:")][0]
@@ -229,7 +229,7 @@ async def test_parked_main_program_costs_nothing(workspace) -> None:
     never terminates a line); the self-stop park must not move the clock.
     """
     ex = _executor(workspace, "sbx_rbe_park")
-    pool = slot_pool_for(ex._route_b)
+    pool = slot_pool_for(ex._own_identity)
     try:
         running = await ex.start(_config(["/bin/true"], str(workspace)))
         await _collect(running)
@@ -340,7 +340,7 @@ async def test_collapsed_generation_is_rebuilt_once_not_permanent(
 
     sandbox_id = "sbx_rbe_collapse"
     ex = _executor(workspace, sandbox_id)
-    pool = slot_pool_for(ex._route_b)
+    pool = slot_pool_for(ex._own_identity)
     try:
         running = await ex.start(_config(["/bin/true"], str(workspace)))
         assert (await _collect(running))[0] == 0
@@ -412,7 +412,7 @@ async def test_live_generation_refusal_is_not_rebuilt(
 
     sandbox_id = "sbx_rbe_refusal"
     ex = _executor(workspace, sandbox_id)
-    pool = slot_pool_for(ex._route_b)
+    pool = slot_pool_for(ex._own_identity)
     try:
         running = await ex.start(_config(["/bin/true"], str(workspace)))
         assert (await _collect(running))[0] == 0
@@ -479,7 +479,7 @@ async def test_dead_generation_refusal_is_coded_and_rebuilt_once(
 
     sandbox_id = "sbx_rbe_dead"
     ex = _executor(workspace, sandbox_id)
-    pool = slot_pool_for(ex._route_b)
+    pool = slot_pool_for(ex._own_identity)
     try:
         running = await ex.start(_config(["/bin/true"], str(workspace)))
         assert (await _collect(running))[0] == 0
@@ -595,7 +595,7 @@ async def test_close_leaves_no_slot_and_the_uid_is_reusable(workspace) -> None:
     """W1 recycle is a *clean* restart: process, channel and control-dir
     residue all go before the uid may serve another generation."""
     ex = _executor(workspace, "sbx_rbe_recycle")
-    pool = slot_pool_for(ex._route_b)
+    pool = slot_pool_for(ex._own_identity)
     first = ex._ensure_instance()
     pid = first._handle.process.pid
     # Transport 1: there is no socket path and no token to leave behind.
@@ -741,7 +741,7 @@ LEASE_HELPER = '''
 import asyncio, json, sys
 from pathlib import Path
 sys.path.insert(0, "/workspace")
-from envd_service.route_b import W1SlotPool
+from envd_service.own_identity import W1SlotPool
 
 async def main():
     policy = json.loads(Path(sys.argv[1]).read_text())

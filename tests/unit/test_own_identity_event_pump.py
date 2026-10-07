@@ -15,11 +15,11 @@ import time
 
 import pytest
 
-from envd_service.route_b import RouteBInstance, SlotHandle
+from envd_service.own_identity import OwnIdentityInstance, SlotHandle
 
 
 class _Pool:
-    """The smallest thing `RouteBInstance` needs (it is not driven here)."""
+    """The smallest thing `OwnIdentityInstance` needs (it is not driven here)."""
 
     channel_factory = None
 
@@ -27,7 +27,7 @@ class _Pool:
         return None
 
 
-def _instance(*, with_events: bool) -> tuple[RouteBInstance, socket.socket | None]:
+def _instance(*, with_events: bool) -> tuple[OwnIdentityInstance, socket.socket | None]:
     if with_events:
         reader, writer = socket.socketpair()
     else:
@@ -38,7 +38,7 @@ def _instance(*, with_events: bool) -> tuple[RouteBInstance, socket.socket | Non
         name="slot-events",
         events_socket=reader,
     )
-    return RouteBInstance(pool=_Pool(), handle=handle, name="slot-events"), writer
+    return OwnIdentityInstance(pool=_Pool(), handle=handle, name="slot-events"), writer
 
 
 def test_a_slot_without_an_events_channel_says_so():
