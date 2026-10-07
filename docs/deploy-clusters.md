@@ -3373,6 +3373,33 @@ tmp/venv/bin/python deploy/scripts/acceptance/cgroup_acceptance.py \
 **没做的（另立）**：`close` 仍在通知表里（N82 候选 ①，每个 fd 一次往返）；clone 族的读数与其缺口
 （`clone3` 那一半没有读数，而量它要用 `wait4(__WCLONE)`；追查见 N85/N86）。
 
+### 7.54 N88 选项 ① 的修复：**已构建待发**（版本 `0.1.0-1134-g1b99eeb-20261007-214216`；apply 被跳板机不可达挡住）
+
+**这一节是"没滚成"的如实记录**：镜像已构建并推送，`apply` 一步没做（集群一个 pod 未动）。
+
+| 步骤 | 状态 |
+|---|---|
+| fork `5eda94d`（`if features.inbound_port_map { nrs.push(SYS_close) }`）+ 表成员钉子（模块 9/9） | ✅ |
+| wheel 重建并钉到 `5eda94d`（`SHA256SUMS.supervise` 的 HEAD 一致） | ✅ |
+| 本地车道读数（`off` 车道 + 出厂默认 5000，新 wheel `6853e846…`）：无映射形状 `openclose` **5075** / `uname` 5098 op/s（各 1 条/op ⇒ N82 ① 的收益保住） | ✅ |
+| `build-and-push.sh` → 版本 `0.1.0-1134-g1b99eeb-20261007-214216`，镜像内容核对过（新 push 的 worker 里 `sandlock-supervise` sha256 = `SHA256SUMS.supervise` 的 x86_64 行） | ✅ |
+| `open-cluster-tunnel.sh` → **失败**：`ssh: connect to host 172.18.74.236 port 22: Operation timed out`（20:19 那次还能连、12 s 建好；21:4x 起不可达）。`cluster-guard` 因此拒绝渲染/apply（`server 127.0.0.1:16443 refused`） | ❌ 阻塞 |
+| 线上两段式 apply + 9/9 复验 + 带映射形状读数 | ❌ 未做（等通道） |
+
+**恢复步骤**（通道一回来照这条走，顺序与 §7.53 相同）：
+
+```bash
+deploy/scripts/open-cluster-tunnel.sh && export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+VERSION="$(cat deploy/stack/.version)"   # = 0.1.0-1134-g1b99eeb-20261007-214216
+DRY_RUN=1 VERSION="$VERSION" deploy/k8s-k0s/apply.sh > tmp/n84-notify/rendered3.yaml   # 再按"除 statefulset/e2b-worker 之外"切两批
+# 第一批 apply → rollout status deploy/control-plane + ds/e2b-c3-agent → 第二批 worker →
+# rollout status statefulset/e2b-worker → 幂等重放 + 预热 → cgroup_acceptance.py（期望 9/9）
+```
+
+**没做的还有**（N88 行里也写着）：② 修-forward（计划 `docs/superpowers/plans/2026-10-07-n88-fix-forward-close-teardown.md`）、
+两条**语义**钉子（"close 释放宿主 listener"、"epoll fd 复用不被陈旧注册服务"）、以及带映射形状的**车道读数**
+（要一条 net_isolation 车道）。
+
 ### 7.53 发版：N82 候选 ①（`close` 出通知表）+ N85（`status`/`stat` 的 pid 归沙箱）—— **本地 + 线上都已验**，版本 `0.1.0-1129-gd99e885-20261007-201744`
 
 `main` = `d99e885`（fork `8239839`；上一版 §7.52）。两件 fork 改动：netlink cookie 集合改成
