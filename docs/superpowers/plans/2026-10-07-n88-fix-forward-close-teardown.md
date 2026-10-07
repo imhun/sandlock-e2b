@@ -21,6 +21,17 @@
    - `handle_epoll_ctl` / `handle_epoll_wait` / `handle_inbound_accept` 命中条目后**复核** identity：
      不符（fd 关了、号被复用、进程没了）就删条目并当普通 fd 处理。
    - 表仍有界：键是 fd 号，来自沙箱自己的 `RLIMIT_NOFILE`（与 netlink 同一条论证）。
+   - **实测踩点（2026-10-07，动手前侦察）**：`readlink("/proc/<pid>/fd/<epfd>")` **不能**当身份 ——
+     epoll fd 是 anon inode，每个 epoll fd 的 readlink 都是同一个字符串 `anon_inode:[eventpoll]`；
+     身份要用 **inode 号**（`std::fs::metadata("/proc/<pid>/fd/<fd>")` 的 `ino()`，`MetadataExt`），
+     它同时适用于 socket（netlink 那条路的身份也可以统一成这个）与 anon inode。
+   - `EpollRegistration.mapped_ino` 是**宿主侧 listener** 的 inode（不是被监视 fd 的身份），
+     所以"fd 复用"的守卫要**新增**一条 epfd 身份记录（例如 `NetworkState` 加
+     `epoll_identity: HashMap<(u32, i32), Option<u64>>`，ADD/MOD 时写、DEL/close 清、
+     `handle_epoll_wait` 取快照前复核），不要试图复用 `mapped_ino`。
+   - **钉子的落点**：`handle_epoll_*` 需要 `SupervisorCtx` 与真实 epoll fd，纯单测不好搭 ⇒
+     这条钉子大概率要落在 `tests/integration`（带映射端口的沙箱：注册 → `close(epfd)` →
+     用同一个 fd 号做别的事 → 不得被合成接管），与 N88 的"带映射形状车道读数"同一次做。
 2. **inbound：把"close 时撤"换成两种可接受的时点之一**（**这一步要人拍**，见下）
    - **(a) 惰性替换**：`ns.inbound` 只在 `listen()`（映射端口）时写入/替换；旧条目由"**用时复核**"
      淘汰 —— 复核 = 那个 inode 是否还是**活的***沙箱侧* socket（`socket_ino(dup_fd_from_pid(...))`
