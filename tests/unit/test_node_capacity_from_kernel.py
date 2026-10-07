@@ -41,9 +41,11 @@ import pytest
 
 from envd_service.agent import (
     CPU_OVERSELL_WARNING,
+    _container_kernel_limits,
     _node_resources,
     _register_payload,
     _reset_cpu_oversell_warning,
+    kernel_ceiling_payload,
 )
 from envd_service.config import Settings
 
@@ -310,3 +312,51 @@ def test_a_missing_mount_leaves_the_env_in_charge(tmp_path, monkeypatch) -> None
     resources = _node_resources(settings)
     assert resources["totalMemoryMB"] == 4096
     assert resources["totalCPUPercent"] == 200
+
+
+@pytest.mark.parametrize("cgroup", ("off", "required"))
+def test_the_heartbeats_kernel_pair_is_not_gated_on_the_lane_switch(
+    tmp_path, cgroup
+) -> None:
+    """The *other* kernel reader is ungated, and the record's pair proves it.
+
+    ``_container_kernel_limits`` -- the reader one section up, and the one the
+    switch **is** about -- answers ``None`` on the ``off`` lane. The heartbeat's
+    ``kernelCeiling`` is a different reader (``kernel_ceiling_payload``) and it
+    does not consult the switch at all: whenever ``E2B_CGROUP_MOUNT`` is there,
+    it reads it. That asymmetry is the shipped shape -- ``deploy/k8s/worker.yaml``
+    sets ``E2B_CGROUP_MOUNT=/pod-cgroup`` and mounts it, and sets no switch, so
+    the default lane is ``off`` + a readable mount and its node record still
+    carries the physical numbers.
+
+    Task 13's review caught the first version of §2.4.8 listing the switch as a
+    source of the record's ``null``s; this pair is what says otherwise, and it
+    turns red if the payload is ever gated the way the totals reader is.
+    """
+    settings = _settings(
+        tmp_path,
+        cgroup=cgroup,
+        kernel={"cpu.max": "400000 100000", "memory.max": "4294967296"},
+    )
+
+    assert kernel_ceiling_payload(settings) == {"cpuPercent": 400, "memoryMB": 4096}
+    # ...and the totals reader is the one the switch speaks to.
+    assert (_container_kernel_limits(settings) is None) is (cgroup == "off")
+
+
+def test_the_heartbeats_pair_is_null_when_the_mount_cannot_be_read(tmp_path) -> None:
+    """"No reading this beat" comes from the mount, never from the lane switch.
+
+    This is the record's *other* ``null`` source (besides a kernel that reports
+    ``max``): ``/pod-cgroup`` is not there -- the macOS dev box, or a lane
+    without the mount -- and the pair reads ``null`` while the switch is
+    ``required``, which is the one value that could not have caused it.
+    """
+    settings = Settings(
+        executor="local",
+        workspace_base=tmp_path / "workspaces",
+        sandbox_cgroup="required",
+        cgroup_mount=tmp_path / "not-mounted",
+    )
+
+    assert kernel_ceiling_payload(settings) == {"cpuPercent": None, "memoryMB": None}

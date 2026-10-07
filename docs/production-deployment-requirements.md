@@ -863,15 +863,23 @@ multinode 每个 worker 1 个（256 进程 = 1 个箱），车队 3 个 —— �
 
 **`kernelCPUPercent` / `kernelMemoryMB` 的 `null` 有两个意思**（Task 13 item 4，只在说读法，
 行为不变）。写入侧早就是分开的两件事：键**缺失** = 保留记录原值（旧 worker 的一拍，或不带这一段
-的应答），键在而值为 **`null`** = 内核在该维度报 `max`（无物理上限，compose 三条车道的实测形状）。
-但落到节点记录里之后两者长得一样 —— `null` 只是"这两个数不是上限"，不是"内核说无限"。它有两种
-来源：① 内核真的报 `max`（没设 `cpus`/`mem_limit` 的车道，读得到、答案就是 `max`）；② **这一拍
-没有读数**（`E2B_SANDBOX_CGROUP=off`、挂载不在、macOS 开发机；Task 12 起"存在但读不懂"的一维也
-走这条路：保留原值 + 一条具名 WARN）。操作员要分清时看**这台 worker 的车道**：能读出
-`cpu.max`/`memory.max` 的车道（k8s/k0s 清单）两个数一定在位，于是 `null` 等于"这台没读到"；
-而内核本来就报 `max` 的车道（compose）两个数从第一次上报起就是 `null`。谁都不看这两个数做准入 ——
-上限那道用的是策略那半（同一行的 `sandbox*Max`，另含 D5b 的内核交叉核对），所以 `null`（不管是哪
-个意思）不改变任何建箱结果，它只回答"这台机器的物理层到底有没有卡住"。
+的应答），键在而值为 **`null`** = 这一拍在这个维度上没有可用读数。落到节点记录里之后两者长得一样，
+所以 `null` 只读作"这两个数不是上限"，不是"内核说无限"。**这两个数只来自心跳的 `kernelCeiling`**
+（`envd_service/agent.py::kernel_ceiling_payload`），而它**不看车道开关**：`E2B_SANDBOX_CGROUP`
+门的是另一个读者 `_container_kernel_limits`，那个读数只喂"每节点"那一档的推导（本节顶部那张表），
+与记录里这对数无关 —— 出厂 k8s 清单就是 `off` + `E2B_CGROUP_MOUNT=/pod-cgroup` 挂进来
+（`deploy/k8s/worker.yaml`，不设开关 = 出厂默认 `off`），它的这两个数照样是物理读数
+（2026-10-07 复核：同一份 settings 下 `kernel_ceiling_payload` 在 `off` / `required` 两种取值下返回
+同一对数，而 `_container_kernel_limits` 在 `off` 下是 `None`）。所以 `null` 的来源是：
+① 内核真的报 `max`（没设 `cpus`/`mem_limit` 的车道，读得到、答案就是 `max`，compose 三条车道是
+实测形状）；② **这一拍读不到**（`/pod-cgroup` 没挂进来或挂的不是这台容器的 cgroup、内容读不出来：
+macOS 开发机、没有这个挂载的车道）；③ 控制面那侧收到的一维读数"存在但读不懂"（Task 12）会被丢掉
+⇒ 记录保留原值，首拍没有原值可留时那一维仍是 `null` + 一条具名 WARN。操作员要分清时看**这台
+worker 的挂载**：挂进来了且是这台容器的 cgroup（k8s/k0s 清单）⇒ 两个数一定在位，于是 `null` 等于
+"这台没读到"；没挂进来 ⇒ 两个数从第一次上报起就是 `null`；而内核本来就报 `max` 的车道（compose）
+虽然读得到，答案本身就是 `null`。谁都不看这两个数做准入 —— 上限那道用的是策略那半（同一行的
+`sandbox*Max`，另含 D5b 的内核交叉核对），所以 `null`（不管是哪个意思）都不改变任何建箱结果，
+它只回答"这台机器的物理层到底有没有卡住"。
 
 **平台自身占用没有预留。** 节点总量的内存那一维取的是容器 `memory.max`（k8s 基线 2 GiB、k0s
 覆盖层 4 GiB），所以"把节点卖满"= 把这个容器**整份**卖给沙箱：`envd`、supervisor、页缓存，以及
