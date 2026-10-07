@@ -76,6 +76,11 @@
 - [x] **T3**：inbound 按 **(a) 惰性替换 + 用时复核** 落地，T1 第 1 枚钉子按新契约改写并绿 —— 途中
   挖出"映射查的是 real 端口而不是 virtual 端口"这个既有缺陷（§0.3）。
 - [x] **T4**：删掉 ① 的条件行，跑 fork 门禁（十相位；`cli` 相位的环境红按 N87 的口径单独记）。
+  **十一档全绿、逐档与基线一致**：core_lib 944 / core_integ 577 / ffi 104 / cli 100 / supervise 57 /
+  supervise_cost 3 / cli_build 0 / python 465（`deploy/scripts/fork-gate.sh`）+ oci 157 /
+  supervise_root 4 / mediation_2uid 9（`--oci-root` 等三个 root 相位要**以 root**跑，`fork-gate.sh`
+  按设计会降到 65534 拒绝它们，改成同镜像里手工跑；途中一次自造的假红：`mediation_2uid` 的
+  `setcap` 因为我的 runner 少给 `/usr/sbin` 而 NotFound，补回 PATH 后 9/9）。
 - [x] **T5**：重建 wheel + 本地车道两条读数（普通形状 + 带映射形状；后者需要一条 net_isolation 车道）
   → 发版 → 线上复跑 9/9 与 `--op openclose` 两档。
   **轮子**：`wheels/fork/` 重建并钉到 `97718d8`（`SHA256SUMS.supervise` 的 HEAD 与两份拷贝逐字核对）。
