@@ -76,8 +76,21 @@
 - [x] **T3**：inbound 按 **(a) 惰性替换 + 用时复核** 落地，T1 第 1 枚钉子按新契约改写并绿 —— 途中
   挖出"映射查的是 real 端口而不是 virtual 端口"这个既有缺陷（§0.3）。
 - [x] **T4**：删掉 ① 的条件行，跑 fork 门禁（十相位；`cli` 相位的环境红按 N87 的口径单独记）。
-- [ ] **T5**：重建 wheel + 本地车道两条读数（普通形状 + 带映射形状；后者需要一条 net_isolation 车道）
+- [x] **T5**：重建 wheel + 本地车道两条读数（普通形状 + 带映射形状；后者需要一条 net_isolation 车道）
   → 发版 → 线上复跑 9/9 与 `--op openclose` 两档。
+  **轮子**：`wheels/fork/` 重建并钉到 `97718d8`（`SHA256SUMS.supervise` 的 HEAD 与两份拷贝逐字核对）。
+  **本地（`-p n88b`，`off` 车道 + 出厂默认 5000，`--op openclose --seconds 40`）**：带映射形状
+  BEFORE（① wheel）**2541 op/s、40/51 轮** → AFTER **5038 op/s、40/101 轮**；普通形状（不设
+  `E2B_PORT_MAPPINGS`）**5039 op/s**（§7.54 的 5075 同形）。覆盖文件 `tmp/n88/override{,-mapped,
+  -mapped-before}.yml`。
+  **发版**：`0.1.0-1138-g50cf84f-20261007-232510`（23:25:10 构建；第一批除 worker 的 24 份 →
+  23:27:19 CP+agent 收敛 → 第二批 worker → **23:27:35** 两 pod 收敛 → 幂等重放 + 预热
+  `cached=true`），过程见 `docs/deploy-clusters.md` §7.55。
+  **线上**：`cgroup_acceptance.py` **`ok: true`，9/9，204.3 s**；第 ③ 条单跑 **29790 op/s、0/596
+  轮停顿**（① 那版 29019 / 0/581）、四路并发 24511 op/s、峰值 1.063 核、`nr_throttled +181`；
+  两台 worker `E2B_SANDBOX_CGROUP=required` 且 `E2B_SANDBOX_NOTIFY_RATE_LIMIT` **unset**。
+  （线上没有 `E2B_PORT_MAPPINGS`，所以那一跑量的是"普通形状无回归"；② 的收益形状是带映射的，
+  读数在本地那一对。）
 
 ## 实施记录（2026-10-07）
 
