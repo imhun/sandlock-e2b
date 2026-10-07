@@ -3152,8 +3152,23 @@ worker 侧对应的是**内核**那一半：`deploy/k8s/worker.yaml` 的 pod lim
   `MemTotal` 1048576 kB、`totalram` 1073741824 B 都不变，`MemFree` 从 `off` 的 1025559 kB 变成
   `required` 的 1048576 kB（`task-4-report.md` §4）。
 
-**待填（Task 7 Step 4）**：重滚的版本号、线上 ⑥⑦⑧⑨ 的读数、混版本窗口的实际时长、以及"k8s pod
-层真的把 `memory`/`pids` 委派给了 worker"这条形状事实 —— 都在重滚那一轮现量现填，本节不预填数字。
+**线上记录（2026-10-07，Task 7 Step 3/4 已完成）**：版本 `0.1.0-1117-g23adedf-20261007-160606`，
+`main` 由 `0fe05b9` fast-forward 到 `23adedf`。按上面那条顺序**分两次 apply**：16:17:11 滚控制面
+（16:17:31 收敛）、16:18:01 滚 worker（16:18:09 完成）、16:18:51 幂等重放 + base image 预热（两台
+`cached=true`，无 428 窗口）。**混版本窗口 ≈ 40 s**，期间旧 worker 心跳 200、**0 条孤儿回收**、无告警。
+
+四条形状事实都在这一轮现量：① 两台 worker 各打一条 `adopted the control plane's per-sandbox ceiling
+(cpuPercent=400 memoryMB=4096 processes=1024)`，且 `cgroup lane ready … subtree_control=cpu memory pids`
+—— **k8s pod 层确实把 `memory`/`pids` 委派给了 worker**（写不上会具名拒绝）；② 节点记录两份读数
+两台一致：策略 `sandbox*Max` 400/4096/1024 + 物理 `kernelCPUPercent=400`/`kernelMemoryMB=4096`
+—— **节点容量确实取自容器内核**；③ 上限的三件套 env 只在**控制面**容器里，worker 一个都不带；
+④ 策略 == 物理 ⇒ **CPU 超卖告警不误报**（两台 `oversell` 计数 0）。
+
+**线上验收 `deploy/scripts/acceptance/cgroup_acceptance.py`：`ok: true`，9/9 全过（240.7 s）**，
+Phase 2 的四条读数（⑥ 内存上限真杀且 `oom_group_kill=0`、⑧ 越界具名 400 而贴着上限 201/204、
+⑦ fork 248 次后 `EAGAIN`、⑨ `memory.max/high` 逐字等于声明且**线程与进程共用一个任务预算**）、
+容量探针（连建 8 个 1 核箱后 autoscaler 扩到 3，第 9 个落在新节点；车队预算随 Σ 健康节点长大）、
+以及本轮踩到的四个坑，全文见 `docs/reports/n83-phase2-online-rollout.md`。
 
 #### 7.50.1 Task 7 Step 1–2：本地车道验收（2026-10-07，**线上未动**）
 
