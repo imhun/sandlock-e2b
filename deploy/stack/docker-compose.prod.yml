@@ -357,11 +357,14 @@ services:
       E2B_MAX_SANDBOX_MEMORY_MB: ${E2B_MAX_SANDBOX_MEMORY_MB:-2048}
       E2B_MAX_SANDBOX_PROCESSES: ${E2B_MAX_SANDBOX_PROCESSES:-256}
       # What a stock create reserves per sandbox (the SDK omits these dims).
-      # The fleet budgets above are counted in these units, so this number is
-      # half of the concurrency arithmetic: 8192MB / 512MB = 16 sandboxes by
-      # memory, 800% / 100% = 8 by CPU and 2048 / 256 = 8 by processes (the
-      # tightest dimension wins). Lowering it here is a user-visible change --
-      # every sandbox gets a 512MB limit instead of 1024MB.
+      # The concurrency ceiling = budget / reservation, tightest dimension
+      # wins. Since N83 Phase 2 / Task 9 the fleet's own budget is **Σ of the
+      # healthy workers' `E2B_NODE_*`** (the three optional overrides above are
+      # commented out), so the arithmetic is against the workers' own totals:
+      # 2 x 4096MB / 1024MB = 8 by memory, 2 x 400% / 100% = 8 by CPU and
+      # 2 x 1024 / 256 = 8 by processes for the two-worker production shape.
+      # Lowering this is a user-visible change -- every sandbox gets a smaller
+      # limit.
       E2B_DEFAULT_MEMORY_MB: ${E2B_DEFAULT_MEMORY_MB:-1024}
       E2B_DEFAULT_CPU_PERCENT: ${E2B_DEFAULT_CPU_PERCENT:-100}
       E2B_DEFAULT_DISK_MB: ${E2B_DEFAULT_DISK_MB:-1024}

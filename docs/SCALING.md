@@ -76,12 +76,16 @@ max(min_replicas,
 每 worker 可容纳数 = 各维度 `E2B_NODE_*_MB / 默认沙箱需求` 的最小值
 （`can_fit` 的逆运算）。进程维度按**整箱语义**记账（M4 D1–D3 起每沙箱
 一个 sandlock 实例，命令与 MCP 网关共享箱内预算）：单沙箱 `max_processes`
-默认已从 64 上调到 256（M4 D6），节点 `total_processes` 默认不变（内嵌
-本地节点取 `E2B_MAX_TOTAL_PROCESSES`，默认 2048），因此该维度每节点最多
-容纳 `2048 / 256 = 8` 个标准沙箱（此前 `2048 / 64 = 32`）——默认上调后
-进程维度不再是富余维度，四维容量换算必须显式计入。
+默认已从 64 上调到 256（M4 D6）；节点 `total_processes` 由该节点自己声明
+（worker 侧 `E2B_NODE_PROCESSES`，缺省 `100 ×` 单沙箱默认）—— **合体**节点
+（`E2B_ENABLE_LOCAL_NODE`，没有 worker 上报可读）另取
+`IN_PROCESS_NODE_DEFAULT_TOTALS["processes"] = 2048`（`E2B_MAX_TOTAL_PROCESSES`
+显式设了就按它），因此**那个形态**每节点最多容纳 `2048 / 256 = 8` 个标准沙箱
+（此前 `2048 / 64 = 32`）——默认上调后进程维度不再是富余维度，四维容量换算
+必须显式计入。车队那一档（N83 Phase 2 / Task 9）不参与这个换算：它是各节点
+`total_*` 的 Σ，按构造不会比节点那一档先拒人。
 内存维度随 FUP #3 同步上调（2026-09-06）：单沙箱默认内存从 512 MiB 提到
-1 GiB（`E2B_DEFAULT_MEMORY_MB`），默认 8192 MiB 节点因此容纳
+1 GiB（`E2B_DEFAULT_MEMORY_MB`），合体节点的默认 8192 MiB 因此容纳
 `8192 / 1024 = 8` 个标准沙箱（此前 `8192 / 512 = 16`），与进程维度同为
 容量主约束；换算必须同时显式计入内存与进程维度。
 

@@ -566,7 +566,8 @@ Control Plane
 
 ### 6.6 总资源上限与准入控制
 
-Control Plane 必须同时限制沙箱数量和宿主总资源，避免 `E2B_MAX_SANDBOXES` 数量达标但聚合资源超过宿主能力。
+Control Plane 必须同时限制沙箱数量和**车队总量**（N83 Phase 2 / Task 9 起 = 各节点的 Σ，见下），
+避免 `E2B_MAX_SANDBOXES` 数量达标但聚合资源超过车队能力。
 
 单沙箱默认配额：
 
@@ -660,7 +661,8 @@ worker 无害（旧 worker 忽略响应里的新字段），旧控制面 + 新 w
 {"code": 503, "message": "No resources available"}
 ```
 
-- 任一总上限设置为 `0` 表示关闭该维度限制。
+- **车队磁盘**上设置 `E2B_MAX_TOTAL_DISK_MB=0` 表示关闭该维度限制（内存/CPU/进程三档的 `0`
+  不是这个意思：那是"按各节点推导"，见上一张表）。
 
 ## 7. 部署与配置
 

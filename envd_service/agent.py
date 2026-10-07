@@ -319,6 +319,22 @@ def _container_kernel_limits(settings: Settings) -> SandboxCeiling | None:
         return None
 
 
+def _smallest_positive(*candidates: int | None) -> int | None:
+    """The smallest positive candidate, or ``None`` when none names a number.
+
+    The rule the two *capped* dimensions share (memory, processes): wherever
+    both a container reading and an ``E2B_NODE_*`` describe the same dimension,
+    the smaller wins -- see :data:`CPU_OVERSELL_WARNING` for why CPU is not one
+    of them. Both "no number" spellings pass through as no candidate: a kernel
+    ``max`` reaches here as ``None`` and an unset env as ``0``, and neither may
+    be mistaken for a limit (a limit is never 0, and the container's ceiling
+    must not be read as "nothing is capped"). Written once so the two
+    dimensions cannot drift apart.
+    """
+    values = [value for value in candidates if value is not None and value > 0]
+    return min(values) if values else None
+
+
 def _node_memory_mb(settings: Settings, kernel: SandboxCeiling | None) -> int:
     """``E2B_NODE_MEMORY_MB`` and this container's ``memory.max``: the smaller.
 
@@ -333,11 +349,9 @@ def _node_memory_mb(settings: Settings, kernel: SandboxCeiling | None) -> int:
     """
     configured = int(os.getenv("E2B_NODE_MEMORY_MB", "0"))
     kernel_mb = None if kernel is None else kernel.memory_mb
-    candidates = [
-        value for value in (configured, kernel_mb) if value is not None and value > 0
-    ]
-    if candidates:
-        return min(candidates)
+    limit = _smallest_positive(configured, kernel_mb)
+    if limit is not None:
+        return limit
     try:
         return (
             os.sysconf("SC_PHYS_PAGES")
@@ -383,11 +397,9 @@ def _node_processes(settings: Settings, kernel: SandboxCeiling | None) -> int:
     """
     configured = int(os.getenv("E2B_NODE_PROCESSES", "0"))
     kernel_tasks = None if kernel is None else kernel.processes
-    candidates = [
-        value for value in (configured, kernel_tasks) if value is not None and value > 0
-    ]
-    if candidates:
-        return min(candidates)
+    limit = _smallest_positive(configured, kernel_tasks)
+    if limit is not None:
+        return limit
     return settings.default_max_processes * 100
 
 

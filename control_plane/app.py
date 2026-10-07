@@ -811,12 +811,19 @@ def create_app(
             # deployment names them (then they win for this node too, exactly as
             # an explicit override does for the fleet). See
             # `IN_PROCESS_NODE_DEFAULT_TOTALS` for the full reasoning.
+            #
+            # Disk is passed through **verbatim**, with no `or` fallback: its
+            # `0` never changed meaning (`docs/env-vars.md`: 0 = that dimension
+            # is not policed), and this node is the one place that reads the
+            # field for its *own* row -- so `E2B_MAX_TOTAL_DISK_MB=0` must keep
+            # leaving this node's disk admission unpoliced, exactly as it did
+            # before Task 9. The three above take the fallback precisely because
+            # their 0 no longer means that.
             total_memory_mb=settings.max_total_memory_mb
             or IN_PROCESS_NODE_DEFAULT_TOTALS["memory_mb"],
             total_cpu_percent=settings.max_total_cpu_percent
             or IN_PROCESS_NODE_DEFAULT_TOTALS["cpu_percent"],
-            total_disk_mb=settings.max_total_disk_mb
-            or IN_PROCESS_NODE_DEFAULT_TOTALS["disk_mb"],
+            total_disk_mb=settings.max_total_disk_mb,
             total_processes=settings.max_total_processes
             or IN_PROCESS_NODE_DEFAULT_TOTALS["processes"],
             # N83 phase 2 (D5, ruling R17): the per-sandbox ceiling is the

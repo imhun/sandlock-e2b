@@ -520,9 +520,11 @@ spec:
             # `resources.limits.cpu: "2"` / `memory: 2Gi`, and the worker
             # refuses a hand-down above its own container's kernel limits
             # (D5b). (This file declares no `E2B_MAX_TOTAL_CPU_PERCENT` /
-            # `_MEMORY_MB` / `_PROCESSES` at all -- it runs the code defaults
-            # 400/8192/2048 -- so those are *not* what 200/2048/256 follows;
-            # only `E2B_MAX_TOTAL_DISK_MB` is named here, commented out.)
+            # `_MEMORY_MB` / `_PROCESSES` at all, and since N83 Phase 2 /
+            # Task 9 that means the fleet's own totals are **Σ of the healthy
+            # workers' `total_*`** rather than any number written here -- so
+            # those are *not* what 200/2048/256 follows either; only
+            # `E2B_MAX_TOTAL_DISK_MB` is named here, commented out.)
             #
             # Written out because the number is a decision: one sandbox may take
             # this lane's whole declared budget, and a deployment that disagrees

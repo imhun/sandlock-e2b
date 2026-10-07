@@ -3112,7 +3112,7 @@ uid 相符；评审六条规格全过），按 `AGENTS.md` 先在**本地 compos
 
 | 清单（**控制面**服务） | `E2B_MAX_SANDBOX_CPU_PERCENT` / `_MEMORY_MB` / `_PROCESSES` | 为什么是这个值 |
 |---|---|---|
-| `deploy/k8s/control-plane.yaml` | `200` / `2048` / `256` | 该车道的 worker pod `resources.limits` 是 `cpu: "2"`、`memory: 2Gi` ⇒ 单箱最多 2 核 / 2 GiB；任务数跟 `E2B_MAX_TOTAL_PROCESSES=2048` 下的节点口径 `256` |
+| `deploy/k8s/control-plane.yaml` | `200` / `2048` / `256` | 该车道的 worker pod `resources.limits` 是 `cpu: "2"`、`memory: 2Gi` ⇒ 单箱最多 2 核 / 2 GiB；任务数跟该车道 worker 自己声明的节点口径 `E2B_NODE_PROCESSES=256`（车队那一档由各节点的 Σ 推导，不再有一条 `E2B_MAX_TOTAL_PROCESSES` 可引用 —— N83 Phase 2 / Task 9） |
 | `deploy/k8s-k0s/control-plane-capacity.patch.yaml` | `400` / `4096` / `1024` | 覆盖层把 worker pod limits 抬到 `cpu: "4"`、`memory: 4Gi` ⇒ 下发的上限必须**同时**抬，否则 worker 的 D5b 会**具名拒绝这份下发**、该节点建箱全拒；任务数跟覆盖层的 `E2B_NODE_PROCESSES=1024` |
 | `deploy/compose/docker-compose.multinode.yml`（control-plane 服务） | `200` / `2048` / `256` | 三条 compose 车道没给 worker 设 `cpus`/`mem_limit`（内核那份是 `max`，实测）⇒ 这里只能给到节点总量 |
 | `deploy/compose/docker-compose.prod.yml`、`deploy/stack/docker-compose.prod.yml`（control-plane 服务） | `${…:-200}` / `${…:-2048}` / `${…:-256}` | 同上；用 `:-默认` 保持这两个文件"生产可用 `.env` 覆盖"的既有风格 |
@@ -3161,8 +3161,10 @@ pod 都没碰）：`deploy/compose/docker-compose.multinode.yml` + 三份 overri
 `tmp/` 下）。相对清单的差别：`E2B_SANDBOX_CGROUP=required`、`E2B_SANDBOX_NOTIFY_RATE_LIMIT=0`、
 `E2B_EXECUTOR=sandlock`、`E2B_PER_SANDBOX_UID=true`、`E2B_NODE_DISK_MB=400000`（Docker VM 整盘已用
 ~111 GB）、`E2B_NODE_PROCESSES=1024`，外加两个**验收专用**的 knob：控制面
-`E2B_MAX_TOTAL_CPU_PERCENT=1600`（清单是 400%＝四个 1 核箱；⑥⑦ 的"同节点邻居"要靠把别处填满来
-逼出同节点，见下）与 `E2B_DEFAULT_MAX_PROCESSES=137` —— 后者**故意不是出厂的 256**，但只作**次要**
+`E2B_MAX_TOTAL_CPU_PERCENT=1600`（**本车道显式抬容量**：清单里已经没有这一条 —— 车队那一档由三
+个 worker 自己的 200% 求和推导（Σ=600%），见 N83 Phase 2 / Task 9；这里写死 1600 是因为 ⑥⑦ 的
+"同节点邻居"要靠把别处填满来逼出同节点，而显式覆盖**仍然**优先于推导，见下）与
+`E2B_DEFAULT_MAX_PROCESSES=137` —— 后者**故意不是出厂的 256**，但只作**次要**
 对照：⑦⑨ 的"声明值"取自 **worker 自己的箱子记录**（`<state base>/_runtime/<id>/sandbox.json` 的
 `max_processes`，建箱 payload 落盘的那一份，worker 自己的运行时也读同一个文件；见下第 3 条坑），
 那两份的一致（记录 137 / 内核 `pids.max` 137）才是检查的判据。镜像：本分支现构建的
@@ -3228,8 +3230,9 @@ sandbox: it has not reported its per-sandbox cpuCount maximum"}`。worker 侧：
    "边跑边采样取峰值"**（⑥/⑦ 都在探针跑动期间每 0.3–0.4 s 读一次），否则这条检查会随重建随机变红
    （实测：一次 9/9 里 ⑥ 就是被这个弄红的）；重建本身作为 `memory_events_counter_reset` 记在报告里。
 2. **邻居盒子不是"再建一个"就有**：`rank_candidates` 按剩余容量打分，新箱**故意**避开已经有一个箱的
-   节点 ⇒ 三节点车道上"同节点邻居"要靠把别的节点**填满**才出现（节点 200%＝两个 1 核箱；清单的全局
-   上限 400% 正好卡在四个箱，所以验收把控制面的 `E2B_MAX_TOTAL_CPU_PERCENT` 抬到 1600 才够填）。
+   节点 ⇒ 三节点车道上"同节点邻居"要靠把别的节点**填满**才出现（节点 200%＝两个 1 核箱；车队那
+  一档现在是 Σ 各节点 = 600%（N83 Phase 2 / Task 9），验收仍显式把它抬到 1600 —— 显式覆盖
+  优先于推导，且 1600 足够把三个节点都填满）。
    填出来的多余箱子是真箱子（有真读数），随该检查一起释放；写死"建 3 个试试"会随调度位置随机变红。
 3. **"声明的任务数"只能从 worker 自己的记录读，不能读 env**：⑦⑨ 要拿"这只箱子被声明了多少任务"去比
    内核的 `pids.max`。出厂清单（`deploy/k8s/worker.yaml`、`deploy/k8s-k0s/worker-capacity.patch.yaml`

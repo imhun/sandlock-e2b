@@ -33,20 +33,25 @@ DEFAULT_CREATE_RATE_LIMIT_PER_MIN = 120
 
 #: The **in-process** node's own totals when ``E2B_MAX_TOTAL_*`` names none.
 #:
-#: N83 phase 2 / Task 9 turned those four into optional overrides for the
-#: *fleet* ladder (unset/``0`` = Σ of the healthy nodes' own totals). The
-#: in-process node (``E2B_ENABLE_LOCAL_NODE``) is the one node that has nothing
-#: to derive from: there is no worker report behind it and no separate container
-#: of its own to read -- *this* process is the node -- so it keeps the numbers
-#: ``E2B_MAX_TOTAL_*`` defaulted to before that ruling, and a combined
-#: deployment's admission behaviour is unchanged. A deployment that wants a
-#: different number for this node sets ``E2B_MAX_TOTAL_*``, which the local node
-#: still reads first. Leaving it at ``0`` instead would read, one line later, as
-#: "unbounded" -- the fail-open the plan's Review Focus §1 names.
+#: N83 phase 2 / Task 9 turned the *memory, CPU and process* totals into
+#: optional overrides for the *fleet* ladder (unset/``0`` = Σ of the healthy
+#: nodes' own totals). The in-process node (``E2B_ENABLE_LOCAL_NODE``) is the
+#: one node that has nothing to derive from: there is no worker report behind it
+#: and no separate container of its own to read -- *this* process is the node --
+#: so it keeps the numbers those three envs defaulted to before that ruling, and
+#: a combined deployment's admission behaviour is unchanged. A deployment that
+#: wants a different number for this node sets ``E2B_MAX_TOTAL_*``, which the
+#: local node still reads first. Leaving it at ``0`` instead would read, one line
+#: later, as "unbounded" -- the fail-open the plan's Review Focus §1 names.
+#:
+#: **Disk is deliberately not in here.** Its ``0`` never changed meaning ("that
+#: dimension is not policed", ``docs/env-vars.md``), so the in-process node takes
+#: ``E2B_MAX_TOTAL_DISK_MB`` verbatim -- a ``0`` there leaves its disk admission
+#: unpoliced exactly as before Task 9, and an unset one is already 10240 from the
+#: field's own default.
 IN_PROCESS_NODE_DEFAULT_TOTALS: dict[str, int] = {
     "memory_mb": 8192,
     "cpu_percent": 400,
-    "disk_mb": 10240,
     "processes": 2048,
 }
 

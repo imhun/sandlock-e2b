@@ -140,6 +140,36 @@ def test_no_healthy_node_leaves_the_fleet_ladder_out_of_the_way(workspace) -> No
     assert registry.count() == 1
 
 
+async def test_the_in_process_nodes_row_keeps_disks_zero_semantics(tmp_path) -> None:
+    """Review round 1 / Important 2: the one row that still reads `0` itself.
+
+    The three derived dimensions fall back to their pre-Task-9 numbers when the
+    deployment names none (``IN_PROCESS_NODE_DEFAULT_TOTALS``) precisely because
+    their ``0`` now means "derive". **Disk's ``0`` never changed meaning** --
+    ``docs/env-vars.md`` and ``spec.md`` both still document it as "that
+    dimension is not policed" -- so ``E2B_MAX_TOTAL_DISK_MB=0`` must leave the
+    in-process node's own disk admission unpoliced, exactly as it did before
+    Task 9, and its row must read ``0`` rather than the 10240 default.
+    """
+    from control_plane.app import create_app
+
+    app = create_app(
+        settings=_settings(enable_local_node=True, max_total_disk_mb=0)
+    )
+    local = app.state.nodes.get("local")
+    assert local is not None
+
+    assert local.total_disk_mb == 0
+    # ...and 0 really is "not policed" on that row, not "nothing may be placed":
+    assert local.blocking_dimension(1024, 100, 10**9, 64) is None
+
+    # The other three dimensions are the *other* decision (their 0 = derive),
+    # so this row gets the pre-Task-9 defaults instead.
+    assert local.total_memory_mb == 8192
+    assert local.total_cpu_percent == 400
+    assert local.total_processes == 2048
+
+
 async def test_a_create_with_no_registered_node_is_a_named_503(tmp_path) -> None:
     """The end-to-end half: no node registered ⇒ named 503, nothing admitted."""
     import httpx

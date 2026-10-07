@@ -809,6 +809,15 @@ class NodeRegistry:
         still counted: their totals bound the sandboxes already placed on them,
         and this sum may only ever be *generous* -- never smaller than what the
         node ladder can admit.
+
+        One contract worth stating where the sum is computed: **a node's
+        ``total_*`` are meant to be positive numbers.** ``0`` in these ledgers
+        reads as "this dimension is not policed", and registration has no guard
+        against it, so a node that reported ``0`` would leave that dimension
+        unpoliced at *both* layers -- the platform's own workers cannot report
+        ``0`` (``envd_service/agent.py`` only ever emits the positive numbers it
+        read or probed), and "0 = unlimited" is not a supported reading of a
+        node total. A registration-time refusal is deliberately not added here.
         """
         records = self.list(healthy_only=True)
         if not records:
