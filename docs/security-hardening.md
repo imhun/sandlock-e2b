@@ -55,6 +55,14 @@
   每秒最多处理 N 个 seccomp 通知，超限 supervisor 睡满窗口剩余时间，
   沙箱被拦截的 syscall 在内核队列积压/阻塞，防止通知洪泛压垮 supervisor。
 - worker 配置 `E2B_SANDBOX_NOTIFY_RATE_LIMIT`（默认 5000/s，0 关闭）。
+- **2026-10-07 起这条闸只作用于没有每沙箱 cgroup 的车道**：`E2B_SANDBOX_CGROUP=required`
+  （线上）不再把 `E2B_SANDBOX_NOTIFY_RATE_LIMIT` 传给沙箱；`off`（回退杆 / in-process
+  mediator 形态）照旧传。理由是 N82 测出的：限流器实际在替 supervisor 记账，而 N83 之后
+  supervisor 就在 `sbx_<id>` 里，洪泛花的是沙箱自己的 `cpu.max` —— 读数见
+  `deploy/scripts/acceptance/cgroup_acceptance.py` 第 3 条（限流关 + `required`：`openclose`
+  洪泛单跑 0.840 核、四路并发 0.994 核 ≤ 1 核额度且 `nr_throttled` 增长）。限流开着时那笔
+  "每秒睡满剩余窗口"的代价（N79/N82 记的 0.86 s）只落在没有额度可花的车道上。实现
+  `envd_service/executors/sandlock.py::_notify_rate_limit_for_the_lane()`。
 - **N81（2026-10-06）之后 stat 族不再进通知表**，所以下面这条 N79 的分类预算已退役（字段
   `notify_rate_limit_stat` 与 `E2B_SANDBOX_STAT_NOTIFY_RATE_LIMIT` 都已删除）：真根形态下沙箱的
   `/proc` 是它自己 rootfs 里的**空目录**，内核答 `stat` 与中介代答的数字相同，拦它只买到 26 µs/次

@@ -431,32 +431,56 @@ def test_the_cgroup_lane_reaches_the_fork_policy(monkeypatch) -> None:
     ``E2B_SANDBOX_CGROUP=required`` is the one deployment in which the kernel
     is the enforcer of a sandbox's memory and task budgets, so it is also the
     only lane allowed to tell the fork to retire the mediator's own
-    address-space accounting. ``off`` must put *nothing* on the wire -- not
-    ``false``, but no key at all, because that lane's document has to stay
-    byte-for-byte the one it was before this field existed.
+    address-space accounting and to drop the notification rate cap (N82: the
+    cap stands in for the supervisor's accounting, and behind a cgroup the
+    flooder pays that accounting itself). ``off`` must put *nothing* new on the
+    wire -- not ``false``, but no key at all, because that lane's document has
+    to stay byte-for-byte the one it was before either field existed.
     """
-    off = _executor(monkeypatch, route_b=_config(mode="auto"))
+    off = _executor(monkeypatch, route_b=_config(mode="auto"), notify_rate_limit=5000)
     assert "kernel_enforced_limits" not in off._policy_ceiling()
     off_doc = rb.supervise_policy_document(off._policy_ceiling())
     assert "kernel_enforced_limits" not in off_doc
+    assert off_doc["notify_rate_limit"] == 5000
 
     on = _executor(
         monkeypatch,
         route_b=_config(
             mode="auto", sandbox_cgroup="required", sandbox_cgroups=_HandleStub()
         ),
+        notify_rate_limit=5000,
     )
     on_doc = rb.supervise_policy_document(on._policy_ceiling())
     assert on_doc["kernel_enforced_limits"] is True
+    assert "notify_rate_limit" not in on_doc
 
-    # The two lanes differ by exactly that one key: switching lanes changes
-    # what the fork is told about *notification accounting*, and nothing else
-    # about the sandbox.
+    # The two lanes differ by exactly that pair -- both of them about
+    # notification accounting -- and by nothing else about the sandbox.
     assert set(on_doc) - set(off_doc) == {"kernel_enforced_limits"}
-    assert set(off_doc) - set(on_doc) == set()
+    assert set(off_doc) - set(on_doc) == {"notify_rate_limit"}
     assert {
         key: value for key, value in on_doc.items() if key != "kernel_enforced_limits"
-    } == off_doc
+    } == {
+        key: value for key, value in off_doc.items() if key != "notify_rate_limit"
+    }
+
+
+def test_an_unset_notify_cap_stays_unset_on_both_lanes(monkeypatch) -> None:
+    """``0`` is the fork's "no cap" on every lane: the key is simply absent.
+
+    The rule above only decides whether a *configured* cap travels. A
+    deployment that never set one must keep producing the document it always
+    did, whichever lane it is on -- ``E2B_SANDBOX_NOTIFY_RATE_LIMIT`` is not in
+    either shipped manifest.
+    """
+    for route_b in (
+        _config(mode="auto"),
+        _config(mode="auto", sandbox_cgroup="required", sandbox_cgroups=_HandleStub()),
+    ):
+        ex = _executor(monkeypatch, route_b=route_b, notify_rate_limit=0)
+        assert "notify_rate_limit" not in rb.supervise_policy_document(
+            ex._policy_ceiling()
+        )
 
 
 # ------------------------------------------------------------------ lease

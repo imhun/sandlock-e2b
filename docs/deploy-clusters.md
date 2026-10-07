@@ -3275,6 +3275,61 @@ sandbox: it has not reported its per-sandbox cpuCount maximum"}`。worker 侧：
 读数、混版本窗口的实际时长（R17 之后窗口是"旧控制面 + 新 worker"，两侧都按设计全拒、不会静默放行）、
 以及"k8s pod 层真的把 `memory`/`pids` 委派给了 worker"这条形状事实。
 
+### 7.51 N82 的收口：通知限流绑到车道（**本地车道已验，线上未滚**）
+
+**改的是什么**：`notify_rate_limit` 只在**没有**每沙箱 cgroup 的车道才随策略下发
+（`envd_service/executors/sandlock.py::_notify_rate_limit_for_the_lane()`，两处落点是
+`_policy_ceiling` 与 `_build_sandbox`）；`E2B_SANDBOX_CGROUP=required`（线上）不下发 —— N82 修正后的
+结论是"限流器在替 supervisor 记账"，而 N83 之后 supervisor 就在 `sbx_<id>` 里，洪泛花的是沙箱
+自己的 `cpu.max`。**闸没删**：`off`（回退杆 / in-process mediator 形态）拿到的值与改动前逐字节
+相同 —— `tests/unit/test_sandlock_executor_route_b.py::test_the_cgroup_lane_reaches_the_fork_policy`
+把这条钉成"两个车道只差 notification accounting 的那一对键"（RED 1 failed → GREEN 43 passed）。
+
+**顺带补的判据**（`deploy/scripts/acceptance/cgroup_acceptance.py`）：第 3 条原先只断言"洪泛峰值
+≤ 额度"，而**限流开着时这条同样成立**（限流把洪泛压在 2545 op/s、箱子只吃 0.27 核，cgroup 看起来
+无辜）⇒ 2026-10-07 那次线上 9/9 其实证不了"限流关"。现在读探针自己的 `stalls=`/`rounds=`，用
+`flood_is_capped()`（`stalls > rounds / 4`）把限流的签名（约每秒一次 >20 ms 的停顿）判掉；钉子
+`tests/unit/test_cgroup_acceptance_flood_signature.py` 拿 N82 的 40/51 与两条 0 停顿读数钉住这条线。
+
+**本地车道形状**（`-p n84notify`、宿主端口 3500）：与 §7.50.1 同一份
+`deploy/compose/docker-compose.multinode.yml` + `tmp/n84-notify/override-required-default-limit.yml`，
+`E2B_SANDBOX_CGROUP=required`，而 **`E2B_SANDBOX_NOTIFY_RATE_LIMIT` 不设**（worker 里是出厂默认
+5000；报告 `lane.worker_env` 三台都读作 `unset`）。§7.50.1 那条车道把限流显式置 0，所以它**测不出**
+这次改动，这一条才是。三台镜像都从本树新构建（控制面 / agent / worker）：旧 `n83p2` 控制面是 R17
+之前的，配 R17 之后的 worker 按设计全拒 —— 第一次跑就撞上 `503 … it has not reported its
+per-sandbox cpuCount maximum`（`tmp/n84-notify/after.log` 的第一轮），把控制面换成本树构建后正常。
+
+```bash
+docker compose -p n84notify -f deploy/compose/docker-compose.multinode.yml \
+    -f tmp/n84-notify/override-required-default-limit.yml up -d
+tmp/venv/bin/python deploy/scripts/acceptance/cgroup_acceptance.py \
+    --api-url http://127.0.0.1:3500 --api-key local-key --internal-key internal-key \
+    --internal-url http://control-plane:3000 --nodes worker-1,worker-2,worker-3 \
+    --worker-exec-template 'docker exec -i n84notify-{node}-1 bash -lc' \
+    --control-plane-exec-template 'docker exec -i n84notify-control-plane-1 bash -lc'
+```
+
+**第 3 条的 RED→GREEN**（同一车道、同一探针 `--op openclose --seconds 40`，只换 worker 的代码；
+镜像内容逐次核对过 —— 旧代码那份 `_notify_rate_limit_for_the_lane` 不存在、旧拼写出现 2 次）：
+
+| | 单跑（自己一只箱子） | 四路并发（自家 spinner 填满额度） | 第 3 条判据 |
+|---|---|---|---|
+| **BEFORE** `tmp/n84-notify/before.json`（旧代码，`elapsed 251.7 s`） | **2542 op/s**、**40/51 轮**停顿（单次最坏 772–784 ms）、峰值 **0.273 核**、`nr_throttled 0` | 2617 op/s、峰值 0.259 核、`nr_throttled +1` | **FAIL**（`stalls > rounds/4`；其余 8 条同跑全过 ⇒ 不是环境红） |
+| **AFTER** `tmp/n84-notify/after.json`（本树，`elapsed 262.0 s`） | **9343 op/s**、**1/187 轮**停顿、峰值 **0.832 核**、`nr_throttled 0` | **11806 op/s**、峰值 **1.007 核 ≤ 1 核额度**、`nr_throttled +22` | **PASS 9/9** |
+
+两条读数的形状差异就是结论本身：BEFORE 的 2542 op/s + 40/51 停顿正是 N82 记的"限流器按通知条数
+计费"签名，而**箱子只用了 0.27 核** —— 旧判据会把它读成"洪泛被额度压住了"。AFTER 的 9343 op/s
+说明限流不在，0.832 / 1.007 核说明额度在。（AFTER 单跑那 **1 次**停顿也是为什么阈值是"四分之一"
+而不是 `stalls == 0`：未限流的车道偶发一次 >20 ms 是正常的，N82/线上那两条 0 停顿读数没有承诺
+永远为 0。）
+
+**线上还剩什么**：这次改动**没上线**，本节只有本地读数。翻线上时（沿用 N83 的重滚纪律：先控制面、
+再 worker，`E2B_SANDBOX_CGROUP` 的回退杆照旧）顺手把第 3 条复跑一次即可 —— 这一回它的
+`stalls`/`rounds` 会真的回答"限流关没关"。本次未提交的改动：`envd_service/executors/sandlock.py`、
+`deploy/scripts/acceptance/cgroup_acceptance.py`、`tests/unit/test_sandlock_executor_route_b.py`、
+`tests/unit/test_cgroup_acceptance_flood_signature.py`、`docs/security-hardening.md` P1-5 与
+`docs/open-issues.md` 的 N82 行。
+
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
 计划 `docs/superpowers/plans/2026-10-03-idle-pause.md`（Task 1–5）的发版记录。这一版

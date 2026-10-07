@@ -15,12 +15,16 @@ about a *reading*, never about "the call did not error":
    ``nr_throttled`` growing and ``usage_usec`` of the order of quota x time
    while it spins. This is the only reading that proves enforcement.
 3. **The flood spends the sandbox's own budget.** With the notify rate limiter
-   turned off on the workers (``E2B_SANDBOX_NOTIFY_RATE_LIMIT=0``, set by the
-   caller's override and echoed in this report), the existing N82 probe
+   off for this lane, the existing N82 probe
    (``probe_n82_traced_syscall_costs.py --op openclose``) must be bounded by the
    sandbox's own ``cpu.max``: the ``sbx_<id>`` cgroup's CPU stays at or below
    the declared quota, whereas the N82 baseline booked the same ~1.02 core to
-   the *worker pod* (`docs/open-issues.md` N82).
+   the *worker pod* (`docs/open-issues.md` N82). The limiter being off is read,
+   not assumed: the probe's own stall counter must not carry the cap's
+   signature (see ``flood_is_capped``) -- since 2026-10-07 a ``required`` lane
+   drops the cap by itself, so a run is free to leave
+   ``E2B_SANDBOX_NOTIFY_RATE_LIMIT`` at its shipped default, and this check is
+   what refuses a verdict that is satisfiable with the cap still in place.
 4. **The narrowing / view shape.** From every worker container: what it sees
    under the mount, ``/proc/self/cgroup``, and which cgroups are writable.
 
@@ -240,6 +244,29 @@ _N82_BASELINE = {"ops_per_s": 18149, "cores_on_worker_pod": 1.02}
 #: starvation, not a subtle one -- the report says so in as many words.
 _NEIGHBOUR_RTT_FACTOR = 3.0
 _NEIGHBOUR_RTT_FLOOR_MS = 50.0
+
+#: The notification cap's signature in the N82 probe. With the cap on, the
+#: supervisor sleeps out what is left of the second once its window is spent,
+#: so single ops land in the hundreds of milliseconds and the probe's stall
+#: counter (a round whose worst op crossed 20 ms) fires about once a second --
+#: N82 read **40 stalls in 51 rounds** (the capped ``off`` lane reads the same
+#: shape). Off, it does not fire at all (N82's uncapped leg: 18149 op/s, 0
+#: stalls; N83's local lane: 9794 op/s, 0 stalls). One round in four is well
+#: clear of both, so that is the line check 3 draws.
+_CAPPED_STALL_SHARE = 0.25
+
+
+def flood_is_capped(stalls: int | None, rounds: int | None) -> bool:
+    """Does this flood still show the notification cap's stall signature?
+
+    ``True`` for an unread flood as well (``None`` or too few rounds): not
+    having looked is not evidence of an uncapped one, and check 3's verdict is
+    about the reading.
+    """
+    if stalls is None or rounds is None or rounds < 4:
+        return True
+    return stalls > rounds * _CAPPED_STALL_SHARE
+
 
 #: The nine checks a complete run owes a verdict on: phase 1's five (plan Task
 #: 7 Step 1, Phase 1) plus phase 2's four (``docs/superpowers/plans/
@@ -2036,12 +2063,22 @@ def main() -> int:
             output = (proc.stdout.read() if proc.stdout else "") or ""
             proc.wait(timeout=30)
             elapsed = time.monotonic() - started
-            ops_per_s = None
+            # The probe's own DONE line is the flood's reading: `ops_per_s` is
+            # what the clients achieved, `stalls`/`rounds` say whether the cap
+            # was in effect (see `flood_is_capped`).
+            ops_per_s = stalls = rounds = None
             for line in output.splitlines():
-                if line.startswith("DONE "):
-                    match = re.search(r"ops_per_s=(\d+)", line)
-                    if match:
-                        ops_per_s = int(match.group(1))
+                if not line.startswith("DONE "):
+                    continue
+                fields = dict(
+                    part.split("=", 1) for part in line.split() if "=" in part
+                )
+                if "ops_per_s" in fields:
+                    ops_per_s = int(fields["ops_per_s"])
+                if "stalls" in fields:
+                    stalls = int(fields["stalls"])
+                if "rounds" in fields:
+                    rounds = int(fields["rounds"])
             interval_cores = []
             for previous, current in zip(samples, samples[1:]):
                 dt = current["at_s"] - previous["at_s"]
@@ -2059,6 +2096,8 @@ def main() -> int:
                 "label": "the N82 probe (openclose) alone in its own sandbox",
                 "probe_output": output.strip(),
                 "ops_per_s": ops_per_s,
+                "stalls": stalls,
+                "rounds": rounds,
                 "elapsed_s": round(elapsed, 1),
                 "sandbox_id": sandbox_id,
                 "node_id": node,
@@ -2173,6 +2212,10 @@ def main() -> int:
             and alone["peak_cores"] is not None
             and alone["peak_cores"] <= 1.15 * quota_cores
             and alone["ops_per_s"] is not None
+            # ... and the cap really was off while it ran: a *capped* flood is
+            # not "a flood inside the quota", it is the cap doing the bounding,
+            # and the cgroup would look innocent either way.
+            and not flood_is_capped(alone["stalls"], alone["rounds"])
             and contested["peak_cores"] is not None
             and contested["peak_cores"] <= 1.15 * quota_cores
             # The flood must actually have run in the binding harness: a

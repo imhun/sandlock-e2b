@@ -1739,6 +1739,33 @@ class SandlockExecutor(Executor):
         mode = str(getattr(self._route_b, "sandbox_cgroup", "off") or "off")
         return mode.strip().lower() == "required"
 
+    def _notify_rate_limit_for_the_lane(self) -> int | None:
+        """The notification cap for this lane, or ``None`` for "no cap".
+
+        N82 (2026-10-06) measured what this cap actually is: a stand-in for the
+        supervisor's *accounting*. The supervisor's CPU used to land on the
+        worker pod and on nobody's quota, so capping the notification rate was
+        the only thing keeping one sandbox from spending a neighbor's core --
+        and the cap was also the 0.86 s of every second that ordinary
+        ``npm install``-class work ran into (N79/N82).
+
+        N83 (2026-10-06/07) removed that premise. On the cgroup lane the whole
+        sandbox tree -- ``sandlock-superv`` included -- sits in ``sbx_<id>``,
+        whose ``cpu.max`` is the sandbox's own declared share, so a flood now
+        spends the flooder's budget and the kernel throttles it
+        (``deploy/scripts/acceptance/cgroup_acceptance.py`` check 3, measured
+        with this cap off). Keeping the cap on *that* lane would buy nothing
+        and pay the stall back.
+
+        So the cap travels only where no cgroup bounds the box: ``off`` (the
+        rollback lever) and the in-process mediator, which has no ``sbx_<id>``
+        to hang a quota on. There the value is what it always was, byte for
+        byte.
+        """
+        if self._kernel_enforced_limits():
+            return None
+        return self._notify_rate_limit or None
+
     def _open_route_b_instance(self):
         """Lease this sandbox's slot and wrap it in the instance shim.
 
@@ -2628,7 +2655,7 @@ class SandlockExecutor(Executor):
             # the tree); the executor only names it.
             "disk_stats_path": self._disk_stats_path,
             "max_file_size": self._max_file_size_bytes(),
-            "notify_rate_limit": self._notify_rate_limit or None,
+            "notify_rate_limit": self._notify_rate_limit_for_the_lane(),
             "uid": sandbox_uid,
             "gid": sandbox_gid,
         }
@@ -2879,7 +2906,7 @@ class SandlockExecutor(Executor):
             "max_disk": f"{self._disk_mb}M",
             "disk_stats_path": self._disk_stats_path,
             "max_file_size": self._max_file_size_bytes(),
-            "notify_rate_limit": self._notify_rate_limit or None,
+            "notify_rate_limit": self._notify_rate_limit_for_the_lane(),
             "clean_env": True,
             "env": dict(config.env),
             "cwd": config.cwd,
