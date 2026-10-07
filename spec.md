@@ -607,13 +607,20 @@ E2B_NODE_*)`，**CPU = `E2B_NODE_*` 说了算（允许超过容器 `cpu.max`，�
 
 **单箱上限（控制面的策略，不是内核读数、也不是 worker 的数）**：`E2B_MAX_SANDBOX_CPU_PERCENT` /
 `E2B_MAX_SANDBOX_MEMORY_MB` / `E2B_MAX_SANDBOX_PROCESSES` 是一箱最多能配到多少。
-**2026-10-07 裁定（R17）：这份上限由控制面持有并下发** —— 控制面 `Settings` 在启动时按
-"显式 env > `E2B_MAX_TOTAL_*` > `E2B_DEFAULT_*`"（`gateway_common/sandbox_ceiling.py` 里那一条规则；
-三档全 `0` 是控制面按名拒绝的配置，**绝不默认成"无上限"**）解析出三个正整数，写进**每个**节点记录
-（`sandbox_{cpu_percent,memory_mb,processes}_max`，因此各节点同值），并在
+**2026-10-07 裁定（R17）：这份上限由控制面持有并下发** —— 控制面按
+"显式 env > **该节点自己的总量** > `E2B_DEFAULT_*`"（`gateway_common/sandbox_ceiling.py` 里那一条规则；
+最后一档是"这个节点连总量都没报"时的唯一正信号，**绝不默认成"无上限"、也绝不 `0`**）解析出三个正整数，
+写进**每个**节点记录
+（`sandbox_{cpu_percent,memory_mb,processes}_max`），并在
 `POST /internal/nodes/register` 与 `/heartbeat` 的**响应体**里下发
 `{"sandboxCeiling": {"cpuPercent": …, "memoryMB": …, "processes": …}}`（`off` 车道照发 —— 这是策略，
-与车道无关）。worker 采纳它（`envd_service/agent.py::adopt_sandbox_ceiling`），再拿它与**本机内核**
+与车道无关）。**解析在"盖章"那一刻、按节点做**（`Settings.sandbox_ceiling_for`）：`register` 用请求
+体里那三个总量，`heartbeat` 用该节点记录里已有的总量（每拍重算 ⇒ 节点总量变了就跟着变），进程内
+`local://` 节点用自己那一行的总量 —— 所以**异构车队各拿各的上限**（各不超过自己那台的总量），下发的那份
+与写进记录的那份是同一次解析的同一个 dict。⚠️ 这中间一档**不是** `E2B_MAX_TOTAL_*`：那是**车队**总量
+（Task 9 起默认 `0` = 按各节点推导），不是某一台节点的承诺；Task 10 修的就是"在构造期解析一次 ⇒ 只能看到
+车队总量 ⇒ 缺省静默退化成创建默认"这个缺陷。worker 采纳下发值
+（`envd_service/agent.py::adopt_sandbox_ceiling`），再拿它与**本机内核**
 读数交叉校验：**下发值 > 内核 ⇒ 具名拒绝这份下发**（`cgroup-refusal ceiling-exceeds-kernel`，不夹取、
 不 WARN；此后该 worker 没有上限 ⇒ 建箱一律**具名拒绝**，绝不无额度放行），**内核 = `max` ⇒ 采纳 +
 一行 WARN**（只比 `cpu.max`/`memory.max` 两维；`pids.max` 的 `max` 是 k8s 实测形状、故意不比 ——
@@ -723,9 +730,9 @@ await sandbox.kill()
 | `E2B_MAX_TOTAL_DISK_MB` | `10240` | 车队磁盘上限，**保持显式**（共享卷上 Σ 会重复计数）；`0` = 该维度不设限 |
 | `E2B_MAX_TOTAL_PROCESSES` | **不设（推导）** | 车队进程上限，**可选覆盖**：不设/`0` = Σ 已注册健康节点的 `totalProcesses` |
 | `E2B_NODE_MEMORY_MB` / `_CPU_PERCENT` / `_PROCESSES` / `_DISK_MB` | 空（回落宿主探测） | **每节点容量**（worker 报的 `total_*`）：内存/进程 = `min(容器 cgroup 限额, env)`，**CPU = env（可超卖内核）**，磁盘 = env（无内核口径）—— 见 `envd_service/agent.py::_node_resources` |
-| `E2B_MAX_SANDBOX_CPU_PERCENT` | 跟随节点总量（k8s **控制面**基线 `200`，k0s 覆盖层 `400`） | 每沙箱 CPU 上限（**控制面的策略**，R17；由控制面下发，worker 不读它）；未设/`<=0` ⇒ 跟随控制面的 `E2B_MAX_TOTAL_CPU_PERCENT`（现在通常不设 ⇒ 再退到创建时的 `E2B_DEFAULT_*`）|
-| `E2B_MAX_SANDBOX_MEMORY_MB` | 跟随节点总量（k8s `2048`，k0s `4096`） | 每沙箱内存上限（MiB），也就是沙箱 `memory.high`/`memory.max` 的上界；同样由控制面下发 |
-| `E2B_MAX_SANDBOX_PROCESSES` | 跟随节点总量（k8s `256`，k0s `1024`） | 每沙箱任务数上限（= `pids.max` 的上界）；同样由控制面下发 |
+| `E2B_MAX_SANDBOX_CPU_PERCENT` | 跟随该节点总量（k8s **控制面**基线 `200`，k0s 覆盖层 `400`） | 每沙箱 CPU 上限（**控制面的策略**，R17；由控制面下发，worker 不读它）；未设/`<=0` ⇒ 跟随**报这个总量的那个节点**的总量（`register`/`heartbeat` 里的 `totalCPUPercent`），节点也没报才退到创建时的 `E2B_DEFAULT_*`（Task 10：解析按节点、在盖章那一刻做，不是构造期一次）|
+| `E2B_MAX_SANDBOX_MEMORY_MB` | 跟随该节点总量（k8s `2048`，k0s `4096`） | 每沙箱内存上限（MiB），也就是沙箱 `memory.high`/`memory.max` 的上界；同样由控制面下发（按节点解析，见上一行） |
+| `E2B_MAX_SANDBOX_PROCESSES` | 跟随该节点总量（k8s `256`，k0s `1024`） | 每沙箱任务数上限（= `pids.max` 的上界）；同样由控制面下发（按节点解析，见上一行） |
 | `E2B_CGROUP_EVENTS_INTERVAL_S` | `5` | worker 扫每箱 `memory.events`/`pids.events` 的间隔（秒）；`0` 关周期扫，收尾那次读照常 |
 | `E2B_ENABLE_NETWORK` | `false` | 是否允许网络 |
 | `E2B_LOG_LEVEL` | `INFO` | 日志级别 |

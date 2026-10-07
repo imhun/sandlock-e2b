@@ -21,8 +21,9 @@ answers:
 
 The ceilings come from the node record the create lands on: in most cases that
 is the in-process ``local://`` node, whose row carries the control plane's own
-resolution (``E2B_MAX_SANDBOX_*`` -> ``E2B_MAX_TOTAL_*`` -> ``E2B_DEFAULT_*``),
-and in the last two a hand-built registry, because the rule is about the record
+resolution (``E2B_MAX_SANDBOX_*`` -> **that node's own total** ->
+``E2B_DEFAULT_*``, per node and at stamping time -- Task 10), and in the last
+two a hand-built registry, because the rule is about the record
 and not about which kind of node it describes. A remote node's row gets the
 **same** three numbers: ruling R17 (2026-10-07) made the ceiling the control
 plane's policy, so the internal API stamps it into every node record at
@@ -163,6 +164,46 @@ async def test_a_size_exactly_at_the_ceiling_is_allowed(make_apps):
 
 
 # ------------------------------------------------------------- the ceilings
+
+
+async def test_without_the_trio_a_create_above_the_create_default_is_admitted(
+    make_apps, monkeypatch
+) -> None:
+    """Task 10: with no trio the ceiling follows the node's own total, so a
+    create larger than the *create* default is the node's business.
+
+    This is the bare shape -- no ``E2B_MAX_SANDBOX_*``, no ``E2B_MAX_TOTAL_*``
+    (a bare ``python -m control_plane``, the SDK test-runner, an embedder). Its
+    in-process node's own totals are ``IN_PROCESS_NODE_DEFAULT_TOTALS`` (8192
+    MiB / 400% / 2048), so ``memoryMB: 2048`` fits with room to spare -- before
+    the fix the ceiling silently resolved to ``E2B_DEFAULT_MEMORY_MB`` (1024)
+    and this same create was refused with a named 400.
+    """
+    for name in (
+        "E2B_MAX_SANDBOX_CPU_PERCENT",
+        "E2B_MAX_SANDBOX_MEMORY_MB",
+        "E2B_MAX_SANDBOX_PROCESSES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    control, _envd = make_apps(
+        control_settings=_settings(
+            max_total_memory_mb=0,
+            max_total_cpu_percent=0,
+            max_total_processes=0,
+        )
+    )
+    local = control.state.nodes.get("local")
+    assert local.sandbox_cpu_percent_max == 400
+    assert local.sandbox_memory_mb_max == 8192
+    assert local.sandbox_processes_max == 2048
+
+    async with _client(control) as client:
+        resp = await _create(client, memoryMB=2048)
+        assert resp.status_code == 201
+        sandbox_id = resp.json()["sandboxID"]
+
+    assert control.state.registry.get(sandbox_id).memory_mb == 2048
+    assert local.reserved_memory_mb == 2048
 
 
 async def test_a_size_above_the_target_nodes_ceiling_is_a_named_400(make_apps):

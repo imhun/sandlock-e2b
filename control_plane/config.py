@@ -248,21 +248,19 @@ class Settings:
         default_factory=lambda: _env_int("E2B_MAX_TOTAL_PROCESSES", 0)
     )
     #: N83 phase 2 (D5): what ONE sandbox may be configured to -- the
-    #: per-sandbox **policy** ceiling, never the node. `0`/unset follows the
-    #: node's own total for the same dimension (``max_total_*`` above), and a
-    #: node that declared no total at all falls back to the per-sandbox create
-    #: default, so the resolved value is never 0: 0 would read downstream as
-    #: "one sandbox may take everything", the fail-open the plan's Review Focus
-    #: §1 names. Ruling R17 (2026-10-07) makes this **the** ceiling: it is the
-    #: control plane's policy, written into every node record and handed down to
-    #: every worker in the register/heartbeat response. The worker no longer
-    #: reads these names at all -- a create request's ``cpuCount``/``memoryMB``
-    #: is the *requirement*, and ``requirement <= ceiling`` is the whole rule.
-    #: The names come from `gateway_common.sandbox_ceiling` (the three
-    #: ``MAX_SANDBOX_*_ENV`` constants), so the Python side spells them once --
-    #: the manifests and the acceptance script still write the strings out
-    #: literally, which is what that module's constants cannot reach. The
-    #: resolution rule is `gateway_common.sandbox_ceiling.resolve_sandbox_ceiling`.
+    #: per-sandbox **policy** ceiling, never the node. These three fields mean
+    #: only "was it configured" (`0`/unset = no); the *resolution* happens per
+    #: node, when that node's record is stamped -- see
+    #: :meth:`sandbox_ceiling_for`. Ruling R17 (2026-10-07) makes this policy
+    #: **the** ceiling: the control plane writes the resolved number into every
+    #: node record and hands it down to every worker in the register/heartbeat
+    #: response. The worker no longer reads these names at all -- a create
+    #: request's ``cpuCount``/``memoryMB`` is the *requirement*, and
+    #: ``requirement <= ceiling`` is the whole rule. The names come from
+    #: `gateway_common.sandbox_ceiling` (the three ``MAX_SANDBOX_*_ENV``
+    #: constants), so the Python side spells them once -- the manifests and the
+    #: acceptance script still write the strings out literally, which is what
+    #: that module's constants cannot reach.
     max_sandbox_cpu_percent: int = field(
         default_factory=lambda: _env_int(MAX_SANDBOX_CPU_PERCENT_ENV, 0)
     )
@@ -729,27 +727,16 @@ class Settings:
         """
         if self.state_base is None:
             self.state_base = self.workspace_base
-        # N83 phase 2 (D5): the per-sandbox ceiling is resolved **here**, once,
-        # so every reader (the in-process ``local://`` node's record, a default
-        # view, a test) sees the same positive number instead of a raw env
-        # value that somebody else still has to interpret. An explicit value
-        # wins; `0`/unset follows the node's own total; a node that declared no
-        # total follows the per-sandbox create default -- never 0 (unlimited).
-        self.max_sandbox_cpu_percent = resolve_sandbox_ceiling(
-            configured=self.max_sandbox_cpu_percent,
-            node_total=self.max_total_cpu_percent,
-            create_default=self.default_cpu_percent,
-        )
-        self.max_sandbox_memory_mb = resolve_sandbox_ceiling(
-            configured=self.max_sandbox_memory_mb,
-            node_total=self.max_total_memory_mb,
-            create_default=self.default_memory_mb,
-        )
-        self.max_sandbox_processes = resolve_sandbox_ceiling(
-            configured=self.max_sandbox_processes,
-            node_total=self.max_total_processes,
-            create_default=self.default_max_processes,
-        )
+        # N83 phase 2 (D5): the per-sandbox ceiling is deliberately **not**
+        # resolved here. The middle rung of its rule is "the node's own total",
+        # and a construction-time resolution can only see the *fleet* total
+        # (``max_total_*``), which Task 9 made 0 by default ("derive from the
+        # nodes"). Reading that 0 as "no node total" skipped the rung and
+        # silently fell through to the create default on every shape that
+        # declares no ``E2B_MAX_SANDBOX_*`` -- a bare ``python -m
+        # control_plane``, the SDK test-runner, an embedder. The resolution
+        # lives in :meth:`sandbox_ceiling_for` and runs where a node record is
+        # stamped, against the totals that node reported.
         # N57: the trees' shared/not question, settled once. ``None`` means the
         # deployment did not name it, so it keeps the old answer -- which is
         # what makes the reslice a no-op for every deployment that has not been
@@ -772,6 +759,48 @@ class Settings:
         }
         self.tenant_rate_limits = {
             str(t): int(v) for t, v in (self.tenant_rate_limits or {}).items()
+        }
+
+    def sandbox_ceiling_for(
+        self,
+        *,
+        node_total_cpu_percent: int,
+        node_total_memory_mb: int,
+        node_total_processes: int,
+    ) -> dict[str, int]:
+        """One node's per-sandbox policy ceiling, given that node's totals.
+
+        N83 phase 2 (D5): an explicit ``E2B_MAX_SANDBOX_*`` wins; else the
+        **node's own total** for the same dimension; else the per-sandbox
+        create default (``E2B_DEFAULT_*``) -- never ``0``, which downstream
+        would read as "one sandbox may take everything" (see
+        :func:`gateway_common.sandbox_ceiling.resolve_sandbox_ceiling`, the
+        rule's one owner).
+
+        The caller supplies the totals because only it has them: the internal
+        API reads them from the worker's register/heartbeat body (and, on a
+        beat, from the node record they were last written to), and
+        :mod:`control_plane.app` reads the in-process node's own row. That is
+        also why this is a method and not a ``__post_init__`` step -- see the
+        comment there. The three ``max_sandbox_*`` settings only say whether a
+        value was configured; nothing keeps a resolved copy.
+        """
+        return {
+            "cpuPercent": resolve_sandbox_ceiling(
+                configured=self.max_sandbox_cpu_percent,
+                node_total=node_total_cpu_percent,
+                create_default=self.default_cpu_percent,
+            ),
+            "memoryMB": resolve_sandbox_ceiling(
+                configured=self.max_sandbox_memory_mb,
+                node_total=node_total_memory_mb,
+                create_default=self.default_memory_mb,
+            ),
+            "processes": resolve_sandbox_ceiling(
+                configured=self.max_sandbox_processes,
+                node_total=node_total_processes,
+                create_default=self.default_max_processes,
+            ),
         }
 
     @property

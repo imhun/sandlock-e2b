@@ -417,19 +417,44 @@ def test_a_separated_control_plane_never_wires_an_agent(tmp_path, monkeypatch):
 # ------------------------------------- its per-sandbox ceiling (N83 phase 2)
 
 
-def test_the_local_nodes_row_carries_the_control_planes_own_ceiling(tmp_path):
-    """N83 phase 2 (D5/D6): the in-process node has no heartbeat to carry a
-    per-sandbox ceiling, so its row carries the control plane's own resolution
-    (``E2B_MAX_SANDBOX_*`` -> ``E2B_MAX_TOTAL_*`` -> ``E2B_DEFAULT_*``) -- and
-    that row is what a create is checked against, not a second copy of the
-    number kept somewhere else."""
+def test_the_local_nodes_row_carries_the_ceiling_resolved_for_its_own_total(
+    tmp_path, monkeypatch
+):
+    """N83 phase 2 (D5/D6, Task 10): the in-process node has no heartbeat to
+    carry a per-sandbox ceiling, so its row carries the resolution *for this
+    node* (``E2B_MAX_SANDBOX_*`` -> **this node's total** -> ``E2B_DEFAULT_*``)
+    -- and that row is what a create is checked against, not a second copy of
+    the number kept somewhere else.
+
+    With neither the trio nor a total named, "this node's total" is
+    ``IN_PROCESS_NODE_DEFAULT_TOTALS`` (the `local://` row has nothing else to
+    derive from), **not** the create default: the ceiling is 8 GiB here, not
+    the 1024 MiB ``E2B_DEFAULT_MEMORY_MB``.
+    """
+    for name in (
+        "E2B_MAX_SANDBOX_CPU_PERCENT",
+        "E2B_MAX_SANDBOX_MEMORY_MB",
+        "E2B_MAX_SANDBOX_PROCESSES",
+        "E2B_MAX_TOTAL_CPU_PERCENT",
+        "E2B_MAX_TOTAL_MEMORY_MB",
+        "E2B_MAX_TOTAL_PROCESSES",
+    ):
+        monkeypatch.delenv(name, raising=False)
     app = _create_control_app(tmp_path, enable_local_node=True)
     local = app.state.nodes.get("local")
     settings = app.state.settings
 
-    assert local.sandbox_cpu_percent_max == settings.max_sandbox_cpu_percent
-    assert local.sandbox_memory_mb_max == settings.max_sandbox_memory_mb
-    assert local.sandbox_processes_max == settings.max_sandbox_processes
+    assert local.total_cpu_percent == 400
+    assert local.total_memory_mb == 8192
+    assert local.total_processes == 2048
+    assert local.sandbox_cpu_percent_max == local.total_cpu_percent
+    assert local.sandbox_memory_mb_max == local.total_memory_mb
+    assert local.sandbox_processes_max == local.total_processes
+    # ...and not the per-sandbox create defaults, which are the fallback only
+    # for a node that declared no total at all.
+    assert local.sandbox_cpu_percent_max != settings.default_cpu_percent
+    assert local.sandbox_memory_mb_max != settings.default_memory_mb
+    assert local.sandbox_processes_max != settings.default_max_processes
 
 
 async def test_a_create_is_refused_by_the_local_nodes_own_ceiling(

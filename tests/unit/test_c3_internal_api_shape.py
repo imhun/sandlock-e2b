@@ -884,8 +884,9 @@ def test_no_agent_client_refuses_the_delegation_by_name(workspace) -> None:
 # D5: the ceiling a *single* sandbox may be configured to is a configured
 # policy (``E2B_MAX_SANDBOX_*``) that defaults to the corresponding node total
 # -- never 0 and never infinity. Ruling R17 (2026-10-07) makes that policy the
-# **control plane's**: its ``Settings`` resolve it once, the internal API writes
-# it into every node record and returns it in the register/heartbeat **response**
+# **control plane's**: it resolves the policy per node (``Settings
+# .sandbox_ceiling_for``, called where that node's record is stamped), writes it
+# into every node record and returns it in the register/heartbeat **response**
 # (the hand-down a worker adopts), and a worker's own report of the same three
 # names is ignored. What a worker still reports is the *physical* half -- the
 # kernel's own limits on its container cgroup (``null`` = no limit), under
@@ -931,88 +932,313 @@ async def _internal_node_view(app, *, key: str = FLEET):
         return await client.get("/internal/nodes", headers={"X-Internal-Key": key})
 
 
-def test_the_control_plane_ceiling_defaults_to_the_node_total(
-    monkeypatch,
-) -> None:
-    """① unset ⇒ the node's own total. Never 0 ("unlimited"), never infinity."""
-    for name in _CEILING_ENVS:
-        monkeypatch.delenv(name, raising=False)
-    settings = ControlSettings(
-        api_keys=("local-key",),
-        internal_api_key=FLEET,
-        max_total_memory_mb=8192,
-        max_total_cpu_percent=400,
-        max_total_processes=2048,
-    )
+def _declared_no_trio(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the three ``E2B_MAX_SANDBOX_*``: the shape Task 10 is about.
 
-    assert settings.max_sandbox_cpu_percent == 400
-    assert settings.max_sandbox_memory_mb == 8192
-    assert settings.max_sandbox_processes == 2048
-
-
-def test_a_non_positive_control_plane_ceiling_follows_the_node_total(
-    monkeypatch,
-) -> None:
-    """``0``/negative is not "unlimited" here: it follows the node total."""
-    monkeypatch.setenv("E2B_MAX_SANDBOX_CPU_PERCENT", "0")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "-1")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_PROCESSES", "0")
-    settings = ControlSettings(
-        api_keys=("local-key",),
-        internal_api_key=FLEET,
-        max_total_memory_mb=8192,
-        max_total_cpu_percent=400,
-        max_total_processes=2048,
-    )
-
-    assert settings.max_sandbox_cpu_percent == 400
-    assert settings.max_sandbox_memory_mb == 8192
-    assert settings.max_sandbox_processes == 2048
-
-
-def test_the_control_plane_ceiling_is_never_zero(monkeypatch) -> None:
-    """Even a node that declared no total gets a positive per-sandbox ceiling.
-
-    ``0`` on this field would read downstream as "one sandbox may take
-    everything" -- the fail-open the plan's Review Focus §1 names. With no
-    declared node total the create default is the only positive signal left.
+    A bare ``python -m control_plane``, the SDK test-runner and the embedded
+    shapes declare none of them, so the per-sandbox ceiling has to come from
+    somewhere else -- the node that reports.
     """
     for name in _CEILING_ENVS:
         monkeypatch.delenv(name, raising=False)
-    settings = ControlSettings(
-        api_keys=("local-key",),
-        internal_api_key=FLEET,
+
+
+#: That same shape's ``Settings``: ``E2B_MAX_TOTAL_*`` are 0 too ("derive",
+#: Task 9), and the create defaults are deliberately distinctive so a silent
+#: fall-through to them is visible in the numbers.
+def _bare_ceiling_settings(**overrides) -> ControlSettings:
+    defaults = dict(
         max_total_memory_mb=0,
         max_total_cpu_percent=0,
         max_total_processes=0,
-        default_cpu_percent=100,
-        default_memory_mb=1024,
-        default_max_processes=256,
+        default_cpu_percent=50,
+        default_memory_mb=777,
+        default_max_processes=99,
     )
-
-    assert settings.max_sandbox_cpu_percent == 100
-    assert settings.max_sandbox_memory_mb == 1024
-    assert settings.max_sandbox_processes == 256
+    defaults.update(overrides)
+    return _delegation_settings(**defaults)
 
 
-def test_an_explicit_control_plane_ceiling_is_independent_of_the_node_total(
-    monkeypatch,
+def _node_totals(memory_mb: int, cpu_percent: int, processes: int) -> dict[str, int]:
+    """The totals a node reports about itself -- the register body's keys."""
+    return {
+        "totalMemoryMB": memory_mb,
+        "totalCPUPercent": cpu_percent,
+        "totalProcesses": processes,
+    }
+
+
+def test_the_hand_down_ceiling_follows_the_nodes_own_total(
+    workspace, monkeypatch
 ) -> None:
-    """② an explicit ceiling wins, however big the node is."""
-    monkeypatch.setenv("E2B_MAX_SANDBOX_CPU_PERCENT", "200")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "1024")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_PROCESSES", "64")
-    settings = ControlSettings(
-        api_keys=("local-key",),
-        internal_api_key=FLEET,
-        max_total_memory_mb=65536,
-        max_total_cpu_percent=1600,
-        max_total_processes=8192,
+    """① no trio ⇒ the ceiling is *this node's* total. Never 0, never infinity.
+
+    Task 10: resolving the ceiling once in ``Settings.__post_init__`` made this
+    shape fall through to the create default -- the control plane's own total is
+    0 there ("derive"), so the middle rung was skipped and a 2 GiB create was
+    refused with a named 400 against a 1024 MiB promise. The resolution now
+    happens where the node record is stamped, against the totals the node
+    reported.
+    """
+    _declared_no_trio(monkeypatch)
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent, settings=_bare_ceiling_settings())
+    expected = {"cpuPercent": 200, "memoryMB": 2048, "processes": 128}
+
+    registered = asyncio.run(
+        _register_node(
+            app,
+            body={
+                "nodeID": NODE_ID,
+                "address": NODE_ENDPOINT.address,
+                "totalDiskMB": 1024,
+                "workerUID": WORKER_UID,
+                "workerGID": WORKER_GID,
+                **_node_totals(2048, 200, 128),
+            },
+        )
+    )
+    assert registered.status_code == 200
+    assert registered.json() == {"nodeID": NODE_ID, "sandboxCeiling": expected}
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_cpu_percent_max == 200
+    assert record.sandbox_memory_mb_max == 2048
+    assert record.sandbox_processes_max == 128
+
+    # The hand-down rides every beat, and the number is the same one: the
+    # record's own totals are the resolution's only input.
+    beat = asyncio.run(_heartbeat_node(app, {"diskUsedMB": 4096}))
+    assert beat.status_code == 200
+    assert beat.json() == {"sandboxCeiling": expected}
+
+
+def test_a_ceiling_follows_its_nodes_total_when_that_total_changes(
+    workspace, monkeypatch
+) -> None:
+    """① again, across a change: the resolution is per node **and per beat**.
+
+    D5's middle rung is the node's own reported total, and a node's total can
+    change (a re-created container with a different ``memory.max``, a new
+    ``E2B_NODE_*``). The re-registration carries the new totals, so the answer
+    and the record move with them -- and every beat after it keeps the new
+    number, because the beat resolves against the record's totals.
+    """
+    _declared_no_trio(monkeypatch)
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent, settings=_bare_ceiling_settings())
+    small = {"cpuPercent": 100, "memoryMB": 1024, "processes": 64}
+    large = {"cpuPercent": 800, "memoryMB": 8192, "processes": 2048}
+
+    first = asyncio.run(
+        _register_node(
+            app,
+            body={
+                "nodeID": NODE_ID,
+                "address": NODE_ENDPOINT.address,
+                "totalDiskMB": 1024,
+                "workerUID": WORKER_UID,
+                "workerGID": WORKER_GID,
+                **_node_totals(1024, 100, 64),
+            },
+        )
+    )
+    assert first.status_code == 200
+    assert first.json() == {"nodeID": NODE_ID, "sandboxCeiling": small}
+
+    again = asyncio.run(
+        _register_node(
+            app,
+            body={
+                "nodeID": NODE_ID,
+                "address": NODE_ENDPOINT.address,
+                "totalDiskMB": 1024,
+                "workerUID": WORKER_UID,
+                "workerGID": WORKER_GID,
+                **_node_totals(8192, 800, 2048),
+            },
+        )
+    )
+    assert again.status_code == 200
+    assert again.json() == {"nodeID": NODE_ID, "sandboxCeiling": large}
+
+    beat = asyncio.run(_heartbeat_node(app, {"diskUsedMB": 4096}))
+    assert beat.status_code == 200
+    assert beat.json() == {"sandboxCeiling": large}
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_cpu_percent_max == 800
+    assert record.sandbox_memory_mb_max == 8192
+    assert record.sandbox_processes_max == 2048
+
+
+def test_a_node_that_reports_no_total_falls_to_the_create_default(
+    workspace, monkeypatch
+) -> None:
+    """② a node with no total of its own ⇒ the create default, and never 0.
+
+    The middle rung is the node's *own* report, not the control plane's fleet
+    total: ``E2B_MAX_TOTAL_*`` says how much the fleet may sell (and its 0 now
+    means "derive from the nodes"), so it is not a per-node promise. A node
+    that declares nothing leaves the create default as the only positive
+    signal -- never a ``0``, which downstream would read as "one sandbox may
+    take everything" (the plan's Review Focus §1).
+    """
+    _declared_no_trio(monkeypatch)
+    agent = _StubDelegateClient()
+    app = _delegation_app(
+        workspace,
+        client=agent,
+        settings=_bare_ceiling_settings(
+            max_total_memory_mb=8192, max_total_cpu_percent=400
+        ),
     )
 
-    assert settings.max_sandbox_cpu_percent == 200
-    assert settings.max_sandbox_memory_mb == 1024
-    assert settings.max_sandbox_processes == 64
+    registered = asyncio.run(
+        _register_node(
+            app,
+            body={
+                "nodeID": NODE_ID,
+                "address": NODE_ENDPOINT.address,
+                "totalDiskMB": 1024,
+                "workerUID": WORKER_UID,
+                "workerGID": WORKER_GID,
+                **_node_totals(0, 0, 0),
+            },
+        )
+    )
+    assert registered.status_code == 200
+    assert registered.json() == {
+        "nodeID": NODE_ID,
+        "sandboxCeiling": {"cpuPercent": 50, "memoryMB": 777, "processes": 99},
+    }
+    assert 0 not in registered.json()["sandboxCeiling"].values()
+
+
+def test_an_explicit_ceiling_wins_and_is_not_clamped_to_the_node(workspace) -> None:
+    """③ an explicit trio is handed down verbatim -- above the node total too.
+
+    The only clamp in this chain is D5b, on the *worker*: a handed-down ceiling
+    above that worker's kernel limit is refused there, by name. Clamping here
+    would turn a loud configuration error into a quieter, smaller promise.
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(
+        workspace,
+        client=agent,
+        settings=_delegation_settings(
+            max_sandbox_cpu_percent=1600,
+            max_sandbox_memory_mb=2048,
+            max_sandbox_processes=256,
+        ),
+    )
+
+    registered = asyncio.run(
+        _register_node(
+            app,
+            body={
+                "nodeID": NODE_ID,
+                "address": NODE_ENDPOINT.address,
+                "totalDiskMB": 1024,
+                "workerUID": WORKER_UID,
+                "workerGID": WORKER_GID,
+                # The node reports less than two of the three explicit values.
+                **_node_totals(1024, 800, 64),
+            },
+        )
+    )
+    assert registered.status_code == 200
+    assert registered.json() == {
+        "nodeID": NODE_ID,
+        "sandboxCeiling": {"cpuPercent": 1600, "memoryMB": 2048, "processes": 256},
+    }
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_cpu_percent_max == 1600
+    assert record.sandbox_memory_mb_max == 2048
+    assert record.sandbox_processes_max == 256
+
+
+#: A second node with its own address and credential, for the heterogeneous
+#: case below: D5 resolves per *node*, so two nodes may legitimately differ.
+NODE_B_ID = "node_b"
+KEY_NODE_B = "key-node-b"
+NODE_B_ENDPOINT = NodeEndpoint("http://10.0.0.2:49983", "10.0.0.2")
+
+
+async def _register_and_beat(
+    app, *, node_id: str, key: str, endpoint, totals: tuple[int, int, int]
+) -> tuple[httpx.Response, httpx.Response]:
+    """One node's registration and the heartbeat that follows it."""
+    async with _delegation_client(app, source_ip=endpoint.ip) as client:
+        registered = await client.post(
+            "/internal/nodes/register",
+            headers={"X-Internal-Key": key},
+            json={
+                "nodeID": node_id,
+                "address": endpoint.address,
+                "totalDiskMB": 1024,
+                "workerUID": WORKER_UID,
+                "workerGID": WORKER_GID,
+                **_node_totals(*totals),
+            },
+        )
+    async with _delegation_client(app, source_ip=endpoint.ip) as client:
+        beat = await client.post(
+            f"/internal/nodes/{node_id}/heartbeat",
+            headers={"X-Internal-Key": key},
+            json={"diskUsedMB": 1024},
+        )
+    return registered, beat
+
+
+def test_a_heterogeneous_fleet_gets_its_own_ceiling_per_node(
+    workspace, monkeypatch
+) -> None:
+    """⑤ per node and per beat: two nodes with different totals keep their own.
+
+    With no trio declared, each node's ceiling is resolved from *its own*
+    totals, so a fleet of unequal nodes hands down unequal ceilings (each no
+    larger than its own total) and each record keeps the number its node was
+    handed. The two answers differing is the point, not a leak: R17 makes the
+    ceiling the control plane's policy, and D5 resolves that policy against the
+    node it is stamped on.
+    """
+    _declared_no_trio(monkeypatch)
+    settings = _delegation_settings(
+        internal_node_keys={KEY_NODE: NODE_ID, KEY_NODE_B: NODE_B_ID}
+    )
+    app = create_control_app(
+        settings=settings,
+        registry=SandboxRegistry(settings),
+        nodes_registry=NodeRegistry(heartbeat_timeout=600.0),
+        workspace_base=workspace,
+        node_address_resolver=StaticAddressResolver(
+            {NODE_ID: NODE_ENDPOINT, NODE_B_ID: NODE_B_ENDPOINT}
+        ),
+        c3_agent_client=_StubDelegateClient(),
+        worker_identity_source=StaticWorkerIdentitySource(
+            {NODE_ID: (WORKER_UID, WORKER_GID), NODE_B_ID: (WORKER_UID, WORKER_GID)}
+        ),
+    )
+    small = {"cpuPercent": 100, "memoryMB": 1024, "processes": 64}
+    large = {"cpuPercent": 800, "memoryMB": 8192, "processes": 2048}
+    nodes = (
+        (NODE_ID, KEY_NODE, NODE_ENDPOINT, (1024, 100, 64), small),
+        (NODE_B_ID, KEY_NODE_B, NODE_B_ENDPOINT, (8192, 800, 2048), large),
+    )
+
+    for node_id, key, endpoint, totals, expected in nodes:
+        registered, beat = asyncio.run(
+            _register_and_beat(app, node_id=node_id, key=key, endpoint=endpoint, totals=totals)
+        )
+        assert registered.status_code == 200
+        assert registered.json() == {"nodeID": node_id, "sandboxCeiling": expected}
+        # Each node's own heartbeat repeats only its own number.
+        assert beat.status_code == 200
+        assert beat.json() == {"sandboxCeiling": expected}
+
+    assert app.state.nodes.get(NODE_ID).sandbox_memory_mb_max == 1024
+    assert app.state.nodes.get(NODE_B_ID).sandbox_memory_mb_max == 8192
+    assert app.state.nodes.get(NODE_ID).sandbox_processes_max == 64
+    assert app.state.nodes.get(NODE_B_ID).sandbox_processes_max == 2048
 
 
 #: A control plane whose own policy is the 2-core/2 GiB pair above, so the

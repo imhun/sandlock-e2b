@@ -182,8 +182,14 @@ def _worker_container_id(body: dict[str, Any]) -> str | None:
     return value
 
 
-def _control_plane_ceiling(settings) -> dict[str, int]:
-    """This control plane's own per-sandbox policy ceiling (N83 phase 2 / R17).
+def _control_plane_ceiling(
+    settings,
+    *,
+    node_total_cpu_percent: int,
+    node_total_memory_mb: int,
+    node_total_processes: int,
+) -> dict[str, int]:
+    """One node's per-sandbox policy ceiling (N83 phase 2 / R17 + D5).
 
     Ruling R17: the ceiling a *single* sandbox may be configured to is the
     **control plane's** policy -- one deployment fact, handed **down** to every
@@ -194,18 +200,24 @@ def _control_plane_ceiling(settings) -> dict[str, int]:
     the same three keys grants nothing and is ignored (see
     :func:`_kernel_ceiling_fields`).
 
-    ``Settings`` resolves the three fields once, in ``__post_init__`` (explicit
-    ``E2B_MAX_SANDBOX_*`` -> the node total -> the per-sandbox create default),
-    so the values are always positive: ``0`` would read downstream as "one
-    sandbox may take everything", the fail-open the plan's Review Focus §1
-    names. Handed down on every lane, ``E2B_SANDBOX_CGROUP=off`` included,
-    because it is a policy and not a kernel fact.
+    D5's middle rung is *the node's own total*, so the resolution is per node
+    and per beat (``Settings.sandbox_ceiling_for``): explicit
+    ``E2B_MAX_SANDBOX_*`` -> ``node_total`` -> the per-sandbox create default.
+    The totals come from the very request that is being answered -- the
+    worker's register body, or, on a heartbeat, the record those totals were
+    last written to -- which is what makes a node whose capacity changes get a
+    ceiling that follows it, and what keeps this shape (no trio declared, no
+    ``E2B_MAX_TOTAL_*`` either) from silently resolving to the create default.
+    The result is always positive: ``0`` would read downstream as "one sandbox
+    may take everything", the fail-open the plan's Review Focus §1 names.
+    Handed down on every lane, ``E2B_SANDBOX_CGROUP=off`` included, because it
+    is a policy and not a kernel fact.
     """
-    return {
-        "cpuPercent": int(settings.max_sandbox_cpu_percent),
-        "memoryMB": int(settings.max_sandbox_memory_mb),
-        "processes": int(settings.max_sandbox_processes),
-    }
+    return settings.sandbox_ceiling_for(
+        node_total_cpu_percent=node_total_cpu_percent,
+        node_total_memory_mb=node_total_memory_mb,
+        node_total_processes=node_total_processes,
+    )
 
 
 def _kernel_ceiling_fields(body: dict[str, Any]) -> dict[str, Any] | None:
@@ -692,38 +704,53 @@ async def register_node(request: Request) -> dict[str, Any]:
     # plane's own, and the worker's body only contributes the *kernel* half.
     # Both are written here, at registration, so every node's row carries the
     # deployment's policy from the moment it joins.
+    totals = {
+        "memory_mb": int(body.get("totalMemoryMB", 0)),
+        "cpu_percent": int(body.get("totalCPUPercent", 0)),
+        "disk_mb": int(body.get("totalDiskMB", 0)),
+        "processes": int(body.get("totalProcesses", 0)),
+    }
+    # Task 10 / D5: one resolution per request, and the *same* dict is both the
+    # answer and the record's policy half -- the hand-down and the stored
+    # promise are one number or they are a bug.
+    ceiling = _control_plane_ceiling(
+        request.app.state.settings,
+        node_total_cpu_percent=totals["cpu_percent"],
+        node_total_memory_mb=totals["memory_mb"],
+        node_total_processes=totals["processes"],
+    )
     record = request.app.state.nodes.register(
         node_id=node_id,
         address=address,
-        total_memory_mb=int(body.get("totalMemoryMB", 0)),
-        total_cpu_percent=int(body.get("totalCPUPercent", 0)),
-        total_disk_mb=int(body.get("totalDiskMB", 0)),
-        total_processes=int(body.get("totalProcesses", 0)),
+        total_memory_mb=totals["memory_mb"],
+        total_cpu_percent=totals["cpu_percent"],
+        total_disk_mb=totals["disk_mb"],
+        total_processes=totals["processes"],
         images=body.get("images") or [],
         labels=body.get("labels") or {},
         pid_namespace=pid_namespace,
         container_id=container_id,
         worker_uid=worker_uid,
         worker_gid=worker_gid,
-        sandbox_ceiling=_ceiling_to_store(request, body),
+        sandbox_ceiling=_ceiling_to_store(ceiling, body),
     )
     _rebuild_node_reservations(request, record)
-    return {
-        "nodeID": record.node_id,
-        "sandboxCeiling": _control_plane_ceiling(request.app.state.settings),
-    }
+    return {"nodeID": record.node_id, "sandboxCeiling": ceiling}
 
 
-def _ceiling_to_store(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+def _ceiling_to_store(
+    policy: dict[str, int], body: dict[str, Any]
+) -> dict[str, Any]:
     """The ceiling one node record gets: the control plane's policy + the
     worker's kernel read (N83 phase 2 / R17).
 
-    The policy triple always comes from this control plane's ``Settings``;
-    the kernel pair is added only when the worker actually reported it, so a
-    heartbeat without one leaves the stored reading alone (the "older worker
-    during a rollout" rule the identity fields follow too).
+    ``policy`` is the triple :func:`_control_plane_ceiling` already resolved
+    for **this** node (never a second, differently-aged copy); the kernel pair
+    is added only when the worker actually reported it, so a heartbeat without
+    one leaves the stored reading alone (the "older worker during a rollout"
+    rule the identity fields follow too).
     """
-    ceiling: dict[str, Any] = dict(_control_plane_ceiling(request.app.state.settings))
+    ceiling: dict[str, Any] = dict(policy)
     kernel = _kernel_ceiling_fields(body)
     if kernel is not None:
         ceiling.update(kernel)
@@ -834,7 +861,18 @@ async def node_heartbeat(node_id: str, request: Request) -> dict[str, Any]:
     # worker, through the response below) without a full re-registration; the
     # *kernel* half is the worker's report, and a beat that carries none leaves
     # the stored reading alone (see ``_kernel_ceiling_fields``).
-    record.apply_sandbox_ceiling(_ceiling_to_store(request, body))
+    #
+    # Task 10 / D5: the policy is resolved against the totals on *this node's
+    # record* -- written at registration, where the worker reported them -- so
+    # a node whose capacity changed gets a ceiling that follows it on the next
+    # beat, and the hand-down below is the same dict that was just stored.
+    ceiling = _control_plane_ceiling(
+        request.app.state.settings,
+        node_total_cpu_percent=record.total_cpu_percent,
+        node_total_memory_mb=record.total_memory_mb,
+        node_total_processes=record.total_processes,
+    )
+    record.apply_sandbox_ceiling(_ceiling_to_store(ceiling, body))
     # N83 phase 2 (Task 5): the kernel's per-sandbox count of what phase 2's two
     # new endings did -- a SIGKILL past ``memory.max``, an ``EAGAIN`` past
     # ``pids.max``. The record keeps the maximum per sandbox and counter and
@@ -888,7 +926,7 @@ async def node_heartbeat(node_id: str, request: Request) -> dict[str, Any]:
     # cgroup handle. A worker that reaches no control plane -- or one that
     # answers without this field -- has no ceiling, and every create on that
     # worker is refused **by name** rather than run unbounded.
-    return {"sandboxCeiling": _control_plane_ceiling(request.app.state.settings)}
+    return {"sandboxCeiling": ceiling}
 
 
 async def _enforce_disk_reports(

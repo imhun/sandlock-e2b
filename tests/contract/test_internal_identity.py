@@ -72,6 +72,12 @@ def _settings(**overrides) -> ControlSettings:
         max_total_cpu_percent=0,
         max_total_disk_mb=0,
         max_total_processes=0,
+        # The per-sandbox ceiling is resolved against the *node's* own report
+        # (N83 phase 2 / D5), so this file declares none: what a node is handed
+        # down is read off the totals ``_register`` below reports.
+        max_sandbox_cpu_percent=0,
+        max_sandbox_memory_mb=0,
+        max_sandbox_processes=0,
     )
     defaults.update(overrides)
     return ControlSettings(**defaults)
@@ -81,21 +87,34 @@ def _endpoints(**extra) -> dict[str, NodeEndpoint]:
     return {"node_a": ENDPOINT_A, "node_b": ENDPOINT_B, **extra}
 
 
-def _register_body(settings: ControlSettings, node_id: str) -> dict:
+#: The totals every registration in this file reports, and so the node totals
+#: its per-sandbox ceiling is resolved against (N83 phase 2 / D5). One literal,
+#: used by both the request builder below and the expected answer: the two
+#: cannot drift apart.
+REGISTER_TOTALS = {
+    "totalMemoryMB": 1024,
+    "totalCPUPercent": 100,
+    "totalProcesses": 64,
+}
+
+
+def _register_body(node_id: str) -> dict:
     """The registration **answer**: the node id plus the handed-down ceiling.
 
     N83 phase 2 / ruling R17: the control plane returns its own resolved
     per-sandbox policy ceiling with every register/heartbeat answer, so a
-    registration is no longer a bare ``{"nodeID": ...}``. The values are read
-    off the same ``Settings`` the control plane resolved them from, which is
-    what makes this an exact assertion and not a partial one.
+    registration is no longer a bare ``{"nodeID": ...}``. With no
+    ``E2B_MAX_SANDBOX_*`` declared (``_settings``) the resolution follows the
+    node's own reported totals, so the three numbers below are
+    ``REGISTER_TOTALS`` -- spelled out, which is what makes this an exact
+    assertion and not a partial one.
     """
     return {
         "nodeID": node_id,
         "sandboxCeiling": {
-            "cpuPercent": settings.max_sandbox_cpu_percent,
-            "memoryMB": settings.max_sandbox_memory_mb,
-            "processes": settings.max_sandbox_processes,
+            "cpuPercent": REGISTER_TOTALS["totalCPUPercent"],
+            "memoryMB": REGISTER_TOTALS["totalMemoryMB"],
+            "processes": REGISTER_TOTALS["totalProcesses"],
         },
     }
 
@@ -135,10 +154,8 @@ async def _register(client, *, key: str, node_id: str, address: str):
         json={
             "nodeID": node_id,
             "address": address,
-            "totalMemoryMB": 1024,
-            "totalCPUPercent": 100,
             "totalDiskMB": 1024,
-            "totalProcesses": 64,
+            **REGISTER_TOTALS,
         },
     )
 
@@ -260,7 +277,7 @@ async def test_node_bs_key_from_node_as_network_position_is_rejected(
             address="http://192.168.1.1:49983",  # ignored: resolver wins
         )
         assert ok.status_code == 200
-        assert ok.json() == _register_body(app.state.settings, "node_b")
+        assert ok.json() == _register_body("node_b")
     assert nodes.get("node_b").address == ENDPOINT_B.address
 
     async with _client(app, source_ip=ENDPOINT_A.ip) as client:
@@ -373,7 +390,7 @@ async def test_registration_derives_the_address_from_the_resolver(workspace) -> 
             client, key=KEY_A, node_id="node_a", address="http://evil.example:1"
         )
         assert resp.status_code == 200
-        assert resp.json() == _register_body(app.state.settings, "node_a")
+        assert resp.json() == _register_body("node_a")
     assert nodes.get("node_a").address == ENDPOINT_A.address
 
 
@@ -521,7 +538,7 @@ async def test_a_fleet_key_is_accepted_only_from_the_claims_resolved_address(
             address="http://evil.example:1",
         )
         assert ok.status_code == 200
-        assert ok.json() == _register_body(app.state.settings, "node_b")
+        assert ok.json() == _register_body("node_b")
     assert nodes.get("node_b").address == ENDPOINT_B.address
 
     async with _client(app, source_ip=ENDPOINT_A.ip) as client:

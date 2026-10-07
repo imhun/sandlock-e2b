@@ -802,38 +802,50 @@ def create_app(
         for tenant_id, limit in settings.tenant_rate_limits.items()
     }
     if settings.enable_local_node and app.state.nodes.get("local") is None:
-        app.state.nodes.add_local_node(
-            # N83 phase 2 / Task 9: the fleet ladder's three derivable
-            # dimensions no longer have a configured default, and this is the
-            # one node with nothing to derive from -- it *is* this process, with
-            # no worker report and no second container of its own. So its row
-            # keeps the numbers `E2B_MAX_TOTAL_*` used to default to, unless the
-            # deployment names them (then they win for this node too, exactly as
-            # an explicit override does for the fleet). See
-            # `IN_PROCESS_NODE_DEFAULT_TOTALS` for the full reasoning.
-            #
-            # Disk is passed through **verbatim**, with no `or` fallback: its
-            # `0` never changed meaning (`docs/env-vars.md`: 0 = that dimension
-            # is not policed), and this node is the one place that reads the
-            # field for its *own* row -- so `E2B_MAX_TOTAL_DISK_MB=0` must keep
-            # leaving this node's disk admission unpoliced, exactly as it did
-            # before Task 9. The three above take the fallback precisely because
-            # their 0 no longer means that.
-            total_memory_mb=settings.max_total_memory_mb
+        # N83 phase 2 / Task 9: the fleet ladder's three derivable dimensions no
+        # longer have a configured default, and this is the one node with
+        # nothing to derive from -- it *is* this process, with no worker report
+        # and no second container of its own. So its row keeps the numbers
+        # `E2B_MAX_TOTAL_*` used to default to, unless the deployment names them
+        # (then they win for this node too, exactly as an explicit override does
+        # for the fleet). See `IN_PROCESS_NODE_DEFAULT_TOTALS` for the full
+        # reasoning.
+        #
+        # Disk is passed through **verbatim**, with no `or` fallback: its `0`
+        # never changed meaning (`docs/env-vars.md`: 0 = that dimension is not
+        # policed), and this node is the one place that reads the field for its
+        # *own* row -- so `E2B_MAX_TOTAL_DISK_MB=0` must keep leaving this
+        # node's disk admission unpoliced, exactly as it did before Task 9. The
+        # three above take the fallback precisely because their 0 no longer
+        # means that.
+        local_totals = {
+            "memory_mb": settings.max_total_memory_mb
             or IN_PROCESS_NODE_DEFAULT_TOTALS["memory_mb"],
-            total_cpu_percent=settings.max_total_cpu_percent
+            "cpu_percent": settings.max_total_cpu_percent
             or IN_PROCESS_NODE_DEFAULT_TOTALS["cpu_percent"],
-            total_disk_mb=settings.max_total_disk_mb,
-            total_processes=settings.max_total_processes
+            "processes": settings.max_total_processes
             or IN_PROCESS_NODE_DEFAULT_TOTALS["processes"],
-            # N83 phase 2 (D5, ruling R17): the per-sandbox ceiling is the
-            # control plane's own policy, so the in-process node and a remote
-            # node's row carry the *same* three numbers -- this one straight
-            # from ``Settings``, a remote one stamped by the internal API on
-            # every register/heartbeat (``control_plane.api.internal``).
-            sandbox_cpu_percent_max=settings.max_sandbox_cpu_percent,
-            sandbox_memory_mb_max=settings.max_sandbox_memory_mb,
-            sandbox_processes_max=settings.max_sandbox_processes,
+        }
+        # N83 phase 2 (D5, ruling R17): the per-sandbox ceiling is the control
+        # plane's own policy, and D5 resolves it against the node it is stamped
+        # on -- here that is this row's own totals, which is why it is resolved
+        # *with* them rather than from ``Settings.__post_init__`` (whose view of
+        # the totals is the fleet's, and 0 by default since Task 9). A remote
+        # node's row is stamped the same way, by the internal API on every
+        # register/heartbeat (``control_plane.api.internal``).
+        local_ceiling = settings.sandbox_ceiling_for(
+            node_total_cpu_percent=local_totals["cpu_percent"],
+            node_total_memory_mb=local_totals["memory_mb"],
+            node_total_processes=local_totals["processes"],
+        )
+        app.state.nodes.add_local_node(
+            total_memory_mb=local_totals["memory_mb"],
+            total_cpu_percent=local_totals["cpu_percent"],
+            total_disk_mb=settings.max_total_disk_mb,
+            total_processes=local_totals["processes"],
+            sandbox_cpu_percent_max=local_ceiling["cpuPercent"],
+            sandbox_memory_mb_max=local_ceiling["memoryMB"],
+            sandbox_processes_max=local_ceiling["processes"],
         )
     app.state.select_node = app.state.nodes.select_and_reserve
     # The autoscaler, when this deployment hosts it (the k8s shape): built
