@@ -235,23 +235,160 @@ def _require_internal_key(request: Request, settings: Settings) -> None:
         raise PermissionError("Unauthorized")
 
 
-def _node_memory_mb(settings: Settings) -> int:
-    """``E2B_NODE_MEMORY_MB``, else this host's physical memory."""
-    memory_mb = int(os.getenv("E2B_NODE_MEMORY_MB", "0"))
-    if memory_mb <= 0:
-        try:
-            memory_mb = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
-        except (ValueError, OSError):
-            memory_mb = settings.default_memory_mb * 100
-    return memory_mb
+#: N83 phase 2 / Task 9 (the user's ruling, 2026-10-07: "cpu 可以超卖"). CPU is
+#: the one dimension this worker may sell **above** its container's own
+#: ``cpu.max``: a cgroup CPU quota is a *share*, so selling more of it costs
+#: contention and nothing else, and the kernel's quota stays the final
+#: throttle. The other two dimensions are the opposite and the difference is
+#: why the rule below is per dimension rather than one rule for the four:
+#: selling past the container's ``memory.max`` gets the **whole container**
+#: OOM-killed -- every compliant sandbox in it dies with the one that overran,
+#: and that is not any single sandbox's fault -- and ``pids.max`` is a hard
+#: task count. So memory and processes take the *smaller* of the two numbers,
+#: and the oversell that is allowed is loud: this line, once per distinct
+#: oversell, with both numbers in it, plus both numbers on the node record
+#: (``total_cpu_percent`` is what is sold, ``kernelCeiling.cpuPercent`` the
+#: physical fact -- see :func:`kernel_ceiling_payload`).
+CPU_OVERSELL_WARNING = (
+    "node capacity: E2B_NODE_CPU_PERCENT=%d is above this container's cpu.max "
+    "(%d%%) and is sold as-is on purpose: CPU is a share, so overselling it "
+    "only costs contention, and the kernel's cpu.max remains the final "
+    "throttle. Memory and processes are not sold this way -- this worker "
+    "reports the container's own limit for those, because a container sold "
+    "past memory.max is the one the kernel kills"
+)
+
+#: The last oversell this process warned about. A heartbeat is every 5 s, so a
+#: warning that fires on every beat is a warning nobody reads; the pair (what
+#: is sold, what the kernel allows) changes only when a redeploy changes it,
+#: and a *new* pair warns again.
+_cpu_oversell_warned_for: tuple[int, int] | None = None
 
 
-def _node_cpu_percent() -> int:
-    """``E2B_NODE_CPU_PERCENT``, else every core this host reports."""
-    cpu = int(os.getenv("E2B_NODE_CPU_PERCENT", "0"))
-    if cpu <= 0:
-        cpu = os.cpu_count() * 100 or 100
-    return cpu
+def _reset_cpu_oversell_warning() -> None:
+    """Forget the last oversell warning -- the one-shot latch's test seam."""
+    global _cpu_oversell_warned_for
+    _cpu_oversell_warned_for = None
+
+
+def _warn_cpu_oversell(sold: int, kernel_percent: int) -> None:
+    global _cpu_oversell_warned_for
+    pair = (sold, kernel_percent)
+    if _cpu_oversell_warned_for == pair:
+        return
+    _cpu_oversell_warned_for = pair
+    logger.warning(CPU_OVERSELL_WARNING, sold, kernel_percent)
+
+
+def _container_kernel_limits(settings: Settings) -> SandboxCeiling | None:
+    """This container's kernel limits, or ``None`` when we take no reading.
+
+    ``None`` is "no reading", which is **not** the same fact as a reading whose
+    fields are ``None``: the latter is a real answer -- "this container's
+    kernel sets no limit on that dimension", the compose lanes' measured shape,
+    where ``cpu.max``/``memory.max``/``pids.max`` all read ``max`` -- and the
+    per-dimension rules below treat the two differently (no reading falls back
+    to today's env/host numbers; a ``None`` field falls back to the env for
+    that dimension only).
+
+    Gated on the lane switch for the reason the plan pinned: with
+    ``E2B_SANDBOX_CGROUP=off`` this worker builds no sandbox cgroup and reads
+    none, so its node totals stay byte-for-byte what they were (``E2B_NODE_*``,
+    else host probing) -- a worker that has no cgroup business of its own does
+    not acquire some to report capacity with.
+
+    The read is best-effort *here* for the same reason the heartbeat's
+    ``kernelCeiling`` is: a node's totals must never be the reason a heartbeat
+    is lost (a heartbeat-less node has its live sandboxes reaped as orphans).
+    The read that has to be strict is the one behind an already-handed-down
+    policy (:func:`adopt_sandbox_ceiling`, D5b), and that one is unchanged.
+    """
+    from envd_service.route_b import sandbox_cgroup_mode
+
+    if sandbox_cgroup_mode(settings) == "off":
+        return None
+    mount = Path(getattr(settings, "cgroup_mount", "/pod-cgroup"))
+    try:
+        return read_kernel_ceiling(mount)
+    except (CgroupRefusal, OSError):
+        logger.debug(
+            "node capacity: cannot read this container's kernel limits at %s; "
+            "reporting the configured or probed node totals",
+            mount,
+        )
+        return None
+
+
+def _node_memory_mb(settings: Settings, kernel: SandboxCeiling | None) -> int:
+    """``E2B_NODE_MEMORY_MB`` and this container's ``memory.max``: the smaller.
+
+    Taking the *smaller* is the whole point of the dimension rule: the container
+    is what the kernel kills when a charge goes over, so a node that sells more
+    than its container has is selling something that does not exist and paying
+    for it with every sandbox in the worker. The kernel reading is the accurate
+    half on k8s, where the host probe below used to report the whole *node*;
+    the env stays the only half on the compose lanes (measured: no ``cpus``/
+    ``mem_limit``, so ``memory.max`` reads ``max``); and today's host probing
+    survives for the case where neither names a number.
+    """
+    configured = int(os.getenv("E2B_NODE_MEMORY_MB", "0"))
+    kernel_mb = None if kernel is None else kernel.memory_mb
+    candidates = [
+        value for value in (configured, kernel_mb) if value is not None and value > 0
+    ]
+    if candidates:
+        return min(candidates)
+    try:
+        return (
+            os.sysconf("SC_PHYS_PAGES")
+            * os.sysconf("SC_PAGE_SIZE")
+            // (1024 * 1024)
+        )
+    except (ValueError, OSError):
+        return settings.default_memory_mb * 100
+
+
+def _node_cpu_percent(kernel: SandboxCeiling | None) -> int:
+    """``E2B_NODE_CPU_PERCENT`` wins outright; then the kernel; then the host.
+
+    "Outright" includes *above* the container's ``cpu.max`` -- that is the
+    user's ruling and the one dimension where the two numbers are allowed to
+    disagree in that direction (:data:`CPU_OVERSELL_WARNING` says so once, and
+    both numbers ride the record). A deployment that names no CPU at all now
+    follows the kernel rather than ``os.cpu_count()``: inside a k8s pod that
+    count is the *node's* cores, which is the inaccuracy this task is about.
+    """
+    configured = int(os.getenv("E2B_NODE_CPU_PERCENT", "0"))
+    kernel_percent = None if kernel is None else kernel.cpu_percent
+    if configured > 0:
+        if kernel_percent is not None and configured > kernel_percent:
+            _warn_cpu_oversell(configured, kernel_percent)
+        return configured
+    if kernel_percent is not None:
+        return kernel_percent
+    return os.cpu_count() * 100 or 100
+
+
+def _node_processes(settings: Settings, kernel: SandboxCeiling | None) -> int:
+    """``E2B_NODE_PROCESSES`` and ``pids.max``: the smaller (see the memory rule).
+
+    Stated plainly rather than dressed up: **the derivation does not fire on
+    either shipped lane today.** ``pids.max`` is ``max`` on k8s and on all
+    three compose stacks (measured 2026-10-06, Phase 2 Task 1), so the process
+    dimension is still what ``E2B_NODE_PROCESSES`` says -- or, when that is
+    unset too, today's ``100 x`` one sandbox's default. The min-rule exists for
+    a deployment that really sets a pod ``pids`` limit, and it is the same rule
+    as memory because the failure is the same shape: a task count is a hard
+    count, not a share.
+    """
+    configured = int(os.getenv("E2B_NODE_PROCESSES", "0"))
+    kernel_tasks = None if kernel is None else kernel.processes
+    candidates = [
+        value for value in (configured, kernel_tasks) if value is not None and value > 0
+    ]
+    if candidates:
+        return min(candidates)
+    return settings.default_max_processes * 100
 
 
 def _node_disk_mb(settings: Settings) -> int:
@@ -265,21 +402,20 @@ def _node_disk_mb(settings: Settings) -> int:
     return disk
 
 
-def _node_processes(settings: Settings) -> int:
-    """``E2B_NODE_PROCESSES``, else 100x one sandbox's default task budget."""
-    processes = int(os.getenv("E2B_NODE_PROCESSES", "0"))
-    if processes <= 0:
-        processes = settings.default_max_processes * 100
-    return processes
-
-
 def _node_resources(settings: Settings) -> dict[str, int]:
-    """Report node capacity: explicit env overrides, else host probing."""
+    """Report node capacity: this container's limits, env overrides, host probe.
+
+    N83 phase 2 / Task 9. The kernel reading is taken once per call and used by
+    the two dimensions that have a rule for it; disk has no kernel reading at
+    all (there is no cgroup file for "how big is my filesystem") and keeps the
+    env/filesystem answer it always had.
+    """
+    kernel = _container_kernel_limits(settings)
     return {
-        "totalMemoryMB": _node_memory_mb(settings),
-        "totalCPUPercent": _node_cpu_percent(),
+        "totalMemoryMB": _node_memory_mb(settings, kernel),
+        "totalCPUPercent": _node_cpu_percent(kernel),
         "totalDiskMB": _node_disk_mb(settings),
-        "totalProcesses": _node_processes(settings),
+        "totalProcesses": _node_processes(settings, kernel),
     }
 
 

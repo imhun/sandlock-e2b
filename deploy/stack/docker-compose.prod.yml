@@ -336,10 +336,15 @@ services:
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE}
       E2B_TEMPLATE_IMAGES: ${E2B_TEMPLATE_IMAGES:-}
       E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-100}
-      E2B_MAX_TOTAL_MEMORY_MB: ${E2B_MAX_TOTAL_MEMORY_MB:-5120}
-      E2B_MAX_TOTAL_CPU_PERCENT: ${E2B_MAX_TOTAL_CPU_PERCENT:-400}
+      # N83 phase 2 / Task 9：车队的内存/CPU/进程总量由已注册健康节点的 `total_*`
+      # 求和推导（`SandboxRegistry._fleet_limits`），这三个 env 变成**可选覆盖**
+      # ——显式设正数就是"故意少卖"，不设 = 推导。这条车道的旧值本来就等于两个
+      # worker 的 Σ（4096×2 / 400×2 / 1024×2），推导后加点/多点 worker 都自动跟。
+      # E2B_MAX_TOTAL_MEMORY_MB: ${E2B_MAX_TOTAL_MEMORY_MB:-5120}
+      # E2B_MAX_TOTAL_CPU_PERCENT: ${E2B_MAX_TOTAL_CPU_PERCENT:-400}
+      # E2B_MAX_TOTAL_PROCESSES: ${E2B_MAX_TOTAL_PROCESSES:-1024}
+      # 磁盘保持显式（共享卷上 Σ 会重复计数）。
       E2B_MAX_TOTAL_DISK_MB: ${E2B_MAX_TOTAL_DISK_MB:-10240}
-      E2B_MAX_TOTAL_PROCESSES: ${E2B_MAX_TOTAL_PROCESSES:-1024}
       # N83 phase 2 / Task 1 + ruling R17: the per-sandbox ceiling is a
       # **control-plane** policy (the workers no longer declare these keys at
       # all). The control plane writes it into every node record and hands it

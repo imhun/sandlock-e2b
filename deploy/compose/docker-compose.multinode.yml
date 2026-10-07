@@ -289,12 +289,21 @@ services:
       # Whole-box semantics (M4 D6): max_processes is the per-sandbox
       # instance budget shared by every command and the MCP gateway, so the
       # default is 256 (fork's whole-box default), not the pre-M4 per-command
-      # 64. Node capacity math: E2B_MAX_TOTAL_PROCESSES / 256.
+      # 64.
       E2B_DEFAULT_MAX_PROCESSES: 256
-      E2B_MAX_TOTAL_MEMORY_MB: 8192
-      E2B_MAX_TOTAL_CPU_PERCENT: 400
+      # N83 phase 2 / Task 9（用户裁定：「max total 是不是没必要了，其实就是
+      # worker 的上限加一起，可以自动计算」）：车队的内存/CPU/进程总量由**已注册
+      # 健康节点的 `total_*` 求和**推导（`SandboxRegistry._fleet_limits`，用的
+      # 就是节点台账同一个数，两套账不可能漂移）。这三个 env 变成**可选覆盖**：
+      # 显式设正数 = 故意少卖；不设/0 = 推导。这条车道三个 worker 各 200%，Σ=600，
+      # 而旧写法写的 400 会把其中 200% 白白锁死。
+      # E2B_MAX_TOTAL_MEMORY_MB: 8192
+      # E2B_MAX_TOTAL_CPU_PERCENT: 400
+      # E2B_MAX_TOTAL_PROCESSES: 2048
+      # 磁盘**保持显式**：worker 报的是 workspace 那个文件系统的大小，共享卷上
+      # 每个节点报同一个数，Σ 会重复计数（`deploy/k8s/control-plane.yaml` 的
+      # `E2B_MAX_TOTAL_DISK_MB` 注释同源）。
       E2B_MAX_TOTAL_DISK_MB: 10240
-      E2B_MAX_TOTAL_PROCESSES: 2048
       # N83 phase 2 / Task 1 + ruling R17: 每箱上限是**控制面的策略**，写在这里
       # （worker 清单再也不声明这三个键）。控制面把它写进每个节点记录，并在每次
       # register/heartbeat 的**响应体**里下发；worker 采纳后再拿它跟本机内核读数

@@ -296,10 +296,15 @@ services:
       E2B_IMAGE_REGISTRY_PASSWORD: ${E2B_IMAGE_REGISTRY_PASSWORD:-}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}
       E2B_MAX_SANDBOXES: ${E2B_MAX_SANDBOXES:-100}
-      E2B_MAX_TOTAL_MEMORY_MB: ${E2B_MAX_TOTAL_MEMORY_MB:-8192}
-      E2B_MAX_TOTAL_CPU_PERCENT: ${E2B_MAX_TOTAL_CPU_PERCENT:-400}
+      # N83 phase 2 / Task 9：车队的内存/CPU/进程总量由已注册健康节点的 `total_*`
+      # 求和推导（`SandboxRegistry._fleet_limits`），这三个 env 变成**可选覆盖**
+      # ——显式设正数就是"故意少卖"，不设 = 推导。写在这里（注释）是为了让"想少卖
+      # 时怎么写"可 grep；`.env` 里那几个值现在到这里就不再有读者了。
+      # E2B_MAX_TOTAL_MEMORY_MB: ${E2B_MAX_TOTAL_MEMORY_MB:-8192}
+      # E2B_MAX_TOTAL_CPU_PERCENT: ${E2B_MAX_TOTAL_CPU_PERCENT:-400}
+      # E2B_MAX_TOTAL_PROCESSES: ${E2B_MAX_TOTAL_PROCESSES:-2048}
+      # 磁盘保持显式（共享卷上 Σ 会重复计数）。
       E2B_MAX_TOTAL_DISK_MB: ${E2B_MAX_TOTAL_DISK_MB:-10240}
-      E2B_MAX_TOTAL_PROCESSES: ${E2B_MAX_TOTAL_PROCESSES:-2048}
       # N83 phase 2 / Task 1 + ruling R17: the per-sandbox ceiling is a
       # **control-plane** policy (the workers no longer declare these keys at
       # all). The control plane writes it into every node record and hands it

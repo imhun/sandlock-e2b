@@ -782,6 +782,44 @@ class NodeRegistry:
             records = [r for r in records if r.status == "healthy"]
         return records
 
+    def healthy_totals(self) -> dict[str, int] | None:
+        """Σ of the healthy nodes' own ``total_*`` -- or ``None`` when empty.
+
+        N83 phase 2 / Task 9 (the user's ruling, 2026-10-07: "max total 是不是
+        没必要了，其实就是 worker 的上限加一起，可以自动计算"): an unset
+        ``E2B_MAX_TOTAL_*`` is this sum. It is the *same* numbers the node
+        ledger admits against (``NodeRecord.blocking_dimension``), which is
+        what keeps the two ledgers from drifting -- and, because a create has
+        to fit its node, it also makes the fleet gate unable to refuse first.
+        The three derivable dimensions are memory/cpu/processes;
+        ``SandboxRegistry._fleet_limits`` is where that list and the reason
+        disk is *not* on it are written down.
+
+        ``None`` is "no node has registered" and is deliberately *not* ``0``:
+        ``0`` in these ledgers means "this dimension is not policed", while
+        ``None`` says "there is nothing to derive from", which the fleet ladder
+        then reads as "do not police this dimension here" -- a create in that
+        state has nowhere to go and is refused by placement, by name (see
+        ``SandboxRegistry._fleet_limits``).
+
+        Read fresh on every call, deliberately -- a registration, a lost
+        heartbeat or a node coming back must change the answer on the *next*
+        create, not after a cache expires, and a cache is one more thing that
+        could disagree with the ledger it is a copy of. Draining nodes are
+        still counted: their totals bound the sandboxes already placed on them,
+        and this sum may only ever be *generous* -- never smaller than what the
+        node ladder can admit.
+        """
+        records = self.list(healthy_only=True)
+        if not records:
+            return None
+        return {
+            "memory": sum(r.total_memory_mb for r in records),
+            "cpu": sum(r.total_cpu_percent for r in records),
+            "disk": sum(r.total_disk_mb for r in records),
+            "processes": sum(r.total_processes for r in records),
+        }
+
     def _sweep_health(self) -> None:
         now = time.time()
         with self._lock:

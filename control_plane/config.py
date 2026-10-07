@@ -31,6 +31,25 @@ from gateway_common.sandbox_ceiling import (
 #: convention, ``0`` disables its limiter.
 DEFAULT_CREATE_RATE_LIMIT_PER_MIN = 120
 
+#: The **in-process** node's own totals when ``E2B_MAX_TOTAL_*`` names none.
+#:
+#: N83 phase 2 / Task 9 turned those four into optional overrides for the
+#: *fleet* ladder (unset/``0`` = Σ of the healthy nodes' own totals). The
+#: in-process node (``E2B_ENABLE_LOCAL_NODE``) is the one node that has nothing
+#: to derive from: there is no worker report behind it and no separate container
+#: of its own to read -- *this* process is the node -- so it keeps the numbers
+#: ``E2B_MAX_TOTAL_*`` defaulted to before that ruling, and a combined
+#: deployment's admission behaviour is unchanged. A deployment that wants a
+#: different number for this node sets ``E2B_MAX_TOTAL_*``, which the local node
+#: still reads first. Leaving it at ``0`` instead would read, one line later, as
+#: "unbounded" -- the fail-open the plan's Review Focus §1 names.
+IN_PROCESS_NODE_DEFAULT_TOTALS: dict[str, int] = {
+    "memory_mb": 8192,
+    "cpu_percent": 400,
+    "disk_mb": 10240,
+    "processes": 2048,
+}
+
 
 def _state_base_from_env() -> Path | None:
     """``E2B_STATE_BASE``, resolved, or ``None`` when the deployment has none.
@@ -181,11 +200,24 @@ class Settings:
     template_images: dict[str, str] = field(
         default_factory=lambda: _env_json_dict("E2B_TEMPLATE_IMAGES")
     )
+    #: N83 phase 2 / Task 9 (the user's ruling, 2026-10-07: "max total 是不是没
+    #: 必要了，其实就是 worker 的上限加一起，可以自动计算"): these three are
+    #: **optional overrides** for the *fleet* ladder. An explicit positive value
+    #: wins -- the one reason left to set one is to deliberately sell less --
+    #: and unset/``0`` derives from the registered healthy nodes' own
+    #: ``total_*`` (`SandboxRegistry._fleet_limits`, one implementation).
+    #:
+    #: So ``0`` no longer means "unlimited" here: it means "derive". With no
+    #: node left to derive from the fleet ladder polices nothing and the create
+    #: is refused by *placement*, by name (``503 No resources available``) --
+    #: the fail-closed direction, and one message instead of two. The one
+    #: reader that still takes ``0`` as "no number named" is the **in-process
+    #: node's own row** -- see :data:`IN_PROCESS_NODE_DEFAULT_TOTALS`.
     max_total_memory_mb: int = field(
-        default_factory=lambda: _env_int("E2B_MAX_TOTAL_MEMORY_MB", 8192)
+        default_factory=lambda: _env_int("E2B_MAX_TOTAL_MEMORY_MB", 0)
     )
     max_total_cpu_percent: int = field(
-        default_factory=lambda: _env_int("E2B_MAX_TOTAL_CPU_PERCENT", 400)
+        default_factory=lambda: _env_int("E2B_MAX_TOTAL_CPU_PERCENT", 0)
     )
     max_total_disk_mb: int = field(
         default_factory=lambda: _env_int("E2B_MAX_TOTAL_DISK_MB", 10240)
@@ -208,7 +240,7 @@ class Settings:
         default_factory=lambda: _env_bool("E2B_PER_SANDBOX_UID", True)
     )
     max_total_processes: int = field(
-        default_factory=lambda: _env_int("E2B_MAX_TOTAL_PROCESSES", 2048)
+        default_factory=lambda: _env_int("E2B_MAX_TOTAL_PROCESSES", 0)
     )
     #: N83 phase 2 (D5): what ONE sandbox may be configured to -- the
     #: per-sandbox **policy** ceiling, never the node. `0`/unset follows the

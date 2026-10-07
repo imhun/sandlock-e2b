@@ -660,3 +660,59 @@ def test_the_k0s_overlay_raises_the_handed_down_ceiling_with_the_pod_limits() ->
     assert int(overlay_cp[CEILING_KEYS[1]]) == int(
         overlay_worker_limits["memory"].removesuffix("Gi")
     ) * 1024
+
+
+#: N83 phase 2 / Task 9: the three dimensions an unset ``E2B_MAX_TOTAL_*``
+#: derives from Σ of the healthy nodes' own totals.
+DERIVED_TOTAL_KEYS = (
+    "E2B_MAX_TOTAL_MEMORY_MB",
+    "E2B_MAX_TOTAL_CPU_PERCENT",
+    "E2B_MAX_TOTAL_PROCESSES",
+)
+
+#: Every control-plane *service* (the k8s manifests and the four compose
+#: stacks, `deploy/compose/docker-compose.yml` included -- it is the
+#: single-machine lane, so it is not in the R17 ceiling list above).
+FLEET_BUDGET_STACKS = CONTROL_PLANE_STACKS + (
+    ("deploy/compose/docker-compose.yml", "control-plane"),
+)
+
+
+def test_the_derivable_fleet_totals_are_not_pinned_in_any_control_plane() -> None:
+    """Task 9: nobody writes the fleet's memory/CPU/process budget down again.
+
+    The user's ruling is that the fleet total *is* Σ of the workers' own
+    limits ("其实就是 worker 的上限加一起，可以自动计算"), so a manifest that
+    states one is a number that can only be wrong: it is either below the sum
+    (the fleet gate refuses work the nodes could have taken -- measured on
+    k8s, where the code default 400 sat under Σ 800 and threw half the CPU
+    away) or above it (dead config). A deployment that really wants to sell
+    less sets one on purpose, which is why this is a pin on the *shipped*
+    manifests and not a rule about the env.
+    """
+    for relative, service in FLEET_BUDGET_STACKS:
+        if service is None:
+            env = _k8s_env(relative)
+        else:
+            env = _compose_service_env(relative, service)
+        declared = [key for key in DERIVED_TOTAL_KEYS if key in env]
+        assert declared == [], (relative, service, declared)
+
+
+def test_the_shared_workspace_disk_budget_is_still_declared() -> None:
+    """Disk is the one fleet number that stays explicit.
+
+    The worker's ``totalDiskMB`` is its *filesystem's* size, so on a shared
+    volume every node reports the same number and Σ double-counts it -- the
+    control-plane manifest's own reason for setting this by hand. The k8s pair
+    is pinned by the k0s overlay instead (this baseline leaves it commented
+    out and names why); every compose lane writes it out.
+    """
+    for relative, service in FLEET_BUDGET_STACKS:
+        if service is None:
+            continue
+        env = _compose_service_env(relative, service)
+        assert "E2B_MAX_TOTAL_DISK_MB" in env, (relative, service)
+
+    overlay = _k8s_env("deploy/k8s-k0s/control-plane-nfs.patch.yaml")
+    assert overlay["E2B_MAX_TOTAL_DISK_MB"] == "10240"

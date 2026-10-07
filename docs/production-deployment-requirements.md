@@ -816,15 +816,45 @@ netns、由 userns root 覆盖"的直接证据；`IFACES=lo` 则确认车队里�
 每请求代价定位并修掉后再走全量。复测脚本：`deploy/scripts/acceptance/netns-node-compare.py`（按节点）、
 `deploy/scripts/acceptance/mcp-3way.py`（三段拆分）。
 
-### 2.4.8 并发容量口径（2026-09-16 调整）
+### 2.4.8 并发容量口径（2026-10-07：车队总量由各节点推导）
 
-`E2B_MAX_TOTAL_*` 是**车队级**预算，`E2B_NODE_*` 是**每节点**容量，两者都以「每沙箱预留」
-为单位计价 —— 而每沙箱预留来自 `E2B_DEFAULT_MEMORY_MB` / `_CPU_PERCENT` / `_DISK_MB` /
-`_MAX_PROCESSES`（`control_plane/config.py`，SDK 的 stock create 不带这些维度）。所以
-**并发上限 = 各维度预算 ÷ 每沙箱预留，取最小值**；清单现在把这四个 `E2B_DEFAULT_*` 也透传给
-control-plane 与 worker（此前只在代码里有默认值 1024MB/100%/1024MB/256）。
+**两条台账，两个来源**（N83 Phase 2 / Task 9；用户裁定「worker 的容量应该取容器的 limit」+
+「max total 其实就是 worker 的上限加一起，可以自动计算」）：
 
-当前口径（2026-09-16 起）：
+| 档 | 谁定 | 规则 |
+|---|---|---|
+| **每节点** | worker 自己报的 `total_*` | 内存/进程 = **`min(容器 cgroup 限额, E2B_NODE_*)`**；**CPU = `E2B_NODE_*` 说了算，允许超过容器 `cpu.max`**（超卖仍打一条具名 WARN，两个数都留在记录/心跳里）；磁盘 = `E2B_NODE_*`（没有内核口径）。读不到内核（`E2B_SANDBOX_CGROUP=off`、挂载不在、macOS）⇒ 回落 env，再回落宿主探测。实现：`envd_service/agent.py::_node_resources` |
+| **车队**（内存/CPU/进程） | **Σ 已注册健康节点** | `E2B_MAX_TOTAL_{MEMORY_MB,CPU_PERCENT,PROCESSES}` 是**可选覆盖**：显式正数 = 按它（**故意少卖**），不设/`0` = 自动求和。实现：`NodeRegistry.healthy_totals` → `SandboxRegistry._fleet_limits`，每个建箱/恢复现算 |
+| **车队磁盘** | **显式** | `E2B_MAX_TOTAL_DISK_MB`：worker 报的是它 workspace 那个**文件系统的大小**，共享卷上每台报同一个数 ⇒ 求和会重复计数（同 `deploy/k8s/control-plane.yaml` 与 `deploy/k8s-k0s/control-plane-nfs.patch.yaml` 的注释） |
+| **沙箱数** | 产品策略 | `E2B_MAX_SANDBOXES`（不是容量，不参与推导） |
+
+**为什么车队那一档按构造不会先拒人**：每个箱都必须过**落点节点**那道台账
+（`NodeRecord.blocking_dimension`），所以 `Σ 已预留 ≤ Σ 各节点总量` 在任何一次成功落点上都
+成立 —— 车队预算取同一个 Σ 时，它最多只能拒节点也会拒的那一箱。这正是要修的东西：此前 k8s
+上 `E2B_MAX_TOTAL_CPU_PERCENT` 落的是代码默认 **400**、而两个节点卖 **800**，一半 CPU 被这
+个数白锁住；三条 compose 车道显式写的 400 < Σ 600 同理。
+
+**并发上限仍按「各维度预算 ÷ 每沙箱预留取最小」算**，每沙箱预留 = `E2B_DEFAULT_*`
+（`control_plane/config.py`，SDK 的 stock create 不带维度）。出厂取值：
+
+| 车道 | 每沙箱预留 | 每节点（worker 报的） | 车队（推导 or 显式） |
+|---|---|---|---|
+| k8s / k0s | 代码默认 **1024MB / 100% / 1024MB / 256**（清单一个 `E2B_DEFAULT_*` 都没设） | 4096MB / **400%**（env = 内核 `4` 核）/ 8192MB 盘 / **1024 进程**（k0s 覆盖层；`pids.max=max` ⇒ 这一维仍是 env） | 内存/CPU/进程 = **N 节点各自相加**；磁盘 = 显式 10240（k0s 覆盖层） |
+| compose（multinode / prod / stack） | 同上（multinode 显式 1024/100/1024/256） | 2048MB / 200% / 4096MB / 256（`.env`；三条车道都没设 `cpus`/`mem_limit` ⇒ 内核三个都是 `max`） | 内存 3×2048=6144、CPU 3×200=600、进程 3×256=768（推导）；磁盘显式 10240 |
+
+⇒ k0s 每个 worker 4 个并发（4GiB/1024MB、4 核/1 核、1024/256 都折到 4），车队 = 4×worker 数；
+multinode 每个 worker 1 个（256 进程 = 1 个箱），车队 3 个 —— 与"每个箱必须过节点台账"一致。
+**注意 compose 车队并发从旧的 4 降到 3**：旧的 4 来自那个写着 400% 的舰队数，而节点其实只
+卖 3×256 进程；推导后车队不再虚高（也不再是空头支票）。
+
+**CPU 可以超卖，内存/进程不可以**（用户裁定，逐字理由）：CPU 是份额，超卖只造成争用，内核
+`cpu.max` 仍是最终节流；而卖超过容器 `memory.max` 量，被杀的是**整个容器**（每个箱自己的
+`memory.max` 都合规，谁都不算违规），`pids.max` 是硬计数同理。所以只有 CPU 允许 `配置 > 内核`，
+且**必须响亮**：一条具名 WARN（`CPU_OVERSELL_WARNING`，同一对数字只打一次，不随 5s 心跳刷屏）
+加上节点记录里的两个数 —— `totalCPUPercent` = 卖出去的，`kernelCeiling.cpuPercent` = 物理的。
+**范围**：只放宽"节点总量"这一层；**每箱上限**那道 D5b（策略上限 > 内核 ⇒ 具名拒绝）不动。
+
+历史口径（2026-09-16 起、Task 9 之前）：
 
 | 维度 | 每沙箱 | 车队预算 | 车队并发 | 每节点预算 | 每节点并发 |
 |---|---|---|---|---|---|
@@ -834,15 +864,18 @@ control-plane 与 worker（此前只在代码里有默认值 1024MB/100%/1024MB/
 | 磁盘 | 1024MB | 10240 | 10 | 8192 | 8 |
 | 沙箱数 | — | 100 | 100 | — | — |
 
-⇒ **车队上限 8（CPU/进程维度绑定），每节点 4**。实测：一次 8 个 create 全部成功、4+4 分摊到
-两个 worker；沙箱记录 `memoryMB=512`（`deploy/scripts/acceptance/capacity_check.py` 的验证输出）。
+⇒ 那张表当时的结论是"车队上限 8（CPU/进程维度绑定），每节点 4"（实测：一次 8 个 create 全部
+成功、4+4 分摊到两个 worker；`deploy/scripts/acceptance/capacity_check.py` 的输出）。它的
+`E2B_DEFAULT_MEMORY_MB=512` 与 `E2B_MAX_TOTAL_CPU_PERCENT=800` 都**不是今天的清单取值**
+（k8s/k0s 清单一个 `E2B_DEFAULT_*` 都没设 ⇒ 落 1024/100，车队那一档现在也不写死）—— 保留下
+来只因为下面两条实测的**箱内数字**还成立，别把上面那两列当成现值。
 
 两个必须知道的后果：
-① **沙箱内存上限减半（1024→512MB）是用户可见变更** —— 之前用满 1GB 的负载现在会被
-`max_memory` 拦（表现为分配失败/被杀）。要回到 1GB 就把 `E2B_DEFAULT_MEMORY_MB` 设回 1024
-（那会让车队内存维度降到 8、与 CPU/进程一致，并发上限仍是 8）。
-② 之前"最多 4 个并发、第 5 个起 `503 No resources available`"的根因就是这张表：
-`E2B_MAX_TOTAL_CPU_PERCENT=400` 与 `E2B_MAX_TOTAL_PROCESSES=1024` 各折算 4 个。
+① 那次把**沙箱内存上限减半（1024→512MB）**，对用户可见 —— 用满 1GB 的负载会被
+`max_memory` 拦（表现为分配失败/被杀）；要回到 1GB 就把 `E2B_DEFAULT_MEMORY_MB` 设回 1024。
+② 当年"最多 4 个并发、第 5 个起 `503 No resources available`"的根因就是那种写死的车队数
+（`E2B_MAX_TOTAL_CPU_PERCENT=400` 与 `E2B_MAX_TOTAL_PROCESSES=1024` 各折算 4 个）—— Task 9
+之后这一档由节点求和，剩下的界是**每节点**那道（那种车道是 256 进程/箱 = 每节点 1 个）。
 
 线上实测（2026-09-16，`deploy/scripts/acceptance/mem512-limit.py` / `deploy/scripts/acceptance/mcp-512-size.py`）：
 

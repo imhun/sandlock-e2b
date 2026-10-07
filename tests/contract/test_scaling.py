@@ -79,10 +79,19 @@ async def _register_node(control, node_id: str) -> None:
             json={
                 "nodeID": node_id,
                 "address": f"http://{node_id}:49983",
-                "totalMemoryMB": 2048,
-                "totalCPUPercent": 200,
-                "totalDiskMB": 4096,
-                "totalProcesses": 128,
+                # N83 phase 2 / Task 9: an unset `E2B_MAX_TOTAL_*` is Σ of the
+                # registered nodes, so this row has to be a node that could
+                # actually host the sandboxes a caller then shows on it. It was
+                # 2048/200/4096/**128** -- under one sandbox's own default
+                # (1024 MiB / 100% / 256 tasks), so the node ladder itself could
+                # never have placed the two boxes
+                # `test_the_hosted_loop_reads_the_fleet_view_the_endpoint_serves`
+                # creates through the registry. Same numbers the other C3
+                # contract lanes register with.
+                "totalMemoryMB": 65536,
+                "totalCPUPercent": 6400,
+                "totalDiskMB": 1048576,
+                "totalProcesses": 4096,
                 "images": [],
                 "labels": {"node-type": "container"},
             },

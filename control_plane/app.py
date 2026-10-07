@@ -34,7 +34,11 @@ from control_plane.c3_agent_client import (
     C3AgentClient,
     build_agent_address_resolver,
 )
-from control_plane.config import Settings, local_node_quota_via_agent
+from control_plane.config import (
+    IN_PROCESS_NODE_DEFAULT_TOTALS,
+    Settings,
+    local_node_quota_via_agent,
+)
 from control_plane.metrics import SlidingWindowCounter
 from control_plane.node_address import build_node_address_resolver
 from control_plane.queue import CreateQueue
@@ -716,6 +720,13 @@ def create_app(
         redis_client=redis_client,
         heartbeat_timeout=settings.node_heartbeat_timeout_s,
     )
+    # N83 phase 2 / Task 9: the three derivable dimensions of the fleet ladder
+    # (memory, CPU, processes) follow Σ of the *healthy* nodes' own totals --
+    # the same numbers the node ladder admits against, read fresh per create.
+    # Disk is not on that list (a shared volume would double-count it) and
+    # ``E2B_MAX_SANDBOXES`` is a policy, not a capacity: see
+    # ``SandboxRegistry._fleet_limits``.
+    registry.set_fleet_totals_provider(app.state.nodes.healthy_totals)
     # C3 Task 2 / D4: where the internal API's *expected* node address and
     # source IP come from. Injected by tests and embedders; otherwise built from
     # ``E2B_NODE_ADDRESS_MODE`` (k8s pod API, or compose hostname resolution).
@@ -792,10 +803,22 @@ def create_app(
     }
     if settings.enable_local_node and app.state.nodes.get("local") is None:
         app.state.nodes.add_local_node(
-            total_memory_mb=settings.max_total_memory_mb,
-            total_cpu_percent=settings.max_total_cpu_percent,
-            total_disk_mb=settings.max_total_disk_mb,
-            total_processes=settings.max_total_processes,
+            # N83 phase 2 / Task 9: the fleet ladder's three derivable
+            # dimensions no longer have a configured default, and this is the
+            # one node with nothing to derive from -- it *is* this process, with
+            # no worker report and no second container of its own. So its row
+            # keeps the numbers `E2B_MAX_TOTAL_*` used to default to, unless the
+            # deployment names them (then they win for this node too, exactly as
+            # an explicit override does for the fleet). See
+            # `IN_PROCESS_NODE_DEFAULT_TOTALS` for the full reasoning.
+            total_memory_mb=settings.max_total_memory_mb
+            or IN_PROCESS_NODE_DEFAULT_TOTALS["memory_mb"],
+            total_cpu_percent=settings.max_total_cpu_percent
+            or IN_PROCESS_NODE_DEFAULT_TOTALS["cpu_percent"],
+            total_disk_mb=settings.max_total_disk_mb
+            or IN_PROCESS_NODE_DEFAULT_TOTALS["disk_mb"],
+            total_processes=settings.max_total_processes
+            or IN_PROCESS_NODE_DEFAULT_TOTALS["processes"],
             # N83 phase 2 (D5, ruling R17): the per-sandbox ceiling is the
             # control plane's own policy, so the in-process node and a remote
             # node's row carry the *same* three numbers -- this one straight

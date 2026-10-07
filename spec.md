@@ -577,14 +577,22 @@ Control Plane 必须同时限制沙箱数量和宿主总资源，避免 `E2B_MAX
 | 磁盘 | `E2B_DEFAULT_DISK_MB=1024`，非 COW 时为准入预留 |
 | 并发进程 | `E2B_DEFAULT_MAX_PROCESSES=256`，映射 `max_processes=256`（M4 D6 whole-box semantics, 2026-09-06）；内核那份是沙箱 cgroup 的 `pids.max`，**任务数（含线程）**，平台自己的进程也占预算 |
 
-宿主总上限：
+车队总上限（**2026-10-07 / N83 Phase 2 Task 9 起**，用户裁定「其实就是 worker 的上限加一起，
+可以自动计算」）：
 
-| 资源 | 默认值 |
-|------|--------|
-| 总内存 | `E2B_MAX_TOTAL_MEMORY_MB=8192` |
-| 总 CPU | `E2B_MAX_TOTAL_CPU_PERCENT=400` |
-| 总磁盘 | `E2B_MAX_TOTAL_DISK_MB=10240` |
-| 总进程 | `E2B_MAX_TOTAL_PROCESSES=2048` |
+| 资源 | 取值 |
+|------|------|
+| 总内存 | **Σ 已注册健康节点的 `totalMemoryMB`**（`E2B_MAX_TOTAL_MEMORY_MB` 是可选覆盖） |
+| 总 CPU | **Σ 已注册健康节点的 `totalCPUPercent`**（`E2B_MAX_TOTAL_CPU_PERCENT` 是可选覆盖） |
+| 总进程 | **Σ 已注册健康节点的 `totalProcesses`**（`E2B_MAX_TOTAL_PROCESSES` 是可选覆盖） |
+| 总磁盘 | `E2B_MAX_TOTAL_DISK_MB=10240`（**显式**：共享卷上 Σ 会重复计数） |
+
+可选覆盖的含义：显式设一个**正数** ⇒ 按它（**故意少卖**，唯一还需要的理由）；**不设 / `0` ⇒ 推导**
+（`control_plane/registry/nodes.py::NodeRegistry.healthy_totals` → `SandboxRegistry._fleet_limits`）。
+所以 `0` 在这一档**不再**是"不限制"；**一个节点都没注册 ⇒ 具名 503**，绝不把"不知道容量"当成
+"无限放行"。每节点那份 `total_*` 由 worker 自己按维度取：内存/进程 = `min(容器 cgroup 限额,
+E2B_NODE_*)`，**CPU = `E2B_NODE_*` 说了算（允许超过容器 `cpu.max`，超卖打一条具名 WARN 并同时
+上报内核读数）**，磁盘 = `E2B_NODE_*`（无内核口径）—— 见 `envd_service/agent.py::_node_resources`。
 
 **谁在强制每个维度**（2026-10-06，N83 Phase 1 之后）：
 
@@ -635,11 +643,14 @@ worker 无害（旧 worker 忽略响应里的新字段），旧控制面 + 新 w
 ```text
 可创建 =
   当前沙箱数 < E2B_MAX_SANDBOXES
-  and 已预留内存 + 单沙箱内存 <= E2B_MAX_TOTAL_MEMORY_MB
-  and 已预留 CPU + 单沙箱 CPU <= E2B_MAX_TOTAL_CPU_PERCENT
+  and 已预留内存 + 单沙箱内存 <= 车队内存上限   # 显式 E2B_MAX_TOTAL_MEMORY_MB，否则 Σ 节点
+  and 已预留 CPU + 单沙箱 CPU <= 车队 CPU 上限  # 显式 E2B_MAX_TOTAL_CPU_PERCENT，否则 Σ 节点
   and 已预留磁盘 + 单沙箱磁盘 <= E2B_MAX_TOTAL_DISK_MB
-  and 已预留进程数 + 单沙箱最大进程数 <= E2B_MAX_TOTAL_PROCESSES
+  and 已预留进程数 + 单沙箱最大进程数 <= 车队进程上限  # 显式 E2B_MAX_TOTAL_PROCESSES，否则 Σ 节点
 ```
+
+（推导出来的那一档按构造**不会先拒人**：每个箱还必须过**落点节点**那道台账，所以
+`Σ 已预留 ≤ Σ 各节点总量` 在任何一次成功落点上恒成立。）
 
 - 创建成功时立即预留配额。
 - kill 或 TTL 回收后立即释放配额。
@@ -705,11 +716,12 @@ await sandbox.kill()
 | `E2B_DEFAULT_MAX_PROCESSES` | `256` | 单沙箱最大并发进程数（M4 D6 whole-box semantics, 2026-09-06） |
 | `E2B_BASE_IMAGE` | 未配置 | `base` 模板的基础镜像；配置后该模板启用容器隔离 |
 | `E2B_TEMPLATE_IMAGES` | `{}` | 模板 ID 到基础镜像的 JSON 映射；条目存在即该模板启用容器隔离 |
-| `E2B_MAX_TOTAL_MEMORY_MB` | `8192` | 宿主总内存上限 |
-| `E2B_MAX_TOTAL_CPU_PERCENT` | `400` | 宿主总 CPU 上限 |
-| `E2B_MAX_TOTAL_DISK_MB` | `10240` | 宿主总磁盘上限 |
-| `E2B_MAX_TOTAL_PROCESSES` | `2048` | 宿主总并发进程上限 |
-| `E2B_MAX_SANDBOX_CPU_PERCENT` | 跟随节点总量（k8s **控制面**基线 `200`，k0s 覆盖层 `400`） | 每沙箱 CPU 上限（**控制面的策略**，R17；由控制面下发，worker 不读它）；未设/`<=0` ⇒ 跟随控制面的 `E2B_MAX_TOTAL_CPU_PERCENT` |
+| `E2B_MAX_TOTAL_MEMORY_MB` | **不设（推导）** | 车队内存上限，**可选覆盖**（Task 9）：正数 = 按它（故意少卖）；不设/`0` = **Σ 已注册健康节点的 `totalMemoryMB`** |
+| `E2B_MAX_TOTAL_CPU_PERCENT` | **不设（推导）** | 车队 CPU 上限，同上（Σ `totalCPUPercent`）；CPU 允许节点**超卖**容器 `cpu.max`（具名 WARN） |
+| `E2B_MAX_TOTAL_DISK_MB` | `10240` | 车队磁盘上限，**保持显式**（共享卷上 Σ 会重复计数）；`0` = 该维度不设限 |
+| `E2B_MAX_TOTAL_PROCESSES` | **不设（推导）** | 车队进程上限，**可选覆盖**：不设/`0` = Σ 已注册健康节点的 `totalProcesses` |
+| `E2B_NODE_MEMORY_MB` / `_CPU_PERCENT` / `_PROCESSES` / `_DISK_MB` | 空（回落宿主探测） | **每节点容量**（worker 报的 `total_*`）：内存/进程 = `min(容器 cgroup 限额, env)`，**CPU = env（可超卖内核）**，磁盘 = env（无内核口径）—— 见 `envd_service/agent.py::_node_resources` |
+| `E2B_MAX_SANDBOX_CPU_PERCENT` | 跟随节点总量（k8s **控制面**基线 `200`，k0s 覆盖层 `400`） | 每沙箱 CPU 上限（**控制面的策略**，R17；由控制面下发，worker 不读它）；未设/`<=0` ⇒ 跟随控制面的 `E2B_MAX_TOTAL_CPU_PERCENT`（现在通常不设 ⇒ 再退到创建时的 `E2B_DEFAULT_*`）|
 | `E2B_MAX_SANDBOX_MEMORY_MB` | 跟随节点总量（k8s `2048`，k0s `4096`） | 每沙箱内存上限（MiB），也就是沙箱 `memory.high`/`memory.max` 的上界；同样由控制面下发 |
 | `E2B_MAX_SANDBOX_PROCESSES` | 跟随节点总量（k8s `256`，k0s `1024`） | 每沙箱任务数上限（= `pids.max` 的上界）；同样由控制面下发 |
 | `E2B_CGROUP_EVENTS_INTERVAL_S` | `5` | worker 扫每箱 `memory.events`/`pids.events` 的间隔（秒）；`0` 关周期扫，收尾那次读照常 |
@@ -734,10 +746,9 @@ services:
       E2B_DEFAULT_CPU_PERCENT: 100
       E2B_DEFAULT_DISK_MB: 1024
       E2B_DEFAULT_MAX_PROCESSES: 256  # M4 D6 whole-box semantics, 2026-09-06
-      E2B_MAX_TOTAL_MEMORY_MB: 8192
-      E2B_MAX_TOTAL_CPU_PERCENT: 400
-      E2B_MAX_TOTAL_DISK_MB: 10240
-      E2B_MAX_TOTAL_PROCESSES: 2048
+      # 2026-10-07 / Task 9：车队的内存/CPU/进程总量由已注册健康节点的 `total_*`
+      # 求和推导，这三条不写（写了就是"故意少卖"的可选覆盖）。
+      E2B_MAX_TOTAL_DISK_MB: 10240  # 磁盘保持显式（共享卷上 Σ 会重复计数）
     ports:
       - "3000:3000"
     volumes:

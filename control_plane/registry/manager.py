@@ -596,6 +596,16 @@ class SandboxRegistry:
             Callable[[SandboxRecord], None]
         ] = []
         self._lock = threading.Lock()
+        #: N83 phase 2 / Task 9: where an unset ``E2B_MAX_TOTAL_*`` gets its
+        #: number -- the node registry's own Σ of the healthy nodes' totals
+        #: (``NodeRegistry.healthy_totals``), or ``None`` when no node has
+        #: registered. ``None`` **here** (no provider wired at all) is a
+        #: different fact again: a bare registry with no node ledger behind it
+        #: (an embedder, a unit lane), which keeps the pre-Task-9 reading of
+        #: ``0`` -- "this dimension is not policed at the fleet layer".
+        self._fleet_totals_provider: (
+            Callable[[], dict[str, int] | None] | None
+        ) = None
         #: N25: sandboxes the last accounting round measured *over* their
         #: budget, with `(used, budget)`. Kept so the fleet view can say how
         #: much over, instead of the crossing log line being the only trace.
@@ -760,7 +770,12 @@ class SandboxRegistry:
     }
 
     def _quota_allows_locked(
-        self, memory_mb: int, cpu: int, disk_mb: int, processes: int
+        self,
+        memory_mb: int,
+        cpu: int,
+        disk_mb: int,
+        processes: int,
+        limits: dict[str, int],
     ) -> str | None:
         """Whether the fleet-wide pool can take one more sandbox.
 
@@ -769,6 +784,13 @@ class SandboxRegistry:
         (see :meth:`_quota_denied_message`); a bare bool used to be enough
         because every refusal said the same thing -- which is exactly what made
         a workspace disk budget indistinguishable from a full memory pool.
+
+        ``limits`` is resolved by the caller (:meth:`_fleet_limits`) and passed
+        in rather than read here, because resolving it asks the *node* registry
+        for its healthy totals and this method runs under ``self._lock``.
+        Taking the two locks in this order while ``NodeRegistry`` takes them in
+        the other one (``_prune_empty_unhealthy`` asks this registry for a
+        node's records while holding its own lock) would be a deadlock.
         """
         s = self._settings
         # Paused sandboxes hold no reservation (E9.2), so they do not consume
@@ -776,23 +798,23 @@ class SandboxRegistry:
         if s.max_sandboxes > 0 and self._held_count_locked() >= s.max_sandboxes:
             return "sandboxes"
         if (
-            s.max_total_memory_mb > 0
-            and self._reserved_memory + memory_mb > s.max_total_memory_mb
+            limits["memory"] > 0
+            and self._reserved_memory + memory_mb > limits["memory"]
         ):
             return "memory"
         if (
-            s.max_total_cpu_percent > 0
-            and self._reserved_cpu + cpu > s.max_total_cpu_percent
+            limits["cpu"] > 0
+            and self._reserved_cpu + cpu > limits["cpu"]
         ):
             return "cpu"
         if (
-            s.max_total_disk_mb > 0
-            and self._reserved_disk + disk_mb > s.max_total_disk_mb
+            limits["disk"] > 0
+            and self._reserved_disk + disk_mb > limits["disk"]
         ):
             return "disk"
         if (
-            s.max_total_processes > 0
-            and self._reserved_processes + processes > s.max_total_processes
+            limits["processes"] > 0
+            and self._reserved_processes + processes > limits["processes"]
         ):
             return "processes"
         return None
@@ -961,14 +983,95 @@ class SandboxRegistry:
             "processes": record.max_processes,
         }
 
-    def _global_limits(self) -> dict[str, int]:
-        s = self._settings
-        return {
-            "memory": s.max_total_memory_mb,
-            "cpu": s.max_total_cpu_percent,
-            "disk": s.max_total_disk_mb,
-            "processes": s.max_total_processes,
-        }
+    def set_fleet_totals_provider(
+        self, provider: Callable[[], dict[str, int] | None]
+    ) -> None:
+        """Wire where an unset ``E2B_MAX_TOTAL_*`` is derived from (Task 9).
+
+        ``provider`` is :meth:`control_plane.registry.nodes.NodeRegistry.
+        healthy_totals`: Σ of the healthy nodes' own ``total_*``, or ``None``
+        when none has registered. The app wires it, so every deployment takes
+        the derived path; a registry built directly (an embedder, a unit lane)
+        has no node ledger to read and keeps the pre-Task-9 reading of ``0``.
+
+        Called only at wiring time -- the *number* is read per admission, never
+        cached.
+        """
+        self._fleet_totals_provider = provider
+
+    #: The three dimensions an unset ``E2B_MAX_TOTAL_*`` derives, with the env
+    #: name each one is spelled as (the name the debug line quotes when there is
+    #: nothing to derive from). Disk is deliberately absent (see below).
+    _DERIVED_FLEET_DIMS = (
+        ("max_total_memory_mb", "memory", "E2B_MAX_TOTAL_MEMORY_MB"),
+        ("max_total_cpu_percent", "cpu", "E2B_MAX_TOTAL_CPU_PERCENT"),
+        ("max_total_processes", "processes", "E2B_MAX_TOTAL_PROCESSES"),
+    )
+
+    def _fleet_limits(self) -> dict[str, int]:
+        """The fleet's own budget for one admission (N83 phase 2 / Task 9).
+
+        Three of the four dimensions are **derivable** now: an explicit
+        ``E2B_MAX_TOTAL_*`` (``> 0``) wins -- the one remaining reason to set
+        one is to deliberately sell less -- and an unset/``0`` one is the Σ of
+        the registered healthy nodes' own ``total_*``, i.e. exactly the numbers
+        the node ladder admits against, so the two ledgers cannot drift.
+
+        Why the derived form can never refuse *first*: a create must also fit
+        the node it lands on (``NodeRecord.blocking_dimension``, on the same
+        create), so ``Σ reserved ≤ Σ totals`` holds at every successful
+        placement and a fleet budget equal to that sum can only refuse what the
+        node ladder would have refused anyway. That is the whole point of the
+        task: the k8s control plane declares no ``E2B_MAX_TOTAL_CPU_PERCENT``
+        while its two nodes sell 800%, so the code default of 400 threw half
+        the fleet's CPU away (and the compose lanes' explicit 400 < 600 did the
+        same).
+
+        A fleet with **no** healthy node is not policed ``here``: ``0`` in this
+        ladder means "this dimension is not policed", and a create in that state
+        is refused one step later by the layer that owns "there is nowhere to
+        put this" -- placement answers its own named
+        ``503 No resources available`` (``control_plane/api/sandboxes.py``), so
+        no sandbox is ever admitted with no capacity known. Refusing in the
+        ledger as well would only take the message away from the layer that
+        knows the reason, and would break every shape that drives this ledger
+        without placement (an embedder, the C3 create-window lane).
+
+        **Disk stays explicit.** The worker's ``totalDiskMB`` is its
+        *filesystem's* size (``shutil.disk_usage``), so on a shared volume every
+        node reports the same number and Σ double-counts it -- the reason the
+        control-plane manifest already gives for setting it by hand
+        (``deploy/k8s/control-plane.yaml`` around :489-498).
+        ``E2B_MAX_SANDBOXES`` is a product policy rather than a capacity and is
+        not part of this ladder at all.
+        """
+        provider = self._fleet_totals_provider
+        derived = provider() if provider is not None else None
+        limits: dict[str, int] = {}
+        for setting_name, dimension, env_name in self._DERIVED_FLEET_DIMS:
+            configured = int(getattr(self._settings, setting_name, 0) or 0)
+            if configured > 0:
+                limits[dimension] = configured
+                continue
+            if provider is None:
+                # No node ledger wired: pre-Task-9 shape, 0 = not policed.
+                limits[dimension] = 0
+                continue
+            if derived is None:
+                # Nothing registered to sum: step aside (see the docstring) and
+                # leave the refusal to placement, which names the real reason.
+                logger.debug(
+                    "fleet totals: no healthy node is registered, so %s does "
+                    "not police %s until one is (a create in this state is "
+                    "refused by placement, by name)",
+                    env_name,
+                    dimension,
+                )
+                limits[dimension] = 0
+                continue
+            limits[dimension] = int(derived.get(dimension, 0))
+        limits["disk"] = int(getattr(self._settings, "max_total_disk_mb", 0) or 0)
+        return limits
 
     # -- the release claim (N41) -------------------------------------------
 
@@ -1091,8 +1194,11 @@ class SandboxRegistry:
             return False
         dims = self._global_dims(record)
         tenant_limits = self._tenant_limits(record.tenant_id, is_admin=False)
+        # Resolved before the lock: it asks the node registry for its healthy
+        # totals, and the two registries must not be locked in both orders
+        # (see ``_quota_allows_locked``).
+        limits = self._fleet_limits()
         if self._quota_store is not None:
-            limits = self._global_limits()
             if not self._quota_store.reserve("global", limits, dims):
                 # Classify only on the way out (one store read, on a refusal):
                 # the caller deserves to know whether it hit the workspace
@@ -1119,7 +1225,11 @@ class SandboxRegistry:
             return True
         with self._lock:
             blocked = self._quota_allows_locked(
-                dims["memory"], dims["cpu"], dims["disk"], dims["processes"]
+                dims["memory"],
+                dims["cpu"],
+                dims["disk"],
+                dims["processes"],
+                limits=limits,
             )
             if blocked is not None:
                 raise ResourceUnavailableError(
@@ -1617,12 +1727,11 @@ class SandboxRegistry:
         disk_mb = s.default_disk_mb
         processes = s.default_max_processes
 
-        limits = {
-            "memory": self._settings.max_total_memory_mb,
-            "cpu": self._settings.max_total_cpu_percent,
-            "disk": self._settings.max_total_disk_mb,
-            "processes": self._settings.max_total_processes,
-        }
+        # N83 phase 2 / Task 9: the four limits this record is admitted
+        # against, with the three derivable dimensions resolved from the
+        # healthy nodes when the deployment named none (see
+        # ``_fleet_limits``). Resolved here, outside the lock below.
+        limits = self._fleet_limits()
         dims = {
             "memory": memory_mb,
             "cpu": cpu,
@@ -1660,7 +1769,11 @@ class SandboxRegistry:
         else:
             with self._lock:
                 blocked = self._quota_allows_locked(
-                    memory_mb, cpu, disk_mb, processes
+                    memory_mb,
+                    cpu,
+                    disk_mb,
+                    processes,
+                    limits=limits,
                 )
                 if blocked is not None:
                     raise ResourceUnavailableError(
