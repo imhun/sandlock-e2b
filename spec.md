@@ -168,7 +168,7 @@ python3 -c "import sandlock; print(sandlock.landlock_abi_version())"
 | `iam` | 支持：`{tokens: {name: {audience, tokenType}}}`；`${e2b.identity.tokens.<name>}` 占位符在代理内替换为签发的 JWT-SVID（HS256，`E2B_IAM_SIGNING_KEY`，默认本地开发密钥） |
 | `mcp` | 支持：base stdio server（command）；GitHub MCP 返回 `400` |
 | `volumeMounts` | 支持：挂载到 rootfs 内 `/home/user/<path>`（或工作区符号链接） |
-| `cpuCount` | 正整数（核）：真的成为 `record.cpu_count`（N83 Phase 2 收口 N84 —— 从前它恒为 1、这个字段被静默忽略）。不传 ⇒ 走 `E2B_DEFAULT_CPU_PERCENT` 的换算（`control_plane/registry/manager.py::cores_from_percent`，向上取整、至少 1 核）；`0`/负数/非整数 ⇒ `400 cpuCount must be a positive integer`；超过请求**落点节点**的单箱上限 ⇒ `400 cpuCount 8 exceeds this node's per-sandbox maximum (4)`；该节点还没上报上限（混版本窗口）⇒ 具名 `503` |
+| `cpuCount` | 正整数（核）：真的成为 `record.cpu_count`（N83 Phase 2 收口 N84 —— 从前它恒为 1、这个字段被静默忽略）。不传 ⇒ 走 `E2B_DEFAULT_CPU_PERCENT` 的换算（`control_plane/registry/manager.py::cores_from_percent`，向上取整、至少 1 核）；`0`/负数/非整数 ⇒ `400 cpuCount must be a positive integer`；超过请求**落点节点**的单箱上限（= 控制面下发的 `E2B_MAX_SANDBOX_CPU_PERCENT`，R17）⇒ `400 cpuCount 8 exceeds this node's per-sandbox maximum (4)` |
 | `memoryMB` | 正整数（MiB）：落成 `record.memory_mb`，也就是沙箱的 `memory.high`/`memory.max`。`0`/负数/非整数 ⇒ `400 memoryMB must be a positive integer`；超过落点节点的单箱上限（`E2B_MAX_SANDBOX_MEMORY_MB`）⇒ 与 `cpuCount` 同形的具名 `400` |
 | `diskSizeMB` | **今天仍被静默忽略**（N84 副问题① 点名的第三个字段；D6 只收了 cpu/内存这一对） |
 
@@ -596,18 +596,29 @@ Control Plane 必须同时限制沙箱数量和宿主总资源，避免 `E2B_MAX
 | 磁盘 | XFS project quota（经 quota-agent）+ 活账本 | worker 只发 HTTP；见 `docs/sandbox-disk-quota.md` |
 | 节点聚合 | 控制面的**预留**配额（准入时预留、kill/TTL 时归还） | 预留制，不是等实际用量超限；见下面的准入算法 |
 
-**单箱上限（策略，不是内核读数）**：`E2B_MAX_SANDBOX_CPU_PERCENT` / `E2B_MAX_SANDBOX_MEMORY_MB` /
-`E2B_MAX_SANDBOX_PROCESSES` 是一箱最多能配到多少；**未设或 `<=0` ⇒ 跟随本节点总量**（worker 读
-`E2B_NODE_*`，控制面读 `E2B_MAX_TOTAL_*`），**节点总量也没声明（`0`）时再退到创建时的每箱默认**
-（`E2B_DEFAULT_*`；三档全 `0` 是控制面按名拒绝的配置，不会静默变成 0），**绝不默认成"无上限"**
-（两侧共读 `gateway_common/sandbox_ceiling.py` 里那一条规则）。worker 启动时拿它与自己容器 cgroup 的内核限额
-交叉校验：**策略 > 内核 ⇒ 具名拒绝启动**（不夹取、不 WARN），**内核 = `max` ⇒ 启动成功 + 一行 WARN**
-（只比 `cpu.max`/`memory.max` 两维；`pids.max` 的 `max` 是 k8s 实测形状、故意不比 ——
-`envd_service/runtime/sandbox_cgroup.py::check_policy_ceiling`；compose 三条车道实测就是这两维都 `max`）。请求超过**落点节点**的上限 ⇒ 具名 `400`；节点还没上报上限 ⇒
-具名 `503`。四条真 cgroup v2 形状（基线 2 核/2 GiB + 策略 200/2048/256 ⇒ 通过；策略 400 ⇒
+**单箱上限（控制面的策略，不是内核读数、也不是 worker 的数）**：`E2B_MAX_SANDBOX_CPU_PERCENT` /
+`E2B_MAX_SANDBOX_MEMORY_MB` / `E2B_MAX_SANDBOX_PROCESSES` 是一箱最多能配到多少。
+**2026-10-07 裁定（R17）：这份上限由控制面持有并下发** —— 控制面 `Settings` 在启动时按
+"显式 env > `E2B_MAX_TOTAL_*` > `E2B_DEFAULT_*`"（`gateway_common/sandbox_ceiling.py` 里那一条规则；
+三档全 `0` 是控制面按名拒绝的配置，**绝不默认成"无上限"**）解析出三个正整数，写进**每个**节点记录
+（`sandbox_{cpu_percent,memory_mb,processes}_max`，因此各节点同值），并在
+`POST /internal/nodes/register` 与 `/heartbeat` 的**响应体**里下发
+`{"sandboxCeiling": {"cpuPercent": …, "memoryMB": …, "processes": …}}`（`off` 车道照发 —— 这是策略，
+与车道无关）。worker 采纳它（`envd_service/agent.py::adopt_sandbox_ceiling`），再拿它与**本机内核**
+读数交叉校验：**下发值 > 内核 ⇒ 具名拒绝这份下发**（`cgroup-refusal ceiling-exceeds-kernel`，不夹取、
+不 WARN；此后该 worker 没有上限 ⇒ 建箱一律**具名拒绝**，绝不无额度放行），**内核 = `max` ⇒ 采纳 +
+一行 WARN**（只比 `cpu.max`/`memory.max` 两维；`pids.max` 的 `max` 是 k8s 实测形状、故意不比 ——
+`envd_service/runtime/sandbox_cgroup.py::check_policy_ceiling`；compose 三条车道实测就是这两维都 `max`）。
+**收到下发之前没有上限**：worker 的 route-B 句柄带 `None`，`attach` 按名拒绝
+（`cgroup-refusal ceiling-unavailable`）。请求里的是**单箱需求**（`cpuCount`/`memoryMB`），判据只有一条
+`需求 <= 上限`：超过**落点节点**的上限 ⇒ 具名 `400`（数字取自记录，而记录由控制面写）。worker 自己再声明
+这三个 env 不改变任何东西（它不再读它们）。**上线顺序随之变成先滚控制面、再滚 worker**：新控制面 + 旧
+worker 无害（旧 worker 忽略响应里的新字段），旧控制面 + 新 worker ⇒ worker 拿不到上限、按设计全拒。
+四条真 cgroup v2 形状（基线 2 核/2 GiB + 下发 200/2048/256 ⇒ 通过；下发 400 ⇒
 `cgroup-refusal ceiling-exceeds-kernel`；compose 无 limits ⇒ 通过 + WARN；k0s 覆盖层 4 核/4 GiB +
-策略 400/4096/1024 ⇒ 通过）与五份清单的取值见 `.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/`
-的 `task-1-report.md`；请求侧的具名 400/503 见同目录 `task-2-report.md`。
+下发 400/4096/1024 ⇒ 通过）与本裁定的实施记录见
+`.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-8-report.md`（原先的"两侧都读"是
+`task-1-report.md` §2.3）。
 
 **撞墙可见（D3 / Review Focus §4）**：`memory.events` 的 `oom_kill`/`oom_group_kill` 与 `pids.events`
 的 `max` 由 worker 采样（活箱每 `E2B_CGROUP_EVENTS_INTERVAL_S`（默认 5 s）一次，加收尾一次），随心跳的
@@ -698,9 +709,9 @@ await sandbox.kill()
 | `E2B_MAX_TOTAL_CPU_PERCENT` | `400` | 宿主总 CPU 上限 |
 | `E2B_MAX_TOTAL_DISK_MB` | `10240` | 宿主总磁盘上限 |
 | `E2B_MAX_TOTAL_PROCESSES` | `2048` | 宿主总并发进程上限 |
-| `E2B_MAX_SANDBOX_CPU_PERCENT` | 跟随节点总量（k8s 基线 `200`，k0s 覆盖层 `400`） | 每沙箱 CPU 上限（**策略**，不是内核读数）；未设/`<=0` ⇒ 跟随节点总量 |
-| `E2B_MAX_SANDBOX_MEMORY_MB` | 跟随节点总量（k8s `2048`，k0s `4096`） | 每沙箱内存上限（MiB），也就是沙箱 `memory.high`/`memory.max` 的上界 |
-| `E2B_MAX_SANDBOX_PROCESSES` | 跟随节点总量（k8s `256`，k0s `1024`） | 每沙箱任务数上限（= `pids.max` 的上界） |
+| `E2B_MAX_SANDBOX_CPU_PERCENT` | 跟随节点总量（k8s **控制面**基线 `200`，k0s 覆盖层 `400`） | 每沙箱 CPU 上限（**控制面的策略**，R17；由控制面下发，worker 不读它）；未设/`<=0` ⇒ 跟随控制面的 `E2B_MAX_TOTAL_CPU_PERCENT` |
+| `E2B_MAX_SANDBOX_MEMORY_MB` | 跟随节点总量（k8s `2048`，k0s `4096`） | 每沙箱内存上限（MiB），也就是沙箱 `memory.high`/`memory.max` 的上界；同样由控制面下发 |
+| `E2B_MAX_SANDBOX_PROCESSES` | 跟随节点总量（k8s `256`，k0s `1024`） | 每沙箱任务数上限（= `pids.max` 的上界）；同样由控制面下发 |
 | `E2B_CGROUP_EVENTS_INTERVAL_S` | `5` | worker 扫每箱 `memory.events`/`pids.events` 的间隔（秒）；`0` 关周期扫，收尾那次读照常 |
 | `E2B_ENABLE_NETWORK` | `false` | 是否允许网络 |
 | `E2B_LOG_LEVEL` | `INFO` | 日志级别 |

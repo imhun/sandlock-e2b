@@ -3009,7 +3009,7 @@ pause 容器 —— 这是"本地全绿 ≠ 线上成立"的一个具体案例�
 所以它绿着也没发现这件事；④ 按 `AGENTS.md`，修完先在**本地 compose 车道**复跑五条验收，再重新构建、
 再走两段式上线。
 
-**回退杆复核（本次实际用过，有效）**：`deploy/k8s-k0s/worker-capacity.patch.yaml:55-56` 的
+**回退杆复核（本次实际用过，有效）**：`deploy/k8s-k0s/worker-capacity.patch.yaml:47-48` 的
 `E2B_SANDBOX_CGROUP` 翻回 `"off"` + `apply.sh` ⇒ 行为逐字节回到 Phase 1 之前；**没有**需要额外清理的
 cgroup（这一版从未建过 `sbx_*`）。集群与用户的本地 `compose` 栈都没有别的改动。
 
@@ -3090,7 +3090,7 @@ uid 相符；评审六条规格全过），按 `AGENTS.md` 先在**本地 compos
 **结论先说**：Phase 2（T1–T5，提交 `0fe05b9..a11f9dd`；`d219797` 是 T1 本尊）把"沙箱能烧多少内存、能起多少任务"从
 **中介记账**换成**内核强制** —— 每个 `sbx_<id>` 同时被 `cpu.max`、`memory.high`/`memory.max`
 （同一根线）与 `pids.max` 约束。超内存**先节流、撑不住再由内核 SIGKILL 那个分配者**（内核这条车道不回 `ENOMEM`、直接杀；`off` 车道的中介是**杀 + 答 `ENOMEM`** —— P2 的产品语义变化是"谁在强制"与"账覆盖谁"，不是"会不会杀"）；超任务数拿 `EAGAIN`（与今天同一种错误）；每箱的
-上限（策略）由三个显式 env 决定，worker 启动时拿它与自己容器的内核限额交叉校验。**本节写的
+上限（策略）由三个显式 env 决定 —— **自 2026-10-07 的 R17 / Task 8 起这三个 env 只写在控制面上，值由控制面写进节点记录并在 register/heartbeat 的响应里下发给 worker**，worker 收到后与自己的内核限额交叉校验（详见本节末的 Task 8 两段）。**本节写的
 全部是本地 compose 车道与一次性真 cgroup v2 容器上量到的**；线上重滚（重建镜像 + 两段式
 `off`→`required`）与验收 ⑥⑦⑧⑨ 的读数归 **Task 7 Step 4**，本节不预填（末尾留了占位）。
 
@@ -3098,30 +3098,39 @@ uid 相符；评审六条规格全过），按 `AGENTS.md` 先在**本地 compos
 
 | # | 改了什么 | 实测出处 |
 |---|---|---|
-| T1 | 三个新 env `E2B_MAX_SANDBOX_CPU_PERCENT` / `_MEMORY_MB` / `_PROCESSES` 是**单箱上限**；未设或 `<=0` ⇒ 跟随节点总量（worker 读 `E2B_NODE_*`，控制面读 `E2B_MAX_TOTAL_*`），**绝不"无上限"**；worker 启动时与容器内核限额交叉校验，**策略 > 内核 ⇒ 具名拒绝启动**，**内核 = `max` ⇒ 一行 WARN**（只比 cpu/内存两维） | 四种形状的真 cgroup v2 探针（基线 2 核/2 GiB + 策略 200/2048/256 ⇒ 通过；策略 400 ⇒ `cgroup-refusal ceiling-exceeds-kernel`；compose 无 limits ⇒ 通过 + WARN；k0s 覆盖层 4 核/4 GiB + 策略 400/4096/1024 ⇒ 通过）与两条心跳 payload 见 `.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-1-report.md` §2.3 |
-| T2 | 创建请求真的解析 `cpuCount`/`memoryMB`（N84 收口）：`record.cpu_count`/`memory_mb` 是唯一真相、台账 cpu 维度由 `cpu_count × 100` 导出；`0`/负数/非整数 ⇒ 具名 `400 must be a positive integer`；超过**落点节点**的单箱上限 ⇒ 具名 `400 cpuCount 8 exceeds this node's per-sandbox maximum (4)`；节点还没上报上限 ⇒ 具名 `503` | RED `20 failed, 1 passed` → GREEN `36 passed`；见 `task-2-report.md` §2 与 `tests/unit/test_sandbox_size_ceiling.py` |
+| T1 | 三个新 env `E2B_MAX_SANDBOX_CPU_PERCENT` / `_MEMORY_MB` / `_PROCESSES` 是**单箱上限**；未设或 `<=0` ⇒ 跟随节点总量，**绝不"无上限"**；worker 拿它与容器内核限额交叉校验，**上限 > 内核 ⇒ 具名拒绝这份下发**，**内核 = `max` ⇒ 一行 WARN**（只比 cpu/内存两维）。**自 2026-10-07 的 R17 起这三个 env 只有控制面读，值由控制面在 register/heartbeat 响应里下发**（T8） | 四种形状的真 cgroup v2 探针（基线 2 核/2 GiB + 下发 200/2048/256 ⇒ 通过；下发 400 ⇒ `cgroup-refusal ceiling-exceeds-kernel`；compose 无 limits ⇒ 通过 + WARN；k0s 覆盖层 4 核/4 GiB + 下发 400/4096/1024 ⇒ 通过）与心跳 payload 见 `.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-1-report.md` §2.3；**R17 的下发/采纳读数见同目录 `task-8-report.md`** |
+| T2 | 创建请求真的解析 `cpuCount`/`memoryMB`（N84 收口）：`record.cpu_count`/`memory_mb` 是唯一真相、台账 cpu 维度由 `cpu_count × 100` 导出；`0`/负数/非整数 ⇒ 具名 `400 must be a positive integer`；超过**落点节点**的单箱上限 ⇒ 具名 `400 cpuCount 8 exceeds this node's per-sandbox maximum (4)`（R17 起这个上限是**控制面**写进记录的，不再有"节点没上报 ⇒ 503"的窗口） | RED `20 failed, 1 passed` → GREEN `36 passed`；见 `task-2-report.md` §2 与 `tests/unit/test_sandbox_size_ceiling.py` |
 | T3 | `attach()` 除 `cpu.max` 再写 `memory.high`/`memory.max`/`pids.max`，**每个写完逐字回读**；`setup()` 一次使能 `+cpu +memory +pids`（腾空前 EBUSY、腾空后 ok，与 `+cpu` 同一条规则）；声明额度高于 worker 的策略上限 ⇒ 第二道具名拒绝 | 真 cgroup v2 探针 20/20：四个限额逐字回读、8 条任务预算 ⇒ 第 8 条 `EAGAIN(11)`、超 `memory.max` 的分配 `SIGKILL(9)`、`memory.events.oom_kill=1`、邻居箱存活、`memory.oom.group=0`；见 `task-3-report.md` §2 |
 | T4 | 通知表**只在 `required` 退掉地址空间那一族**（mmap/munmap/brk/mremap，及 `sysv_ipc` 允许时的 shmget）；**clone 族整族保留**（R13/R14：`resource::handle_fork` 是 `clone3` 命名空间创建禁令与 checkpoint `hold_forks` 的唯一执行点，而 cBPF 读不到用户指针后面的 `clone_args`、`clone3` 又不在默认 blocklist 里 —— 退掉它是拿安全控制换延迟） | 同一台机、同一支 `deploy/scripts/acceptance/probe_n82_traced_syscall_costs.py`：`mmap` 的 `required` **293562 op/s**（4 次 stall），`off` 2540、BEFORE 2539（两档都是 40 次/51 轮的 N82 签名）；`clone` 两档 `off` 1676 / `required` 1625 op/s（未变）；fork `831a7da` + 父仓 `e60d754`；见 `task-4-report.md` §3 |
 | T5 | 每箱 `memory.events`（`oom_kill`/`oom_group_kill`）与 `pids.events`（`max`）由 worker 采样（活箱每 `E2B_CGROUP_EVENTS_INTERVAL_S`（默认 5 s），加收尾一次），随心跳的 `sandboxEvents` 上报；控制面按每箱每计数取最大值，**增长**就打一行点名沙箱的 WARN | 真 cgroup v2 探针 21/21（修复轮后 30/30）：`pids.current=3`（2 线程 + 1 进程）、fork 与线程各撞一次 ⇒ `pids.events.max=1`、`oom_kill=1`；收尾那份读数在箱子被拆掉之后仍在；见 `task-5-report.md` §2.3 |
 
-**五份清单的单箱上限**（显式写出；值 = 该车道愿意给**一个沙箱**的上限）
+**各清单的单箱上限**（显式写出；值 = 该车道愿意给**一个沙箱**的上限）
 
-| 清单 | `E2B_MAX_SANDBOX_CPU_PERCENT` / `_MEMORY_MB` / `_PROCESSES` | 为什么是这个值 |
+**2026-10-07（R17 / Task 8）之后这三行 env 只写在控制面服务上**：worker 清单一个都不声明
+（worker 不再读它们），控制面把值写进每个节点记录并在 register/heartbeat 的响应里下发。
+
+| 清单（**控制面**服务） | `E2B_MAX_SANDBOX_CPU_PERCENT` / `_MEMORY_MB` / `_PROCESSES` | 为什么是这个值 |
 |---|---|---|
-| `deploy/k8s/worker.yaml` | `200` / `2048` / `256` | 该 pod 的 `resources.limits` 就是 `cpu: "2"`、`memory: 2Gi` ⇒ 单箱最多 2 核 / 2 GiB；任务数跟 `E2B_NODE_PROCESSES=256` |
-| `deploy/k8s-k0s/worker-capacity.patch.yaml` | `400` / `4096` / `1024` | 覆盖层把 pod limits 抬到 `cpu: "4"`、`memory: 4Gi` ⇒ 单箱上限必须同时抬，否则 D5b 交叉校验会**具名拒绝启动**；任务数跟覆盖层的 `E2B_NODE_PROCESSES=1024` |
-| `deploy/compose/docker-compose.multinode.yml`（三个 worker） | `200` / `2048` / `256` | 三条 compose 车道没给 worker 设 `cpus`/`mem_limit`（内核那份是 `max`，实测）⇒ 这里只能给到节点总量 |
-| `deploy/compose/docker-compose.prod.yml`、`deploy/stack/docker-compose.prod.yml` | `${…:-200}` / `${…:-2048}` / `${…:-256}` | 同上；用 `:-默认` 保持这两个文件"生产可用 `.env` 覆盖"的既有风格 |
+| `deploy/k8s/control-plane.yaml` | `200` / `2048` / `256` | 该车道的 worker pod `resources.limits` 是 `cpu: "2"`、`memory: 2Gi` ⇒ 单箱最多 2 核 / 2 GiB；任务数跟 `E2B_MAX_TOTAL_PROCESSES=2048` 下的节点口径 `256` |
+| `deploy/k8s-k0s/control-plane-capacity.patch.yaml` | `400` / `4096` / `1024` | 覆盖层把 worker pod limits 抬到 `cpu: "4"`、`memory: 4Gi` ⇒ 下发的上限必须**同时**抬，否则 worker 的 D5b 会**具名拒绝这份下发**、该节点建箱全拒；任务数跟覆盖层的 `E2B_NODE_PROCESSES=1024` |
+| `deploy/compose/docker-compose.multinode.yml`（control-plane 服务） | `200` / `2048` / `256` | 三条 compose 车道没给 worker 设 `cpus`/`mem_limit`（内核那份是 `max`，实测）⇒ 这里只能给到节点总量 |
+| `deploy/compose/docker-compose.prod.yml`、`deploy/stack/docker-compose.prod.yml`（control-plane 服务） | `${…:-200}` / `${…:-2048}` / `${…:-256}` | 同上；用 `:-默认` 保持这两个文件"生产可用 `.env` 覆盖"的既有风格 |
+
+worker 侧对应的是**内核**那一半：`deploy/k8s/worker.yaml` 的 pod limits（2 核 / 2 GiB）与
+`deploy/k8s-k0s/worker-capacity.patch.yaml` 抬到 4 核 / 4 GiB —— 两个文件必须与上面那两行走在
+一起（`tests/unit/test_worker_env_key_sets.py::test_the_k0s_overlay_raises_the_handed_down_ceiling_with_the_pod_limits`
+把这条耦合钉住了）。
 
 **上线顺序与回退杆**
 
-- **顺序约束（R12）**：创建路径按"落点节点的单箱上限"校验，而那个上限**只**来自 worker 的心跳
-  （`sandboxCeiling`）。混版本窗口里**旧 worker 的记录没有上限 ⇒ 建箱被具名 503**；所以 Task 7
-  要么**先滚 worker 再滚控制面**，要么接受窗口期内建箱被拒（方向是 fail-closed，不是静默放行）。
+- **顺序约束（R17 / Task 8，推翻 R12）**：单箱上限是**控制面的策略**，由控制面写进节点记录并在
+  register/heartbeat 的**响应**里下发给 worker。所以**先滚控制面、再滚 worker**：新控制面 + 旧 worker
+  无害（旧 worker 忽略响应里的新字段，用自己的那份 env），旧控制面 + 新 worker ⇒ worker 拿不到上限、
+  **按设计全拒**（方向是 fail-closed，不是静默放行）。
 - **两段式车道**（计划 Task 7 Step 3）：先用 `off` 滚完冒烟，再翻 `required` —— Phase 2 的
   `memory.*`/`pids.max`/事件采样只在 `required` 上生效（`off` 那条车道逐字节回到 Phase 1 之前）；
   请求侧的尺寸解析与单箱上限是**车道无关**的（见下一条）。
-- **回退杆**：把 `E2B_SANDBOX_CGROUP` 那一条的 `value` 翻回 `"off"`（`deploy/k8s-k0s/worker-capacity.patch.yaml:55-56`，§7.49 用过、实测有效的那一杆；compose 是 `deploy/compose/docker-compose.multinode.yml` 里的 env）⇒ 不再写 `memory.*`/`pids.max`、不建事件采样循环；内存退回 fork 的中介记账（超预算**杀分配者 + 答 `ENOMEM`**，账只覆盖载荷），任务数退回 clone 族计数（`EAGAIN`）；**请求侧不受这条回退影响**（`cpuCount`/`memoryMB` 的具名 400/503 读的是心跳里的
+- **回退杆**：把 `E2B_SANDBOX_CGROUP` 那一条的 `value` 翻回 `"off"`（`deploy/k8s-k0s/worker-capacity.patch.yaml:47-48`，§7.49 用过、实测有效的那一杆；compose 是 `deploy/compose/docker-compose.multinode.yml` 里的 env）⇒ 不再写 `memory.*`/`pids.max`、不建事件采样循环；内存退回 fork 的中介记账（超预算**杀分配者 + 答 `ENOMEM`**，账只覆盖载荷），任务数退回 clone 族计数（`EAGAIN`）；**请求侧不受这条回退影响**（`cpuCount`/`memoryMB` 的具名 400/503 读的是心跳里的
   `sandboxCeiling`，`off` 车道照带，见 R11）。
 - **一条不可自动收回的差别**：`required` 上箱内 `/proc/meminfo` 的 `MemFree` 不再跟中介账本
   （账本退役），恒等于全额；`MemTotal`/`sysinfo.totalram` 照旧报声明额度。两档读数（同一支探针）：
@@ -3174,29 +3183,38 @@ tmp/venv/bin/python deploy/scripts/acceptance/cgroup_acceptance.py \
 |---|---|
 | ⑥ 内存墙杀分配者 | （green5 / green6）`memory.max = memory.high = 67108864`（＝声明的 64 MiB，逐字）；箱内 `python3` 触到上限 ⇒ 被测进程 **SIGKILL**（两跑都是 `{"hog_exit": 137}`；加固前的几跑里有"命令本身带 `Killed`"的另一种同义形状，脚本两种都读，见坑 1）；箱子自己 `memory.events` 的**采样峰值** `oom_kill=1`、`oom_group_kill=0`（D3：只有分配者死）、`memory_peak_live_max = 67108864`（＝上限）、杀掉之后箱子仍答 `echo box-alive`；同节点邻居 5 次往返 min **28.2 ms**（green5：安静 27.9 ms，上限 83.6）/**48.5 ms**（green6：安静 29.1 ms，上限 87.2） |
 | ⑦ 任务预算回 EAGAIN | （green5 / green6）声明的 `max_processes` 取自 worker 记录 = **137**，`pids.max = 137`（逐字相等）；fork 炸弹在箱内 **129 次 fork 后 `errno=11`（EAGAIN）**（两跑同）；`pids.current` 峰值 **137**（＝`pids.max`）而同一采样点 `cgroup.procs = 134 < 137` ⇒ 是**内核**那堵墙（它数线程）而不是中介的进程计数器；`pids.events.max` 采样峰值 `1`；同节点邻居 min 往返 **29.6 ms**（green5，上限 74.0）/ **29.7 ms**（green6，上限 78.3） |
-| ⑧ 超上限 ⇒ 具名 400 | （green5 / green6，两跑同）`cpuCount 8` ⇒ `400` + `cpuCount 8 exceeds this node's per-sandbox maximum (2)`；`memoryMB 8193` ⇒ `400` + `memoryMB 8193 exceeds this node's per-sandbox maximum (2048)`；**贴着上限**的 `cpuCount 2` ⇒ `201`（否则"一律拒绝"也能过）→ `DELETE 204`（这一条现在也进判据）。两条上限都是从 worker 容器里读的 `E2B_MAX_SANDBOX_*` 反推，不是写死的 2 |
+| ⑧ 超上限 ⇒ 具名 400 | （green5 / green6，两跑同）`cpuCount 8` ⇒ `400` + `cpuCount 8 exceeds this node's per-sandbox maximum (2)`；`memoryMB 8193` ⇒ `400` + `memoryMB 8193 exceeds this node's per-sandbox maximum (2048)`；**贴着上限**的 `cpuCount 2` ⇒ `201`（否则"一律拒绝"也能过）→ `DELETE 204`（这一条现在也进判据）。两条上限都是从**控制面容器**里读的 `E2B_MAX_SANDBOX_*` 反推（R17：策略归控制面），不是写死的 2 |
 | ⑨ peak 与任务单位 | （green5 / green6）`memory.max = memory.high = 268435456`（＝声明 256 MiB）、`pids.max = 137` ＝ **worker 记录的 `max_processes`**；箱内扣住 64 MiB ⇒ `memory.peak = 72667136`（green5）/ `72818688`（green6）∈ [64 MiB, `memory.max`]；`pids.current` 稳态：只有壳+python **8**、再加 2 个线程 **10**、再加 1 个 fork 子进程 **9**（两跑同）⇒ **Δ=2（两个线程）与 Δ=1（一个进程）逐字相等**（Task 5 探针那条"2 线程 + 1 进程 = 3"的同一单位；每条读数 9 个采样点全同值） |
 
 **RED 一档：`off` 车道**（同一份 override，只把 `E2B_SANDBOX_CGROUP` 翻成 `off`，重建三台 worker；
 最终脚本复跑 `red-off-fix`：`elapsed 76.6`、退出码 1，形状与加固前那一跑**逐条同名**）：
 ⑨ 条里的 **⑥⑦⑨ 逐条具名失败**（"no sbx_<id> cgroup … 没有 `memory.max`/`pids.max`/`memory.peak` 可读"），
 ①–⑤ 照 Phase 1 那样全 FAIL（`measuredCpuPercent` 回到 ~400% 那一档、沙箱没有 cgroup），
-**⑧ 仍是 PASS 且这是对的**：请求侧的上限读的是心跳里的 `sandboxCeiling`，`off` 车道照带（R11）——
+**⑧ 仍是 PASS 且这是对的**：请求侧的上限是**控制面自己的策略**（R17：写进节点记录、与车道无关），`off` 车道照样生效 ——
 它**不可能**被这个开关弄红。同一条 `off` 车道上手工跑同一支 hog：箱子也是 `exit=0 / {"hog_exit": 137} / stderr=Killed`
 —— 所以"超预算"两档**都会杀**，Phase 2 变的不是"会不会杀"，而是**谁在杀**（内核）与**账覆盖谁**；
 差别在于 `off` 那档**没有任何 cgroup 与内核计数**可读（这就是 ⑥⑦⑨ 在那档具名失败的原因）。
 
-**RED 二档：混版本车道（R12）**（最终脚本复跑 `red-mixedversion-fix`：`elapsed 60.8`、退出码 1，
-形状与加固前那一跑同名；`down -v` 重开，三台 worker 换成 **Phase 2 之前**的镜像
-`…/e2b-sandlock-worker:0.1.0-1049-g5dde329-20261006-102253`——实测该镜像里既没有 `sandboxCeiling`
-也没有 `E2B_MAX_SANDBOX_*`；控制面仍是本分支的构建）：**⑧ 具名失败**，读数正是这条窗口的定义——
-贴着上限的请求答 **`503 node worker-2 cannot size a sandbox: it has not reported its per-sandbox
-cpuCount maximum`**（具名 503），而"离谱的超限请求"（`cpuCount 8` / `memoryMB 8193`）答的是
-`503 No resources available`（没有上限可查 ⇒ 落到准入那一道，节点装不下 8 核）；⑥⑦⑨ 同档具名失败
-（`sized create answered 503: …cpuCount maximum`），①–⑤ 直接在建箱处拒绝。**这条窗口既是 ⑧ 的 RED，
-也是 Step 3 上线顺序（先 worker 后控制面）的现场证据**：节点记录里存过上限之后，旧 worker 的心跳
-**不会**把它抹掉（`apply_sandbox_ceiling` 只写不删），所以混版本只在"记录从没拿到上限"的节点上咬人
-——本题那档是 `down -v` 之后由旧 worker **首次注册**造出来的。
+**RED 二档：没有下发的车道（R17 / Task 8）**（`red-oldcp`：`elapsed 61.0`、退出码 1；`down -v` 重开，
+三台 worker 是本分支的构建，**控制面换成 BASE（`c10cf45`）的镜像** `n83t8-cp-old` —— 用同一个
+Dockerfile 从 `git archive c10cf45` 的树里构建，实测 `grep -c _control_plane_ceiling = 0`、
+`grep -c kernelCeiling = 0`）：**⑥⑦⑧⑨ 全部具名失败**。⑧ 的原始读数：
+`cpu_status=503 / cpu_message="No resources available"`、`memory_status=503 / memory_message="No
+resources available"`、`at_ceiling_status=503`（期望分别是两个点名上限的 `400` 与一个 `201`）；
+⑥⑦⑨ 的失败文案是 `sized create answered 503: {"code":503,"message":"node worker-3 cannot size a
+sandbox: it has not reported its per-sandbox cpuCount maximum"}`。worker 侧：整轮心跳都是
+`HTTP/1.1 204 No Content`，日志里**没有** `adopted the control plane's per-sandbox ceiling` 那一行
+—— 上限从没到过它手里。**这条车道就是 R17 的上线顺序（先控制面、后 worker）的现场证据**：旧控制面
+不给下发，新 worker 拿不到上限，于是**全拒**（fail-closed），而不是无额度放行。
+
+**Task 8 的 GREEN（R17）**（`green2`：`elapsed 256.2`、退出码 0、**9/9 pass**；`green` 是第一跑，
+形状相同，跑在下发去抖修复之前）：⑧ 的两条期望值来自**控制面容器**里读出的
+`E2B_MAX_SANDBOX_CPU_PERCENT=200` / `_MEMORY_MB=2048`（`ceiling_source` 点名了这一点），worker 容器
+那份 `observed` 只有 `E2B_SANDBOX_CGROUP` / `E2B_CGROUP_MOUNT` / `E2B_SANDBOX_NOTIFY_RATE_LIMIT` /
+`E2B_DEFAULT_MAX_PROCESSES`（**没有**那三个键）；worker 日志里是
+`adopted the control plane's per-sandbox ceiling (cpuPercent=200 memoryMB=2048 processes=256)` 与
+`cgroup lane ready … subtree_control=cpu memory pids`，而 compose 车道那行"内核 `max`"的 WARN
+**每个 worker 只出现一次**（去抖之前是每拍一次：实测 30 s 里 4 行）。
 
 **三条本车道实测的坑（供 Step 3/4 带上）**
 

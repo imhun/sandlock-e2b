@@ -1441,7 +1441,7 @@ async def test_heartbeat_endpoint_stores_usage_snapshot(tmp_path):
                 "platformDiskBudgetMB": 4096,
             },
         )
-        assert response.status_code == 204
+        assert response.status_code == 200
         record = control.state.nodes.get(node_id)
         assert record.used_disk_mb == 42
         assert record.disk_total_mb == 4096

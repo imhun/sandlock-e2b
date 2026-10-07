@@ -81,6 +81,25 @@ def _endpoints(**extra) -> dict[str, NodeEndpoint]:
     return {"node_a": ENDPOINT_A, "node_b": ENDPOINT_B, **extra}
 
 
+def _register_body(settings: ControlSettings, node_id: str) -> dict:
+    """The registration **answer**: the node id plus the handed-down ceiling.
+
+    N83 phase 2 / ruling R17: the control plane returns its own resolved
+    per-sandbox policy ceiling with every register/heartbeat answer, so a
+    registration is no longer a bare ``{"nodeID": ...}``. The values are read
+    off the same ``Settings`` the control plane resolved them from, which is
+    what makes this an exact assertion and not a partial one.
+    """
+    return {
+        "nodeID": node_id,
+        "sandboxCeiling": {
+            "cpuPercent": settings.max_sandbox_cpu_percent,
+            "memoryMB": settings.max_sandbox_memory_mb,
+            "processes": settings.max_sandbox_processes,
+        },
+    }
+
+
 def _app(
     workspace,
     *,
@@ -241,7 +260,7 @@ async def test_node_bs_key_from_node_as_network_position_is_rejected(
             address="http://192.168.1.1:49983",  # ignored: resolver wins
         )
         assert ok.status_code == 200
-        assert ok.json() == {"nodeID": "node_b"}
+        assert ok.json() == _register_body(app.state.settings, "node_b")
     assert nodes.get("node_b").address == ENDPOINT_B.address
 
     async with _client(app, source_ip=ENDPOINT_A.ip) as client:
@@ -264,7 +283,7 @@ async def test_node_bs_key_from_node_as_network_position_is_rejected(
             headers={"X-Internal-Key": KEY_B},
             json={},
         )
-        assert honest.status_code == 204
+        assert honest.status_code == 200
 
 
 # ------------------------------------------------- ③ 源 IP 层不是恒真的死代码
@@ -291,7 +310,7 @@ async def test_the_two_nodes_expected_source_ips_differ(workspace) -> None:
         assert (
             await _register(client, key=KEY_B, node_id="node_b", address="")
         ).status_code == 200
-    for source_ip, expected in ((ENDPOINT_B.ip, 204), (ENDPOINT_A.ip, 403)):
+    for source_ip, expected in ((ENDPOINT_B.ip, 200), (ENDPOINT_A.ip, 403)):
         async with _client(app, source_ip=source_ip) as client:
             resp = await client.post(
                 "/internal/nodes/node_b/heartbeat",
@@ -354,7 +373,7 @@ async def test_registration_derives_the_address_from_the_resolver(workspace) -> 
             client, key=KEY_A, node_id="node_a", address="http://evil.example:1"
         )
         assert resp.status_code == 200
-        assert resp.json() == {"nodeID": "node_a"}
+        assert resp.json() == _register_body(app.state.settings, "node_a")
     assert nodes.get("node_a").address == ENDPOINT_A.address
 
 
@@ -502,7 +521,7 @@ async def test_a_fleet_key_is_accepted_only_from_the_claims_resolved_address(
             address="http://evil.example:1",
         )
         assert ok.status_code == 200
-        assert ok.json() == {"nodeID": "node_b"}
+        assert ok.json() == _register_body(app.state.settings, "node_b")
     assert nodes.get("node_b").address == ENDPOINT_B.address
 
     async with _client(app, source_ip=ENDPOINT_A.ip) as client:
@@ -569,7 +588,7 @@ async def test_a_node_that_resolves_to_several_addresses_is_accepted_from_any(
             headers={"X-Internal-Key": KEY_B},
             json={},
         )
-        assert heartbeat.status_code == 204
+        assert heartbeat.status_code == 200
 
     # A source in neither address is still refused, and the refusal names the
     # whole set so "why did this node start failing?" is one line.

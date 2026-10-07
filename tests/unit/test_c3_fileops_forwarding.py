@@ -332,7 +332,7 @@ async def test_a_heartbeat_refreshes_a_verified_workers_identity(workspace) -> N
             headers={"X-Internal-Key": KEY_A},
             json={"workerUID": 65533, "workerGID": 65533},
         )
-    assert resp.status_code == 204
+    assert resp.status_code == 200
     node = app.state.nodes.get(NODE_A)
     assert (node.worker_uid, node.worker_gid) == (65533, 65533)
 
@@ -367,7 +367,7 @@ async def test_a_worker_claiming_another_identity_gets_nothing_stored(
             headers={"X-Internal-Key": KEY_A},
             json={"workerUID": UID_X, "workerGID": UID_X},
         )
-    assert resp.status_code == 204
+    assert resp.status_code == 200
     node = app.state.nodes.get(NODE_A)
     assert (node.worker_uid, node.worker_gid) == (WORKER_UID, WORKER_GID), (
         "the forged claim must never replace a verified identity"
@@ -504,8 +504,8 @@ async def test_an_unverifiable_identity_is_reported_once_per_node(
     # One registration and two heartbeats: the line is owed once, not three
     # times (and in production the heartbeat is every ~5 s, forever).
     await _enroll(app)
-    assert await _heartbeat(app) == 204
-    assert await _heartbeat(app) == 204
+    assert await _heartbeat(app) == 200
+    assert await _heartbeat(app) == 200
 
     assert _identity_warnings(caplog) == [
         f"internal API: node {NODE_A} reported worker identity "
@@ -533,8 +533,8 @@ async def test_a_shape_with_no_source_at_all_says_that_instead(
     caplog.set_level("WARNING", logger="control_plane.api.internal")
     caplog.clear()
     await _enroll(app)
-    assert await _heartbeat(app) == 204
-    assert await _heartbeat(app) == 204
+    assert await _heartbeat(app) == 200
+    assert await _heartbeat(app) == 200
 
     assert _identity_warnings(caplog) == [
         f"internal API: node {NODE_A} reported worker identity "
@@ -557,7 +557,7 @@ async def test_a_verified_identity_logs_nothing(
     caplog.set_level("WARNING", logger="control_plane.api.internal")
     caplog.clear()
     await _enroll(app)
-    assert await _heartbeat(app) == 204
+    assert await _heartbeat(app) == 200
     assert _identity_warnings(caplog) == []
     assert (NODE_A, "no-pin") not in internal_module._unverified_identity_reported
 

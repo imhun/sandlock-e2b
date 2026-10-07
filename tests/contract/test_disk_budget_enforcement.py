@@ -83,7 +83,7 @@ async def test_over_budget_report_blocks_writes_and_never_pauses(apps, control_c
         json={"sandboxDiskUsage": {sid: over}},
     )
 
-    assert response.status_code == 204
+    assert response.status_code == 200
     after = registry.get(sid)
     assert after.state == "running", "a crossing must not pause the sandbox"
     assert after.workspace_disk_used_bytes == over
@@ -110,7 +110,7 @@ async def test_a_tree_within_budget_leaves_the_sandbox_running(apps, control_cli
         json={"sandboxDiskUsage": {sid: record.disk_size_mb * 1024 * 1024}},
     )
 
-    assert response.status_code == 204
+    assert response.status_code == 200
     assert registry.get(sid).state == "running"
     assert nodes.get("node_disk").reserved_disk_mb == record.disk_size_mb
 
@@ -163,7 +163,7 @@ async def test_the_measurement_lands_on_the_record(apps, control_client):
         json={"sandboxDiskUsage": {sid: measured}},
     )
 
-    assert response.status_code == 204
+    assert response.status_code == 200
     assert registry.get(sid).workspace_disk_used_bytes == measured
     assert registry.get(sid).state == "running"
     metrics = await control_client.get(

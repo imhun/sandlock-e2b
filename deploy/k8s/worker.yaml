@@ -661,25 +661,19 @@ spec:
               value: "20"
             - name: E2B_NODE_PROCESSES
               value: "256"
-            # N83 phase 2 / Task 1 (D5): the largest values a **single** sandbox
-            # may be configured to on this lane -- the per-sandbox *policy*
-            # ceiling. Written out even though it equals the `E2B_NODE_*` totals
-            # above (which is also what the code default resolves to), because
-            # the number is a decision: one sandbox may take this node's whole
-            # declared budget here, and a deployment that disagrees lowers these
-            # without touching the node's own capacity. They are *checked*, not
-            # derived: at startup the worker compares them with the kernel's own
-            # read of its container cgroup (`cpu.max` = 2 cores / `memory.max` =
-            # 2 GiB here, from `resources.limits` below) and refuses to start if
-            # the policy is above it (D5b). Processes has no kernel counterpart
-            # today (`pids.max` = `max`), so it follows the node's declared
-            # count; the k0s overlay raises the trio with the pod's limits.
-            - name: E2B_MAX_SANDBOX_CPU_PERCENT
-              value: "200"
-            - name: E2B_MAX_SANDBOX_MEMORY_MB
-              value: "2048"
-            - name: E2B_MAX_SANDBOX_PROCESSES
-              value: "256"
+            # N83 phase 2 / ruling R17 (2026-10-07): the per-sandbox *policy*
+            # ceiling (`E2B_MAX_SANDBOX_*`) is **not** declared here any more.
+            # It is the control plane's policy -- one deployment fact, written
+            # on `deploy/k8s/control-plane.yaml` -- and the control plane hands
+            # it **down** in every register/heartbeat answer
+            # (`control_plane/api/internal.py`), where this worker adopts it
+            # (`envd_service/agent.py::adopt_sandbox_ceiling`). The worker then
+            # cross-checks the handed-down number against the kernel's own read
+            # of its container cgroup (`cpu.max` = 2 cores / `memory.max` =
+            # 2 GiB here, from `resources.limits` below) and refuses the
+            # hand-down -- keeping every create refused by name -- if the
+            # promise is above what this container can deliver (D5b). A worker
+            # that declares these three keys grants nothing.
             # N83 phase 1 / Task 2: the per-sandbox cgroup switch and where the
             # narrowed cgroupfs view lands. `off` is the code default (inert:
             # no sandbox cgroup is built, no limit is written, behaviour is

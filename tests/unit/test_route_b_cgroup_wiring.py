@@ -62,8 +62,9 @@ DECLARED_PERCENT = 200
 #: -- the record is where they come from, so the pool carries them verbatim.
 DECLARED_MEMORY_MB = 2048
 DECLARED_MAX_PROCESSES = 512
-#: The worker's own per-sandbox ceiling (``E2B_MAX_SANDBOX_*``, N83 phase 2
-#: R3): the number the module's second gate compares a declared size against.
+#: The per-sandbox ceiling the **control plane** handed down (N83 phase 2 / R17;
+#: it is the control plane's own ``E2B_MAX_SANDBOX_*``): the number the module's
+#: second gate compares a declared size against.
 POLICY_CEILING = SandboxCeiling(cpu_percent=400, memory_mb=4096, processes=1024)
 CONTROL_PLANE_URL = "http://control-plane:3000"
 NODE_ID = "worker-1"
@@ -189,11 +190,6 @@ def _settings(**overrides) -> SimpleNamespace:
         sandbox_cgroup="off",
         cgroup_mount="/pod-cgroup",
         cgroup_delegate_wait_s=30.0,
-        # N83 phase 2: the per-sandbox policy ceiling (R3). Explicit here, so
-        # the resolved ceiling does not follow this test host's CPU/memory.
-        max_sandbox_cpu_percent=400,
-        max_sandbox_memory_mb=4096,
-        max_sandbox_processes=1024,
         default_cpu_percent=100,
         default_memory_mb=512,
         default_max_processes=64,
@@ -248,6 +244,9 @@ def _pools_reset(monkeypatch, tmp_path):
     )
     rb.reset_slot_pools()
     rb.reset_sandbox_cgroups()
+    # N83 phase 2 / R17: the hand-down is process-wide too -- clear it so one
+    # case's adopted ceiling cannot decide the next case's gate.
+    monkeypatch.setattr(node_agent, "_HANDED_DOWN_CEILING", None)
     yield
     rb.reset_slot_pools()
     rb.reset_sandbox_cgroups()
@@ -343,6 +342,7 @@ def test_the_required_switch_builds_one_handle_for_the_whole_process(
             built.append(kwargs)
 
     monkeypatch.setattr(rb, "SandboxCgroups", Recording)
+    monkeypatch.setattr(node_agent, "_HANDED_DOWN_CEILING", POLICY_CEILING)
     settings = _settings(sandbox_cgroup="required", cgroup_mount="/pod-cgroup")
     first = rb.sandbox_cgroups_for(settings)
     assert first is rb.sandbox_cgroups_for(settings)
@@ -351,10 +351,10 @@ def test_the_required_switch_builds_one_handle_for_the_whole_process(
             "mount": Path("/pod-cgroup"),
             "worker_uid": os.geteuid(),
             "container_token": None,
-            # N83 phase 2 (R3): the handle is built with the worker's own
-            # per-sandbox ceiling, so ``attach`` can refuse a declared size
-            # above it *by name*. It is resolved next to the handle because
-            # both are one process-wide fact.
+            # N83 phase 2 (R3/R17): the handle is built with the per-sandbox
+            # ceiling the control plane handed down, so ``attach`` can refuse a
+            # declared size above it *by name*. It is read next to the handle
+            # because both are one process-wide fact.
             "policy_ceiling": POLICY_CEILING,
         }
     ]
@@ -522,14 +522,16 @@ def test_a_caller_that_declares_nothing_hands_attach_a_none(tmp_path) -> None:
     assert fake.attached[0]["max_processes"] is None
 
 
-def test_the_handle_is_built_with_the_workers_policy_ceiling(
+def test_the_handle_is_built_with_the_handed_down_policy_ceiling(
     monkeypatch, tmp_path
 ) -> None:
-    """R3: the second gate compares against ``sandbox_ceiling_for(settings)``.
+    """R3/R17: the second gate compares against the control plane's hand-down.
 
-    Not the kernel read (``kernel_ceiling`` is only the startup cross-check):
-    the policy is a deployment decision, and the process-wide handle is built
-    with it, so every ``attach`` through that handle sees the same number.
+    Not the kernel read (``kernel_ceiling`` is only the adoption cross-check):
+    the policy is the *control plane's* deployment decision, adopted from every
+    register/heartbeat answer (``envd_service.agent.adopted_sandbox_ceiling``),
+    and the process-wide handle is built with it, so every ``attach`` through
+    that handle sees the same number.
     """
     built: list[dict] = []
 
@@ -538,9 +540,50 @@ def test_the_handle_is_built_with_the_workers_policy_ceiling(
             built.append(kwargs)
 
     monkeypatch.setattr(rb, "SandboxCgroups", Recording)
+    monkeypatch.setattr(node_agent, "_HANDED_DOWN_CEILING", POLICY_CEILING)
     rb.sandbox_cgroups_for(_settings(sandbox_cgroup="required"))
 
     assert built[0]["policy_ceiling"] == POLICY_CEILING
+
+
+def test_a_late_hand_down_updates_the_live_handle_in_place(
+    monkeypatch, tmp_path
+) -> None:
+    """R17: the value can change under a live process, and the handle follows.
+
+    The handle is process-wide and cached -- and it is the object the lane's
+    ``setup`` established the delegated parent on -- so a new ceiling is applied
+    *to* it. Rebuilding instead would abandon the parent every live
+    ``sbx_<id>`` hangs under, which is exactly what the brief's ruling forbids.
+    """
+    ceiling = SandboxCeiling(cpu_percent=200, memory_mb=2048, processes=256)
+    settings = _settings(sandbox_cgroup="required")
+    monkeypatch.setattr(node_agent, "_HANDED_DOWN_CEILING", ceiling)
+    handle = rb.sandbox_cgroups_for(settings)
+    assert handle.policy_ceiling == ceiling
+
+    changed = SandboxCeiling(cpu_percent=100, memory_mb=1024, processes=128)
+    assert rb.update_sandbox_cgroup_ceiling(settings, changed) is True
+
+    assert rb.sandbox_cgroups_for(settings) is handle
+    assert handle.policy_ceiling == changed
+
+
+def test_an_off_lane_never_builds_or_updates_a_handle(monkeypatch, tmp_path) -> None:
+    """The ``off`` lane stays byte-for-byte today's: no handle, no update."""
+    built: list[dict] = []
+
+    class Recording:
+        def __init__(self, **kwargs):  # pragma: no cover - must not run
+            built.append(kwargs)
+
+    monkeypatch.setattr(rb, "SandboxCgroups", Recording)
+    settings = _settings(sandbox_cgroup="off")
+    assert rb.sandbox_cgroups_for(settings) is None
+    assert rb.update_sandbox_cgroup_ceiling(
+        settings, SandboxCeiling(cpu_percent=100, memory_mb=1024, processes=128)
+    ) is False
+    assert built == []
 
 
 # ------------------------------------------------------- the fail-closed half

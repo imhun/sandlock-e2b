@@ -71,7 +71,6 @@ from envd_service.xfs_quota import (
 )
 from envd_service.volumes import build_volume_mounts, cleanup_volume_projects
 from gateway_common import create_trace
-from gateway_common.sandbox_ceiling import resolve_sandbox_ceiling
 from gateway_common.archive import (
     ArchiveRefusal,
     BoundedTreeWriter,
@@ -290,58 +289,181 @@ def _node_type() -> str:
     return "physical"
 
 
-def sandbox_ceiling_for(settings: Settings) -> SandboxCeiling:
-    """The per-sandbox **policy** ceiling this worker resolves (N83 D5).
+#: N83 phase 2, ruling R17 (2026-10-07): the per-sandbox **policy** ceiling is
+#: the control plane's, and this process holds the copy it handed down. It is a
+#: process-wide fact -- one deployment, one policy, one number -- because every
+#: reader that has to agree about it lives in this process: the route-B pool's
+#: second gate (``attach``'s declared-size check) and the cgroup lane's
+#: startup/positive cross-check against the kernel.
+#:
+#: ``None`` until the first register/heartbeat response carries one. ``None`` is
+#: **not** "unbounded": it is the state in which every create is refused by name
+#: (``cgroup-refusal ceiling-unavailable`` through the cgroup handle, and the
+#: in-process fallback refuses the same way), because "checked against nothing"
+#: is the fail-open direction this whole lane exists to close.
+_HANDED_DOWN_CEILING: SandboxCeiling | None = None
 
-    Three explicit envs, each one falling back to the same dimension of the
-    node's own total (``_node_resources``) and then to the per-sandbox create
-    default -- so the answer is never ``0`` ("unlimited") and never the whole
-    machine by accident. The rule itself lives in
-    :func:`gateway_common.sandbox_ceiling.resolve_sandbox_ceiling` because the
-    control plane resolves the *same* three names for its in-process node, and
-    the two sides have to agree: what this worker reports in its heartbeat's
-    ``sandboxCeiling`` is the number the control plane stores.
+#: The last handed-down value this process cross-checked against its own kernel
+#: (D5b). The answer, not the value: a hand-down only has to be *verified* once,
+#: and a beat that repeats the value it already answered must not re-read the
+#: kernel and re-log its verdict -- the heartbeat is every 5 s, so "check per
+#: beat" is twelve identical WARNs a minute on the compose lane (measured on the
+#: `n83t8` lane: the mount root reads `max` there, which is a legal shape and
+#: must be *said once*, not shouted). A **changed** value is checked again --
+#: which is exactly when the promise can newly exceed this container.
+_CEILING_CROSSCHECKED: SandboxCeiling | None = None
 
-    ``getattr`` with a zero default, like the rest of the optional settings:
-    an embedder's settings double that predates these fields keeps today's
-    behaviour (the ceiling follows the node total) instead of crashing.
+
+def adopted_sandbox_ceiling() -> SandboxCeiling | None:
+    """The per-sandbox policy ceiling the control plane handed down, if any."""
+    return _HANDED_DOWN_CEILING
+
+
+def reset_adopted_sandbox_ceiling() -> None:
+    """Forget the hand-down (tests, and a worker that re-reads its settings)."""
+    global _HANDED_DOWN_CEILING, _CEILING_CROSSCHECKED
+    _HANDED_DOWN_CEILING = None
+    _CEILING_CROSSCHECKED = None
+
+
+def _ceiling_from_response(payload: Any) -> SandboxCeiling | None:
+    """The handed-down ceiling in one register/heartbeat response, or ``None``.
+
+    Shape: ``{"sandboxCeiling": {"cpuPercent": <int>, "memoryMB": <int>,
+    "processes": <int>}}`` -- the control plane's own resolved policy. A body
+    without it (an older control plane, a proxy, a non-JSON answer) yields
+    ``None``, which is the fail-closed state: no ceiling, no create.
+
+    The three values are required to be positive integers: ``0`` would read
+    downstream as "one sandbox may take everything". A control plane that
+    answered that way is not trusted with a number this worker would then hand
+    to ``attach`` -- the answer is treated as no hand-down at all, and the
+    reason is logged once per adoption attempt.
     """
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("sandboxCeiling")
+    if not isinstance(value, dict):
+        return None
+    fields: dict[str, int] = {}
+    for name in ("cpuPercent", "memoryMB", "processes"):
+        raw = value.get(name)
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+            logger.warning(
+                "node agent: the control plane handed down a per-sandbox "
+                "ceiling with %s=%r; refusing to adopt it (a non-positive "
+                "ceiling would read as unlimited), so every create stays "
+                "refused by name until a usable one arrives",
+                name,
+                raw,
+            )
+            return None
+        fields[name] = raw
     return SandboxCeiling(
-        cpu_percent=resolve_sandbox_ceiling(
-            configured=int(getattr(settings, "max_sandbox_cpu_percent", 0) or 0),
-            node_total=_node_cpu_percent(),
-            create_default=settings.default_cpu_percent,
-        ),
-        memory_mb=resolve_sandbox_ceiling(
-            configured=int(getattr(settings, "max_sandbox_memory_mb", 0) or 0),
-            node_total=_node_memory_mb(settings),
-            create_default=settings.default_memory_mb,
-        ),
-        processes=resolve_sandbox_ceiling(
-            configured=int(getattr(settings, "max_sandbox_processes", 0) or 0),
-            node_total=_node_processes(settings),
-            create_default=settings.default_max_processes,
-        ),
+        cpu_percent=fields["cpuPercent"],
+        memory_mb=fields["memoryMB"],
+        processes=fields["processes"],
     )
 
 
-def sandbox_ceiling_payload(settings: Settings) -> dict[str, Any]:
-    """The heartbeat's ``sandboxCeiling``: the policy plus the kernel's read.
+def adopt_sandbox_ceiling(settings: Settings, payload: Any) -> SandboxCeiling | None:
+    """Adopt the ceiling a register/heartbeat response handed down (R17).
 
-    Both halves travel, side by side, because the control plane stores both:
-    the policy is what a create is checked against (Task 2/3), the kernel's is
-    what the physical layer actually allows. ``None`` in a kernel field is the
-    kernel's ``max`` -- no physical limit, which is the compose lanes' real
-    shape.
+    Three steps, in this order, and every one of them can only *lower* what this
+    worker will run:
+
+    1. the response's three numbers (:func:`_ceiling_from_response`); no usable
+       answer -- an older control plane, a proxy that stripped the body, a
+       non-positive value -- leaves the process with **no ceiling**, so every
+       create is refused by name instead of running unbounded;
+    2. D5b, the cross-check against this worker's **own** kernel: a policy
+       above what this container's cgroup allows ("the control plane promised
+       4 GiB, this container has 2") is a configuration error, so the hand-down
+       is **refused** rather than adopted -- the named refusal is logged and the
+       worker keeps running with no ceiling, which is the fail-closed direction.
+       The check is skipped on the ``off`` lane (no cgroup business of ours) and
+       where the mount does not exist (nothing to read, and ``setup`` refuses
+       that lane by name later). It runs **once per handed-down value**
+       (:data:`_CEILING_CROSSCHECKED`), so a refusal is sticky until the
+       control plane sends a different number -- the same pressure the hand-down
+       itself applies: fix the numbers, and the next value is re-checked;
+    3. the value is stored process-wide **and** pushed into the live cgroup
+       handle, so a policy change reaches a process that is already running
+       without rebuilding the handle (a rebuild would abandon the delegated
+       parent ``setup`` established).
+
+    Returns the adopted ceiling, or ``None`` when nothing was adopted.
+    """
+    ceiling = _ceiling_from_response(payload)
+    if ceiling is None:
+        return None
+    global _HANDED_DOWN_CEILING, _CEILING_CROSSCHECKED
+    if ceiling == _CEILING_CROSSCHECKED:
+        # Same value as the last beat: nothing new to verify. It may or may not
+        # have been adopted -- either way the answer is already on this
+        # process, and re-answering it must not re-log it.
+        return _HANDED_DOWN_CEILING
+    from envd_service.route_b import (
+        sandbox_cgroup_mode,
+        update_sandbox_cgroup_ceiling,
+    )
+
+    if sandbox_cgroup_mode(settings) != "off":
+        mount = Path(getattr(settings, "cgroup_mount", "/pod-cgroup"))
+        if mount.is_dir():
+            try:
+                check_policy_ceiling(ceiling, mount=mount)
+            except CgroupRefusal as exc:
+                _CEILING_CROSSCHECKED = ceiling
+                logger.error(
+                    "node agent: refusing the per-sandbox ceiling the control "
+                    "plane handed down (%s); this worker keeps running with no "
+                    "ceiling, so every create is refused by name until the "
+                    "control plane's E2B_MAX_SANDBOX_* fits this container",
+                    exc,
+                )
+                return None
+    _CEILING_CROSSCHECKED = ceiling
+    if ceiling == _HANDED_DOWN_CEILING:
+        return ceiling
+    _HANDED_DOWN_CEILING = ceiling
+    update_sandbox_cgroup_ceiling(settings, ceiling)
+    logger.info(
+        "node agent: adopted the control plane's per-sandbox ceiling "
+        "(cpuPercent=%s memoryMB=%s processes=%s)",
+        ceiling.cpu_percent,
+        ceiling.memory_mb,
+        ceiling.processes,
+    )
+    return ceiling
+
+
+def kernel_ceiling_payload(settings: Settings) -> dict[str, Any]:
+    """The heartbeat's ``kernelCeiling``: this worker's **physical** reading.
+
+    Only this half travels up now, under a name of its own. The policy half is
+    the control plane's and it hands it *down* (see
+    :func:`adopt_sandbox_ceiling`); a worker's copy of those three names would
+    grant nothing and could only drift. Renaming the report -- rather than
+    squeezing a kernel-only body into the old five-field ``sandboxCeiling`` --
+    is what keeps a *mixed-version* rollout sane in the direction this branch's
+    ordering does **not** use: an older control plane ignores an unknown
+    ``kernelCeiling`` key and keeps the node healthy (its create path then
+    refuses by name), where a ``sandboxCeiling`` without its three policy keys
+    would be refused by that control plane's own shape check -- and a
+    heartbeat-less node is a node whose live sandboxes get reaped as orphans.
+
+    ``None`` in either field is the kernel's ``max`` -- no physical limit,
+    which is the compose lanes' real shape.
 
     The kernel read is best-effort *here*: a heartbeat must never be lost
     because this node's cgroup view cannot be read (on a macOS dev box it does
     not exist at all, and on a lane with ``E2B_SANDBOX_CGROUP=off`` there is no
-    cgroup business of ours to read). The cross-check that *has* to be strict
-    is the startup one (:func:`start_cgroup_lane`), where a missing read is a
-    named refusal.
+    cgroup business of ours to read). The read that *has* to be strict is the
+    one behind a policy that is already in hand
+    (:func:`adopt_sandbox_ceiling`, step 2), where a missing read is a named
+    refusal.
     """
-    policy = sandbox_ceiling_for(settings)
     kernel_cpu: int | None = None
     kernel_memory: int | None = None
     mount = Path(getattr(settings, "cgroup_mount", "/pod-cgroup"))
@@ -350,18 +472,15 @@ def sandbox_ceiling_payload(settings: Settings) -> dict[str, Any]:
     except (CgroupRefusal, OSError):
         logger.debug(
             "cgroup ceiling: cannot read the kernel ceiling at %s; reporting "
-            "the policy half only",
+            "no physical reading",
             mount,
         )
     else:
         kernel_cpu = kernel.cpu_percent
         kernel_memory = kernel.memory_mb
     return {
-        "cpuPercent": policy.cpu_percent,
-        "memoryMB": policy.memory_mb,
-        "processes": policy.processes,
-        "kernelCpuPercent": kernel_cpu,
-        "kernelMemoryMB": kernel_memory,
+        "cpuPercent": kernel_cpu,
+        "memoryMB": kernel_memory,
     }
 
 
@@ -382,11 +501,12 @@ def _register_payload(
             "node-type": os.getenv("E2B_NODE_TYPE") or _node_type(),
         },
         **_node_resources(settings),
-        # N83 phase 2 (D5/D5b): what ONE sandbox may be configured to on this
-        # node, plus the kernel's own read of this container's cgroup. It rides
-        # the registration as well as every heartbeat -- register *is* the first
-        # heartbeat, and the control plane creates the node record from it.
-        "sandboxCeiling": sandbox_ceiling_payload(settings),
+        # N83 phase 2 (D5b/R17): this worker's **kernel** reading -- the
+        # kernel's own limits on this container's cgroup. It rides the
+        # registration as well as every heartbeat (register *is* the first
+        # heartbeat); the *policy* travels the other way, in the response,
+        # because it is the control plane's decision.
+        "kernelCeiling": kernel_ceiling_payload(settings),
     }
     # C3 Task 3 (ruling D9.3): the worker's own pid namespace identity. The
     # control plane stores it and hands it to the agent, which is what makes the
@@ -544,9 +664,9 @@ def _heartbeat_usage_payload(
 ) -> dict[str, Any]:
     """Disk usage + quota alerts + MCP port band carried by each heartbeat.
 
-    N83 phase 2 adds ``sandboxCeiling`` (the caller passes it in): the
-    per-sandbox policy this worker resolved and the kernel's own read of its
-    container cgroup.
+    N83 phase 2 adds ``kernelCeiling`` (the caller passes it in): this worker's
+    physical reading -- the kernel's own limits on this container's cgroup. The
+    policy is the *control plane's* and travels in the response (ruling R17).
 
     ... and (Task 5) ``sandboxEvents``: the kernel's per-sandbox count of the
     two endings phase 2 introduced -- an over-budget sandbox SIGKILLed, and a
@@ -575,11 +695,11 @@ def _heartbeat_usage_payload(
         # cgroup that no longer exists (every file operation refused by name).
         payload["containerID"] = container_id
     if ceiling is not None:
-        # N83 phase 2 (Task 1): the per-sandbox ceiling, both halves. Refreshed
-        # with every heartbeat like the identity fields above -- a re-deploy
-        # that lowers the policy ceiling must reach the control plane's node
-        # record without waiting for a full re-registration.
-        payload["sandboxCeiling"] = dict(ceiling)
+        # N83 phase 2 (Task 1): this worker's kernel reading. Refreshed with
+        # every heartbeat like the identity fields above -- the control plane
+        # stores it beside the policy it wrote itself, so a re-created container
+        # (a new cgroup) is never described by the old container's reading.
+        payload["kernelCeiling"] = dict(ceiling)
     if sandbox_events:
         # N83 phase 2 (Task 5): the kernel's own count of this sandbox hitting
         # its cgroup wall. The control plane keeps the maximum per sandbox and
@@ -1999,16 +2119,15 @@ def start_cgroup_lane(
     must not read as "off" (that is a whole fleet without a quota while looking
     configured). See :func:`envd_service.route_b.sandbox_cgroup_mode`.
 
-    N83 phase 2 / D5b adds the second startup refusal, and it is the same
-    *kind* of fact as the typo above: a configured per-sandbox ceiling that is
-    **above** what this worker's own cgroup allows is a launch-time
-    configuration error, so it is refused here -- by name, synchronously, before
-    any create can be accepted -- instead of being clamped or retried (a
-    retry loop would turn a permanent misconfiguration into a heartbeat-spaced
-    warning). The kernel's half is read from ``E2B_CGROUP_MOUNT``; a mount that
-    does not exist is not a cross-check we can make (and cannot build a sandbox
-    cgroup either -- ``setup`` refuses that by name below), while a mount that
-    exists but cannot produce the numbers is refused.
+    N83 phase 2 / D5b's cross-check ("the control plane promised 4 GiB, this
+    container has 2") is **not** made here any more. Under ruling R17 the
+    policy is handed down in the register/heartbeat response, so at this point
+    in the startup sequence there is no policy to compare with the kernel --
+    and a check against a default would be a check against a number this worker
+    invented. It runs at the first hand-down instead
+    (:func:`adopt_sandbox_ceiling`, D5b), where both halves exist; until then
+    the lane has no ceiling and the route-B pool refuses every create by name,
+    which is the same fail-closed state a ``setup`` that has not landed leaves.
 
     ``sandbox_cgroups`` is the handle to bring up; the production path leaves it
     unset and resolves the process-wide one from ``settings``, and tests inject
@@ -2019,9 +2138,6 @@ def start_cgroup_lane(
     mode = sandbox_cgroup_mode(settings)
     if mode == "off":
         return None
-    mount = Path(getattr(settings, "cgroup_mount", "/pod-cgroup"))
-    if mount.is_dir():
-        check_policy_ceiling(sandbox_ceiling_for(settings), mount=mount)
     handle = (
         sandbox_cgroups
         if sandbox_cgroups is not None
@@ -2292,6 +2408,9 @@ class NodeAgent:
                 )
                 if resp.status_code == 200:
                     self._node_id = resp.json().get("nodeID")
+                    # N83 phase 2 / R17: the registration's answer is the first
+                    # hand-down of the control plane's per-sandbox ceiling.
+                    self._adopt_ceiling(resp)
                     logger.info(
                         "registered node %s at %s", self._node_id, self._node_address
                     )
@@ -2328,11 +2447,16 @@ class NodeAgent:
                         worker_identity_fields(),
                         reported_container_id(),
                         cpu_provider=self._cpu_provider,
-                        ceiling=sandbox_ceiling_payload(self._settings),
+                        ceiling=kernel_ceiling_payload(self._settings),
                         sandbox_events=self._cgroup_events,
                     ),
                     headers=headers,
                 )
+                if resp.status_code == 200:
+                    # N83 phase 2 / R17: the policy rides every heartbeat's
+                    # answer, so a re-deploy that changes it reaches this
+                    # worker (and its live cgroup handle) on the next beat.
+                    self._adopt_ceiling(resp)
                 if resp.status_code == 404:
                     # The control plane lost us (e.g. it restarted);
                     # re-register on the next cycle.
@@ -2351,6 +2475,31 @@ class NodeAgent:
         # (this one is closed when the ``async with`` above exits, and a detached
         # round outlives it).
         self._start_reconcile_if_due()
+
+    def _adopt_ceiling(self, resp) -> None:
+        """Take the per-sandbox ceiling out of one register/heartbeat answer.
+
+        The response body is read defensively: this runs inside the heartbeat
+        loop, where an exception costs the beat (and the reconcile trigger it
+        carries), so a body that cannot be parsed is the same fail-closed state
+        as one that carries no ceiling -- no ceiling, no create -- rather than
+        a broken loop.
+
+        The exchange itself (the kernel cross-check, the "adopted" line) lives in
+        :func:`adopt_sandbox_ceiling`, which knows whether the value is new; a
+        beat that repeats the ceiling already in hand logs nothing.
+        """
+        try:
+            payload = resp.json()
+        except Exception:  # noqa: BLE001 - a bad body is "no hand-down"
+            logger.warning(
+                "node agent: the control plane's answer carried no parsable "
+                "body; the per-sandbox ceiling stays unset and every create "
+                "stays refused by name",
+                exc_info=True,
+            )
+            return
+        adopt_sandbox_ceiling(self._settings, payload)
 
     def _maybe_scan_disk(self, *, force: bool = False) -> dict[str, int]:
         """Start a scan round if one is due (single-flight); return the last.

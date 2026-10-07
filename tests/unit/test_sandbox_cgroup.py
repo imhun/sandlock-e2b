@@ -698,11 +698,13 @@ def test_release_removes_a_box_that_carried_all_three_limits(tmp_path: Path) -> 
 def test_attach_refuses_a_declared_size_above_the_worker_ceiling(
     tmp_path: Path,
 ) -> None:
-    """R3's second gate compares the declared size with ``E2B_MAX_SANDBOX_*``.
+    """R3's second gate compares the declared size with the handed-down ceiling.
 
     The control plane already refused an oversized request (Task 2); this is
     the worker's own defense -- no clamp, no "run smaller silently", and
     nothing half-built is left behind for a size this worker will not promise.
+    The ceiling is the *control plane's* (ruling R17), adopted by the worker and
+    pushed into the live handle.
     """
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
@@ -726,12 +728,11 @@ def test_attach_refuses_a_declared_size_above_the_worker_ceiling(
 
     assert str(excinfo.value) == (
         "cgroup-refusal size-exceeds-ceiling: sandbox alpha declares more than "
-        "this worker's per-sandbox ceiling "
-        "(cpuPercent 800 > 400 (E2B_MAX_SANDBOX_CPU_PERCENT); "
-        "memoryMB 8192 > 4096 (E2B_MAX_SANDBOX_MEMORY_MB); "
-        "maxProcesses 2048 > 1024 (E2B_MAX_SANDBOX_PROCESSES)) -- refusing the "
-        "create rather than running a smaller sandbox silently; lower the "
-        "request or raise E2B_MAX_SANDBOX_*"
+        "the per-sandbox ceiling the control plane handed down "
+        "(cpuPercent 800 > 400; memoryMB 8192 > 4096; "
+        "maxProcesses 2048 > 1024) -- refusing the create rather than running a "
+        "smaller sandbox silently; lower the request or raise "
+        "E2B_MAX_SANDBOX_* on the control plane"
     )
     # No half-built box, and nothing else in the delegated subtree moved.
     assert sorted(child.name for child in parent.iterdir()) == before
@@ -741,10 +742,10 @@ def test_attach_refuses_a_declared_size_above_the_worker_ceiling(
 def test_attach_refuses_when_the_handle_carries_no_ceiling(tmp_path: Path) -> None:
     """Fail closed: with nothing to compare against, nothing is written.
 
-    A handle built by hand (or by an embedder) without the worker's ceiling
-    cannot answer "is this request inside what this node may promise?", so the
-    create is refused by name -- the same direction as
-    ``E2B_SANDBOX_CGROUP=required`` without a handle.
+    A handle with no hand-down (built by hand, by an embedder, or by a worker
+    whose control plane has not answered yet) cannot answer "is this request
+    inside what this node may promise?", so the create is refused by name -- the
+    same direction as ``E2B_SANDBOX_CGROUP=required`` without a handle.
     """
     mount = _pod_mount(tmp_path)
     parent = mount / "worker-container"
@@ -765,8 +766,11 @@ def test_attach_refuses_when_the_handle_carries_no_ceiling(tmp_path: Path) -> No
     assert str(excinfo.value) == (
         "cgroup-refusal ceiling-unavailable: this handle carries no per-sandbox "
         "ceiling, so sandbox alpha's declared size cannot be checked against "
-        "anything (N83 phase 2 R3) -- build it through "
-        "sandbox_cgroups_for(settings), or set E2B_SANDBOX_CGROUP=off"
+        "anything (N83 phase 2 R3/R17): the control plane has not handed one "
+        "down to this worker (or the one it handed down was refused), and a "
+        "create is never run unbounded on this lane -- set "
+        "E2B_SANDBOX_CGROUP=off for a lane that deliberately builds no "
+        "per-sandbox cgroup"
     )
     assert (parent / "sbx_alpha").exists() is False
 
@@ -912,21 +916,26 @@ def test_setup_refuses_when_the_kernel_does_not_echo_every_controller(
     assert (parent / "worker").exists() is False
 
 
-# --------------------------- the per-sandbox ceiling (N83 phase 2, Task 1)
+# --------------------------- the per-sandbox ceiling (N83 phase 2, Task 1+8)
 #
 # D5: what a *single* sandbox may be configured to is a configured policy
-# (``E2B_MAX_SANDBOX_*``), never a kernel read -- and never 0/infinity. An
-# unset (or ``<=0``) value follows the node's own total, which is the safe
-# default: one sandbox cannot be bigger than the whole node, and the deployment
-# can still lower it explicitly. D5b: at startup that policy is cross-checked
-# against the kernel's own ceilings on the worker's cgroup -- a policy above
-# the kernel is refused **by name**, and a kernel that sets no ceiling (the
-# compose lane, measured) gets one explicit WARN instead of silence.
+# (``E2B_MAX_SANDBOX_*``), never a kernel read -- and never 0/infinity. Ruling
+# R17 (2026-10-07) moves the *owner* of that policy to the control plane: the
+# worker no longer reads the three envs at all, it **adopts** the ceiling the
+# control plane hands down in every register/heartbeat answer
+# (``envd_service.agent.adopt_sandbox_ceiling``). Before a hand-down there is no
+# ceiling, and no ceiling means no create (``cgroup-refusal
+# ceiling-unavailable``) -- never "run unbounded".
+#
+# D5b rides on the adoption: the handed-down policy is cross-checked against the
+# kernel's own limits on this worker's container cgroup -- a policy above the
+# kernel is refused **by name** (and *not* adopted, so creates stay refused),
+# and a kernel that sets no ceiling (the compose lane, measured) gets one
+# explicit WARN instead of silence.
 
-#: Every ceiling-shaped env this file touches. Cleared first so a developer's
-#: shell cannot shape the reading (the node totals fall back to host probing
-#: when the node env is unset, so clearing them is what makes "unset" mean
-#: "follow the node total" rather than "follow this laptop").
+#: Every ceiling-shaped env this file touches. Cleared (and, in the
+#: ignored-env case, *set*) to prove the worker's own environment no longer
+#: shapes the ceiling: the control plane's hand-down is the only source.
 _CEILING_ENVS = (
     "E2B_MAX_SANDBOX_CPU_PERCENT",
     "E2B_MAX_SANDBOX_MEMORY_MB",
@@ -956,63 +965,175 @@ def _kernel_mount(
     return mount
 
 
-def test_the_worker_ceiling_defaults_to_the_node_total(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """① unset ⇒ the node's own total. Never 0 ("unlimited"), never infinity."""
-    _clear_ceiling_env(monkeypatch)
-    monkeypatch.setenv("E2B_NODE_MEMORY_MB", "2048")
-    monkeypatch.setenv("E2B_NODE_CPU_PERCENT", "200")
-    monkeypatch.setenv("E2B_NODE_PROCESSES", "1024")
+#: The control plane's answer, as it arrives on the wire: the ceiling it handed
+#: down, built from its own ``E2B_MAX_SANDBOX_*``.
+HAND_DOWN = {
+    "sandboxCeiling": {"cpuPercent": 200, "memoryMB": 2048, "processes": 256}
+}
 
-    ceiling = node_agent.sandbox_ceiling_for(Settings())
 
-    assert ceiling == SandboxCeiling(
-        cpu_percent=200, memory_mb=2048, processes=1024
+def _no_mount(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lane whose cgroup mount does not exist: nothing to cross-check."""
+    monkeypatch.setenv("E2B_SANDBOX_CGROUP", "off")
+    monkeypatch.delenv("E2B_CGROUP_MOUNT", raising=False)
+
+
+def _adoption_log(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The agent's own lines during one adoption attempt, in order."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == node_agent.logger.name
+    ]
+
+
+def _refusal_line(refusal: str) -> str:
+    """The one ERROR a refused hand-down logs, verbatim around its ``refusal``."""
+    return (
+        "node agent: refusing the per-sandbox ceiling the control plane handed "
+        f"down ({refusal}); this worker keeps running with no ceiling, so every "
+        "create is refused by name until the control plane's "
+        "E2B_MAX_SANDBOX_* fits this container"
     )
 
 
-def test_a_non_positive_worker_ceiling_follows_the_node_total_too(
+def test_the_worker_adopts_the_ceiling_the_control_plane_hands_down(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A ``0`` in the env must not read as "this sandbox may take everything".
+    """① R17: the hand-down is the ceiling -- nothing else is consulted."""
+    _clear_ceiling_env(monkeypatch)
+    _no_mount(monkeypatch)
+    node_agent.reset_adopted_sandbox_ceiling()
 
-    ``0`` is the repo's convention for "the dimension is off" in the *node*
-    budget; on the per-sandbox ceiling it would mean "no ceiling at all", which
-    is exactly the fail-open Review Focus §1 names. It follows the node total.
+    adopted = node_agent.adopt_sandbox_ceiling(Settings(), dict(HAND_DOWN))
+
+    assert adopted == SandboxCeiling(cpu_percent=200, memory_mb=2048, processes=256)
+    assert node_agent.adopted_sandbox_ceiling() == adopted
+    node_agent.reset_adopted_sandbox_ceiling()
+
+
+def test_the_workers_own_env_no_longer_shapes_the_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The three envs on a *worker* grant nothing: the values are the CP's.
+
+    This is the operator mistake ruling R17 has to make harmless -- a worker
+    manifest that still carries the trio (one that was not updated, or copied
+    from an older release) must not change a single number.
     """
     _clear_ceiling_env(monkeypatch)
-    monkeypatch.setenv("E2B_NODE_MEMORY_MB", "2048")
-    monkeypatch.setenv("E2B_NODE_CPU_PERCENT", "200")
-    monkeypatch.setenv("E2B_NODE_PROCESSES", "1024")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_CPU_PERCENT", "0")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "-1")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_PROCESSES", "0")
+    _no_mount(monkeypatch)
+    for name in _CEILING_ENVS:
+        monkeypatch.setenv(name, "4096")
+    node_agent.reset_adopted_sandbox_ceiling()
 
-    ceiling = node_agent.sandbox_ceiling_for(Settings())
-
-    assert ceiling == SandboxCeiling(
-        cpu_percent=200, memory_mb=2048, processes=1024
+    assert node_agent.adopt_sandbox_ceiling(Settings(), dict(HAND_DOWN)) == (
+        SandboxCeiling(cpu_percent=200, memory_mb=2048, processes=256)
     )
+    node_agent.reset_adopted_sandbox_ceiling()
 
 
-def test_an_explicit_worker_ceiling_is_independent_of_the_node_total(
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_non_positive_hand_down_is_refused_rather_than_adopted(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """② an explicit ceiling wins, however big the node is."""
+    """A ``0`` from the control plane must not read as "one box may take all".
+
+    ``0`` never means "unlimited" on this field, and a control plane that
+    answered it is not trusted with a number that would end up in
+    ``memory.max``. The hand-down is dropped, which leaves the worker with no
+    ceiling -- the fail-closed direction, not the fail-open one.
+    """
     _clear_ceiling_env(monkeypatch)
-    monkeypatch.setenv("E2B_NODE_MEMORY_MB", "16384")
-    monkeypatch.setenv("E2B_NODE_CPU_PERCENT", "800")
-    monkeypatch.setenv("E2B_NODE_PROCESSES", "4096")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_CPU_PERCENT", "200")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "1024")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_PROCESSES", "64")
+    _no_mount(monkeypatch)
+    node_agent.reset_adopted_sandbox_ceiling()
 
-    ceiling = node_agent.sandbox_ceiling_for(Settings())
+    with caplog.at_level(logging.WARNING):
+        adopted = node_agent.adopt_sandbox_ceiling(
+            Settings(),
+            {"sandboxCeiling": {"cpuPercent": 0, "memoryMB": 2048, "processes": 256}},
+        )
 
-    assert ceiling == SandboxCeiling(
-        cpu_percent=200, memory_mb=1024, processes=64
+    assert adopted is None
+    assert node_agent.adopted_sandbox_ceiling() is None
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == node_agent.logger.name
+    ] == [
+        "node agent: the control plane handed down a per-sandbox ceiling with "
+        "cpuPercent=0; refusing to adopt it (a non-positive ceiling would read "
+        "as unlimited), so every create stays refused by name until a usable "
+        "one arrives"
+    ]
+
+
+def test_no_hand_down_means_no_ceiling_and_the_handle_refuses_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before the first answer there is no ceiling, and no ceiling is no create.
+
+    The refusal is the handle's own named one, raised *before* anything is
+    created: the lane cannot place a box it cannot bound.
+    """
+    _clear_ceiling_env(monkeypatch)
+    node_agent.reset_adopted_sandbox_ceiling()
+    # The handle the pool would have built before the first answer: no ceiling.
+    cg, _parent, _proc = _live_cgroups(tmp_path)
+    cg.set_policy_ceiling(node_agent.adopted_sandbox_ceiling())
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(sandbox_id="sbx_none", pid=SELF_PID, cpu_percent=100,
+                  memory_mb=None, max_processes=None)
+
+    assert str(excinfo.value) == (
+        "cgroup-refusal ceiling-unavailable: this handle carries no per-sandbox "
+        "ceiling, so sandbox sbx_none's declared size cannot be checked against "
+        "anything (N83 phase 2 R3/R17): the control plane has not handed one "
+        "down to this worker (or the one it handed down was refused), and a "
+        "create is never run unbounded on this lane -- set "
+        "E2B_SANDBOX_CGROUP=off for a lane that deliberately builds no "
+        "per-sandbox cgroup"
     )
+
+
+def test_the_cross_check_runs_once_per_handed_down_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The heartbeat repeats the value; the verdict must not be re-logged.
+
+    The policy rides *every* beat (5 s), so "check and log per beat" is twelve
+    identical lines a minute on the compose lane's legal "the kernel sets no
+    limit" shape. One line per handed-down value is the whole rule -- and a
+    **changed** value is checked again, which is the case that can newly exceed
+    this container.
+    """
+    _clear_ceiling_env(monkeypatch)
+    mount = _kernel_mount(tmp_path, cpu="max 100000", memory="max", pids="max")
+    monkeypatch.setenv("E2B_SANDBOX_CGROUP", "required")
+    monkeypatch.setenv("E2B_CGROUP_MOUNT", str(mount))
+    node_agent.reset_adopted_sandbox_ceiling()
+    settings = Settings()
+    payload = {"sandboxCeiling": dict(HAND_DOWN["sandboxCeiling"])}
+
+    with caplog.at_level(logging.WARNING):
+        first = node_agent.adopt_sandbox_ceiling(settings, payload)
+        second = node_agent.adopt_sandbox_ceiling(settings, payload)
+        third = node_agent.adopt_sandbox_ceiling(settings, payload)
+
+    assert first == second == third == SandboxCeiling(
+        cpu_percent=200, memory_mb=2048, processes=256
+    )
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == sandbox_cgroup.__name__
+    ] == [
+        f"cgroup ceiling: {mount} sets no kernel limit for cpu.max, memory.max "
+        "(read 'max'): the physical layer caps nothing, so the per-sandbox "
+        "ceiling the control plane handed down is the only bound and aggregate "
+        "admission rests on the platform's ledger alone"
+    ]
+    node_agent.reset_adopted_sandbox_ceiling()
 
 
 def test_kernel_ceiling_reads_the_container_cgroups_own_limits(
@@ -1032,88 +1153,111 @@ def test_kernel_ceiling_reads_the_container_cgroups_own_limits(
     )
 
 
-def test_the_startup_lane_refuses_a_ceiling_above_the_kernel(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_hand_down_above_the_kernel_is_refused_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """③ cpu: ``cpu.max`` says 2 cores, the policy asks for 4 ⇒ start refused."""
+    """③ cpu: ``cpu.max`` says 2 cores, the control plane hands down 4 ⇒ refused.
+
+    The refusal is the named ``ceiling-exceeds-kernel``, and it is *not* adopted:
+    the worker keeps no ceiling, so every create on it stays refused by name --
+    the "the control plane promised 4 cores, this container has 2" mistake is
+    caught where both numbers are finally in the same hand.
+    """
     _clear_ceiling_env(monkeypatch)
     mount = _kernel_mount(
         tmp_path, cpu="200000 100000", memory="4294967296", pids="max"
     )
     monkeypatch.setenv("E2B_SANDBOX_CGROUP", "required")
     monkeypatch.setenv("E2B_CGROUP_MOUNT", str(mount))
-    monkeypatch.setenv("E2B_MAX_SANDBOX_CPU_PERCENT", "400")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "2048")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_PROCESSES", "256")
+    node_agent.reset_adopted_sandbox_ceiling()
 
-    with pytest.raises(CgroupRefusal) as excinfo:
-        start_cgroup_lane(Settings())
+    with caplog.at_level(logging.ERROR):
+        adopted = node_agent.adopt_sandbox_ceiling(
+            Settings(),
+            {"sandboxCeiling": {"cpuPercent": 400, "memoryMB": 2048, "processes": 256}},
+        )
 
-    assert str(excinfo.value) == (
-        "cgroup-refusal ceiling-exceeds-kernel: this worker's cgroup allows "
-        "less than the configured per-sandbox ceiling "
-        "(E2B_MAX_SANDBOX_CPU_PERCENT=400 > 200% (cpu.max)) -- lower the env "
-        "or raise the worker container's limits; refusing to start rather "
-        "than accepting sandboxes the container layer would throttle or "
-        "OOM-kill"
-    )
+    assert adopted is None
+    assert node_agent.adopted_sandbox_ceiling() is None
+    assert _adoption_log(caplog) == [
+        _refusal_line(
+            "cgroup-refusal ceiling-exceeds-kernel: this worker's cgroup allows "
+            "less than the per-sandbox ceiling the control plane handed down "
+            "(cpuPercent=400 > 200% (cpu.max)) -- lower E2B_MAX_SANDBOX_* on the "
+            "control plane or raise the worker container's limits; refusing the "
+            "hand-down rather than accepting sandboxes the container layer would "
+            "throttle or OOM-kill"
+        )
+    ]
 
 
-def test_the_startup_lane_refuses_a_ceiling_above_the_kernels_memory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_hand_down_above_the_kernels_memory_is_refused_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """③ memory: the same rule for ``memory.max`` (the "8 GiB promised, 2 given" case)."""
+    """③ memory: the same rule for ``memory.max`` ("8 GiB promised, 2 given")."""
     _clear_ceiling_env(monkeypatch)
     mount = _kernel_mount(
         tmp_path, cpu="400000 100000", memory="2147483648", pids="max"
     )
     monkeypatch.setenv("E2B_SANDBOX_CGROUP", "required")
     monkeypatch.setenv("E2B_CGROUP_MOUNT", str(mount))
-    monkeypatch.setenv("E2B_MAX_SANDBOX_CPU_PERCENT", "400")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "4096")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_PROCESSES", "256")
+    node_agent.reset_adopted_sandbox_ceiling()
 
-    with pytest.raises(CgroupRefusal) as excinfo:
-        start_cgroup_lane(Settings())
+    with caplog.at_level(logging.ERROR):
+        adopted = node_agent.adopt_sandbox_ceiling(
+            Settings(),
+            {"sandboxCeiling": {"cpuPercent": 400, "memoryMB": 4096, "processes": 256}},
+        )
 
-    assert str(excinfo.value) == (
-        "cgroup-refusal ceiling-exceeds-kernel: this worker's cgroup allows "
-        "less than the configured per-sandbox ceiling "
-        "(E2B_MAX_SANDBOX_MEMORY_MB=4096 > 2048 MiB (memory.max)) -- lower "
-        "the env or raise the worker container's limits; refusing to start "
-        "rather than accepting sandboxes the container layer would throttle "
-        "or OOM-kill"
-    )
+    assert adopted is None
+    assert node_agent.adopted_sandbox_ceiling() is None
+    assert _adoption_log(caplog) == [
+        _refusal_line(
+            "cgroup-refusal ceiling-exceeds-kernel: this worker's cgroup allows "
+            "less than the per-sandbox ceiling the control plane handed down "
+            "(memoryMB=4096 > 2048 MiB (memory.max)) -- lower E2B_MAX_SANDBOX_* "
+            "on the control plane or raise the worker container's limits; "
+            "refusing the hand-down rather than accepting sandboxes the "
+            "container layer would throttle or OOM-kill"
+        )
+    ]
 
 
-def test_the_startup_lane_refuses_when_the_kernel_ceiling_cannot_be_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_kernel_ceiling_that_cannot_be_read_refuses_the_hand_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The kernel's half is a hard input, not an optional one: no read, no start."""
+    """The kernel's half is a hard input, not an optional one: no read, no adopt."""
     _clear_ceiling_env(monkeypatch)
     mount = tmp_path / "pod"
     mount.mkdir()
     _write(mount / "cpu.max", "400000 100000")
     monkeypatch.setenv("E2B_SANDBOX_CGROUP", "required")
     monkeypatch.setenv("E2B_CGROUP_MOUNT", str(mount))
-    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "2048")
+    node_agent.reset_adopted_sandbox_ceiling()
 
-    with pytest.raises(CgroupRefusal) as excinfo:
-        start_cgroup_lane(Settings())
+    with caplog.at_level(logging.ERROR):
+        adopted = node_agent.adopt_sandbox_ceiling(
+            Settings(),
+            {"sandboxCeiling": {"cpuPercent": 400, "memoryMB": 2048, "processes": 256}},
+        )
 
-    assert str(excinfo.value) == (
-        f"cgroup-refusal kernel-ceiling-read: {mount / 'memory.max'}"
-    )
+    assert adopted is None
+    assert node_agent.adopted_sandbox_ceiling() is None
+    assert _adoption_log(caplog) == [
+        _refusal_line(f"cgroup-refusal kernel-ceiling-read: {mount / 'memory.max'}")
+    ]
 
 
 async def test_the_compose_shape_starts_and_warns_that_the_kernel_sets_no_ceiling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """④ the measured compose shape: kernel ``max`` ⇒ start, with one WARN.
+    """④ the measured compose shape: kernel ``max`` ⇒ adopt, with one WARN.
 
     The three compose stacks set no ``cpus``/``mem_limit``, so the physical
-    layer caps nothing there -- which is legal, and must be *said*: the policy
-    and the platform's ledger are then the only things holding the line.
+    layer caps nothing there -- which is legal, and must be *said*: the
+    handed-down policy and the platform's ledger are then the only things
+    holding the line. The cgroup lane itself still starts (its task runs to
+    completion here) -- the WARN is what the operator gets, not a refusal.
     """
     _clear_ceiling_env(monkeypatch)
     mount = _kernel_mount(
@@ -1121,33 +1265,36 @@ async def test_the_compose_shape_starts_and_warns_that_the_kernel_sets_no_ceilin
     )
     monkeypatch.setenv("E2B_SANDBOX_CGROUP", "required")
     monkeypatch.setenv("E2B_CGROUP_MOUNT", str(mount))
-    monkeypatch.setenv("E2B_MAX_SANDBOX_CPU_PERCENT", "200")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_MEMORY_MB", "2048")
-    monkeypatch.setenv("E2B_MAX_SANDBOX_PROCESSES", "256")
     monkeypatch.setattr(
         node_agent,
         "request_cgroup_delegate",
         lambda **kwargs: {"op": "delegate-cgroup", "containerCgroup": str(mount)},
     )
+    node_agent.reset_adopted_sandbox_ceiling()
 
     class ReadyCgroups:
         def setup(self, *, wait_s: float) -> str:
             return f"cgroup ready parent={mount}/worker drained=1 subtree_control=cpu"
 
     with caplog.at_level(logging.WARNING):
+        adopted = node_agent.adopt_sandbox_ceiling(
+            Settings(), {"sandboxCeiling": dict(HAND_DOWN["sandboxCeiling"])}
+        )
         task = start_cgroup_lane(Settings(), sandbox_cgroups=ReadyCgroups())
         await asyncio.wait_for(task, timeout=5)
 
+    assert adopted == SandboxCeiling(cpu_percent=200, memory_mb=2048, processes=256)
     assert [
         record.getMessage()
         for record in caplog.records
         if record.name == sandbox_cgroup.__name__
     ] == [
         f"cgroup ceiling: {mount} sets no kernel limit for cpu.max, memory.max "
-        "(read 'max'): the physical layer caps nothing, so the configured "
-        "per-sandbox ceiling is the only bound and aggregate admission rests "
-        "on the platform's ledger alone"
+        "(read 'max'): the physical layer caps nothing, so the per-sandbox "
+        "ceiling the control plane handed down is the only bound and aggregate "
+        "admission rests on the platform's ledger alone"
     ]
+    node_agent.reset_adopted_sandbox_ceiling()
 
 
 def test_a_ceiling_that_matches_the_kernel_is_silent(

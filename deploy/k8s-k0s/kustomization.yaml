@@ -49,3 +49,14 @@ patches:
       name: control-plane
       namespace: sandlock
     path: control-plane-nfs.patch.yaml
+  # N83 phase 2 / ruling R17: the per-sandbox ceiling the control plane hands
+  # down lives on the control plane now, so the overlay raises it here -- with
+  # the same three numbers `worker-capacity.patch.yaml` gives the worker's pod
+  # limits (the worker refuses a hand-down above its own kernel read, D5b).
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: control-plane
+      namespace: sandlock
+    path: control-plane-capacity.patch.yaml

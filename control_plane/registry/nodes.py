@@ -23,10 +23,14 @@ class NodeRecord:
     total_cpu_percent: int = 0
     total_disk_mb: int = 0
     total_processes: int = 0
-    #: N83 phase 2 (D5/D5b): the *promise* side of this node's sandbox sizing --
-    #: the largest values a single sandbox may be configured to here, resolved
-    #: by the worker from ``E2B_MAX_SANDBOX_*`` (``0`` = an older worker that
-    #: never reported one; the worker's own resolution is never 0).
+    #: N83 phase 2 (D5/D5b, ruling R17): the *promise* side of this node's
+    #: sandbox sizing -- the largest values a single sandbox may be configured
+    #: to here. This is the **control plane's** policy, not the worker's: the
+    #: ceiling is a deployment decision, so every node's row carries the
+    #: control plane's own resolved ``E2B_MAX_SANDBOX_*`` (the same three
+    #: numbers on every node), written by the control plane at
+    #: register/heartbeat. A ``0`` is a row the control plane has not written
+    #: yet (explicitly built records, embedders) -- never "unlimited".
     sandbox_cpu_percent_max: int = 0
     sandbox_memory_mb_max: int = 0
     sandbox_processes_max: int = 0
@@ -241,24 +245,33 @@ class NodeRecord:
             self.platform_disk_budget_mb = int(platform_disk_budget_mb)
 
     def apply_sandbox_ceiling(self, ceiling: Mapping[str, Any]) -> None:
-        """Store one worker's reported per-sandbox ceiling -- both copies.
+        """Store the per-sandbox ceiling's two halves -- side by side, one owner
+        each (N83 phase 2 / R17).
 
-        ``ceiling`` is the heartbeat's ``sandboxCeiling``, already shape-checked
-        by the internal API: the three policy values the worker resolved
-        (``cpuPercent``/``memoryMB``/``processes``) and the kernel's own read of
-        its container cgroup (``kernelCpuPercent``/``kernelMemoryMB``; ``None``
-        = the kernel sets no limit there). They are stored side by side on
-        purpose: the policy is what a create is checked against, the kernel's is
-        what the physical layer actually allows, and an operator comparing the
-        two can see a node whose policy is only bounded by its ledger.
+        The **policy** half (``cpuPercent``/``memoryMB``/``processes``) is the
+        control plane's own resolved ``E2B_MAX_SANDBOX_*``: the internal API
+        builds it from its ``Settings`` and passes it here, so what a create is
+        checked against is the deployment's decision and not whatever a worker
+        believes. The **kernel** half (``kernelCpuPercent``/``kernelMemoryMB``)
+        is the worker's read of its own container cgroup and is passed through
+        verbatim; a key that is **absent** leaves the stored value alone, so a
+        heartbeat that carries no kernel read (an older worker during a
+        rollout) cannot erase one the record already holds. A key that is
+        *present but null* is the worker saying "the kernel sets no limit here"
+        (the compose lanes' measured shape) and is stored as such.
+
+        They are stored together on purpose: an operator comparing the two sees
+        a node whose policy is only bounded by the platform's ledger.
         """
         self.sandbox_cpu_percent_max = int(ceiling["cpuPercent"])
         self.sandbox_memory_mb_max = int(ceiling["memoryMB"])
         self.sandbox_processes_max = int(ceiling["processes"])
-        kernel_cpu = ceiling.get("kernelCpuPercent")
-        kernel_memory = ceiling.get("kernelMemoryMB")
-        self.kernel_cpu_percent = None if kernel_cpu is None else int(kernel_cpu)
-        self.kernel_memory_mb = None if kernel_memory is None else int(kernel_memory)
+        if "kernelCpuPercent" in ceiling:
+            kernel_cpu = ceiling["kernelCpuPercent"]
+            self.kernel_cpu_percent = None if kernel_cpu is None else int(kernel_cpu)
+        if "kernelMemoryMB" in ceiling:
+            kernel_memory = ceiling["kernelMemoryMB"]
+            self.kernel_memory_mb = None if kernel_memory is None else int(kernel_memory)
 
     #: How many sandboxes' event counters one node record keeps. Only boxes that
     #: hit a wall are stored at all, so this bounds a node that has lived for
@@ -583,10 +596,10 @@ class NodeRegistry:
                 if worker_uid is not None and worker_gid is not None:
                     record.worker_uid = worker_uid
                     record.worker_gid = worker_gid
-                # N83 phase 2: same "only ever set" rule as the identities
-                # above -- an older worker during a rollout reports no ceiling,
-                # and erasing the one the record holds would make this node look
-                # like an unlimited one.
+                # N83 phase 2 (R17): the policy half of the ceiling is the
+                # control plane's own and is written on every registration --
+                # it is what a create is checked against, so a node whose row
+                # carried none must not keep looking like an unlimited one.
                 if sandbox_ceiling is not None:
                     record.apply_sandbox_ceiling(sandbox_ceiling)
                 record.draining = False

@@ -1,0 +1,30 @@
+# 按集群节点的真实规格声明**控制面下发**的每箱上限。
+#
+# N83 phase 2 / 用户裁定 R17（2026-10-07）：每箱上限是**控制面的策略**，
+# 由控制面写进每个节点记录、并在每次 register/heartbeat 的**响应体**里下发给
+# worker（`control_plane/api/internal.py`）；worker 采纳它，再拿它跟**本机内核**
+# 的读数（`cpu.max`/`memory.max`）交叉校验（D5b）—— 上限高于内核就拒绝这份下发，
+# 于是该 worker 上所有建箱都具名拒绝。所以这份 patch 必须与
+# `worker-capacity.patch.yaml` 的 pod `resources.limits`（4 核 / 4 GiB）**逐字对齐**：
+# 基线控制面声明的是 2 核 / 2 GiB 车道（`../k8s/control-plane.yaml`），覆盖层把它
+# 抬到这台节点真实给的 4 核 / 4 GiB —— 与 worker 侧那三个数完全相同。
+#
+# 与 `worker-capacity.patch.yaml` 分开一个文件，是因为前者是「pod 容量」这一件事，
+# 这里是「控制面策略」那一件；两者一起改才是一个完整动作。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: sandlock
+spec:
+  template:
+    spec:
+      containers:
+        - name: control-plane
+          env:
+            - name: E2B_MAX_SANDBOX_CPU_PERCENT
+              value: "400"
+            - name: E2B_MAX_SANDBOX_MEMORY_MB
+              value: "4096"
+            - name: E2B_MAX_SANDBOX_PROCESSES
+              value: "1024"

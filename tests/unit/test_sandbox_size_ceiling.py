@@ -15,17 +15,20 @@ answers:
 * a size above the target node's per-sandbox ceiling is a named ``400`` -- the
   number in the message is the promise of the node the create is checked
   against, so it cannot belong to a different machine;
-* a node whose record carries **no** ceiling for a dimension cannot size work
-  at all (the mixed-version window, where a worker is still the old build):
-  ``503``, naming the node and the dimension, because an unknown ceiling must
-  never read as "unlimited".
+* the sandbox's own task budget (``maxProcesses``, the deployment's default,
+  not a request field) has no ``400`` to earn: a node whose promise is below it
+  answers ``503``, naming the node.
 
 The ceilings come from the node record the create lands on: in most cases that
 is the in-process ``local://`` node, whose row carries the control plane's own
 resolution (``E2B_MAX_SANDBOX_*`` -> ``E2B_MAX_TOTAL_*`` -> ``E2B_DEFAULT_*``),
-and in the last three a hand-built registry, because the rule is about the
-record and not about which kind of node it describes. A remote node's row gets
-the same three fields from the worker's heartbeat.
+and in the last two a hand-built registry, because the rule is about the record
+and not about which kind of node it describes. A remote node's row gets the
+**same** three numbers: ruling R17 (2026-10-07) made the ceiling the control
+plane's policy, so the internal API stamps it into every node record at
+register/heartbeat instead of storing whatever a worker reported. That is also
+why there is no longer a "this node has not reported a ceiling yet" ``503``:
+the control plane always knows its own policy.
 """
 
 from __future__ import annotations
@@ -249,7 +252,14 @@ async def test_an_unknown_promise_keeps_the_fleet_question_quiet(make_apps):
 
 async def test_the_landed_nodes_ceiling_is_the_one_quoted(make_apps):
     """A fleet whose nodes disagree still gets a truthful message: the number is
-    the landed node's promise, and its reservation goes straight back."""
+    the landed node's promise, and its reservation goes straight back.
+
+    R17 makes every node's policy the control plane's, so a fleet that
+    disagrees is no longer something a heartbeat can produce -- this case pins
+    the *record-level* rule with explicitly built rows, which is what keeps the
+    refusal honest if a row ever carries a different number (an embedder, a
+    migration, a stale row from another replica).
+    """
     nodes = NodeRegistry()
     nodes.add_local_node(
         node_id="local",
@@ -315,34 +325,6 @@ async def test_a_size_that_is_not_a_positive_integer_is_a_named_400(
 
 
 # --------------------------------------------------- the unknown ceiling (R12)
-
-
-async def test_a_node_with_no_reported_ceiling_cannot_size_work(make_apps):
-    """The mixed-version window: an old worker reports no ceiling, so the node
-    cannot be asked to size anything -- 503, named by node and dimension."""
-    nodes = NodeRegistry()
-    nodes.add_local_node(
-        node_id="worker-old",
-        total_memory_mb=8192,
-        total_cpu_percent=400,
-        total_disk_mb=10240,
-        total_processes=2048,
-    )
-    control, _envd = make_apps(
-        control_settings=_settings(enable_local_node=False),
-        control_kwargs={"nodes_registry": nodes},
-    )
-    async with _client(control) as client:
-        resp = await _create(client)
-
-    assert resp.status_code == 503
-    assert resp.json() == {
-        "code": 503,
-        "message": (
-            "node worker-old cannot size a sandbox: it has not reported its "
-            "per-sandbox cpuCount maximum"
-        ),
-    }
 
 
 async def test_a_node_whose_process_promise_is_below_the_default_cannot_size_work(

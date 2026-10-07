@@ -200,7 +200,7 @@ async def test_heartbeat_activity_report_marks_records(apps, control_client):
         headers=headers,
         json={"sandboxActivity": {sid: reported, "sbx_unknown": reported}},
     )
-    assert ok.status_code == 204
+    assert ok.status_code == 200
     assert registry.get(sid).last_active_at > stamp
     # A *stale* report never moves the stamp backwards.
     stale = await control_client.post(
@@ -208,7 +208,7 @@ async def test_heartbeat_activity_report_marks_records(apps, control_client):
         headers=headers,
         json={"sandboxActivity": {sid: stamp.timestamp()}},
     )
-    assert stale.status_code == 204
+    assert stale.status_code == 200
     assert registry.get(sid).last_active_at > stamp
 
 
@@ -262,7 +262,7 @@ async def test_heartbeat_cpu_report_lands_on_the_record(apps, control_client):
             }
         },
     )
-    assert ok.status_code == 204
+    assert ok.status_code == 200
     assert registry.get(sid).measured_cpu_percent == 380.0
 
     view = await control_client.get(

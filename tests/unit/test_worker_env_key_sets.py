@@ -107,7 +107,18 @@ def _k8s_worker_env() -> dict[str, str]:
     `"<valueFrom>"`, since this pin is about which keys exist and what a
     literal switch like `E2B_PID_NS` is set to.
     """
-    lines = (REPO / FLEET_K8S).read_text(encoding="utf-8").splitlines()
+    return _k8s_env(FLEET_K8S)
+
+
+def _k8s_env(relative: str) -> dict[str, str]:
+    """One k8s manifest's (or overlay patch's) `- name: E2B_*` entries.
+
+    The k0s overlay patches are strategic-merge files with the same env-list
+    shape as the manifests they patch, so one reader serves both -- and a pin
+    that reads the *patch* is what makes "the overlay raises this value" a fact
+    about the deployed lane rather than about the baseline.
+    """
+    lines = (REPO / relative).read_text(encoding="utf-8").splitlines()
     env: dict[str, str] = {}
     for index, line in enumerate(lines):
         match = _K8S_NAME_RE.match(line)
@@ -265,22 +276,39 @@ KEY_CLASSES: dict[str, set[str]] = {
     # at all, so both carry neither key -- their `.env` classes below name that
     # absence rather than letting a missing switch look like an oversight.
     #
-    # N83 phase 2 / Task 1 (2026-10-06) adds the ceiling trio to the same
-    # class, for the same reason: what a *single* sandbox may be configured to
-    # (`E2B_MAX_SANDBOX_*`, D5) only means anything where a per-sandbox cgroup
-    # is built. The fleet names all three next to its `E2B_NODE_*` totals (the
-    # k0s overlay raises them with the pod's limits, because the worker's
-    # startup cross-check refuses a policy above the kernel's read), the three
-    # C3 compose stacks name them at the node totals their kernel layer does
-    # not set, and the two stacks that build no per-sandbox cgroup name none.
+    # N83 phase 2 / Task 1 (2026-10-06) put the ceiling trio
+    # (`E2B_MAX_SANDBOX_*`, D5) in this class, because what a *single* sandbox
+    # may be configured to only means anything where a per-sandbox cgroup is
+    # built. Ruling R17 (2026-10-07) moved them **out of the worker manifests
+    # entirely**: the ceiling is the *control plane's* policy, handed down in
+    # the register/heartbeat answer, so the keys belong to the control-plane
+    # manifests now -- and `test_the_ceiling_trio_lives_on_the_control_plane`
+    # below is where they are pinned. A worker that still declares them grants
+    # nothing (the worker never reads them), which is why they are no longer
+    # classified here: this file's job is the *worker* key set.
     "sandbox_cgroup": {
         "E2B_SANDBOX_CGROUP",
         "E2B_CGROUP_MOUNT",
-        "E2B_MAX_SANDBOX_CPU_PERCENT",
-        "E2B_MAX_SANDBOX_MEMORY_MB",
-        "E2B_MAX_SANDBOX_PROCESSES",
     },
 }
+
+#: N83 phase 2 / R17: the three per-sandbox ceilings, and every manifest that
+#: must declare them. The control plane is the owner -- it writes them into
+#: every node record and hands them down -- so each lane's *control-plane*
+#: service names all three, and the value is pinned nowhere here on purpose:
+#: what matters at this layer is that the key exists where the policy lives.
+CEILING_KEYS = (
+    "E2B_MAX_SANDBOX_CPU_PERCENT",
+    "E2B_MAX_SANDBOX_MEMORY_MB",
+    "E2B_MAX_SANDBOX_PROCESSES",
+)
+
+CONTROL_PLANE_STACKS = (
+    ("deploy/k8s/control-plane.yaml", None),
+    ("deploy/compose/docker-compose.multinode.yml", "control-plane"),
+    ("deploy/compose/docker-compose.prod.yml", "control-plane"),
+    ("deploy/stack/docker-compose.prod.yml", "control-plane"),
+)
 
 #: Keys a *stack* declares that the k8s manifest does not, in exactly one named
 #: class. The per-stack whitelists below are unions of these.
@@ -530,3 +558,86 @@ def test_the_three_multinode_workers_declare_the_same_env_keys() -> None:
         for name in ("worker-1", "worker-2", "worker-3")
     }
     assert len(set(map(frozenset, workers.values()))) == 1, workers
+
+
+def test_the_ceiling_trio_lives_on_the_control_plane() -> None:
+    """N83 phase 2 / ruling R17: the policy keys are the control plane's, and
+    no worker-shaped stack declares them any more.
+
+    The ceiling is one deployment fact -- the control plane writes it into every
+    node record and hands it down in the register/heartbeat answer -- so a
+    worker manifest that declares it can only mislead an operator. Both halves
+    are pinned exactly: every lane's *control-plane* service names all three,
+    and every *worker* service names none.
+    """
+    for relative, service in CONTROL_PLANE_STACKS:
+        if service is None:
+            env = _k8s_env(relative)
+        else:
+            env = _compose_service_env(relative, service)
+        missing = [key for key in CEILING_KEYS if key not in env]
+        assert missing == [], (relative, service, missing)
+    for path, env in _worker_envs().items():
+        declared = [key for key in CEILING_KEYS if key in env]
+        assert declared == [], (path, declared)
+
+
+def _resource_limits(relative: str, container: str) -> dict[str, str]:
+    """One container's `resources.limits` block, key -> raw value.
+
+    Line-oriented like the env readers above, and scoped to a named container
+    so a manifest with a sidecar (the control-plane pod's buildkit) cannot lend
+    its limits to the pod the ceiling is about.
+    """
+    lines = (REPO / relative).read_text(encoding="utf-8").splitlines()
+    header = f"        - name: {container}"
+    starts = [index for index, line in enumerate(lines) if line == header]
+    assert len(starts) == 1, (relative, container, starts)
+    limits: dict[str, str] = {}
+    inside = False
+    for line in lines[starts[0] + 1 :]:
+        if line.strip() == "" or line.strip().startswith("#"):
+            continue
+        if line.startswith("        - name: "):
+            break
+        if line.strip() == "limits:":
+            inside = True
+            continue
+        if inside:
+            match = re.match(r"^\s+([a-zA-Z]+):\s*(\S+)\s*$", line)
+            if match:
+                limits[match.group(1)] = _unquote(match.group(2))
+                continue
+            if line.strip() in {"requests:", "resources:"}:
+                inside = False
+    return limits
+
+
+def test_the_k0s_overlay_raises_the_handed_down_ceiling_with_the_pod_limits() -> None:
+    """The overlay's control-plane policy and the worker pod's kernel, in step.
+
+    The worker refuses a hand-down above its own container's kernel limits
+    (D5b), so these two files are one action: raising the ceiling without
+    raising the pod turns every create on that node into a named refusal, and
+    raising the pod without the ceiling silently under-sells the lane. The
+    baseline is pinned the same way (2 cores / 2 GiB), because that is the pair
+    the overlay *moves away from*.
+    """
+    baseline_cp = _k8s_env("deploy/k8s/control-plane.yaml")
+    baseline_worker_limits = _resource_limits("deploy/k8s/worker.yaml", "worker")
+    assert [baseline_cp[key] for key in CEILING_KEYS] == ["200", "2048", "256"]
+    assert baseline_worker_limits["cpu"] == "2"
+    assert baseline_worker_limits["memory"] == "2Gi"
+
+    overlay_cp = _k8s_env("deploy/k8s-k0s/control-plane-capacity.patch.yaml")
+    overlay_worker_limits = _resource_limits(
+        "deploy/k8s-k0s/worker-capacity.patch.yaml", "worker"
+    )
+    assert [overlay_cp[key] for key in CEILING_KEYS] == ["400", "4096", "1024"]
+    assert overlay_worker_limits["cpu"] == "4"
+    assert overlay_worker_limits["memory"] == "4Gi"
+    # cpuCount is cores on the wire and percent in the policy, memory is MiB.
+    assert int(overlay_cp[CEILING_KEYS[0]]) == int(overlay_worker_limits["cpu"]) * 100
+    assert int(overlay_cp[CEILING_KEYS[1]]) == int(
+        overlay_worker_limits["memory"].removesuffix("Gi")
+    ) * 1024

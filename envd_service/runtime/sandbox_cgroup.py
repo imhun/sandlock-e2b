@@ -84,12 +84,7 @@ import time
 from pathlib import Path
 
 from gateway_common.paths import validate_sandbox_id
-from gateway_common.sandbox_ceiling import (
-    MAX_SANDBOX_CPU_PERCENT_ENV,
-    MAX_SANDBOX_MEMORY_MB_ENV,
-    MAX_SANDBOX_PROCESSES_ENV,
-    SandboxCeiling,
-)
+from gateway_common.sandbox_ceiling import SandboxCeiling
 
 logger = logging.getLogger(__name__)
 
@@ -348,8 +343,10 @@ def read_sandbox_events(directory: Path) -> dict[str, int]:
 def check_policy_ceiling(policy: SandboxCeiling, *, mount: Path) -> SandboxCeiling:
     """D5b: cross-check the configured per-sandbox ceiling against the kernel's.
 
-    The policy comes from ``E2B_MAX_SANDBOX_*`` (never from this read); the
-    kernel's comes from the worker's own cgroup. Two outcomes, both loud:
+    The policy is the one the **control plane** handed down (ruling R17: its
+    own ``E2B_MAX_SANDBOX_*``, arriving in the register/heartbeat answer --
+    never from this read and never from this worker's own env); the kernel's
+    comes from the worker's own cgroup. Two outcomes, both loud:
 
     * **policy above the kernel** -- a named ``cgroup-refusal
       ceiling-exceeds-kernel`` that the worker's startup path turns into a
@@ -374,7 +371,7 @@ def check_policy_ceiling(policy: SandboxCeiling, *, mount: Path) -> SandboxCeili
         and policy.cpu_percent > kernel.cpu_percent
     ):
         above.append(
-            f"E2B_MAX_SANDBOX_CPU_PERCENT={policy.cpu_percent} > "
+            f"cpuPercent={policy.cpu_percent} > "
             f"{kernel.cpu_percent}% (cpu.max)"
         )
     if (
@@ -383,16 +380,17 @@ def check_policy_ceiling(policy: SandboxCeiling, *, mount: Path) -> SandboxCeili
         and policy.memory_mb > kernel.memory_mb
     ):
         above.append(
-            f"E2B_MAX_SANDBOX_MEMORY_MB={policy.memory_mb} > "
+            f"memoryMB={policy.memory_mb} > "
             f"{kernel.memory_mb} MiB (memory.max)"
         )
     if above:
         raise CgroupRefusal(
             "cgroup-refusal ceiling-exceeds-kernel: this worker's cgroup allows "
-            f"less than the configured per-sandbox ceiling ({'; '.join(above)}) "
-            "-- lower the env or raise the worker container's limits; refusing "
-            "to start rather than accepting sandboxes the container layer would "
-            "throttle or OOM-kill"
+            f"less than the per-sandbox ceiling the control plane handed down "
+            f"({'; '.join(above)}) -- lower E2B_MAX_SANDBOX_* on the control "
+            "plane or raise the worker container's limits; refusing the "
+            "hand-down rather than accepting sandboxes the container layer "
+            "would throttle or OOM-kill"
         )
     unbounded = [
         name
@@ -405,9 +403,9 @@ def check_policy_ceiling(policy: SandboxCeiling, *, mount: Path) -> SandboxCeili
     if unbounded:
         logger.warning(
             "cgroup ceiling: %s sets no kernel limit for %s (read 'max'): the "
-            "physical layer caps nothing, so the configured per-sandbox ceiling "
-            "is the only bound and aggregate admission rests on the platform's "
-            "ledger alone",
+            "physical layer caps nothing, so the per-sandbox ceiling the "
+            "control plane handed down is the only bound and aggregate "
+            "admission rests on the platform's ledger alone",
             mount,
             ", ".join(unbounded),
         )
@@ -500,6 +498,27 @@ class SandboxCgroups:
         #: A successful ``attach`` for the same id drops its entry -- a new
         #: occupant's account starts at zero (Task 5 review, fix 2).
         self._retired_events: dict[str, dict[str, int]] = {}
+
+    # -- the policy ceiling (N83 phase 2 / R17) -------------------------
+
+    @property
+    def policy_ceiling(self) -> SandboxCeiling | None:
+        """The per-sandbox ceiling this handle currently checks against."""
+        return self._policy_ceiling
+
+    def set_policy_ceiling(self, ceiling: SandboxCeiling | None) -> None:
+        """Replace the per-sandbox policy ceiling this handle checks against.
+
+        The ceiling is the control plane's and it is handed down on every
+        register/heartbeat answer, so it can change under a live process (a
+        re-deploy that lowers it). The handle is process-wide and cached -- it
+        is the object ``setup`` established the delegated parent on -- so a
+        change is applied **in place** (``envd_service.route_b`` calls this from
+        the hand-down path); rebuilding the handle instead would abandon the
+        parent every live ``sbx_<id>`` hangs under. ``None`` is legal and means
+        "no ceiling in hand", which ``attach`` then refuses by name.
+        """
+        self._policy_ceiling = ceiling
 
     # -- startup -------------------------------------------------------
 
@@ -828,58 +847,56 @@ class SandboxCgroups:
     ) -> tuple[str, str]:
         """R3's second gate: the declared sizes vs this worker's own ceiling.
 
-        The ceiling is the one injected at construction (the worker's
-        ``E2B_MAX_SANDBOX_*`` policy, resolved by
-        ``envd_service.route_b.policy_ceiling_for``) -- explicitly **not** the
-        kernel read: the kernel's half is the startup cross-check's business,
-        and a kernel that sets no limit is a legal lane where the policy is the
-        only bound left.
+        The ceiling is the one in hand -- the control plane's own policy,
+        handed down and read through ``envd_service.route_b.policy_ceiling_for``
+        (N83 phase 2 / R17) -- explicitly **not** the kernel read: the kernel's
+        half is the hand-down cross-check's business, and a kernel that sets no
+        limit is a legal lane where the policy is the only bound left.
 
         Three outcomes, none of them silent:
 
         * a declared dimension is above the ceiling -- one named refusal naming
-          every offending dimension, its value and the env that carries the
-          limit (no clamp: the API promise and the kernel have to agree);
+          every offending dimension and its value (no clamp: the API promise
+          and the kernel have to agree);
         * a dimension nobody declared -- the ceiling is written, so the sandbox
           is still bounded by the deployment's own number;
-        * no ceiling on this handle at all -- refused by name, because "checked
-          against nothing" is the fail-open direction this whole module exists
-          to close.
+        * no ceiling on this handle at all (no hand-down has arrived, or the one
+          that arrived was refused) -- refused by name, because "checked against
+          nothing" is the fail-open direction this whole module exists to close.
         """
         ceiling = self._policy_ceiling
         if ceiling is None:
             raise CgroupRefusal(
                 "cgroup-refusal ceiling-unavailable: this handle carries no "
                 f"per-sandbox ceiling, so sandbox {sandbox_id}'s declared size "
-                "cannot be checked against anything (N83 phase 2 R3) -- build "
-                "it through sandbox_cgroups_for(settings), or set "
-                "E2B_SANDBOX_CGROUP=off"
+                "cannot be checked against anything (N83 phase 2 R3/R17): the "
+                "control plane has not handed one down to this worker (or the "
+                "one it handed down was refused), and a create is never run "
+                "unbounded on this lane -- set E2B_SANDBOX_CGROUP=off for a "
+                "lane that deliberately builds no per-sandbox cgroup"
             )
         memory = ceiling.memory_mb if memory_mb is None else int(memory_mb)
         processes = ceiling.processes if max_processes is None else int(max_processes)
         above: list[str] = []
         if ceiling.cpu_percent is not None and int(cpu_percent) > ceiling.cpu_percent:
             above.append(
-                f"cpuPercent {cpu_percent} > {ceiling.cpu_percent} "
-                f"({MAX_SANDBOX_CPU_PERCENT_ENV})"
+                f"cpuPercent {cpu_percent} > {ceiling.cpu_percent}"
             )
         if ceiling.memory_mb is not None and memory > ceiling.memory_mb:
             above.append(
-                f"memoryMB {memory} > {ceiling.memory_mb} "
-                f"({MAX_SANDBOX_MEMORY_MB_ENV})"
+                f"memoryMB {memory} > {ceiling.memory_mb}"
             )
         if ceiling.processes is not None and processes > ceiling.processes:
             above.append(
-                f"maxProcesses {processes} > {ceiling.processes} "
-                f"({MAX_SANDBOX_PROCESSES_ENV})"
+                f"maxProcesses {processes} > {ceiling.processes}"
             )
         if above:
             raise CgroupRefusal(
                 f"cgroup-refusal size-exceeds-ceiling: sandbox {sandbox_id} "
-                "declares more than this worker's per-sandbox ceiling "
-                f"({'; '.join(above)}) -- refusing the create rather than "
-                "running a smaller sandbox silently; lower the request or "
-                "raise E2B_MAX_SANDBOX_*"
+                "declares more than the per-sandbox ceiling the control plane "
+                f"handed down ({'; '.join(above)}) -- refusing the create "
+                "rather than running a smaller sandbox silently; lower the "
+                "request or raise E2B_MAX_SANDBOX_* on the control plane"
             )
         return memory_max_for(memory), pids_max_for(processes)
 

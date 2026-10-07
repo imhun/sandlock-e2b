@@ -506,6 +506,30 @@ spec:
               value: '{"py311": "registry.cn-shanghai.aliyuncs.com/byteplan/python:3.11-slim"}'
             - name: E2B_MAX_SANDBOXES
               value: "1000"
+            # N83 phase 2 / Task 1 + ruling R17 (2026-10-07): the largest
+            # values a **single** sandbox may be configured to -- the
+            # per-sandbox *policy* ceiling. It lives here, on the control plane,
+            # because it is a policy: the control plane writes it into every
+            # node record and hands it **down** to every worker in the
+            # register/heartbeat answer (`POST /internal/nodes[/{id}]/...`), and
+            # the worker adopts it (`envd_service/agent.py`). The worker no
+            # longer declares these keys at all.
+            #
+            # Written out even though it equals the `E2B_MAX_TOTAL_*` values
+            # above (which is also what the code default resolves to), because
+            # the number is a decision: one sandbox may take this node's whole
+            # declared budget here, and a deployment that disagrees lowers the
+            # trio without touching the node's own capacity. The worker refuses
+            # a hand-down above its own container's kernel limits (D5b), so
+            # raising these means raising the pod's `resources.limits` with them
+            # -- the k0s overlay does both (`control-plane-capacity.patch.yaml`
+            # here, `worker-capacity.patch.yaml` for the pod).
+            - name: E2B_MAX_SANDBOX_CPU_PERCENT
+              value: "200"
+            - name: E2B_MAX_SANDBOX_MEMORY_MB
+              value: "2048"
+            - name: E2B_MAX_SANDBOX_PROCESSES
+              value: "256"
             # Template.build talks to the buildkit sidecar below over a unix
             # socket inside the shared `buildkit-data` emptyDir -- the same
             # arrangement (and the same address) as the compose stack, which

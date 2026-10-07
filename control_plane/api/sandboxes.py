@@ -189,31 +189,16 @@ def _ceiling_text(field: str, ceiling: int) -> str:
 def _reported_ceiling(node, attribute: str) -> int:
     """A node record's ceiling for one dimension; ``0`` when it has none.
 
-    ``0`` *is* the record's "no ceiling has arrived yet" value (N83 phase 2),
-    so a row written before the field existed, or one whose value is not a
-    number at all, must read as unknown and refuse by name -- never as a
-    number nobody reported, and never as a crash on the create path.
+    ``0`` is a row the control plane has not written a policy into (N83 phase
+    2 / R17: the policy is the control plane's own and every node's row carries
+    it, so this is not the mixed-version window it used to be). A value that is
+    not a number reads the same way, and the comparison below is fail-closed
+    either way: a positive request is always above a ``0`` ceiling.
     """
     value = getattr(node, attribute, 0)
     if not isinstance(value, int) or isinstance(value, bool):
         return 0
     return value
-
-
-def _node_cannot_size(node_id: str, field: str) -> OfficialError:
-    """503: this node's record carries no ceiling for ``field`` yet.
-
-    The mixed-version window (a worker that is still an older build reports no
-    ``sandboxCeiling``) and any other node whose promise never arrived land
-    here. An unknown ceiling must never read as "unlimited", so the create is
-    refused by name -- node and dimension -- instead of being handed a quota
-    nobody promised.
-    """
-    return OfficialError(
-        503,
-        f"node {node_id} cannot size a sandbox: it has not reported its "
-        f"per-sandbox {field} maximum",
-    )
 
 
 def _size_refusal(check: _SizeCeiling, *, node_id: str) -> OfficialError:
@@ -268,8 +253,6 @@ def _node_size_refusal(
     for check in _size_ceilings(
         node, cpu_count=cpu_count, memory_mb=memory_mb, processes=processes
     ):
-        if check.ceiling <= 0:
-            return _node_cannot_size(node.node_id, check.field)
         if check.requested > check.ceiling:
             return _size_refusal(check, node_id=node.node_id)
     return None
@@ -1417,10 +1400,11 @@ async def _create_sandbox_attempt(
             raise size_refusal
         # 节点层无容量：还没有任何状态可回滚，直接交给调度器决定是否驱逐。
         raise _CapacityExhausted(_node_refusal_message(request, dims))
-    # N83 phase 2 (D6/R12): 上限按**这个请求真落到的那个节点**校验 —— 就是刚
-    # 刚被预留的那个记录，所以拒绝文案里的数字一定属于这台机器；拒绝时把预留
-    # 原样还回去，与下面每一条早退路径同一个做法。记录里还没有上限（混版本窗口：
-    # worker 还是旧版）⇒ 具名 503，绝不无额度放行。
+    # N83 phase 2 (D6, ruling R17): 上限按**这个请求真落到的那个节点**校验 ——
+    # 就是刚刚被预留的那个记录，所以拒绝文案里的数字一定属于这台机器；拒绝时把
+    # 预留原样还回去，与下面每一条早退路径同一个做法。这份上限是**控制面自己**
+    # 的策略（每个节点同值，由 register/heartbeat 写进记录），不是 worker 报的，
+    # 所以这里不再有"节点没上报上限 ⇒ 503"的窗口。
     size_refusal = _node_size_refusal(
         node, cpu_count=cpu_count, memory_mb=memory_mb, processes=dims[3]
     )

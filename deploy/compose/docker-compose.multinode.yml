@@ -295,6 +295,17 @@ services:
       E2B_MAX_TOTAL_CPU_PERCENT: 400
       E2B_MAX_TOTAL_DISK_MB: 10240
       E2B_MAX_TOTAL_PROCESSES: 2048
+      # N83 phase 2 / Task 1 + ruling R17: 每箱上限是**控制面的策略**，写在这里
+      # （worker 清单再也不声明这三个键）。控制面把它写进每个节点记录，并在每次
+      # register/heartbeat 的**响应体**里下发；worker 采纳后再拿它跟本机内核读数
+      # 交叉校验（D5b），上限高于内核就拒绝这份下发、该 worker 上所有建箱具名拒绝。
+      # 取值 = 本车道每个 worker 的 `E2B_NODE_*` 总量（一个箱可以吃掉一个节点声明的
+      # 全部预算）；三个 compose 车道都不设 `cpus`/`mem_limit`（实测），内核层读
+      # `max`，所以 D5b 在这条车道上只会打一行 WARN —— 这三个数加上控制面的台账
+      # 就是全部的界。
+      E2B_MAX_SANDBOX_CPU_PERCENT: 200
+      E2B_MAX_SANDBOX_MEMORY_MB: 2048
+      E2B_MAX_SANDBOX_PROCESSES: 256
     ports:
       - "3100:3000"
     volumes:
@@ -444,17 +455,6 @@ services:
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
-      # N83 phase 2 / Task 1 (D5): the per-sandbox ceiling -- the largest a
-      # *single* sandbox may be configured to here. Equal to this lane's
-      # `E2B_NODE_*` totals on purpose (one sandbox may take the worker's whole
-      # declared budget), but written out because they are a decision, and
-      # because this lane is where D5's whole shape matters: none of the compose
-      # stacks set `cpus`/`mem_limit` (measured), so the kernel layer reads
-      # `max` and the worker's startup cross-check can only **warn** -- these
-      # three numbers plus the control plane's ledger are the entire bound.
-      E2B_MAX_SANDBOX_CPU_PERCENT: 200
-      E2B_MAX_SANDBOX_MEMORY_MB: 2048
-      E2B_MAX_SANDBOX_PROCESSES: 256
       # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
       # default, inert) and where the rw cgroupfs view lands. This lane gets the
       # same *narrowed* view k8s gets, by a different device: compose **has**
@@ -563,11 +563,6 @@ services:
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
-      # N83 phase 2 / Task 1 (D5): same per-sandbox ceiling as worker-1 -- see
-      # the note there; this lane's kernel layer is `max` too.
-      E2B_MAX_SANDBOX_CPU_PERCENT: 200
-      E2B_MAX_SANDBOX_MEMORY_MB: 2048
-      E2B_MAX_SANDBOX_PROCESSES: 256
       # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
       # default, inert) and where the rw cgroupfs view lands. This lane gets the
       # same *narrowed* view k8s gets, by a different device: compose **has**
@@ -676,11 +671,6 @@ services:
       E2B_NODE_CPU_PERCENT: 200
       E2B_NODE_DISK_MB: 4096
       E2B_NODE_PROCESSES: 256
-      # N83 phase 2 / Task 1 (D5): same per-sandbox ceiling as worker-1 -- see
-      # the note there; this lane's kernel layer is `max` too.
-      E2B_MAX_SANDBOX_CPU_PERCENT: 200
-      E2B_MAX_SANDBOX_MEMORY_MB: 2048
-      E2B_MAX_SANDBOX_PROCESSES: 256
       # N83 phase 1 / Task 2: the per-sandbox cgroup switch (`off` = the code
       # default, inert) and where the rw cgroupfs view lands. This lane gets the
       # same *narrowed* view k8s gets, by a different device: compose **has**

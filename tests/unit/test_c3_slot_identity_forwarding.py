@@ -181,7 +181,7 @@ async def test_a_heartbeat_refreshes_the_workers_pid_namespace(workspace) -> Non
             headers={"X-Internal-Key": KEY_A},
             json={"pidNamespace": "pid:[4026532709]"},
         )
-    assert resp.status_code == 204
+    assert resp.status_code == 200
     assert app.state.nodes.get(NODE_A).pid_namespace == "pid:[4026532709]"
 
     async with _client(app) as client:

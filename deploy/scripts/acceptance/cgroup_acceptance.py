@@ -85,9 +85,12 @@ four more, same rule -- each one a reading:
 8. **An over-ceiling create is a named ``400``.** ``cpuCount: 8`` (or a
    ``memoryMB`` past the node's promise) answers ``400`` with the exact message
    the node's own ceiling implies, while a request *at* the ceiling is
-   accepted -- so "always refuses" cannot pass either. On a node whose record
-   carries no ceiling at all (the mixed-version window, R12) the same request
-   is a named ``503``, which is this check's RED.
+   accepted -- so "always refuses" cannot pass either. The ceiling is the
+   *control plane's* policy (ruling R17): the expected text is built from the
+   ``E2B_MAX_SANDBOX_*`` the **control-plane container** declares, and the
+   whole lane is this check's RED (with the cgroup lane off the worker still
+   sizes creates, so check 8 runs -- what it measures either way is the number
+   the control plane handed down vs. the one the create was refused with).
 9. **Peak and task unit.** ``memory.max``/``memory.high`` equal the declared
    ``memoryMB`` byte for byte and ``pids.max`` equals **this box's own recorded
    declaration** -- the worker's ``_runtime/<id>/sandbox.json``
@@ -154,7 +157,15 @@ rate limit):
         --api-key "$E2B_API_KEY" --internal-key internal-key \\
         --internal-url http://control-plane:3000 \\
         --nodes worker-1,worker-2,worker-3 \\
-        --worker-exec-template 'docker exec -i n83acc-{node}-1 bash -lc'
+        --worker-exec-template 'docker exec -i n83acc-{node}-1 bash -lc' \\
+        --control-plane-exec-template 'docker exec -i n83acc-control-plane-1 bash -lc'
+
+``--control-plane-exec-template`` (with ``--control-plane-node``, default
+``control-plane``) is how check 8 reaches the manifest that declares the
+per-sandbox ceilings: ruling R17 moved them to the control plane, and the
+expected refusal text is built from what that container declares. The default
+template names an ``n83acc``-project control-plane container, so any lane with
+another project name passes it explicitly.
 
 It prints one JSON object (every reading, plus ``ok``) and exits non-zero when
 any check fails.
@@ -381,6 +392,12 @@ def sandboxes_on_node(
 #: a run must not be able to print a value it did not observe (fix round 1,
 #: finding 2: the archived RED artifact, which ran with the lane off, printed
 #: "required" because the report field was a canned string).
+#:
+#: N83 phase 2 / ruling R17: the three per-sandbox ceilings are **not** read
+#: here any more. They are the control plane's policy now and they are read out
+#: of the *control-plane* container (``control_plane_env`` below) -- the worker
+#: containers do not declare them at all, and reading a key the deployment moved
+#: is exactly how check 8's expectation follows the move.
 _LANE_ENV_SCRIPT = r"""
 import json, os, pathlib, sys
 
@@ -395,13 +412,6 @@ WANTED = (
     # it to be set is the environment satisfying the check; when a lane does
     # set it, the report shows whether the two agree.
     "E2B_DEFAULT_MAX_PROCESSES",
-    # ... and the three per-sandbox ceilings check 8's expected refusal text is
-    # built from: the worker reports these in its heartbeat, the control plane
-    # quotes them back in the ``400``, and reading them out of the container is
-    # what keeps the expectation from being a hard-coded "2".
-    "E2B_MAX_SANDBOX_CPU_PERCENT",
-    "E2B_MAX_SANDBOX_MEMORY_MB",
-    "E2B_MAX_SANDBOX_PROCESSES",
 )
 
 
@@ -436,6 +446,72 @@ print(json.dumps({"pid1": pathlib.Path("/proc/1/cmdline").read_bytes().split(b"\
 def lane_env(shell: WorkerShell, node: str) -> dict:
     """The three switches as this *worker container* actually sees them."""
     return shell.json(node, "python3 - <<'PY'\n%s\nPY" % _LANE_ENV_SCRIPT)
+
+
+#: The three per-sandbox ceilings check 8's expected refusal text is built from.
+#: N83 phase 2 / ruling R17 moved them to the **control plane**: it is the one
+#: that owns the policy, writes it into every node record and quotes it back in
+#: the ``400``. So the expectation is read *there* -- never hard-coded, and never
+#: from a place the deployment no longer declares them.
+_CEILING_ENV_SCRIPT = r"""
+import json, os, pathlib
+
+WANTED = (
+    "E2B_MAX_SANDBOX_CPU_PERCENT",
+    "E2B_MAX_SANDBOX_MEMORY_MB",
+    "E2B_MAX_SANDBOX_PROCESSES",
+)
+
+proc1 = {}
+try:
+    for entry in pathlib.Path("/proc/1/environ").read_bytes().split(b"\0"):
+        key, _, value = entry.partition(b"=")
+        name = key.decode("utf-8", "replace")
+        if name in WANTED:
+            proc1[name] = value.decode("utf-8", "replace")
+except OSError:
+    pass
+
+observed = {}
+for name in WANTED:
+    if name in proc1:
+        observed[name] = {"value": proc1[name], "source": "/proc/1/environ"}
+    elif name in os.environ:
+        observed[name] = {"value": os.environ[name], "source": "exec env"}
+    else:
+        observed[name] = {"value": None, "source": "unset"}
+print(json.dumps({
+    "pid1": pathlib.Path("/proc/1/cmdline").read_bytes().split(b"\0")[0].decode("utf-8", "replace"),
+    "observed": observed,
+}))
+"""
+
+
+def control_plane_env(template: str, node: str, *, timeout: float = 60.0) -> dict:
+    """The three per-sandbox ceilings as the **control plane** container sees them.
+
+    The lane names how to reach that container (``--control-plane-exec-template``,
+    with ``{node}`` substituted by ``--control-plane-node``) for the same reason
+    the worker reads use a template: the script is lane-neutral, and on the k8s
+    lane reaching the control-plane pod is a different incantation from the
+    compose ``docker exec``.
+    """
+    argv = shlex.split(template.replace("{node}", node))
+    argv.append("python3 - <<'PY'\n%s\nPY" % _CEILING_ENV_SCRIPT)
+    done = _run(argv, timeout=timeout)
+    if done.returncode != 0:
+        raise Refusal(
+            f"control-plane command on {node} exited {done.returncode}: "
+            f"{done.stderr.strip()[:400] or done.stdout.strip()[:400]}"
+        )
+    out = done.stdout.strip()
+    payload = out.splitlines()[-1] if out else ""
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise Refusal(
+            f"control-plane command on {node} did not end in a JSON line: {out!r}"
+        ) from exc
 
 
 #: The lane-neutral identity of "this worker's own container cgroup": the unique
@@ -918,6 +994,22 @@ def main() -> int:
         help="how to run a shell script inside a worker container; '{node}' is substituted",
     )
     parser.add_argument(
+        "--control-plane-exec-template",
+        default=os.environ.get(
+            "N83_ACC_CP_EXEC", "docker exec -i n83acc-control-plane-1 bash -lc"
+        ),
+        help=(
+            "how to run a shell script inside the control-plane container (check 8 "
+            "reads the per-sandbox ceilings there since ruling R17); '{node}' is "
+            "substituted with --control-plane-node when present"
+        ),
+    )
+    parser.add_argument(
+        "--control-plane-node",
+        default=os.environ.get("N83_ACC_CP_NODE", "control-plane"),
+        help="the name '{node}' takes in --control-plane-exec-template",
+    )
+    parser.add_argument(
         "--nodes",
         default=os.environ.get("N83_ACC_NODES", "worker-1,worker-2,worker-3"),
     )
@@ -937,12 +1029,17 @@ def main() -> int:
             "api_url": args.api_url,
             "internal_url": args.internal_url,
             "worker_exec_template": args.worker_exec_template,
+            "control_plane_exec_template": args.control_plane_exec_template,
+            "control_plane_node": args.control_plane_node,
             "nodes": nodes,
             "cgroup_mount": args.cgroup_mount,
             "template": args.template,
             "flood_seconds": args.flood_seconds,
             # Filled in below from inside the workers -- see lane_env().
             "worker_env": {},
+            # ... and from inside the control plane -- the per-sandbox ceilings
+            # check 8's expected refusal text is built from (ruling R17).
+            "control_plane_env": {},
         },
         "n82_baseline": _N82_BASELINE,
         "checks": {},
@@ -959,6 +1056,15 @@ def main() -> int:
             report["lane"]["worker_env"][node] = lane_env(shell, node)
         except Refusal as exc:
             report["lane"]["worker_env"][node] = {"error": str(exc)}
+    # ...and the three per-sandbox ceilings out of the control plane (R17):
+    # same rule, same reason -- the number check 8 quotes has to be one the run
+    # observed, in the container that owns it.
+    try:
+        report["lane"]["control_plane_env"] = control_plane_env(
+            args.control_plane_exec_template, args.control_plane_node
+        )
+    except Refusal as exc:
+        report["lane"]["control_plane_env"] = {"error": str(exc)}
 
     def record(key: str, passed: bool, **readings) -> None:
         existing = report["checks"].get(key, {})
@@ -1098,16 +1204,22 @@ def main() -> int:
         """One dimension of the node's per-sandbox ceiling, read in-container.
 
         Check 8's refusal text quotes the node's promise, so the expected text
-        is built from the same ``E2B_MAX_SANDBOX_*`` the worker reports in its
-        heartbeat -- read out of the worker container, so a lane that moved a
-        ceiling moves the expectation with it.
+        is built from the same ``E2B_MAX_SANDBOX_*`` the control plane handed
+        down -- read out of the **control-plane** container (ruling R17 moved
+        the three keys there; a worker no longer declares them), so a lane that
+        moved a ceiling moves the expectation with it. ``node`` is kept in the
+        signature because the failure names which reading is missing.
         """
-        observed = report["lane"]["worker_env"].get(node, {}).get("observed", {})
+        observed = (
+            report["lane"]["control_plane_env"].get("observed", {})
+            if isinstance(report["lane"]["control_plane_env"], dict)
+            else {}
+        )
         value = (observed.get(key) or {}).get("value")
         if not isinstance(value, str) or not value.strip().isdigit() or int(value) < 1:
             raise Refusal(
-                f"the lane does not declare {key} inside {node} (read {value!r}), so "
-                "check 8 cannot know which ceiling the refusal should quote"
+                f"the lane's control plane does not declare {key} (read {value!r}), "
+                "so check 8 cannot know which ceiling the refusal should quote"
             )
         return int(value) // unit
 
@@ -1580,11 +1692,16 @@ def main() -> int:
                 criterion=(
                     "cpuCount/memoryMB past the node's per-sandbox ceiling answer "
                     "exactly 400 with the message that quotes that ceiling, and a "
-                    "request *at* the ceiling is accepted (201); a node that has not "
-                    "reported a ceiling answers the named 503 instead (R12); and the "
-                    "boundary box's DELETE answers 204"
+                    "request *at* the ceiling is accepted (201); the ceiling is the "
+                    "control plane's own policy, handed down to the worker (R17), so "
+                    "the number quoted is the one the control-plane container "
+                    "declares; and the boundary box's DELETE answers 204"
                 ),
-                ceiling_source=f"E2B_MAX_SANDBOX_* read inside {ceiling_node}",
+                ceiling_source=(
+                    "E2B_MAX_SANDBOX_* read inside the control plane "
+                    f"({args.control_plane_node}); the refusal quotes the number "
+                    f"the create was checked against on {ceiling_node}"
+                ),
                 cpu_ceiling=cpu_ceiling,
                 memory_ceiling=memory_ceiling,
                 cpu_status=cpu_status,

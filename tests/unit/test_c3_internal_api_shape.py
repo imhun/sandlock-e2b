@@ -484,7 +484,7 @@ def _delegation_client(app, *, source_ip: str = "10.0.0.1") -> httpx.AsyncClient
 
 
 async def _enroll_node(
-    app, *, key: str = KEY_NODE, container_id=None, sandbox_ceiling=None
+    app, *, key: str = KEY_NODE, container_id=None, kernel_ceiling=None
 ) -> None:
     """Register node A -- the node-scoped identity every delegation needs."""
     body = {
@@ -497,8 +497,8 @@ async def _enroll_node(
     }
     if container_id is not None:
         body["containerID"] = container_id
-    if sandbox_ceiling is not None:
-        body["sandboxCeiling"] = sandbox_ceiling
+    if kernel_ceiling is not None:
+        body["kernelCeiling"] = kernel_ceiling
     body["workerUID"] = WORKER_UID
     body["workerGID"] = WORKER_GID
     async with _delegation_client(app) as client:
@@ -883,14 +883,17 @@ def test_no_agent_client_refuses_the_delegation_by_name(workspace) -> None:
 #
 # D5: the ceiling a *single* sandbox may be configured to is a configured
 # policy (``E2B_MAX_SANDBOX_*``) that defaults to the corresponding node total
-# -- never 0 and never infinity. The control plane's ``Settings`` fields are
-# the in-process ``local://`` node's copy of that rule; a *worker* node gets
-# both copies from the worker's own heartbeat (``sandboxCeiling``): the policy
-# it resolved and the kernel's read of its own container cgroup (``None`` =
-# the kernel sets no limit). They are stored side by side so a reader can see
-# both the promise and the physical ceiling it was checked against.
+# -- never 0 and never infinity. Ruling R17 (2026-10-07) makes that policy the
+# **control plane's**: its ``Settings`` resolve it once, the internal API writes
+# it into every node record and returns it in the register/heartbeat **response**
+# (the hand-down a worker adopts), and a worker's own report of the same three
+# names is ignored. What a worker still reports is the *physical* half -- the
+# kernel's own limits on its container cgroup (``null`` = no limit), under
+# ``kernelCeiling``. Both halves are stored side by side on the node record, so
+# a reader can see the promise and the physical ceiling it was checked against.
 
-#: One worker's report: a 4-core/4 GiB container with a 2-core/2 GiB policy.
+#: One worker's hand-down: a 2-core/2 GiB policy for every node, with a
+#: kernel reading of a 4-core/4 GiB container.
 SANDBOX_CEILING = {
     "cpuPercent": 200,
     "memoryMB": 2048,
@@ -898,6 +901,14 @@ SANDBOX_CEILING = {
     "kernelCpuPercent": 400,
     "kernelMemoryMB": 4096,
 }
+
+#: ...and that same hand-down as it goes the other way: the *response* body of a
+#: register/heartbeat, built from this control plane's own Settings.
+HAND_DOWN = {"cpuPercent": 200, "memoryMB": 2048, "processes": 256}
+
+#: What a worker on this build reports now: the physical half, under its own
+#: name. The kernel says 4 cores / 4 GiB, the control plane's policy is smaller.
+KERNEL_CEILING = {"cpuPercent": 400, "memoryMB": 4096}
 
 _CEILING_ENVS = (
     "E2B_MAX_SANDBOX_CPU_PERCENT",
@@ -1004,18 +1015,82 @@ def test_an_explicit_control_plane_ceiling_is_independent_of_the_node_total(
     assert settings.max_sandbox_processes == 64
 
 
-def test_the_heartbeat_carries_both_ceilings_into_the_node_record(
+#: A control plane whose own policy is the 2-core/2 GiB pair above, so the
+#: hand-down's numbers are the *Settings*' and not this host's.
+def _ceiling_settings(**overrides) -> ControlSettings:
+    defaults = dict(
+        max_total_memory_mb=8192,
+        max_total_cpu_percent=400,
+        max_total_processes=2048,
+        max_sandbox_cpu_percent=200,
+        max_sandbox_memory_mb=2048,
+        max_sandbox_processes=256,
+    )
+    defaults.update(overrides)
+    return _delegation_settings(**defaults)
+
+
+async def _register_node(app, *, key: str = KEY_NODE, body: dict | None = None):
+    async with _delegation_client(app) as client:
+        return await client.post(
+            "/internal/nodes/register",
+            headers={"X-Internal-Key": key},
+            json=body
+            or {
+                "nodeID": NODE_ID,
+                "address": NODE_ENDPOINT.address,
+                "totalMemoryMB": 1024,
+                "totalCPUPercent": 100,
+                "totalDiskMB": 1024,
+                "totalProcesses": 64,
+                "workerUID": WORKER_UID,
+                "workerGID": WORKER_GID,
+            },
+        )
+
+
+def test_the_register_and_heartbeat_answers_carry_the_handed_down_ceiling(
     workspace,
 ) -> None:
-    """⑤ the record keeps the policy copy *and* the kernel copy, side by side.
+    """⑤ R17: the policy travels **down**, on every lane, from the CP's own env.
 
-    Registration carries it too (it is the first heartbeat), and a heartbeat
-    that reports nothing leaves what the record already holds alone -- that is
-    what keeps a mixed-version rollout from erasing the ceilings.
+    Registration's answer is the first hand-down (the worker adopts it before
+    any create can arrive), and every heartbeat's answer repeats it -- which is
+    how a re-deploy that lowers ``E2B_MAX_SANDBOX_*`` reaches a running worker
+    without a restart. The values are the control plane's, never a worker's.
     """
     agent = _StubDelegateClient()
-    app = _delegation_app(workspace, client=agent)
-    asyncio.run(_enroll_node(app, sandbox_ceiling=SANDBOX_CEILING))
+    app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
+
+    registered = asyncio.run(_register_node(app))
+    assert registered.status_code == 200
+    assert registered.json() == {"nodeID": NODE_ID, "sandboxCeiling": HAND_DOWN}
+
+    beat = asyncio.run(_heartbeat_node(app, {"diskUsedMB": 4096}))
+    assert beat.status_code == 200
+    assert beat.json() == {"sandboxCeiling": HAND_DOWN}
+
+    # ... and the record the create path reads carries the same three numbers,
+    # beside the physical reading the worker reported.
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_cpu_percent_max == 200
+    assert record.sandbox_memory_mb_max == 2048
+    assert record.sandbox_processes_max == 256
+
+
+def test_the_record_keeps_the_policy_and_the_kernel_read_side_by_side(
+    workspace,
+) -> None:
+    """The two halves have one owner each: the CP's policy, the worker's kernel.
+
+    The worker's report is the *physical* half only (``kernelCeiling``: the
+    kernel's limits on its container cgroup), and a beat that carries none
+    leaves the reading the record already holds alone -- that is what keeps a
+    mixed-version rollout from erasing the kernel side.
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
+    asyncio.run(_enroll_node(app, kernel_ceiling=KERNEL_CEILING))
 
     record = app.state.nodes.get(NODE_ID)
     assert record.sandbox_cpu_percent_max == 200
@@ -1024,62 +1099,59 @@ def test_the_heartbeat_carries_both_ceilings_into_the_node_record(
     assert record.kernel_cpu_percent == 400
     assert record.kernel_memory_mb == 4096
 
-    # A later beat refreshes both copies (a lower policy ceiling is a normal
-    # re-deploy, not an error) ...
+    # A later beat refreshes the kernel read (a new container cgroup) ...
     resp = asyncio.run(
-        _heartbeat_node(
-            app,
-            {
-                "sandboxCeiling": {
-                    "cpuPercent": 100,
-                    "memoryMB": 1024,
-                    "processes": 128,
-                    "kernelCpuPercent": None,
-                    "kernelMemoryMB": None,
-                }
-            },
-        )
+        _heartbeat_node(app, {"kernelCeiling": {"cpuPercent": 800, "memoryMB": None}})
     )
-    assert resp.status_code == 204
-    assert record.sandbox_cpu_percent_max == 100
-    assert record.sandbox_memory_mb_max == 1024
-    assert record.sandbox_processes_max == 128
-    assert record.kernel_cpu_percent is None
+    assert resp.status_code == 200
+    assert record.kernel_cpu_percent == 800
     assert record.kernel_memory_mb is None
+    # ... and the policy is untouched by anything the worker sends: it is the
+    # control plane's, and this beat carried no policy at all.
+    assert record.sandbox_cpu_percent_max == 200
+    assert record.sandbox_memory_mb_max == 2048
+    assert record.sandbox_processes_max == 256
 
-    # ... and the internal view exposes both copies under their own names.
+    # The internal view exposes both halves under their own names.
     view = asyncio.run(_internal_node_view(app))
     assert view.status_code == 200
     (node,) = [n for n in view.json() if n["nodeID"] == NODE_ID]
-    assert node["sandboxCPUPercentMax"] == 100
-    assert node["sandboxMemoryMBMax"] == 1024
-    assert node["sandboxProcessesMax"] == 128
-    assert node["kernelCPUPercent"] is None
+    assert node["sandboxCPUPercentMax"] == 200
+    assert node["sandboxMemoryMBMax"] == 2048
+    assert node["sandboxProcessesMax"] == 256
+    assert node["kernelCPUPercent"] == 800
     assert node["kernelMemoryMB"] is None
 
 
-def test_a_heartbeat_without_a_ceiling_leaves_the_record_alone(workspace) -> None:
+def test_a_heartbeat_without_a_kernel_reading_leaves_the_record_alone(
+    workspace,
+) -> None:
     """An older worker during a rollout reports nothing -- never erase."""
     agent = _StubDelegateClient()
-    app = _delegation_app(workspace, client=agent)
-    asyncio.run(_enroll_node(app, sandbox_ceiling=SANDBOX_CEILING))
+    app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
+    asyncio.run(_enroll_node(app, kernel_ceiling=KERNEL_CEILING))
 
-    assert asyncio.run(_heartbeat_node(app, {"diskUsedMB": 4096})).status_code == 204
+    assert asyncio.run(_heartbeat_node(app, {"diskUsedMB": 4096})).status_code == 200
 
     record = app.state.nodes.get(NODE_ID)
+    assert record.kernel_cpu_percent == 400
+    assert record.kernel_memory_mb == 4096
     assert record.sandbox_cpu_percent_max == 200
     assert record.sandbox_memory_mb_max == 2048
     assert record.sandbox_processes_max == 256
-    assert record.kernel_cpu_percent == 400
-    assert record.kernel_memory_mb == 4096
 
 
-def test_a_zero_sandbox_ceiling_in_a_heartbeat_is_refused_by_name(
-    workspace,
-) -> None:
-    """A 0 is refused rather than stored: downstream it would mean "unlimited"."""
+def test_a_workers_own_policy_report_grants_nothing(workspace) -> None:
+    """R17: the *worker's* copy of the trio is ignored, never stored.
+
+    An older worker during a rollout still sends the five-field
+    ``sandboxCeiling`` report. Its kernel pair is the reading this control plane
+    wants; its policy trio is another process's opinion about a number the
+    control plane owns, so it is dropped -- including a ``0``, which downstream
+    would read as "one sandbox may take everything".
+    """
     agent = _StubDelegateClient()
-    app = _delegation_app(workspace, client=agent)
+    app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
     asyncio.run(_enroll_node(app))
 
     resp = asyncio.run(
@@ -1088,25 +1160,46 @@ def test_a_zero_sandbox_ceiling_in_a_heartbeat_is_refused_by_name(
             {
                 "sandboxCeiling": {
                     "cpuPercent": 0,
-                    "memoryMB": 2048,
-                    "processes": 256,
+                    "memoryMB": 65536,
+                    "processes": 4096,
+                    "kernelCpuPercent": 400,
+                    "kernelMemoryMB": 4096,
                 }
             },
         )
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"sandboxCeiling": HAND_DOWN}
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_cpu_percent_max == 200
+    assert record.sandbox_memory_mb_max == 2048
+    assert record.sandbox_processes_max == 256
+    assert record.kernel_cpu_percent == 400
+    assert record.kernel_memory_mb == 4096
+
+
+def test_a_non_positive_kernel_reading_is_refused_by_name(workspace) -> None:
+    """The kernel half is shape-checked too: ``0`` is not a limit a kernel sets."""
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
+    asyncio.run(_enroll_node(app))
+
+    resp = asyncio.run(
+        _heartbeat_node(app, {"kernelCeiling": {"cpuPercent": 0, "memoryMB": 2048}})
     )
 
     assert resp.status_code == 400
     assert resp.json() == {
         "code": 400,
         "message": (
-            "sandboxCeiling.cpuPercent must be a positive integer: the "
-            "per-sandbox ceiling is never 0 (which would read as unlimited) "
-            "or negative -- the worker resolves an unset E2B_MAX_SANDBOX_* "
-            "to its node total"
+            "kernelCeiling.cpuPercent must be a positive integer or null: null "
+            "is the kernel's own 'max' (this worker's container cgroup sets no "
+            "limit on that dimension)"
         ),
     }
     record = app.state.nodes.get(NODE_ID)
-    assert record.sandbox_cpu_percent_max == 0
+    assert record.kernel_cpu_percent is None
 
 
 # ------------- N83 phase 2 (Task 5): the kernel's per-sandbox event counters
@@ -1144,7 +1237,7 @@ def test_the_heartbeat_carries_the_event_counters_into_the_node_record(
     asyncio.run(_enroll_node(app))
 
     resp = asyncio.run(_heartbeat_node(app, {"sandboxEvents": SANDBOX_EVENTS}))
-    assert resp.status_code == 204
+    assert resp.status_code == 200
 
     record = app.state.nodes.get(NODE_ID)
     assert record.sandbox_events == SANDBOX_EVENTS
@@ -1162,10 +1255,10 @@ def test_a_heartbeat_without_events_leaves_the_record_alone(workspace) -> None:
     asyncio.run(_enroll_node(app))
     assert (
         asyncio.run(_heartbeat_node(app, {"sandboxEvents": SANDBOX_EVENTS})).status_code
-        == 204
+        == 200
     )
 
-    assert asyncio.run(_heartbeat_node(app, {"diskUsedMB": 4096})).status_code == 204
+    assert asyncio.run(_heartbeat_node(app, {"diskUsedMB": 4096})).status_code == 200
 
     assert app.state.nodes.get(NODE_ID).sandbox_events == SANDBOX_EVENTS
 
@@ -1187,7 +1280,7 @@ def test_a_growing_counter_logs_one_named_warn_per_growth(
             asyncio.run(
                 _heartbeat_node(app, {"sandboxEvents": {"alpha": {"oom_kill": 1}}})
             ).status_code
-            == 204
+            == 200
         )
         assert _warns() == [
             "sandbox alpha on node node_a: oom_kill grew from 0 to 1 -- the "
@@ -1201,7 +1294,7 @@ def test_a_growing_counter_logs_one_named_warn_per_growth(
             asyncio.run(
                 _heartbeat_node(app, {"sandboxEvents": {"alpha": {"oom_kill": 1}}})
             ).status_code
-            == 204
+            == 200
         )
         assert len(_warns()) == 1
 
@@ -1213,7 +1306,7 @@ def test_a_growing_counter_logs_one_named_warn_per_growth(
                     {"sandboxEvents": {"beta": {"pids_max": 4}}},
                 )
             ).status_code
-            == 204
+            == 200
         )
         assert _warns()[1:] == [
             "sandbox beta on node node_a: pids_max grew from 0 to 4 -- the "
@@ -1249,14 +1342,14 @@ def test_a_smaller_counter_never_erases_what_was_seen(
             asyncio.run(
                 _heartbeat_node(app, {"sandboxEvents": {"alpha": {"oom_kill": 5}}})
             ).status_code
-            == 204
+            == 200
         )
         warns = len(_warnings_from(caplog, "control_plane.registry.nodes"))
         assert (
             asyncio.run(
                 _heartbeat_node(app, {"sandboxEvents": {"alpha": {"oom_kill": 2}}})
             ).status_code
-            == 204
+            == 200
         )
         assert len(_warnings_from(caplog, "control_plane.registry.nodes")) == warns
 
@@ -1286,7 +1379,7 @@ def test_a_malformed_counter_entry_does_not_fail_the_heartbeat(
             )
         )
 
-    assert resp.status_code == 204
+    assert resp.status_code == 200
     assert _warnings_from(caplog, "control_plane.api.internal") == [
         "internal API: sandboxEvents[alpha].oom_kill is not a non-negative "
         "integer (-1); ignoring this counter report",

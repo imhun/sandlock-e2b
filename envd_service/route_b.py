@@ -496,11 +496,13 @@ def sandbox_cgroups_for(settings) -> SandboxCgroups | None:
     An unknown switch value is refused by name (see
     :func:`sandbox_cgroup_mode`) rather than read as "off".
 
-    N83 phase 2 (R3) also hands the handle the worker's **policy** ceiling
+    N83 phase 2 (R3/R17) also hands the handle the **policy** ceiling
     (:func:`policy_ceiling_for`), which is the number ``attach`` checks a
-    declared sandbox size against. It is resolved here, beside the handle,
-    because both are one process-wide fact -- and because resolving it *after*
-    the ``off`` early return is what keeps that lane byte-for-byte unchanged.
+    declared sandbox size against. It is the one the control plane handed down
+    (``envd_service.agent.adopted_sandbox_ceiling``); a handle built before the
+    first hand-down carries ``None`` and refuses every ``attach`` by name until
+    :func:`update_sandbox_cgroup_ceiling` fills it in. Reading it here, *after*
+    the ``off`` early return, is what keeps that lane byte-for-byte unchanged.
     """
     mode = sandbox_cgroup_mode(settings)
     if mode == "off":
@@ -522,21 +524,46 @@ def sandbox_cgroups_for(settings) -> SandboxCgroups | None:
 
 
 def policy_ceiling_for(settings) -> SandboxCeiling:
-    """The worker's per-sandbox **policy** ceiling (N83 phase 2, R3).
+    """The per-sandbox **policy** ceiling the control plane handed down (R17).
 
-    One rule, one reader: :func:`envd_service.agent.sandbox_ceiling_for`
-    resolves ``E2B_MAX_SANDBOX_*`` (falling back to this node's own total) and
-    the heartbeat reports exactly the same numbers to the control plane, so the
-    first gate (the control plane's 400) and this second one (``attach``'s
-    named refusal) can never disagree about what one sandbox may be.
+    One reader for the whole worker, deliberately: this is the *control
+    plane's* number (:func:`envd_service.agent.adopted_sandbox_ceiling`, filled
+    from every register/heartbeat answer), so the first gate (the control
+    plane's own 400 against its own policy) and this second one (``attach``'s
+    named refusal) can never disagree about what one sandbox may be. ``None``
+    means no hand-down has arrived (or the one that arrived was refused): the
+    handle then refuses every ``attach`` by name rather than running a box
+    nobody bounded.
 
     Imported lazily because :mod:`envd_service.agent` is a much heavier module
     (FastAPI routes, the executor factory) and it reaches back here for the
     startup lane; the function is the seam tests stand in for.
     """
-    from envd_service.agent import sandbox_ceiling_for
+    from envd_service.agent import adopted_sandbox_ceiling
 
-    return sandbox_ceiling_for(settings)
+    return adopted_sandbox_ceiling()
+
+
+def update_sandbox_cgroup_ceiling(settings, ceiling: SandboxCeiling) -> bool:
+    """Push a freshly handed-down ceiling into the **live** handle (R17).
+
+    Called when a register/heartbeat answer changes the policy. The handle is
+    process-wide and cached -- and it is the object ``setup`` established the
+    delegated parent on -- so it is *updated*, never rebuilt: rebuilding would
+    abandon the parent every live ``sbx_<id>`` hangs under. Returns whether a
+    handle was there to update; on the ``off`` lane (and before
+    :func:`sandbox_cgroups_for` has ever built one) there is nothing to update,
+    which is exactly the lane that must stay untouched.
+    """
+    mode = sandbox_cgroup_mode(settings)
+    if mode == "off":
+        return False
+    mount = Path(getattr(settings, "cgroup_mount", "/pod-cgroup"))
+    handle = _CGROUP_HANDLES.get((str(mount), os.geteuid(), cgroup_container_token()))
+    if handle is None:
+        return False
+    handle.set_policy_ceiling(ceiling)
+    return True
 
 
 def reset_sandbox_cgroups() -> None:

@@ -211,10 +211,13 @@ class Settings:
     #: node that declared no total at all falls back to the per-sandbox create
     #: default, so the resolved value is never 0: 0 would read downstream as
     #: "one sandbox may take everything", the fail-open the plan's Review Focus
-    #: §1 names. The rule is shared with the worker
-    #: (`gateway_common.sandbox_ceiling.resolve_sandbox_ceiling`), because the
-    #: worker reports its own resolution in every heartbeat and the two numbers
-    #: describe the same node.
+    #: §1 names. Ruling R17 (2026-10-07) makes this **the** ceiling: it is the
+    #: control plane's policy, written into every node record and handed down to
+    #: every worker in the register/heartbeat response. The worker no longer
+    #: reads these names at all -- a create request's ``cpuCount``/``memoryMB``
+    #: is the *requirement*, and ``requirement <= ceiling`` is the whole rule.
+    #: The resolution rule itself still lives in
+    #: `gateway_common.sandbox_ceiling.resolve_sandbox_ceiling`.
     max_sandbox_cpu_percent: int = field(
         default_factory=lambda: _env_int("E2B_MAX_SANDBOX_CPU_PERCENT", 0)
     )
