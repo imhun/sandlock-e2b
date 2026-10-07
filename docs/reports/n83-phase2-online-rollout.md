@@ -106,3 +106,28 @@ StatefulSet 收回 `2 desired / 2 current / 2 ready`。（观察：被缩掉的 
 不再写 `memory.*`/`pids.max`、不建事件采样循环；内存退回 fork 的中介记账（超预算**杀分配者 + 答
 `ENOMEM`**，账只覆盖载荷），任务数退回 clone 族计数（`EAGAIN`）；**请求侧的尺寸校验不受影响**
 （上限是控制面的策略，R17 之后与这个开关无关）。上一版镜像 tag = `0.1.0-1089-g28fd5af-20261006-195538`。
+
+## 第二次滚：follow-up 批（2026-10-07 17:18–17:23）
+
+上线的第一批（follow-up）与第一次同形：版本 **`0.1.0-1121-g8080d33-20261007-171729`**（`main` = `8080d33`），
+四件镜像同 tag；**同样分两次 apply**：17:18:39 滚控制面（含 agent DaemonSet 收敛）→ 17:19:14 滚 worker
+（`rolling update complete 2 pods`）→ 幂等重放 + base image 预热（两台 `cached=true`）。混版本窗口 ≈ 35 s。
+
+这一批与上一批的差别只在**拒绝的形状与探针的声明**（`attach()` 的 `EACCES` 拒绝从错名的 `attach-io`
+改成点名真因的 `attach-stat`；手工构造的全 `None` 上限从裸 `TypeError` 改成具名 `ceiling-unbounded`；
+两个探针建箱时显式声明额度），**不改任何"沙箱能吃什么"的语义**。
+
+复验（同一支脚本、同一入口）：
+
+- 两台 worker 各打 `adopted the control plane's per-sandbox ceiling (cpuPercent=400 memoryMB=4096
+  processes=1024)` 与 `cgroup lane ready … subtree_control=cpu memory pids`；
+- **线上验收 `ok: true`，9/9 全过，244.2 s**。四条 Phase 2 读数与第一次逐条同形：
+  ⑥ `memory.max == memory.high == 67108864`、`hog_exit=137`、`oom_kill=1`、**`oom_group_kill=0`**、
+  同节点邻居 68.35 → 72.13 ms；⑦ `pids.max=256`、fork 后 **`errno=11`（EAGAIN）**、`pids.events.max=1`、
+  邻居 68.82 → 67.91 ms；⑧ `400 cpuCount 16 exceeds this node's per-sandbox maximum (4)` 与
+  `400 memoryMB 16385 …(4096)`，贴着上限 `201`/`204`；⑨ `memory.max == memory.high == 268435456`、
+  `pids.max=256`、`memory.peak=73211904`、**线程 +2 / 进程 +1 都记在 `pids.current` 上**；
+- 集群：全部 pod Running、**重启数 0**、无残留沙箱。
+
+**回退杆**：同上（翻 `worker-capacity.patch.yaml:47-48`）；两次可退的上一版分别是
+`0.1.0-1117-g23adedf-20261007-160606`（第一次）与 `0.1.0-1089-g28fd5af-20261006-195538`（Phase 1）。
