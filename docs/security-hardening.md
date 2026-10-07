@@ -55,7 +55,7 @@
   每秒最多处理 N 个 seccomp 通知，超限 supervisor 睡满窗口剩余时间，
   沙箱被拦截的 syscall 在内核队列积压/阻塞，防止通知洪泛压垮 supervisor。
 - worker 配置 `E2B_SANDBOX_NOTIFY_RATE_LIMIT`（默认 5000/s，0 关闭）。
-- **2026-10-07 起这条闸只作用于没有每沙箱 cgroup 的车道**：`E2B_SANDBOX_CGROUP=required`
+- **2026-10-07 起这条闸只作用于没有每沙箱 cgroup 的车道**（已随 `0.1.0-1123-g8cde486-20261007-182952` 上线，线上 `cgroup_acceptance.py` 9/9）：`E2B_SANDBOX_CGROUP=required`
   （线上）不再把 `E2B_SANDBOX_NOTIFY_RATE_LIMIT` 传给沙箱；`off`（回退杆 / in-process
   mediator 形态）照旧传。理由是 N82 测出的：限流器实际在替 supervisor 记账，而 N83 之后
   supervisor 就在 `sbx_<id>` 里，洪泛花的是沙箱自己的 `cpu.max` —— 读数见
