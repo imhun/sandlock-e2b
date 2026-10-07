@@ -4,7 +4,7 @@ On this path the worker holds **no privilege at all**: it forks the slot's
 child, the child unshares its user namespace, the worker reports
 ``{sandbox_id, pid}`` to the control plane (fire-and-forget: the child polls
 ``setresuid(X)`` itself and execs ``sandlock-supervise``; nothing "releases"
-it), and the identity is written by the agent. ``E2B_SLOT_IDENTITY=agent-grant``
+it), and the identity is written by the agent. ``E2B_IDENTITY_GRANT=agent-grant``
 selects it; the default stays ``spawn`` so the broker path is still there until
 Task 4/7 retire it.
 
@@ -34,7 +34,7 @@ import httpx
 import pytest
 
 import envd_service.own_identity as rb
-import envd_service.slot_identity as si
+import envd_service.identity_grant as si
 import envd_service.worker_identity as wi
 from envd_service.config import Settings
 from envd_service.priv_helpers import PrivHelperError, request_identity
@@ -43,7 +43,7 @@ from envd_service.own_identity import OwnIdentityConfig, W1SlotPool
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONTROL_PLANE_URL = "http://control-plane:3000"
 NODE_ID = "worker-1"
-SANDBOX_ID = "sbx_slot_identity"
+SANDBOX_ID = "sbx_identity_grant"
 CHILD_PID = 4242
 PID_NAMESPACE = "pid:[4026532458]"
 #: The real ``Popen``, kept before any test patches the module attribute.
@@ -101,7 +101,7 @@ def _settings(**overrides) -> SimpleNamespace:
         slot_tmp_root="/tmp/c3-slot-identity-test",
         slot_transport="fd",
         slot_verb_timeout_s=15.0,
-        slot_identity="agent-grant",
+        identity_grant="agent-grant",
         control_plane_url=CONTROL_PLANE_URL,
         node_id=NODE_ID,
         internal_api_key="internal-key",
@@ -113,31 +113,64 @@ def _settings(**overrides) -> SimpleNamespace:
 # ----------------------------------------------------------- the worker's mode
 
 
-def test_the_only_slot_identity_mode_left_is_agent_grant(
+def test_the_only_identity_grant_mode_left_is_agent_grant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """C3 is the shape; the pre-C3 starter is a named refusal (N52)."""
-    monkeypatch.delenv("E2B_SLOT_IDENTITY", raising=False)
-    assert Settings().slot_identity == "agent-grant"
+    monkeypatch.delenv("E2B_IDENTITY_GRANT", raising=False)
+    assert Settings().identity_grant == "agent-grant"
     bare = _settings()
-    del bare.slot_identity  # an embedder's settings object, not the worker's
-    monkeypatch.setenv("E2B_SLOT_IDENTITY", "agent-grant")
-    assert OwnIdentityConfig.from_settings(bare).slot_identity == "agent-grant"
+    del bare.identity_grant  # an embedder's settings object, not the worker's
+    monkeypatch.setenv("E2B_IDENTITY_GRANT", "agent-grant")
+    assert OwnIdentityConfig.from_settings(bare).identity_grant == "agent-grant"
     # The worker's own resolved setting wins over the environment.
     assert (
-        OwnIdentityConfig.from_settings(_settings(slot_identity="agent-grant")).slot_identity
+        OwnIdentityConfig.from_settings(_settings(identity_grant="agent-grant")).identity_grant
         == "agent-grant"
     )
     # Anything else -- including the retired `spawn` -- is named, not guessed.
     for retired in ("spawn", "something-else"):
-        monkeypatch.setenv("E2B_SLOT_IDENTITY", retired)
+        monkeypatch.setenv("E2B_IDENTITY_GRANT", retired)
         with pytest.raises(PrivHelperError) as excinfo:
             OwnIdentityConfig.from_settings(bare)
         assert "must be 'agent-grant'" in str(excinfo.value)
         assert "retired" in str(excinfo.value)
     with pytest.raises(ValueError) as excinfo:
-        OwnIdentityConfig(slot_identity="spawn")
+        OwnIdentityConfig(identity_grant="spawn")
     assert "retired" in str(excinfo.value)
+
+
+def test_the_legacy_grant_key_warns_and_names_the_new_one(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``E2B_IDENTITY_GRANT`` is the new name; the old one still works, warned.
+
+    The mechanism is renamed from "slot identity" to "identity grant", so the
+    env name moves with it. A deployment still spelling the old name keeps
+    working and is told -- once -- which line to change.
+    """
+    from envd_service import env_alias
+
+    env_alias.reset_warnings()
+    monkeypatch.delenv("E2B_IDENTITY_GRANT", raising=False)
+    monkeypatch.setenv("E2B_SLOT_IDENTITY", "agent-grant")
+    with caplog.at_level("WARNING", logger="envd_service.env_alias"):
+        assert Settings().identity_grant == "agent-grant"
+    assert "E2B_SLOT_IDENTITY" in caplog.text
+    assert "E2B_IDENTITY_GRANT" in caplog.text
+
+
+def test_the_retired_grant_value_is_still_refused_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new key carries the same named refusal for the retired ``spawn``."""
+    monkeypatch.delenv("E2B_SLOT_IDENTITY", raising=False)
+    monkeypatch.setenv("E2B_IDENTITY_GRANT", "spawn")
+    bare = _settings()
+    del bare.identity_grant  # force the environment read inside from_settings
+    with pytest.raises(PrivHelperError, match="must be 'agent-grant'"):
+        OwnIdentityConfig.from_settings(bare)
+
 
 
 def test_agent_grant_needs_a_reporter_rather_than_root(
@@ -146,12 +179,12 @@ def test_agent_grant_needs_a_reporter_rather_than_root(
     """The whole point of the mode: no root, no broker -- only the CP."""
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     assert (
-        OwnIdentityConfig(slot_identity="agent-grant", identity_reporter=lambda *a: {})
+        OwnIdentityConfig(identity_grant="agent-grant", identity_reporter=lambda *a: {})
         .privileged_starter
         is True
     )
     assert (
-        OwnIdentityConfig(slot_identity="agent-grant").privileged_starter is False
+        OwnIdentityConfig(identity_grant="agent-grant").privileged_starter is False
     ), "without a reporter the child could never be granted an identity"
 
 
@@ -167,7 +200,7 @@ def test_the_pool_never_gets_a_broker_spawner(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("E2B_CONTROL_PLANE_URL", CONTROL_PLANE_URL)
     monkeypatch.setenv("E2B_NODE_ID", NODE_ID)
     agent_grant = OwnIdentityConfig.from_settings(
-        _settings(slot_identity="agent-grant")
+        _settings(identity_grant="agent-grant")
     )
     assert agent_grant.spawner is None
     assert agent_grant.identity_reporter is not None
@@ -181,11 +214,11 @@ def test_the_child_comes_from_clone3_and_the_parent_half_never_execs(
     ``e2b-slot-spawn`` (the broker) and ``setpriv`` are what the *old* path
     needed; this one must not reach for either -- the worker is unprivileged and
     the identity comes from the agent. N80 (2026-10-06) also dropped the
-    ``python -m envd_service.slot_identity`` hop: ``clone3`` creates the child
+    ``python -m envd_service.identity_grant`` hop: ``clone3`` creates the child
     inside the namespace, so the only thing that ever execs is
     ``sandlock-supervise``, and it does so in the child half.
     """
-    import envd_service.slot_identity as si
+    import envd_service.identity_grant as si
 
     cloned: list[str] = []
 
@@ -229,7 +262,7 @@ def _drive_the_child_half(monkeypatch: pytest.MonkeyPatch, *, pass_fds=()):
     it ends in ``os._exit``/``execvpe``. Both are replaced here so the test can
     see the order instead of dying with the child.
     """
-    import envd_service.slot_identity as si
+    import envd_service.identity_grant as si
 
     class _ChildFinished(Exception):
         """Unwinds the child half at its own ``os._exit``."""
@@ -285,7 +318,7 @@ def test_the_child_half_reaches_the_poll_with_the_modules_own_timeout(
     reaped task's id-map files are root-owned, so a 65534 grantor cannot even
     open them.
     """
-    monkeypatch.setenv("E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S", "7.5")
+    monkeypatch.setenv("E2B_IDENTITY_GRANT_WAIT_TIMEOUT_S", "7.5")
 
     polls, executed, exits = _drive_the_child_half(monkeypatch)
 
@@ -304,7 +337,7 @@ def test_the_child_half_defaults_to_the_module_default_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The shipped path: route B passes no ``timeout_s`` at all."""
-    monkeypatch.delenv("E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("E2B_IDENTITY_GRANT_WAIT_TIMEOUT_S", raising=False)
 
     polls, _executed, exits = _drive_the_child_half(monkeypatch)
 
@@ -560,7 +593,7 @@ def _pool(tmp_path: Path, **overrides) -> tuple[W1SlotPool, list, list, list]:
         spawner=_spawn,
         channel_factory=_factory,
         socket_timeout_s=2.0,
-        slot_identity="agent-grant",
+        identity_grant="agent-grant",
         identity_reporter=_reporter,
     )
     options.update(overrides)
@@ -627,7 +660,7 @@ def test_the_agent_grant_pool_starts_the_child_with_the_unshare_helper(
         seen.update(kwargs, supervise_bin=supervise_bin)
         return FakeProcess()
 
-    monkeypatch.setattr(rb, "_spawn_slot_identity", _fake_starter)
+    monkeypatch.setattr(rb, "_spawn_slot_child", _fake_starter)
     pool, _spawned, order, reports = _pool(tmp_path, spawner=None)
     handle = pool.acquire_sync(SANDBOX_ID, {"ceiling": {}}, uid=20001)
 

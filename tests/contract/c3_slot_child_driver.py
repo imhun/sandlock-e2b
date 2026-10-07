@@ -1,4 +1,4 @@
-"""Worker-side driver for ``test_c3_slot_identity_grant.py`` (C3 Task 3 / D11.2).
+"""Worker-side driver for ``test_c3_identity_grant_grant.py`` (C3 Task 3 / D11.2).
 
 It is the *worker* of that lane: it starts the slot's child through the
 **production** code and then waits, so the test can play the control plane and
@@ -11,9 +11,9 @@ module is stdlib-only, so no worker image is needed):
 
 Modes (the test picks one):
 
-* ``production`` -- :func:`envd_service.own_identity._spawn_slot_identity`, i.e. the
+* ``production`` -- :func:`envd_service.own_identity._spawn_slot_child`, i.e. the
   worker's real starter: it builds ``child_argv`` for
-  ``python -m envd_service.slot_identity``, passes the handshake descriptor and
+  ``python -m envd_service.identity_grant``, passes the handshake descriptor and
   **returns only after the child's ``unshare`` byte**. This is the arm that
   covers the child module end to end (argv parsing, handshake, poll loop, and
   the descriptor surviving the interpreter start).
@@ -40,8 +40,8 @@ import sys
 import time
 from pathlib import Path
 
-from envd_service import slot_identity as si
-from envd_service.own_identity import _spawn_slot_identity
+from envd_service import identity_grant as si
+from envd_service.own_identity import _spawn_slot_child
 
 #: A slot's line for the "it really got there" fact: the program the child
 #: ``execv``s after its identity lands. Nothing else about it is production --
@@ -64,7 +64,7 @@ def _slot_exec(tmp_dir: Path) -> str:
 
 def _start_production(uid: int, slot_exec: str) -> subprocess.Popen:
     """The worker's real starter, unmodified."""
-    return _spawn_slot_identity(
+    return _spawn_slot_child(
         Path(slot_exec),
         uid,
         Path("/tmp/c3-slot-policy.json"),

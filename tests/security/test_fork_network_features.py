@@ -129,7 +129,7 @@ def _own_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExecutor
             uid_start=pooled_uid,
             uid_size=1,
             tmp_root=scratch,
-            slot_identity="agent-grant",
+            identity_grant="agent-grant",
             identity_reporter=_lane_identity_reporter(pooled_uid, 1),
         ),
     )

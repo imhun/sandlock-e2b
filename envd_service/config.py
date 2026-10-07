@@ -538,18 +538,24 @@ class Settings:
     # ``spawn`` (the worker, or its file-capability broker, performing the
     # setuid itself) is a named refusal now; that shape lives in git if a
     # deployment ever needs it back.
-    slot_identity: str = field(
-        default_factory=lambda: (os.getenv("E2B_SLOT_IDENTITY") or "agent-grant")
+    identity_grant: str = field(
+        default_factory=lambda: env_alias.read(
+            "E2B_IDENTITY_GRANT", legacy="E2B_SLOT_IDENTITY", default="agent-grant"
+        )
         .strip()
         .lower()
     )
-    # Deadline for one slot-identity report to the control plane. The control
+    # Deadline for one identity-grant report to the control plane. The control
     # plane's own CP→agent deadline is inside this one, so the worker's bound is
     # the outer of the two (both are named refusals -- a stuck hop must never
     # look like "the create hangs").
-    slot_identity_timeout_s: float = field(
-        default_factory=lambda: _env_float(
-            "E2B_SLOT_IDENTITY_REPORT_TIMEOUT_S", 10.0
+    identity_grant_report_timeout_s: float = field(
+        default_factory=lambda: float(
+            env_alias.read(
+                "E2B_IDENTITY_GRANT_REPORT_TIMEOUT_S",
+                legacy="E2B_SLOT_IDENTITY_REPORT_TIMEOUT_S",
+                default="10.0",
+            )
         )
     )
     # N83 phase 1: the per-sandbox cgroup lane. ``off`` (the default) leaves the

@@ -359,7 +359,7 @@ spec:
             # chain, and a host-pid namespace collapses that chain to one entry
             # -- the lookup would refuse every grant while the manifest still
             # looked correct.
-            - name: E2B_SLOT_IDENTITY
+            - name: E2B_IDENTITY_GRANT
               value: agent-grant
             # N5/N10 closed (2026-09-17): this manifest now runs the same
             # per-sandbox namespace shape the compose stack has run in

@@ -207,7 +207,7 @@ def _supervise_argv(
     """``sandlock-supervise``'s own argv, and the descriptors it must inherit.
 
     One builder for both starters: the ``setpriv`` form (:func:`_spawn_slot`)
-    and C3's unprivileged form (:func:`_spawn_slot_identity`) differ in *who*
+    and C3's unprivileged form (:func:`_spawn_slot_child`) differ in *who*
     performs the identity change, never in what the slot is told.
     """
     argv = [
@@ -253,7 +253,7 @@ def _supervise_argv(
     return argv, []
 
 
-def _spawn_slot_identity(
+def _spawn_slot_child(
     supervise_bin: Path,
     uid: int,
     policy_path: Path,
@@ -269,7 +269,7 @@ def _spawn_slot_identity(
     """The C3 starter: clone3 a child into its own user namespace, then wait.
 
     No root, no ``setpriv``, no file-capability broker. The child
-    (:mod:`envd_service.slot_identity`) is created by ``clone3(CLONE_NEWUSER)``
+    (:mod:`envd_service.identity_grant`) is created by ``clone3(CLONE_NEWUSER)``
     and polls ``setresuid(X)``; the pool reports its container pid to the
     control plane, which instructs agent face A to write the map. The child is
     the one that execs ``sandlock-supervise`` -- so the process tree, the cgroup
@@ -280,7 +280,7 @@ def _spawn_slot_identity(
     returns only once the namespace exists -- so the report may go out as soon
     as this returns, and D11's race has no window left to live in.
     """
-    from envd_service.slot_identity import spawn_child
+    from envd_service.identity_grant import spawn_child
 
     env = dict(os.environ)
     # Same reason as the setpriv form: the registry-root formula must not follow
@@ -610,7 +610,7 @@ class W1SlotPool:
         socket_timeout_s: float = 30.0,
         transport: str = "fd",
         verb_timeout_s: float = 15.0,
-        slot_identity: str = "agent-grant",
+        identity_grant: str = "agent-grant",
         identity_reporter: Callable[[str, int], object] | None = None,
         sandbox_cgroups: "SandboxCgroups | None" = None,
     ) -> None:
@@ -620,7 +620,7 @@ class W1SlotPool:
                 "registry path and no token in the slot's argv) or 'path' "
                 "(a registered slot an external fleet started)"
             )
-        if slot_identity != "agent-grant":
+        if identity_grant != "agent-grant":
             # 'spawn' -- the worker (or its file-capability spawner) performing
             # the setuid itself -- was retired on 2026-09-30 (open-issues N52):
             # the shipped shape is C3, where the child unshares and the
@@ -630,9 +630,9 @@ class W1SlotPool:
             raise ValueError(
                 "route-B slot identity must be 'agent-grant' (C3: the child "
                 f"unshares and the per-node agent writes its identity); "
-                f"{slot_identity!r} is retired"
+                f"{identity_grant!r} is retired"
             )
-        if slot_identity == "agent-grant" and identity_reporter is None:
+        if identity_grant == "agent-grant" and identity_reporter is None:
             # A child whose identity nobody reports would poll setresuid until
             # its own deadline and then die. Refusing here names the wiring
             # mistake at construction time instead of at the first create.
@@ -650,13 +650,13 @@ class W1SlotPool:
         if spawner is not None:
             self._spawner = spawner
         else:
-            self._spawner = lambda **kw: _spawn_slot_identity(
+            self._spawner = lambda **kw: _spawn_slot_child(
                 self._supervise_bin,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 **kw,
             )
-        self.slot_identity = slot_identity
+        self.identity_grant = identity_grant
         self._identity_reporter = identity_reporter
         self._sandbox_cgroups = sandbox_cgroups
         self.transport = transport
@@ -945,7 +945,7 @@ class W1SlotPool:
 
         **The timing is the security property** (N83 phase 1, plan section 4).
         The child is forked but cannot ``exec`` until its identity lands
-        (``slot_identity`` polls ``setresuid``), and ``fork`` can only happen
+        (``identity_grant`` polls ``setresuid``), and ``fork`` can only happen
         after ``exec`` -- so placing it here, before the identity report, means
         everything the sandbox ever forks is inside the cgroup. Reporting the
         identity first would leave a window in which the sandbox runs outside
@@ -2146,7 +2146,7 @@ def slot_pool_for(
         # Two fleets with different identity modes are different shapes: one
         # starts privileged children, the other unprivileged ones that wait for
         # a grant. They must never share a ledger.
-        config.slot_identity,
+        config.identity_grant,
         # N83 phase 1: a fleet that attaches each child to a cgroup and one that
         # does not are different shapes too -- sharing the ledger would hide
         # which of them placed a given slot.
@@ -2163,7 +2163,7 @@ def slot_pool_for(
             supervise_bin=supervise_bin,
             transport=config.transport,
             verb_timeout_s=config.verb_timeout_s,
-            slot_identity=config.slot_identity,
+            identity_grant=config.identity_grant,
             identity_reporter=config.identity_reporter,
             sandbox_cgroups=config.sandbox_cgroups,
         )
@@ -2199,8 +2199,8 @@ class OwnIdentityConfig:
     #: per-node agent writes the identity. ``spawn`` (the worker, or its
     #: file-capability broker, performing the ``setuid`` itself) was retired on
     #: 2026-09-30 (open-issues N52) and is refused by name. Selected by
-    #: ``E2B_SLOT_IDENTITY``.
-    slot_identity: str = "agent-grant"
+    #: ``E2B_IDENTITY_GRANT``.
+    identity_grant: str = "agent-grant"
     #: The CP caller for ``agent-grant`` (``(sandbox_id, pid) -> answer``). It is
     #: resolved from settings/environment in production
     #: (``envd_service.worker_identity.build_identity_reporter``) and injected by
@@ -2225,11 +2225,11 @@ class OwnIdentityConfig:
         object predates this field must not slip through; but a caller that
         builds the config by hand (tests, embedders) is the other half.
         """
-        if str(self.slot_identity).strip().lower() != "agent-grant":
+        if str(self.identity_grant).strip().lower() != "agent-grant":
             raise ValueError(
                 "route-B slot identity must be 'agent-grant' (C3: the child "
                 "unshares and the per-node agent writes its identity); "
-                f"{self.slot_identity!r} is retired (open-issues N52)"
+                f"{self.identity_grant!r} is retired (open-issues N52)"
             )
         # Same rule for the cgroup switch (N83 phase 1): an unknown value is
         # refused by name rather than read as "off" -- "off" is a fleet with no
@@ -2262,17 +2262,17 @@ class OwnIdentityConfig:
         """
         from envd_service.worker_identity import build_identity_reporter
 
-        raw_slot_identity = str(
-            getattr(settings, "slot_identity", None)
-            or os.getenv("E2B_SLOT_IDENTITY", "agent-grant")
+        raw_identity_grant = str(
+            getattr(settings, "identity_grant", None)
+            or os.getenv("E2B_IDENTITY_GRANT", "agent-grant")
         ).strip().lower()
-        if raw_slot_identity != "agent-grant":
+        if raw_identity_grant != "agent-grant":
             raise PrivHelperError(
-                "E2B_SLOT_IDENTITY must be 'agent-grant' (the C3 shape: the "
+                "E2B_IDENTITY_GRANT must be 'agent-grant' (the C3 shape: the "
                 "child unshares, the per-node agent writes its identity); "
-                f"{raw_slot_identity!r} is retired (open-issues N52)"
+                f"{raw_identity_grant!r} is retired (open-issues N52)"
             )
-        slot_identity = raw_slot_identity
+        identity_grant = raw_identity_grant
         return cls(
             mode=str(getattr(settings, "own_identity", "auto")).lower(),
             slots=int(getattr(settings, "max_slots", 0) or 0),
@@ -2289,7 +2289,7 @@ class OwnIdentityConfig:
             verb_timeout_s=float(
                 getattr(settings, "slot_verb_timeout_s", 15.0)
             ),
-            slot_identity=slot_identity,
+            identity_grant=identity_grant,
             identity_reporter=build_identity_reporter(settings),
             # N83 phase 1: ``off`` (the default) resolves to ``None`` without
             # constructing anything; an unknown switch value is refused here, by

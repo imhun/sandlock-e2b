@@ -8,7 +8,7 @@ the cgroup a *quota* rather than a decoration are pinned:
 
 * the child is placed (``attach``) **after** it is forked and **before** its
   identity is reported -- the child cannot ``exec`` until its identity lands
-  (``slot_identity`` polls ``setresuid``) and ``fork`` can only happen after
+  (``identity_grant`` polls ``setresuid``) and ``fork`` can only happen after
   ``exec``, so everything the sandbox ever forks is inside the cgroup (the
   TOCTOU guarantee, plan section 4);
 * a refusal anywhere on that path fails the create **by name** and leaves
@@ -182,11 +182,11 @@ def _settings(**overrides) -> SimpleNamespace:
         slot_tmp_root="/tmp/n83-cgroup-wiring-test",
         slot_transport="fd",
         slot_verb_timeout_s=15.0,
-        slot_identity="agent-grant",
+        identity_grant="agent-grant",
         control_plane_url=CONTROL_PLANE_URL,
         node_id=NODE_ID,
         internal_api_key="internal-key",
-        slot_identity_timeout_s=10.0,
+        identity_grant_report_timeout_s=10.0,
         sandbox_cgroup="off",
         cgroup_mount="/pod-cgroup",
         cgroup_delegate_wait_s=30.0,
@@ -228,7 +228,7 @@ def _pool(
         spawner=_spawn,
         channel_factory=_channel_factory(order),
         socket_timeout_s=2.0,
-        slot_identity="agent-grant",
+        identity_grant="agent-grant",
         identity_reporter=_reporter,
         sandbox_cgroups=sandbox_cgroups,
     )
@@ -402,7 +402,7 @@ def test_with_the_switch_off_nothing_touches_a_cgroup(
             constructed.append(kwargs)
 
     monkeypatch.setattr(rb, "SandboxCgroups", Recording)
-    monkeypatch.setattr(rb, "_spawn_slot_identity", lambda *a, **kw: FakeProcess())
+    monkeypatch.setattr(rb, "_spawn_slot_child", lambda *a, **kw: FakeProcess())
     order: list = []
     config = OwnIdentityConfig.from_settings(_settings(sandbox_cgroup="off"))
     assert config.sandbox_cgroups is None

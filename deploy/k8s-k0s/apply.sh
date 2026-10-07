@@ -63,7 +63,7 @@ printf '%s\n' "$rendered" | kubectl apply -f -
 # C3 Task 7 退役了 C1 的 `ds/e2b-priv-broker` 与它的 rollout 闸门：worker 不再有
 # socket 形态，也就不再和某个节点 daemon 共享一份"镜像契约"。
 #
-# agent 是 worker 的**上游**（`E2B_SLOT_IDENTITY=agent-grant`）：worker 起一个槽位时
+# agent 是 worker 的**上游**（`E2B_IDENTITY_GRANT=agent-grant`）：worker 起一个槽位时
 # 要先由 CP 指令本节点的 agent 授予身份，agent 不在就没有回落路径（建箱直接失败并
 # 点名）。所以它必须在 worker 之前收敛；只等 worker 的话，这道闸门可能在一个从未
 # 起来的 agent 上放行。

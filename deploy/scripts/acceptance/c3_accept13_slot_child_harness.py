@@ -19,7 +19,7 @@ Two lines of evidence it exists to produce:
   written its map (``c3_accept13_slot_report.py``).
 
 The child is the **production** child program, not a copy of it:
-``spawn_child`` execs ``python3 -m envd_service.slot_identity --uid X
+``spawn_child`` execs ``python3 -m envd_service.identity_grant --uid X
 --unshared-fd N -- python3 <report>``, exactly ``W1SlotPool``'s argv shape (the
 report stands in for ``sandlock-supervise``, whose first act is the same
 ``policy.json`` read). Everything the child does with its identity after that
@@ -45,11 +45,11 @@ def _log(tag: str, message: str) -> None:
 
 
 def child_argv(uid: int, report: str, tag: str, probe_dir: str, write_fd: int) -> list[str]:
-    """The production child's argv (``envd_service.slot_identity``'s own shape)."""
+    """The production child's argv (``envd_service.identity_grant``'s own shape)."""
     return [
         sys.executable,
         "-m",
-        "envd_service.slot_identity",
+        "envd_service.identity_grant",
         "--uid",
         str(uid),
         "--unshared-fd",

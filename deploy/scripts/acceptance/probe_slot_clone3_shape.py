@@ -1,6 +1,6 @@
 """N80 收尾：route B 的 slot 能不能用 clone3 建 userns，然后立刻 exec 出干净进程。
 
-要验证的链（改后的 `slot_identity.spawn_child` 会走的形状）：
+要验证的链（改后的 `identity_grant.spawn_child` 会走的形状）：
 
     worker（多线程）clone3(CLONE_NEWUSER) → 子进程里一行 os.execvpe(小 python)
       → exec 之后是干净进程（锁状态已随 exec 消失） → 它在新 userns 里
@@ -14,7 +14,7 @@
 denied`）—— 因为那条路径上有一个与内核无关的 Python 缺陷（`spawn_child` 的形参 `timeout_s`
 遮蔽同名模块函数 ⇒ 子进程在第一次 `setresuid` 之前就 `os._exit(4)`，agent 于是打一个已死的
 pid，僵尸的 id-map 文件属主是 root ⇒ EACCES）。要验真实路径请直接驱动
-`envd_service.slot_identity.spawn_child`（`tmp/n80/spawn_child_probe.py` 是那种探针）。
+`envd_service.identity_grant.spawn_child`（`tmp/n80/spawn_child_probe.py` 是那种探针）。
 
 必须在 worker 容器里跑（真实 seccomp 档 + 真实线程形态）：
 

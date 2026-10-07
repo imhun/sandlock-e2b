@@ -37,6 +37,8 @@ import subprocess
 import time
 from typing import Sequence
 
+from envd_service import env_alias
+
 #: ``clone3`` on both x86_64 and aarch64 (the deployment's two architectures).
 CLONE3_SYSCALL = 435
 
@@ -197,10 +199,10 @@ DEFAULT_TIMEOUT_S = 30.0
 POLL_INTERVAL_S = 0.05
 
 def identity_wait_timeout_s() -> float:
-    """``E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S`` (seconds, default 30).
+    """``E2B_IDENTITY_GRANT_WAIT_TIMEOUT_S`` (seconds, default 30).
 
     Deliberately not the same knob as the worker→CP report deadline
-    (``E2B_SLOT_IDENTITY_REPORT_TIMEOUT_S``): the child is waiting for the whole
+    (``E2B_IDENTITY_GRANT_REPORT_TIMEOUT_S``): the child is waiting for the whole
     round trip (report → CP → agent → kernel), so its bound has to be the
     outer one. Two names keep a tightened report deadline from silently cutting
     the child's wait short.
@@ -210,7 +212,10 @@ def identity_wait_timeout_s() -> float:
     (``None`` by default, and route B never passes one) as if it were the helper
     killed every child with ``os._exit(4)`` before its first ``setresuid``.
     """
-    raw = os.getenv("E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S")
+    raw = env_alias.read(
+        "E2B_IDENTITY_GRANT_WAIT_TIMEOUT_S",
+        legacy="E2B_SLOT_IDENTITY_WAIT_TIMEOUT_S",
+    )
     if not raw:
         return DEFAULT_TIMEOUT_S
     try:
@@ -276,7 +281,7 @@ def spawn_child(
 
     N80 (2026-10-06): the child is created by ``clone3`` and does **not** exec
     until its identity lands. That replaces the old shape -- exec
-    ``python -m envd_service.slot_identity``, which then unshared -- and, with
+    ``python -m envd_service.identity_grant``, which then unshared -- and, with
     it, the whole handshake byte: ``clone3`` returning *is* "the namespace
     exists and its map is still empty", so the worker reports the pid straight
     away instead of waiting for the child to say so (D11's race is gone

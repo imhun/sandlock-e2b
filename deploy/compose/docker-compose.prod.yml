@@ -487,7 +487,7 @@ services:
       # `{sandbox_id, pid}` to the **control plane** and never to the agent
       # (`worker <-> agent` does not exist), and this container carries no agent
       # address and no agent token.
-      E2B_SLOT_IDENTITY: agent-grant
+      E2B_IDENTITY_GRANT: agent-grant
       # C3 (Task 4 slice B): the file steps go to the agent too -- the worker
       # image no longer ships `/var/lib/e2b-priv/`, so `agent` is the shape
       # this stack is built for. N52 (2026-09-30) retired the `exec`/`socket`

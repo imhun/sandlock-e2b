@@ -1041,7 +1041,7 @@ async def node_reconcile(node_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.post("/internal/nodes/{node_id}/slot-identity")
-async def node_slot_identity(node_id: str, request: Request) -> dict[str, Any]:
+async def node_identity_grant(node_id: str, request: Request) -> dict[str, Any]:
     """Forward a slot child's reported pid to this node's agent (C3 Task 3).
 
     The worker forks the slot's child and reports ``{sandbox_id, pid}`` -- the

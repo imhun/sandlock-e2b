@@ -453,8 +453,8 @@ def test_the_production_child_path_grants_then_execs(
 ) -> None:
     """D11.2: the *worker's* child module, not a stand-in, end to end.
 
-    ``_spawn_slot_identity`` builds ``child_argv`` for
-    ``python -m envd_service.slot_identity``, hands it the handshake descriptor
+    ``_spawn_slot_child`` builds ``child_argv`` for
+    ``python -m envd_service.identity_grant``, hands it the handshake descriptor
     and returns only after the child's ``unshare``. From there the real grant
     runs (face A's ``as_uid`` against the real ``/proc``) and the child -- which
     has been polling ``setresuid`` -- execs the program it was told to run. That

@@ -521,7 +521,7 @@ services:
       # worker image no longer ships `/var/lib/e2b-priv/`. N52 (2026-09-30)
       # retired the `exec`/`socket` transports and the `spawn` identity: those
       # shapes live in git if a deployment ever needs them back.
-      E2B_SLOT_IDENTITY: agent-grant
+      E2B_IDENTITY_GRANT: agent-grant
       E2B_PRIV_HELPER_TRANSPORT: agent
       E2B_INTERNAL_API_KEY: ${E2B_INTERNAL_API_KEY}
       E2B_INTERNAL_API_KEYS: ${E2B_INTERNAL_API_KEYS:-}

@@ -232,7 +232,7 @@ KEY_CLASSES: dict[str, set[str]] = {
     # `c3-agent` service) run `agent-grant`; the arm-lane fleet stack, the
     # single-machine example and the test runner have no agent and keep the
     # code default (`spawn`, the rollback lever).
-    "slot_identity": {"E2B_SLOT_IDENTITY"},
+    "identity_grant": {"E2B_IDENTITY_GRANT"},
     # Named template images (`docs/HANDOFF.md`: unset = the fixed set only).
     "template_images": {"E2B_TEMPLATE_IMAGES"},
     # Per-worker wiring: who the worker is and which control plane it dials.
@@ -388,7 +388,7 @@ EXTRA_CLASSES: dict[str, set[str]] = {
 #: * `E2B_PRIV_HELPER_TRANSPORT=agent` (its workers run the agent shape; the
 #:   key is named on all three C3 compose stacks -- see `priv_helper_transport`
 #:   in `KEY_CLASSES`);
-#: * `E2B_SLOT_IDENTITY=agent-grant` (likewise, `slot_identity`).
+#: * `E2B_IDENTITY_GRANT=agent-grant` (likewise, `identity_grant`).
 #:
 #: What is left is k8s-only: the state layout, the disk-enforcement knobs and
 #: the real-root/checkpoint switches. (C1's broker socket path used to be in
@@ -418,7 +418,7 @@ _COMPOSE_EXAMPLE_MISSING = (
 #: `spawn`) and the transport (instead of inheriting the inert `auto`).
 _C3_COMPOSE_MISSING = (
     _COMPOSE_EXAMPLE_MISSING
-    - KEY_CLASSES["slot_identity"]
+    - KEY_CLASSES["identity_grant"]
     - KEY_CLASSES["priv_helper_transport"]
 )
 
@@ -435,7 +435,7 @@ _DEMO_MISSING = (
     | KEY_CLASSES["netns_pair"]
     | KEY_CLASSES["egress_switch"]
     | KEY_CLASSES["slot_tmp_root"]
-    | KEY_CLASSES["slot_identity"]
+    | KEY_CLASSES["identity_grant"]
     | KEY_CLASSES["sandbox_cgroup"]
 )
 
@@ -451,7 +451,7 @@ _RUNNER_MISSING = (
     | KEY_CLASSES["netns_pair"]
     | KEY_CLASSES["egress_switch"]
     | KEY_CLASSES["slot_tmp_root"]
-    | KEY_CLASSES["slot_identity"]
+    | KEY_CLASSES["identity_grant"]
     | KEY_CLASSES["sandbox_cgroup"]
 )
 

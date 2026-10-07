@@ -13,7 +13,7 @@ whose container pid is the same number.
 * two workers (``worker-1``, ``worker-2``) are made to hold a live slot child at
   the *same* container pid, by the rent-a-pid harness
   (``c3_accept13_slot_child_harness.py``), which runs the **production** child
-  program (``envd_service.slot_identity``) -- only *which* pid it waits for is
+  program (``envd_service.identity_grant``) -- only *which* pid it waits for is
   the rig's business;
 * three real sandboxes are created (one per worker) so the control plane has
   records to derive the uid and the worker identity from;

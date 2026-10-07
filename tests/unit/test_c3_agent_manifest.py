@@ -543,7 +543,7 @@ def test_the_agent_is_in_the_baseline_kustomization() -> None:
 def test_the_k0s_apply_gate_converges_the_agent_before_the_worker() -> None:
     """The worker's new upstream has to be up before the worker rolls.
 
-    `E2B_SLOT_IDENTITY=agent-grant` is fail-closed: a worker whose node has no
+    `E2B_IDENTITY_GRANT=agent-grant` is fail-closed: a worker whose node has no
     agent fails every slot start by name. The gate is therefore agent ->
     worker, and **nothing else**: C1's broker-before-worker gate is retired
     (C3 Task 7), so a `ds/e2b-priv-broker` line here would be a write against
@@ -720,7 +720,7 @@ def test_the_worker_is_on_the_agent_grant_path_and_carries_no_agent_secret() -> 
     assert "hostPID" not in pod
     container = _containers(worker)["worker"]
     env = _env(container)
-    assert env["E2B_SLOT_IDENTITY"]["value"] == "agent-grant"
+    assert env["E2B_IDENTITY_GRANT"]["value"] == "agent-grant"
     # Task 4 slice B: the file steps are the agent's too. The two switches move
     # together with the binary removal -- a worker without the binaries and
     # still on the `spawn`/`exec` path is the broken intermediate state.
@@ -940,7 +940,7 @@ def test_no_compose_worker_receives_the_agent_token_or_the_agent_identity() -> N
             assert "E2B_C3_AGENT_TOKEN" not in env, (path.name, name)
             assert "E2B_C3_AGENT_URL" not in env, (path.name, name)
             assert "E2B_C3_AGENT_MAINT_URL" not in env, (path.name, name)
-            assert env["E2B_SLOT_IDENTITY"] == "agent-grant", (path.name, name)
+            assert env["E2B_IDENTITY_GRANT"] == "agent-grant", (path.name, name)
             # Task 4 slice B: the file steps moved to the agent in the same
             # change as the binary removal -- a worker without the binaries and
             # still on `auto` would silently degrade to the E5.1 shape.
@@ -1114,7 +1114,7 @@ def test_the_local_shapes_are_untouched() -> None:
     for path in LOCAL_SHAPES:
         text = path.read_text(encoding="utf-8")
         assert "c3-agent" not in text, path.name
-        assert "E2B_SLOT_IDENTITY" not in text, path.name
+        assert "E2B_IDENTITY_GRANT" not in text, path.name
         assert "E2B_C3_AGENT_TOKEN" not in text, path.name
 
 
@@ -1144,7 +1144,7 @@ def test_the_shapes_excluded_from_c3_declare_that_they_have_no_file_ops() -> Non
         text = path.read_text(encoding="utf-8")
         assert "excluded from C3's coverage by name" in text, path.name
         for key in (
-            "E2B_SLOT_IDENTITY",
+            "E2B_IDENTITY_GRANT",
             "E2B_PRIV_HELPER_TRANSPORT",
             "E2B_C3_AGENT_URL",
             "E2B_C3_AGENT_MAINT_URL",

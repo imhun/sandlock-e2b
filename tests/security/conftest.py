@@ -292,7 +292,7 @@ def route_b_sandbox(
             # C3 is the only slot-identity shape left (N52): every slot is
             # granted by writing the child's map, and in this lane the root
             # process performing the write stands in for the node's agent.
-            slot_identity="agent-grant",
+            identity_grant="agent-grant",
             identity_reporter=_lane_identity_reporter(
                 host_uid if host_uid is not None else SANDBOX_UID, 2
             ),

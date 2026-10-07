@@ -168,7 +168,7 @@ def test_worker_seccomp_profile_is_the_default_plus_pidfd_getfd_and_a_narrowed_u
     that: on the shipped profile a process that is root *inside its own user
     namespace* could create a UTS/IPC/cgroup/time namespace (all four measured
     `ALLOW`), while the deployment only ever builds user, net, pid and mount
-    namespaces (`envd_service/slot_identity.py`,
+    namespaces (`envd_service/identity_grant.py`,
     `crates/sandlock-core/src/{context,procfs,realroot}.rs`,
     `envd_service/executors/sandlock.py`). The mask below is
     `CLONE_NEWTIME|NEWCGROUP|NEWUTS|NEWIPC`, so those four are now refused
@@ -830,7 +830,7 @@ def test_k0s_overlay_moves_the_seccomp_root_to_the_k0s_kubelet_dir() -> None:
     env = {e["name"]: e.get("value") for e in container["env"]}
     assert env["E2B_PRIV_HELPER_TRANSPORT"] == "agent"
     assert "E2B_PRIV_HELPER_SOCKET" not in env
-    assert env["E2B_SLOT_IDENTITY"] == "agent-grant"
+    assert env["E2B_IDENTITY_GRANT"] == "agent-grant"
     assert env["E2B_IMAGE_CACHE_DIR"] == "/var/lib/e2b-images"
 
 
@@ -1358,7 +1358,7 @@ def test_apply_converges_the_agent_before_the_worker_and_has_no_broker_gate() ->
     spoke a socket protocol whose handshake the worker validated at startup.
     The socket transport is retired, so that line would now name a DaemonSet no
     manifest ships -- `kubectl rollout status` on it fails, it does not no-op --
-    and the only ordering left is the agent's: `E2B_SLOT_IDENTITY=agent-grant`
+    and the only ordering left is the agent's: `E2B_IDENTITY_GRANT=agent-grant`
     is fail-closed, so a worker whose node has no agent fails every slot start
     by name.
 
@@ -1429,7 +1429,7 @@ def test_the_workers_upstream_is_the_agent_and_no_broker_is_rendered(
     # The premise of the pin: this render really runs the agent shape, and the
     # socket it used to fall back to is gone.
     assert env["E2B_PRIV_HELPER_TRANSPORT"] == "agent"
-    assert env["E2B_SLOT_IDENTITY"] == "agent-grant"
+    assert env["E2B_IDENTITY_GRANT"] == "agent-grant"
     assert "E2B_PRIV_HELPER_SOCKET" not in env
     assert pod.get("initContainers", []) == []
     # The worker's upstream: one agent DaemonSet, in the same render (the

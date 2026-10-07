@@ -441,7 +441,7 @@ services:
       E2B_NODE_ID: worker-1
       # C3 (Task 3): slot identity comes from the `c3-agent` service above, via
       # the control plane -- this container holds no agent address or token.
-      E2B_SLOT_IDENTITY: agent-grant
+      E2B_IDENTITY_GRANT: agent-grant
       # C3 (Task 4 slice B): the file steps go to the agent too; the worker
       # image no longer ships the file-capability binaries.
       E2B_PRIV_HELPER_TRANSPORT: agent
@@ -551,7 +551,7 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-2:49983
       E2B_NODE_ID: worker-2
-      E2B_SLOT_IDENTITY: agent-grant
+      E2B_IDENTITY_GRANT: agent-grant
       E2B_PRIV_HELPER_TRANSPORT: agent
       E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key
@@ -659,7 +659,7 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_NODE_ADDRESS: http://worker-3:49983
       E2B_NODE_ID: worker-3
-      E2B_SLOT_IDENTITY: agent-grant
+      E2B_IDENTITY_GRANT: agent-grant
       E2B_PRIV_HELPER_TRANSPORT: agent
       E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key

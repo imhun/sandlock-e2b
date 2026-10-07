@@ -108,7 +108,7 @@ def _isolate_singletons(monkeypatch):
     ``configure`` installs one, and the agent client holds its in a
     module-global list (that is the shape the worker uses at startup). A leaked
     one makes *later* tests run in a shape they never asked for -- which is
-    exactly how this file's first version broke ``test_route_b_slot_identity``
+    exactly how this file's first version broke ``test_route_b_identity_grant``
     when the two were run in one session.
     """
     monkeypatch.setattr(agent_fileops, "_ACTIVE", [None])

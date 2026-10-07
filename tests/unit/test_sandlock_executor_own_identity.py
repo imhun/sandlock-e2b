@@ -222,7 +222,7 @@ def _config(**over) -> OwnIdentityConfig:
         # a reporter writes its identity. These cases are about the slot
         # machinery, so the reporter is a no-op -- the child's own polling is
         # not what they exercise.
-        "slot_identity": "agent-grant",
+        "identity_grant": "agent-grant",
         "identity_reporter": lambda *args: {},
     }
     cfg.update(over)
@@ -349,7 +349,7 @@ def test_forced_route_b_without_a_reporter_fails_loudly(monkeypatch) -> None:
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     with pytest.raises(
         RuntimeError,
-        match=r"^route B was requested but E2B_SLOT_IDENTITY=agent-grant needs "
+        match=r"^route B was requested but E2B_IDENTITY_GRANT=agent-grant needs "
         r"the control-plane reporter",
     ):
         _executor(
@@ -986,7 +986,7 @@ def test_the_refusal_predicate_tracks_the_forks_privilege_rule(
 #: knows no control plane cannot report a slot identity (C3: the child
 #: unshares and the agent writes it), so the slot is declined.
 NO_REPORTER_DECLINE = (
-    "E2B_SLOT_IDENTITY=agent-grant needs the control-plane reporter, and this "
+    "E2B_IDENTITY_GRANT=agent-grant needs the control-plane reporter, and this "
     "worker does not know where its control plane is (E2B_CONTROL_PLANE_URL "
     "and E2B_NODE_ID)"
 )

@@ -178,7 +178,7 @@ def build_identity_reporter(
     if not url or not node:
         return None
     internal_key = getattr(settings, "internal_api_key", "") or ""
-    timeout = float(getattr(settings, "slot_identity_timeout_s", 5.0) or 5.0)
+    timeout = float(getattr(settings, "identity_grant_report_timeout_s", 5.0) or 5.0)
 
     def _report(sandbox_id: str, pid: int) -> dict[str, Any]:
         from envd_service.priv_helpers import request_identity

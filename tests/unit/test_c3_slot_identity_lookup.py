@@ -25,7 +25,7 @@ own grants: every refusal below is fail-closed and named.
 
 This lane drives the lookup against a synthetic ``/proc`` (the shape a real
 Linux kernel produces: tab-separated ``NSpid`` chains, ``ns/pid`` symlinks and
-per-process ``cgroup`` paths). ``tests/contract/test_c3_slot_identity_grant.py``
+per-process ``cgroup`` paths). ``tests/contract/test_c3_identity_grant_grant.py``
 drives the same code against a real kernel with two worker containers.
 """
 

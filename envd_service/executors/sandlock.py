@@ -1568,7 +1568,7 @@ class SandlockExecutor(Executor):
             # what is missing is the control-plane reporter, not a privileged
             # starter.
             reason = (
-                "E2B_SLOT_IDENTITY=agent-grant needs the control-plane "
+                "E2B_IDENTITY_GRANT=agent-grant needs the control-plane "
                 "reporter, and this worker does not know where its control "
                 "plane is (E2B_CONTROL_PLANE_URL and E2B_NODE_ID)"
             )

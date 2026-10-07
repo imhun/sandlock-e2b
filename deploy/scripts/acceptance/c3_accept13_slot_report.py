@@ -2,7 +2,7 @@
 """What the slot's child *is*, once the agent has written its identity map.
 
 This is the command the harness execs through the production child program
-(``python3 -m envd_service.slot_identity --uid X --unshared-fd N -- <this>``),
+(``python3 -m envd_service.identity_grant --uid X --unshared-fd N -- <this>``),
 so the identity it reports is the one the shipped path really produces -- not
 one this rig arranged.
 
