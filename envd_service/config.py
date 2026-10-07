@@ -19,6 +19,7 @@ from gateway_common.env import (
 )
 from gateway_common.paths import PURE_ROOTFS_DIR_NAME
 from gateway_common.archive import DEFAULT_TREE_COPY_MAX_BYTES
+from envd_service import env_alias
 
 logger = logging.getLogger(__name__)
 
@@ -478,7 +479,9 @@ class Settings:
     # in ``on`` (route A vs route B is a deployment decision, never a silent
     # downgrade -- docs/supervise-identity-handoff.md §8).
     own_identity: str = field(
-        default_factory=lambda: os.getenv("E2B_ROUTE_B", "auto").lower()
+        default_factory=lambda: env_alias.read(
+            "E2B_OWN_IDENTITY", legacy="E2B_ROUTE_B", default="auto"
+        ).lower()
     )
     # Maximum live slots. W1 recycle semantics: one uid = one supervise
     # process = one sandbox generation, and reuse means restarting in place,
