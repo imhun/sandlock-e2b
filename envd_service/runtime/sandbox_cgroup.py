@@ -37,15 +37,17 @@ whole mounted VM tree.
 
 N83 phase 2 (Task 1) adds the *ceiling* half here too, and for the same reason
 this module exists: both ceilings are cgroup facts. The **policy** ceiling (what
-one sandbox may be configured to) comes from the environment, never from a
-kernel read -- see :mod:`gateway_common.sandbox_ceiling`. The **kernel** ceiling
-(``cpu.max``/``memory.max``/``pids.max`` on the worker's own cgroup) is read by
-:func:`read_kernel_ceiling`, and :func:`check_policy_ceiling` cross-checks the
-two at worker startup (plan D5b): a policy above the kernel is refused **by
-name**, and a kernel that sets no ceiling at all -- the compose lanes' measured
-shape, where nothing sets ``cpus``/``mem_limit`` -- starts normally with one
-explicit WARN, because there the policy and the platform's ledger are the only
-bounds left.
+one sandbox may be configured to) is the **control plane's**, handed down in the
+register/heartbeat answer (ruling R17; before that it came from the worker's own
+environment) -- see :mod:`gateway_common.sandbox_ceiling` for the names and the
+resolution rule. The **kernel** ceiling (``cpu.max``/``memory.max``/``pids.max``
+on the worker's own cgroup) is read by :func:`read_kernel_ceiling`, and
+:func:`check_policy_ceiling` cross-checks the two **when the worker adopts a
+hand-down** (plan D5b): a policy above the kernel is refused **by name** -- and
+not adopted, so the worker has no ceiling and every create is refused -- and a
+kernel that sets no ceiling at all -- the compose lanes' measured shape, where
+nothing sets ``cpus``/``mem_limit`` -- is adopted with one explicit WARN,
+because there the policy and the platform's ledger are the only bounds left.
 
 N83 phase 2 (Task 3) adds the *writing* half: ``setup()`` enables ``memory``
 and ``pids`` beside phase 1's ``cpu`` (one command, the same drain -- a write
@@ -221,10 +223,10 @@ def _processes_limit(path: Path) -> int | None:
 
     Both shipped lanes delegate the ``pids`` controller, so the file is
     normally there; a mount that does not expose it reads as "no limit known"
-    rather than refusing, because the plan's startup cross-check (D5b) is about
-    ``cpu.max``/``memory.max``: a ``pids.max`` of ``max`` is the *measured* k8s
-    shape, not a policy/physical mismatch, and warning about it on every k8s
-    start would train operators to ignore the warning that matters.
+    rather than refusing, because the hand-down cross-check (D5b) is about
+    ``cpu.max``/``memory.max`` only: a ``pids.max`` of ``max`` is the *measured*
+    k8s shape, not a policy/physical mismatch, and warning about it on every
+    k8s hand-down would train operators to ignore the warning that matters.
     """
     if not path.is_file():
         return None
@@ -349,13 +351,16 @@ def check_policy_ceiling(policy: SandboxCeiling, *, mount: Path) -> SandboxCeili
     comes from the worker's own cgroup. Two outcomes, both loud:
 
     * **policy above the kernel** -- a named ``cgroup-refusal
-      ceiling-exceeds-kernel`` that the worker's startup path turns into a
-      refusal to run. Not a clamp and not a warning: the API would otherwise
-      promise a sandbox 8 GiB while the container layer OOM-kills it at 2.
+      ceiling-exceeds-kernel`` that the worker's hand-down path
+      (``envd_service.agent.adopt_sandbox_ceiling``) turns into a refusal to
+      adopt the policy -- so the worker keeps running with **no** ceiling and
+      every create on it is refused by name. Not a clamp and not a warning: the
+      API would otherwise promise a sandbox 8 GiB while the container layer
+      OOM-kills it at 2.
     * **the kernel sets no ceiling** (``max``) -- one WARN naming the
-      dimensions, then normal startup. This is the compose lane's measured
-      shape, and it is legal: the policy and the platform's ledger are then the
-      only bounds, which is exactly what an operator has to know.
+      dimensions, then the hand-down is adopted. This is the compose lane's
+      measured shape, and it is legal: the policy and the platform's ledger are
+      then the only bounds, which is exactly what an operator has to know.
 
     Only ``cpu.max``/``memory.max`` are compared (D5b). ``pids.max`` is read
     into the returned ceiling for callers, but its ``max`` is the *measured*

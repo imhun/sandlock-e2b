@@ -515,15 +515,21 @@ spec:
             # the worker adopts it (`envd_service/agent.py`). The worker no
             # longer declares these keys at all.
             #
-            # Written out even though it equals the `E2B_MAX_TOTAL_*` values
-            # above (which is also what the code default resolves to), because
-            # the number is a decision: one sandbox may take this node's whole
-            # declared budget here, and a deployment that disagrees lowers the
-            # trio without touching the node's own capacity. The worker refuses
-            # a hand-down above its own container's kernel limits (D5b), so
-            # raising these means raising the pod's `resources.limits` with them
-            # -- the k0s overlay does both (`control-plane-capacity.patch.yaml`
-            # here, `worker-capacity.patch.yaml` for the pod).
+            # The trio aligns with this lane's **worker pod**, not with anything
+            # on this manifest: `deploy/k8s/worker.yaml` pins
+            # `resources.limits.cpu: "2"` / `memory: 2Gi`, and the worker
+            # refuses a hand-down above its own container's kernel limits
+            # (D5b). (This file declares no `E2B_MAX_TOTAL_CPU_PERCENT` /
+            # `_MEMORY_MB` / `_PROCESSES` at all -- it runs the code defaults
+            # 400/8192/2048 -- so those are *not* what 200/2048/256 follows;
+            # only `E2B_MAX_TOTAL_DISK_MB` is named here, commented out.)
+            #
+            # Written out because the number is a decision: one sandbox may take
+            # this lane's whole declared budget, and a deployment that disagrees
+            # lowers the trio without touching the node's own capacity. Raising
+            # them means raising that pod's limits with them -- the k0s overlay
+            # does both (`control-plane-capacity.patch.yaml` here,
+            # `worker-capacity.patch.yaml` for the pod).
             - name: E2B_MAX_SANDBOX_CPU_PERCENT
               value: "200"
             - name: E2B_MAX_SANDBOX_MEMORY_MB

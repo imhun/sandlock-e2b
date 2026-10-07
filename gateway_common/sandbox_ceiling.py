@@ -1,4 +1,4 @@
-"""The per-sandbox *policy* ceiling (N83 phase 2, D5): one rule, two readers.
+"""The per-sandbox *policy* ceiling (N83 phase 2, D5): one rule, one owner.
 
 What a **single** sandbox may be configured to is a deployment decision, and
 the plan's ruling (P3, corrected 2026-10-06) is that it comes from an explicit
@@ -13,11 +13,12 @@ both measured:
   total is the safe default -- but the deployment must be able to lower it
   (four cores for the node does not mean four cores for one sandbox).
 
-Both sides of the wire read this one function, because the control plane and
-the worker have to agree about the *names* and about the "unset or ``<=0``
-follows the node total" rule: the worker reports what it resolved in its
-heartbeat and the control plane stores it, so a rule that drifted would show
-up as two different ceilings for the same node.
+**The control plane is the only reader** (ruling R17, 2026-10-07): the ceiling
+is its policy, resolved once from the environment, written into every node
+record and handed **down** to the workers in the register/heartbeat answer.
+The worker no longer reads this function (nor the env) at all -- it adopts the
+handed-down value and cross-checks it against its own kernel -- so the names
+live here once, for the manifests and for the control plane's ``Settings``.
 
 ``<= 0`` never means "unlimited" here. ``0`` is this repo's convention for a
 *node* budget whose dimension is switched off; on a per-sandbox ceiling it

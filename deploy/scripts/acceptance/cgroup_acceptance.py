@@ -87,10 +87,12 @@ four more, same rule -- each one a reading:
    the node's own ceiling implies, while a request *at* the ceiling is
    accepted -- so "always refuses" cannot pass either. The ceiling is the
    *control plane's* policy (ruling R17): the expected text is built from the
-   ``E2B_MAX_SANDBOX_*`` the **control-plane container** declares, and the
-   whole lane is this check's RED (with the cgroup lane off the worker still
-   sizes creates, so check 8 runs -- what it measures either way is the number
-   the control plane handed down vs. the one the create was refused with).
+   ``E2B_MAX_SANDBOX_*`` the **control-plane container** declares. This check's
+   RED is the **no-hand-down lane** -- a control plane built before R17, so the
+   worker never gets a ceiling and every sized create is refused -- and *not*
+   the ``off`` lane, where it stays green: the ceiling and the request-side
+   refusals are lane-independent by design (measured: `tmp/task8/red-off.json`
+   has ⑧ pass, `tmp/task8/red-oldcp.json` has it fail).
 9. **Peak and task unit.** ``memory.max``/``memory.high`` equal the declared
    ``memoryMB`` byte for byte and ``pids.max`` equals **this box's own recorded
    declaration** -- the worker's ``_runtime/<id>/sandbox.json``
@@ -179,7 +181,16 @@ taken from that cluster (never from this lane's defaults):
         --internal-url http://e2b-control-plane.sandlock.svc.cluster.local:3000 \\
         --internal-key "$E2B_INTERNAL_API_KEY" \\
         --nodes e2b-worker-0,e2b-worker-1 \\
-        --worker-exec-template 'kubectl -n sandlock exec {node} -c worker -- bash -lc'
+        --worker-exec-template 'kubectl -n sandlock exec {node} -c worker -- bash -lc' \\
+        --control-plane-exec-template 'kubectl -n sandlock exec {node} -c control-plane -- bash -lc' \\
+        --control-plane-node e2b-control-plane-0
+
+``--control-plane-exec-template`` has to be passed on any lane whose
+control-plane container is not the compose default (``docker exec -i
+n83acc-control-plane-1``): check 8 reads the per-sandbox ceilings out of *that*
+container, and a template that reaches nothing shows up as
+``lane.control_plane_env.error`` -- a tooling gap that would otherwise read like
+a platform failure.
 """
 
 from __future__ import annotations
@@ -1366,9 +1377,10 @@ def main() -> int:
 
         Run *before* checks 1-5 and each in its own ``try``: on a lane whose
         phase-1 lane is absent -- ``E2B_SANDBOX_CGROUP=off``, or the
-        mixed-version window where the worker reports no ceiling at all -- a
-        refusal here is a *named failed reading* for that check, not a reason
-        to stop before the phase-2 checks have said what they saw.
+        pre-R17 window where the worker never receives a ceiling (a control
+        plane that does not hand one down) -- a refusal here is a *named failed
+        reading* for that check, not a reason to stop before the phase-2 checks
+        have said what they saw.
         """
         # ---- check 6: the memory ceiling kills, and only the allocator ----
         marker = len(boxes)
@@ -1812,8 +1824,8 @@ def main() -> int:
         # N83 phase 2 / Task 7: checks 6-9 run first, each in its own try (see
         # run_phase2_checks): they are the checks that must still report a
         # named reading on a lane where the phase-1 lane is off, or where the
-        # worker predates the ceiling (the mixed-version window) and the
-        # creates below refuse.
+        # control plane does not hand a ceiling down (the pre-R17 window) and
+        # the creates below refuse.
         run_phase2_checks()
 
         # ---- check 1: the quota is real ----------------------------------

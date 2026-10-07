@@ -2892,9 +2892,10 @@ op 在位但惰性）→ **第二次 apply** 把 `deploy/k8s-k0s/worker-capacity
 `cpu.procs`/`subtree_control` 可写）+ 一条端到端冒烟（② 的 3 s 自旋读数）。任何一条红 ⇒ 立刻用
 下面的回退杆。
 
-**回退杆（停一次就够）**：把 `deploy/k8s-k0s/worker-capacity.patch.yaml`**第 55 行**那一条
-（`- name: E2B_SANDBOX_CGROUP`，第 56 行是它的 `value: "required"`；Task 1 在它上面插了单箱上限块，
-所以是 55/56 而不是当初的 41/42）的 value 翻回 **`"off"`** 并 apply（compose 车道同理：
+**回退杆（停一次就够）**：把 `deploy/k8s-k0s/worker-capacity.patch.yaml`**第 47 行**那一条
+（`- name: E2B_SANDBOX_CGROUP`，第 48 行是它的 `value: "required"`；Task 1 在这一段上面插过单箱上限块、
+Task 8 又把它删掉，所以是 47/48 而不是当初的 41/42 —— 改之前先 `grep -n E2B_SANDBOX_CGROUP` 对一眼）
+的 value 翻回 **`"off"`** 并 apply（compose 车道同理：
 `deploy/compose/docker-compose.multinode.yml` 的 `${E2B_SANDBOX_CGROUP:-off}`）。`off` 是代码默认，
 于是行为逐字节回到 Phase 1 之前；**已经在跑的沙箱 cgroup 会在它被拆除时照常 `cgroup.kill` + `rmdir`
 释放**，不需要额外清理（worker 重建时 `worker/` 目录由自检复用/拒绝，见 `sandbox_cgroup.py`）。
@@ -3239,9 +3240,11 @@ sandbox: it has not reported its per-sandbox cpuCount maximum"}`。worker 侧：
    137）—— request → worker 记录 → 内核，与 ⑥⑨ 用 `GET /sandboxes/{id}` 读内存声明是同一种三方比对；
    车道 env 只作**次要对照**打印在报告里、不参与判据。k8s 侧因此不需要任何清单改动。
 
-**下一步（等授权，不预填）**：Step 3 = 重建镜像 + 两段式重滚（先 `off` 滚完冒烟 → 再翻
-`required`，顺序见 R12）并线上复验 ⑥⑦⑧；Step 4 = 本节末尾这份记录：重滚的版本号、线上 ⑥⑦⑧⑨ 的
-读数、混版本窗口的实际时长、以及"k8s pod 层真的把 `memory`/`pids` 委派给了 worker"这条形状事实。
+**下一步（等授权，不预填）**：Step 3 = 重建镜像 + 两段式重滚（**顺序见本节的 R17：先滚控制面
+（它下发单箱上限），再滚 worker；`E2B_SANDBOX_CGROUP` 那一项仍是先 `off` 滚完冒烟 → 再翻
+`required`**）并线上复验 ⑥⑦⑧；Step 4 = 本节末尾这份记录：重滚的版本号、线上 ⑥⑦⑧⑨ 的
+读数、混版本窗口的实际时长（R17 之后窗口是"旧控制面 + 新 worker"，两侧都按设计全拒、不会静默放行）、
+以及"k8s pod 层真的把 `memory`/`pids` 委派给了 worker"这条形状事实。
 
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 

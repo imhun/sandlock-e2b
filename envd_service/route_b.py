@@ -517,13 +517,13 @@ def sandbox_cgroups_for(settings) -> SandboxCgroups | None:
             mount=mount,
             worker_uid=worker_uid,
             container_token=token,
-            policy_ceiling=policy_ceiling_for(settings),
+            policy_ceiling=policy_ceiling_for(),
         )
         _CGROUP_HANDLES[key] = handle
     return handle
 
 
-def policy_ceiling_for(settings) -> SandboxCeiling:
+def policy_ceiling_for() -> SandboxCeiling | None:
     """The per-sandbox **policy** ceiling the control plane handed down (R17).
 
     One reader for the whole worker, deliberately: this is the *control
@@ -534,6 +534,10 @@ def policy_ceiling_for(settings) -> SandboxCeiling:
     means no hand-down has arrived (or the one that arrived was refused): the
     handle then refuses every ``attach`` by name rather than running a box
     nobody bounded.
+
+    No ``settings`` argument: the hand-down is one process-wide fact and
+    nothing here reads a setting to find it (before R17 this resolved the
+    worker's own env, which is exactly what made the parameter meaningful).
 
     Imported lazily because :mod:`envd_service.agent` is a much heavier module
     (FastAPI routes, the executor factory) and it reaches back here for the

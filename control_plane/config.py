@@ -222,9 +222,10 @@ class Settings:
     #: reads these names at all -- a create request's ``cpuCount``/``memoryMB``
     #: is the *requirement*, and ``requirement <= ceiling`` is the whole rule.
     #: The names come from `gateway_common.sandbox_ceiling` (the three
-    #: ``MAX_SANDBOX_*_ENV`` constants), so the env spelling has exactly one
-    #: definition in the tree; the resolution rule is
-    #: `gateway_common.sandbox_ceiling.resolve_sandbox_ceiling`.
+    #: ``MAX_SANDBOX_*_ENV`` constants), so the Python side spells them once --
+    #: the manifests and the acceptance script still write the strings out
+    #: literally, which is what that module's constants cannot reach. The
+    #: resolution rule is `gateway_common.sandbox_ceiling.resolve_sandbox_ceiling`.
     max_sandbox_cpu_percent: int = field(
         default_factory=lambda: _env_int(MAX_SANDBOX_CPU_PERCENT_ENV, 0)
     )
