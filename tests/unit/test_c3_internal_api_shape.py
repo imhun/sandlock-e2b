@@ -983,6 +983,14 @@ def test_the_hand_down_ceiling_follows_the_nodes_own_total(
     _declared_no_trio(monkeypatch)
     agent = _StubDelegateClient()
     app = _delegation_app(workspace, client=agent, settings=_bare_ceiling_settings())
+    # Task 10's contract: the trio stays **raw** on ``Settings`` (0 = "not
+    # declared"), and all resolving happens per node at stamping time. A
+    # ``__post_init__`` that resolved them again -- the defect this task
+    # removed -- would make these red instead of quietly changing which rung
+    # the resolution takes.
+    assert app.state.settings.max_sandbox_cpu_percent == 0
+    assert app.state.settings.max_sandbox_memory_mb == 0
+    assert app.state.settings.max_sandbox_processes == 0
     expected = {"cpuPercent": 200, "memoryMB": 2048, "processes": 128}
 
     registered = asyncio.run(

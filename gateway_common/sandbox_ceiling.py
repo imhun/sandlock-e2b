@@ -14,11 +14,15 @@ both measured:
   (four cores for the node does not mean four cores for one sandbox).
 
 **The control plane is the only reader** (ruling R17, 2026-10-07): the ceiling
-is its policy, resolved once from the environment, written into every node
-record and handed **down** to the workers in the register/heartbeat answer.
-The worker no longer reads this function (nor the env) at all -- it adopts the
-handed-down value and cross-checks it against its own kernel -- so the names
-live here once, for the manifests and for the control plane's ``Settings``.
+is its policy, resolved for **each node** -- an explicit value, else *that
+node's* own total, else the create default (``Settings.sandbox_ceiling_for``,
+called where the node record is stamped) -- written into that node's record
+and handed **down** to it in the register/heartbeat answer. Per node, not one
+number copied onto every row: a heterogeneous fleet legitimately gets
+different ceilings (each no larger than its own total). The worker no longer
+reads this function (nor the env) at all -- it adopts the handed-down value
+and cross-checks it against its own kernel -- so the names live here once, for
+the manifests and for the control plane's ``Settings``.
 
 ``<= 0`` never means "unlimited" here. ``0`` is this repo's convention for a
 *node* budget whose dimension is switched off; on a per-sandbox ceiling it

@@ -25,12 +25,14 @@ class NodeRecord:
     total_processes: int = 0
     #: N83 phase 2 (D5/D5b, ruling R17): the *promise* side of this node's
     #: sandbox sizing -- the largest values a single sandbox may be configured
-    #: to here. This is the **control plane's** policy, not the worker's: the
-    #: ceiling is a deployment decision, so every node's row carries the
-    #: control plane's own resolved ``E2B_MAX_SANDBOX_*`` (the same three
-    #: numbers on every node), written by the control plane at
-    #: register/heartbeat. A ``0`` is a row the control plane has not written
-    #: yet (explicitly built records, embedders) -- never "unlimited".
+    #: to here. This is the **control plane's** policy, not the worker's, and
+    #: it is resolved **for this node** (``Settings.sandbox_ceiling_for``): an
+    #: explicit ``E2B_MAX_SANDBOX_*``, else this row's own totals, else the
+    #: per-sandbox create default. It is therefore not one number shared by
+    #: every row -- unequal nodes get unequal ceilings -- and the number here
+    #: is written by the control plane at register/heartbeat. A ``0`` is a row
+    #: the control plane has not written yet (explicitly built records,
+    #: embedders) -- never "unlimited".
     sandbox_cpu_percent_max: int = 0
     sandbox_memory_mb_max: int = 0
     sandbox_processes_max: int = 0
@@ -249,9 +251,11 @@ class NodeRecord:
         each (N83 phase 2 / R17).
 
         The **policy** half (``cpuPercent``/``memoryMB``/``processes``) is the
-        control plane's own resolved ``E2B_MAX_SANDBOX_*``: the internal API
-        builds it from its ``Settings`` and passes it here, so what a create is
-        checked against is the deployment's decision and not whatever a worker
+        control plane's own policy for **this node**, resolved against the
+        totals that node reported (``Settings.sandbox_ceiling_for``: explicit
+        ``E2B_MAX_SANDBOX_*`` first). The internal API computes it once per
+        register/heartbeat and passes it here, so what a create is checked
+        against is the deployment's decision and not whatever a worker
         believes. The **kernel** half (``kernelCpuPercent``/``kernelMemoryMB``)
         is the worker's read of its own container cgroup and is passed through
         verbatim; a key that is **absent** leaves the stored value alone, so a

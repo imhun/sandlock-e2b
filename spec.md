@@ -615,7 +615,8 @@ E2B_NODE_*)`，**CPU = `E2B_NODE_*` 说了算（允许超过容器 `cpu.max`，�
 `POST /internal/nodes/register` 与 `/heartbeat` 的**响应体**里下发
 `{"sandboxCeiling": {"cpuPercent": …, "memoryMB": …, "processes": …}}`（`off` 车道照发 —— 这是策略，
 与车道无关）。**解析在"盖章"那一刻、按节点做**（`Settings.sandbox_ceiling_for`）：`register` 用请求
-体里那三个总量，`heartbeat` 用该节点记录里已有的总量（每拍重算 ⇒ 节点总量变了就跟着变），进程内
+体里那三个总量，`heartbeat` 用该节点记录里已有的总量（**每次心跳都重算，但输入只有 register 写下的
+那一份** ⇒ 节点总量变了、并随该 worker 重启/重建**重新注册**之后，下一拍才跟着变），进程内
 `local://` 节点用自己那一行的总量 —— 所以**异构车队各拿各的上限**（各不超过自己那台的总量），下发的那份
 与写进记录的那份是同一次解析的同一个 dict。⚠️ 这中间一档**不是** `E2B_MAX_TOTAL_*`：那是**车队**总量
 （Task 9 起默认 `0` = 按各节点推导），不是某一台节点的承诺；Task 10 修的就是"在构造期解析一次 ⇒ 只能看到
