@@ -61,13 +61,21 @@ E2B 侧 `deploy/scripts/acceptance/probe_n82_traced_syscall_costs.py`、k0s（�
 
 ## 任务
 
-- [ ] **T1（RED）**：先写第 4 条那枚钉子（fd 复用），在**今天的树**上跑：它应该**绿**
+- [x] **T1（RED）**：先写第 4 条那枚钉子（fd 复用），在**今天的树**上跑：它应该**绿**
   （今天靠 close 注销）；然后把 `close` 从表里删掉、**不动** `is_cookie`，同一枚钉子应变**红**
   —— 这就是"为什么必须有活体校验"的证据。
-- [ ] **T2**：`is_cookie` 加活体校验（注入时记 identity，命中后复核）+ 集合上界（LRU + 具名打点）。
+  **读数（2026-10-07）**：绿 → 删表成员后红（`{'closed': 'rc=0 errno=0', 'reused': True, 'virtualized': (324, 0), 'verdict': 'KERNEL:88'}` ——
+  对**已关闭**的 fd 号仍然 `rc=0`，内核该答 `EBADF(9)`）→ 见 T2 后转绿。
+- [x] **T2**：`is_cookie` 加活体校验（注入时记 identity，命中后复核）+ 集合上界（LRU + 具名打点）。
   T1 的钉子在"删了 close、加了校验"的树上必须**绿**。
-- [ ] **T3**：删 `SYS_close` 与它的注册，跑 fork 门禁（`sandlock-dev:latest` 十相位），
+  **落地形状与计划不同的一处**：上界**不需要 LRU** —— 键是 fd 号，而 fd 号来自沙箱自己的
+  `RLIMIT_NOFILE`，所以 `insert` 每个进程最多那么多条；identity 记的是
+  `readlink("/proc/<tgid>/fd/<fd>")`（`socket:[<inode>]`），命中后复核，不符/关掉就删条目并当普通 fd。
+- [x] **T3**：删 `SYS_close` 与它的注册，跑 fork 门禁（`sandlock-dev:latest`），
   确认 netlink 那族用例全绿、无新增红。
+  **读数**：`test_netlink_virt` **15/0**；整套门禁 `core_lib 941/0`（= 刷新后的基线）、
+  `core_integ 575/0`、`ffi 104/0`；`cli` 相位红但是**既有问题**（`kernel_enforced_limits` 的
+  CLI 参数定义，见 open-issues N87，与本次无关）。
 - [ ] **T4**：`build-sandlock-wheels.sh` 重建 wheel + 重钉 `SHA256SUMS.supervise`，
   本地 compose 车道跑第 1/2 条读数（RED→GREEN 都留）。
 - [ ] **T5**：发版（先控制面后 worker，同 §7.52 的顺序）+ 线上复跑第 1/2 条 + N82 探针全套
