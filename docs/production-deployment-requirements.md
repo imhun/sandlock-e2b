@@ -868,7 +868,7 @@ multinode 每个 worker 1 个（256 进程 = 1 个箱），车队 3 个 —— �
 （`envd_service/agent.py::kernel_ceiling_payload`），而它**不看车道开关**：`E2B_SANDBOX_CGROUP`
 门的是另一个读者 `_container_kernel_limits`，那个读数只喂"每节点"那一档的推导（本节顶部那张表），
 与记录里这对数无关 —— 出厂 k8s 清单就是 `off` + `E2B_CGROUP_MOUNT=/pod-cgroup` 挂进来
-（`deploy/k8s/worker.yaml`，不设开关 = 出厂默认 `off`），它的这两个数照样是物理读数
+（`deploy/k8s/worker.yaml` 显式设 `off`，k0s 覆盖层 `worker-capacity.patch.yaml` 才翻成 `required`），它的这两个数照样是物理读数
 （2026-10-07 复核：同一份 settings 下 `kernel_ceiling_payload` 在 `off` / `required` 两种取值下返回
 同一对数，而 `_container_kernel_limits` 在 `off` 下是 `None`）。所以 `null` 的来源是：
 ① 内核真的报 `max`（没设 `cpus`/`mem_limit` 的车道，读得到、答案就是 `max`，compose 三条车道是
