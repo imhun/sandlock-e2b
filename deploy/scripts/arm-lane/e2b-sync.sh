@@ -56,7 +56,8 @@ tar -C "$repo/third_party/sandlock/python/src" --exclude '__pycache__' -cf - san
     | guest "sudo tar -C $venv/lib/python3.12/site-packages -xf -"
 limactl copy --backend=scp "$so" "$name:/tmp/libsandlock_ffi.so" >/dev/null
 
-# 3. the mediator binary route B spawns per sandbox. envd_service/route_b.py
+# 3. the mediator binary the own-identity slot spawns per sandbox.
+#    envd_service/own_identity.py
 #    looks for it as `<sandlock package>/bin/sandlock-supervise`, i.e. the
 #    wheel's layout -- without it every mediated (chroot) test dies with
 #    "the installed sandlock wheel has no sandlock-supervise".

@@ -2,7 +2,7 @@
 
 Two measurements of the same workflow ("a file lands in the sandbox, then the
 sandbox runs it"), both on the production path -- pooled per-sandbox host uid
-plus an ``E2B_ROUTE_B=auto`` slot, which is the only identity that mediations
+plus an ``E2B_OWN_IDENTITY=auto`` slot, which is the only identity that mediations
 run as (see ``tests/security/conftest.py::route_b_sandbox``):
 
 * a **dynamic ELF binary** copied into the workspace runs. It only runs because

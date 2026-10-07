@@ -375,7 +375,7 @@ def test_agent_grant_engages_route_b_without_root_or_a_broker(monkeypatch) -> No
 def test_forced_route_b_without_a_host_uid_fails_loudly(monkeypatch) -> None:
     with pytest.raises(
         RuntimeError,
-        match=r"^route B was requested \(E2B_ROUTE_B=on / E2B_ROUTE_B_SLOTS>0\) "
+        match=r"^route B was requested \(E2B_OWN_IDENTITY=on / E2B_MAX_SLOTS>0\) "
         r"but no per-sandbox host uid",
     ):
         _executor(monkeypatch, own_identity=_config(mode="on"), host_uid=None)

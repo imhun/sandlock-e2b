@@ -695,7 +695,7 @@ class W1SlotPool:
             if not self._free:
                 raise RuntimeError(
                     "route-B slot pool exhausted (all uids live); "
-                    "raise E2B_ROUTE_B_SLOTS or wait for a release"
+                    "raise E2B_MAX_SLOTS or wait for a release"
                 )
             chosen = self._free.pop(0)
         else:
@@ -1085,7 +1085,7 @@ class W1SlotPool:
                 logger.warning(
                     "route-B slot %s: cannot scope %s to gid %d from this "
                     "worker; the document is world-readable at mode 0444 "
-                    "(run the worker as root or place E2B_ROUTE_B_TMP_ROOT on "
+                    "(run the worker as root or place E2B_SLOT_TMP_ROOT on "
                     "storage the slots own)",
                     slot_name,
                     path.name,
@@ -2130,7 +2130,7 @@ def slot_pool_for(
     The segment is the host-uid pool itself: a slot is started at the uid the
     worker already allocated to the sandbox, so route B cannot widen the uid
     space and ``E2B_UID_POOL_*`` stays the single source of truth for
-    identity. ``E2B_ROUTE_B_SLOTS`` caps live slots below the segment size.
+    identity. ``E2B_MAX_SLOTS`` caps live slots below the segment size.
     """
     size = int(config.uid_size)
     if config.slots > 0:

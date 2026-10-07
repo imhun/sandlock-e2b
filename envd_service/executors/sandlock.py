@@ -1527,16 +1527,16 @@ class SandlockExecutor(Executor):
         ``auto`` engages where it matters: the chroot (image-rootfs) shape is
         the only one where ``fs_denied``/chroot path mediation runs, and
         mediating as the sandbox's own uid is what makes mediated writes belong
-        to the sandbox (T5). ``E2B_ROUTE_B_SLOTS>0`` or ``E2B_ROUTE_B=on`` asks
+        to the sandbox (T5). ``E2B_MAX_SLOTS>0`` or ``E2B_OWN_IDENTITY=on`` asks
         for a slot in every shape instead. An operator who explicitly asked for
         route B and cannot get it fails loudly -- route A vs route B is a
         deployment decision, never a silent downgrade (§8).
         """
         cfg = self._own_identity
         if cfg is None:
-            return "the worker passed no route-B config (E2B_ROUTE_B_* unset)"
+            return "the worker passed no route-B config (E2B_OWN_IDENTITY_* unset)"
         if cfg.mode == "off":
-            return "E2B_ROUTE_B=off"
+            return "E2B_OWN_IDENTITY=off"
         if sandlock is None:
             return "the native sandlock module is unavailable"
         forced = cfg.mode == "on" or cfg.slots > 0
@@ -1558,7 +1558,7 @@ class SandlockExecutor(Executor):
             )
             if forced:
                 raise RuntimeError(
-                    "route B was requested (E2B_ROUTE_B=on / E2B_ROUTE_B_SLOTS>0) "
+                    "route B was requested (E2B_OWN_IDENTITY=on / E2B_MAX_SLOTS>0) "
                     "but " + reason
                 )
             return reason
@@ -1598,7 +1598,7 @@ class SandlockExecutor(Executor):
             if forced:
                 raise RuntimeError(
                     "route B was requested with transport=fd, but " + reason
-                    + ": rebuild wheels/fork/ or set E2B_ROUTE_B_TRANSPORT=path"
+                    + ": rebuild wheels/fork/ or set E2B_SLOT_TRANSPORT=path"
                 )
             if not type(self)._own_identity_no_fd_client_warned:
                 type(self)._own_identity_no_fd_client_warned = True
@@ -1606,7 +1606,7 @@ class SandlockExecutor(Executor):
                     "route B unavailable for sandbox_id=%s: %s; not falling back to "
                     "the registered transport, whose token would sit in the slot's "
                     "world-readable argv (rebuild wheels/fork/ or set "
-                    "E2B_ROUTE_B_TRANSPORT=path deliberately)",
+                    "E2B_SLOT_TRANSPORT=path deliberately)",
                     self._sandbox_id or "-",
                     reason,
                 )
@@ -1652,7 +1652,7 @@ class SandlockExecutor(Executor):
             "mediator, so the fork refuses the create instead of leaving "
             "supervisor-owned files behind (T5, no downgrade tier is set any "
             "more). Fix: keep E2B_PER_SANDBOX_UID on and let route B lease a "
-            "slot (E2B_ROUTE_B=auto/on), or run a privileged launcher or an "
+            "slot (E2B_OWN_IDENTITY=auto/on), or run a privileged launcher or an "
             "external slot fleet.",
             self._sandbox_id or "-",
             self._own_identity_decline or "reason unavailable",
@@ -1704,7 +1704,7 @@ class SandlockExecutor(Executor):
         for per-sandbox cgroups (``E2B_SANDBOX_CGROUP=required``) therefore
         cannot serve it: letting it run is exactly the silent "no quota" the
         switch forbids, and it is the shape an operator hits by turning
-        ``E2B_ROUTE_B=off`` (or dropping the per-sandbox host uid, or the
+        ``E2B_OWN_IDENTITY=off`` (or dropping the per-sandbox host uid, or the
         control-plane reporter) while the cgroup switch still says required.
 
         Raised at construction, so the create fails with the decline reason on

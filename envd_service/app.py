@@ -58,7 +58,7 @@ PER_UID_NO_PTRACE_WARNING = (
     "the in-process RunAs path cannot write the sandbox's uid_map, so "
     "sandboxes that are not routed through a supervise slot will fail to "
     "start (add CAP_SYS_PTRACE, or keep chroot sandboxes on route B -- "
-    "E2B_ROUTE_B=auto/on -- whose slot self-maps and needs no ptrace)"
+    "E2B_OWN_IDENTITY=auto/on -- whose slot self-maps and needs no ptrace)"
 )
 
 

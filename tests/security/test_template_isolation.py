@@ -9,7 +9,7 @@ mediating in-process no longer gets a silent, supervisor-owned sandbox (T5):
 the fork refuses the create.
 
 That makes *how* these tests build the sandbox part of what is under test --
-they drive the production path (pooled per-sandbox uid + ``E2B_ROUTE_B=auto`` +
+they drive the production path (pooled per-sandbox uid + ``E2B_OWN_IDENTITY=auto`` +
 slot) rather than a hand-built in-process instance -- and the refusal of the
 old shape is pinned here too, so the downgrade tier cannot quietly return.
 """
@@ -105,7 +105,7 @@ async def test_image_rootfs_cannot_reach_host_filesystem():
 async def test_in_process_chroot_is_refused_without_a_slot(caplog):
     """The dropped downgrade tier, pinned.
 
-    With ``E2B_ROUTE_B=off`` a root worker would mediate in-process while the
+    With ``E2B_OWN_IDENTITY=off`` a root worker would mediate in-process while the
     sandbox runs as uid 1000 -- exactly the T5 shape. Before 2026-09-10 E2B
     asked the fork to accept it through an explicit downgrade tier (loud, but
     it still leaves supervisor-owned files); now nothing is asked, and fork B3
@@ -126,7 +126,7 @@ async def test_in_process_chroot_is_refused_without_a_slot(caplog):
         executor, workspace = route_b_sandbox(IMAGE, rootfs, with_route_b=False)
     try:
         assert executor._own_identity_active is False
-        assert executor._own_identity_decline == "E2B_ROUTE_B=off"
+        assert executor._own_identity_decline == "E2B_OWN_IDENTITY=off"
         disclosed = [
             record.getMessage()
             for record in caplog.records
@@ -134,7 +134,7 @@ async def test_in_process_chroot_is_refused_without_a_slot(caplog):
         ]
         assert len(disclosed) == 1, disclosed
         assert (
-            "runs in-process, not on a supervise slot (E2B_ROUTE_B=off)"
+            "runs in-process, not on a supervise slot (E2B_OWN_IDENTITY=off)"
             in disclosed[0]
         ), disclosed[0]
         with pytest.raises(

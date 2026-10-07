@@ -238,9 +238,9 @@ def route_b_sandbox(
     this helper is also the way a test asks for "the deployment's shape" rather
     than for one particular mediation state.
 
-    ``with_route_b`` mirrors the production default (``E2B_ROUTE_B=auto``): the
+    ``with_route_b`` mirrors the production default (``E2B_OWN_IDENTITY=auto``): the
     mediated shape is exactly the one auto engages a slot for. ``False`` stands
-    for an operator who set ``E2B_ROUTE_B=off``.
+    for an operator who set ``E2B_OWN_IDENTITY=off``.
 
     The default ``host_uid`` follows the worker's privilege, exactly like
     ``envd_service/app.py`` does: a root worker gets a pooled uid (and can map

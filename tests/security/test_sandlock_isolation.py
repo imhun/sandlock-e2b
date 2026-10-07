@@ -108,7 +108,7 @@ async def test_dev_shm_absent_but_dev_null_writable():
     at all (no cross-sandbox tmpfs/queue surface) while /dev/null stays a
     writable host chardev.
 
-    Built through the worker's own path (pooled host uid + ``E2B_ROUTE_B=auto``
+    Built through the worker's own path (pooled host uid + ``E2B_OWN_IDENTITY=auto``
     slot): this is the mediated chroot shape, and mediation now runs as the
     sandbox's host uid, not as the worker -- see
     ``tests/security/conftest.py::route_b_sandbox``.

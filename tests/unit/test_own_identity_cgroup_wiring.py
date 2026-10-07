@@ -15,7 +15,7 @@ the cgroup a *quota* rather than a decoration are pinned:
   nothing behind -- no half slot, no reported identity, and never "run without
   a quota";
 * a sandbox that would run **in-process** (route B declined: no host uid, no
-  reporter, ``E2B_ROUTE_B=off``) is refused by name as well, because the
+  reporter, ``E2B_OWN_IDENTITY=off``) is refused by name as well, because the
   in-process mediator has no cgroup at all (plan Review Focus 4).
 
 The startup lane (delegation handshake, then the worker's own self-check) is
