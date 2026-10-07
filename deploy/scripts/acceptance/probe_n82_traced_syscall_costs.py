@@ -14,14 +14,19 @@
     export E2B_API_KEY=...
     python deploy/scripts/acceptance/probe_n82_traced_syscall_costs.py --op openclose --seconds 40
 
-    --op 取 openclose | close | mmap | clone | getdents | uname | chdir | stat | getpid
+    --op 取 openclose | close | mmap | clone | clone3 | getdents | uname | chdir | stat | getpid
     （`stat` 是 N81 之后的对照：应当 0 停顿、几十万 op/s；`getpid` 是纯循环对照。）
 
 `clone` 是 N83 Phase 2 Task 4 加进来的那一支（R7）：没有它，退通知表就只量得到 mmap
-那一半。它 run 的是**热 fork 循环**的形状 —— `fork()` + `waitpid()` 一次 —— 也就是
-`seccomp_plan::BASE_NOTIF_SYSCALLS` 的 clone/clone3 与 wait 族各吃一条通知。两族在
-Task 4 里**都没有退**（理由见 `seccomp_plan.rs`），所以这一支的读数在退表前后应当**持平**；
-它正是"另一半没退"的证据，不是对照组。
+那一半。它 run 的是**热 fork 循环**的形状 —— `fork()` + `waitpid()` 一次。两族在
+Task 4 里**都没有退**（理由见 `seccomp_plan.rs`）。
+
+**`clone3` 是 N86 补的另一半**：`os.fork()` 走的是老 `clone`（glibc 的 `fork` 不用
+`clone3`），而 R13 保住整族的理由恰恰是 `clone3`（`clone_args` 在用户指针后、cBPF 读不到）。
+裸 `clone3(flags=0, exit_signal=SIGCHLD)` 的子进程是 **clone child** —— `wait4(flags=0)`
+答 `ECHILD`，必须带 `__WCLONE` 才收得到（形状与三处对照见
+`deploy/scripts/acceptance/probe_clone3_wait_shape.py`）—— 所以这一支的 `one()` 里
+reap 用的是 `wait4(..., __WCLONE)`，不是 `os.waitpid()`。
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from e2b import Sandbox
 
 INNER = dedent(
     """
+    import ctypes
     import mmap as mmap_mod
     import os
     import time
@@ -41,6 +47,37 @@ INNER = dedent(
     OP = os.environ.get("N82_OP", "openclose")
     PATH = "/etc/os-release"
     DENT = "/usr/lib/python3.11" if os.path.isdir("/usr/lib/python3.11") else "/etc"
+
+    # clone3 = 435 on x86_64 and aarch64; a bare clone3 child is a *clone child*,
+    # so its reap needs __WCLONE (N86).
+    _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+    _LIBC.syscall.restype = ctypes.c_long
+    _LIBC.wait4.restype = ctypes.c_long
+    _LIBC.wait4.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    _SYS_CLONE3 = 435
+    _SIGCHLD = 17
+    _WCLONE = -2147483648
+
+
+    class _CloneArgs(ctypes.Structure):
+        _fields_ = [
+            (name, ctypes.c_ulonglong)
+            for name in (
+                "flags", "exit_signal", "stack", "stack_size", "tls",
+                "set_tid", "set_tid_size", "cgroup",
+                "last_tid", "last_tid_size", "padding",
+            )
+        ]
+
+
+    def _clone3_once():
+        args = _CloneArgs(flags=0, exit_signal=_SIGCHLD)
+        ctypes.set_errno(0)
+        rc = _LIBC.syscall(_SYS_CLONE3, ctypes.byref(args), ctypes.c_size_t(64))
+        if rc == 0:
+            os._exit(0)
+        if rc > 0:
+            _LIBC.wait4(rc, None, _WCLONE, None)
 
     def one():
         if OP == "openclose":
@@ -58,6 +95,8 @@ INNER = dedent(
             if pid == 0:
                 os._exit(0)
             os.waitpid(pid, 0)
+        elif OP == "clone3":
+            _clone3_once()
         elif OP == "getdents":
             os.listdir(DENT)
         elif OP == "uname":
