@@ -3102,7 +3102,7 @@ uid 相符；评审六条规格全过），按 `AGENTS.md` 先在**本地 compos
 | T1 | 三个新 env `E2B_MAX_SANDBOX_CPU_PERCENT` / `_MEMORY_MB` / `_PROCESSES` 是**单箱上限**；未设或 `<=0` ⇒ 跟随节点总量，**绝不"无上限"**；worker 拿它与容器内核限额交叉校验，**上限 > 内核 ⇒ 具名拒绝这份下发**，**内核 = `max` ⇒ 一行 WARN**（只比 cpu/内存两维）。**自 2026-10-07 的 R17 起这三个 env 只有控制面读，值由控制面在 register/heartbeat 响应里下发**（T8） | 四种形状的真 cgroup v2 探针（基线 2 核/2 GiB + 下发 200/2048/256 ⇒ 通过；下发 400 ⇒ `cgroup-refusal ceiling-exceeds-kernel`；compose 无 limits ⇒ 通过 + WARN；k0s 覆盖层 4 核/4 GiB + 下发 400/4096/1024 ⇒ 通过）与心跳 payload 见 `.superpowers/sdd/2026-10-06-n83-phase2-memory-pids/task-1-report.md` §2.3；**R17 的下发/采纳读数见同目录 `task-8-report.md`** |
 | T2 | 创建请求真的解析 `cpuCount`/`memoryMB`（N84 收口）：`record.cpu_count`/`memory_mb` 是唯一真相、台账 cpu 维度由 `cpu_count × 100` 导出；`0`/负数/非整数 ⇒ 具名 `400 must be a positive integer`；超过**落点节点**的单箱上限 ⇒ 具名 `400 cpuCount 8 exceeds this node's per-sandbox maximum (4)`（R17 起这个上限是**控制面**写进记录的，不再有"节点没上报 ⇒ 503"的窗口） | RED `20 failed, 1 passed` → GREEN `36 passed`；见 `task-2-report.md` §2 与 `tests/unit/test_sandbox_size_ceiling.py` |
 | T3 | `attach()` 除 `cpu.max` 再写 `memory.high`/`memory.max`/`pids.max`，**每个写完逐字回读**；`setup()` 一次使能 `+cpu +memory +pids`（腾空前 EBUSY、腾空后 ok，与 `+cpu` 同一条规则）；声明额度高于 worker 的策略上限 ⇒ 第二道具名拒绝 | 真 cgroup v2 探针 20/20：四个限额逐字回读、8 条任务预算 ⇒ 第 8 条 `EAGAIN(11)`、超 `memory.max` 的分配 `SIGKILL(9)`、`memory.events.oom_kill=1`、邻居箱存活、`memory.oom.group=0`；见 `task-3-report.md` §2 |
-| T4 | 通知表**只在 `required` 退掉地址空间那一族**（mmap/munmap/brk/mremap，及 `sysv_ipc` 允许时的 shmget）；**clone 族整族保留**（R13/R14：`resource::handle_fork` 是 `clone3` 命名空间创建禁令与 checkpoint `hold_forks` 的唯一执行点，而 cBPF 读不到用户指针后面的 `clone_args`、`clone3` 又不在默认 blocklist 里 —— 退掉它是拿安全控制换延迟） | 同一台机、同一支 `deploy/scripts/acceptance/probe_n82_traced_syscall_costs.py`：`mmap` 的 `required` **293562 op/s**（4 次 stall），`off` 2540、BEFORE 2539（两档都是 40 次/51 轮的 N82 签名）；`clone` 两档 `off` 1676 / `required` 1625 op/s（未变）；fork `831a7da` + 父仓 `e60d754`；见 `task-4-report.md` §3 |
+| T4 | 通知表**只在 `required` 退掉地址空间那一族**（mmap/munmap/brk/mremap，及 `sysv_ipc` 允许时的 shmget）；**clone 族整族保留**（R13/R14：`resource::handle_fork` 是 `clone3` 命名空间创建禁令与 checkpoint `hold_forks` 的唯一执行点，而 cBPF 读不到用户指针后面的 `clone_args`、`clone3` 又不在默认 blocklist 里 —— 退掉它是拿安全控制换延迟） | 同一台机、同一支 `deploy/scripts/acceptance/probe_n82_traced_syscall_costs.py`：`mmap` 的 `required` **293562 op/s**（4 次 stall），`off` 2540、BEFORE 2539（两档都是 40 次/51 轮的 N82 签名）；`clone` 两档 `off` 1676 / `required` 1625 op/s（未变；**2026-10-07 更正口径**：这一支**不是限流读数** —— 它受限的是沙箱自己那 1 核额度，实测 656 µs/op × 1510 ≈ 1.00 核，限流开关对它无影响；且它跑的是 `os.fork()` = `clone` 那一半，`clone3` 那半没有读数。见 N86）；fork `831a7da` + 父仓 `e60d754`；见 `task-4-report.md` §3 |
 | T5 | 每箱 `memory.events`（`oom_kill`/`oom_group_kill`）与 `pids.events`（`max`）由 worker 采样（活箱每 `E2B_CGROUP_EVENTS_INTERVAL_S`（默认 5 s），加收尾一次），随心跳的 `sandboxEvents` 上报；控制面按每箱每计数取最大值，**增长**就打一行点名沙箱的 WARN | 真 cgroup v2 探针 21/21（修复轮后 30/30）：`pids.current=3`（2 线程 + 1 进程）、fork 与线程各撞一次 ⇒ `pids.events.max=1`、`oom_kill=1`；收尾那份读数在箱子被拆掉之后仍在；见 `task-5-report.md` §2.3 |
 
 **各清单的单箱上限**（显式写出；值 = 该车道愿意给**一个沙箱**的上限）
@@ -3371,7 +3371,7 @@ tmp/venv/bin/python deploy/scripts/acceptance/cgroup_acceptance.py \
 一道防洪泛闸，而不是把闸也一起拆掉。
 
 **没做的（另立）**：`close` 仍在通知表里（N82 候选 ①，每个 fd 一次往返）；clone 族的读数与其缺口
-（`clone3` 那一半没有读数，且沙箱里 `clone3` 的子进程 `waitpid` 报 `ECHILD`）见 §7.51 之后的追查。
+（`clone3` 那一半没有读数，而量它要用 `wait4(__WCLONE)`；追查见 N85/N86）。
 
 ### 7.36 发版：闲置即暂挂 + N77（2026-10-03，版本 `0.1.0-965-gb5f194a-20261003-193743`）
 
