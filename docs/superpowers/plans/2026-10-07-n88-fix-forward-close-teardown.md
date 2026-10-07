@@ -65,13 +65,72 @@
 
 ## 任务
 
-- [ ] **T1**：写判据 1/2 两枚钉子，在**今天的树**上跑 —— 1 应绿（① 在位）、2 应红（readiness 现在
+- [x] **T1**：写判据 1/2 两枚钉子，在**今天的树**上跑 —— 1 应绿（① 在位）、2 应红（readiness 现在
   只有 ① 的通知在兜底？先读一遍现状：若 2 已绿，说明还有别的兜底，先查清再动）。
-- [ ] **T2**：readiness 改成用时校验（identity），T1 的第 2 枚钉子转绿。
-- [ ] **T3**：inbound 按 **(a) 惰性替换 + 用时复核** 落地，T1 第 1 枚钉子按新契约改写并绿。
-- [ ] **T4**：删掉 ① 的条件行，跑 fork 门禁（十相位；`cli` 相位的环境红按 N87 的口径单独记）。
+  **实测与计划的配对相反**：`close` 的兜底就是 `if policy.inbound_port_map` 下注册的
+  `handle_epoll_close`，所以"fd 复用"那枚在 ① 在位时是**绿**的；而 inbound 那枚按 ② 的新契约写
+  （close 不释放宿主 listener、再 listen 要接管）在 ① 在位时就是**红**的。两枚都写在
+  `test_net_isolate.rs`（走带映射端口的真实沙箱，不是单测）：`n88_a_reused_epoll_fd_number_is_not_synthesized`、
+  `n88_the_mapping_outlives_close_and_serves_a_relistened_socket`。
+- [x] **T2**：readiness 改成用时校验，T1 的第 2 枚钉子转绿 —— **实现换成了"读内核的 fdinfo"**（§0）。
+- [x] **T3**：inbound 按 **(a) 惰性替换 + 用时复核** 落地，T1 第 1 枚钉子按新契约改写并绿 —— 途中
+  挖出"映射查的是 real 端口而不是 virtual 端口"这个既有缺陷（§0.3）。
+- [x] **T4**：删掉 ① 的条件行，跑 fork 门禁（十相位；`cli` 相位的环境红按 N87 的口径单独记）。
 - [ ] **T5**：重建 wheel + 本地车道两条读数（普通形状 + 带映射形状；后者需要一条 net_isolation 车道）
   → 发版 → 线上复跑 9/9 与 `--op openclose` 两档。
+
+## 实施记录（2026-10-07）
+
+### 0. 侦察结论更正：epoll fd **没有**可用的 identity —— 改成读内核自己的表
+
+动手前那条"用 `metadata("/proc/<pid>/fd/<fd>").ino()` 当 epoll fd 的身份"是**错的**。dev 容器实测
+（`sandlock-dev-f17`，Linux 7.0.14-orbstack）：
+
+```
+readlink1 anon_inode:[eventpoll]   readlink2 anon_inode:[eventpoll]      # 同一个字符串
+fstat ino 3087 3087                # 两个 epoll 实例共用**同一个 inode**
+kcmp(e1,e2) = -1 EPERM             # 非特权；特权下 EINVAL（CONFIG_CHECKPOINT_RESTORE 不可用）
+```
+
+也就是说 anon inode 的 `st_ino` 是全内核共享的一个数（3087），`kcmp` 这条路也不在。既然内核已经把
+"这个 epoll 注册了哪些 fd"放在 `/proc/<pid>/fdinfo/<epfd>` 里（`tfd: %8d events: %8x data: %16llx
+pos:%lli ino:%lx sdev:%x`，2.6.28 起稳定），认证的对象就从"epoll 的身份"换成**内核自己的注册表**：
+
+- `epoll_wait` 时读 fdinfo，按 `tfd:` 行重建注册（fd / events / data / 被监视文件的 ino）；
+- 只对"ino 命中 `ns.inbound`（或 fdinfo 没印 ino）"的**候选**做 dup+端口复核，其余按普通 fd 处理；
+- 一条候选都不是 ⇒ `Continue`，交给内核 —— 闭合的 fd 给 EBADF、非 epoll fd 给 EINVAL，正是钉子要的读数；
+- 于是 supervisor 侧**没有任何 epoll 状态**：`epoll_ctl`、`close` 一起离开通知表，
+  `NetworkState::epoll_registrations` 与 `EpollRegistration` 整块删掉。
+
+比"给 epoll fd 加一条 identity 记录"更省、更准：不复用 `mapped_ino`（那是**宿主 listener** 的 inode），
+也没有"校验与合成之间兄弟线程复用 fd"的那条窗口 —— 内核的表就是那一刻的真值。
+
+### 0.2 RED/GREEN 读数（`tmp/n88/`；每步都是同一条断言，精确匹配）
+
+| 步骤 | 树 | 钉子 A（fd 复用） | 钉子 B（映射生命周期） |
+|---|---|---|---|
+| T1 | ① 在位（`5eda94d`） | **绿**（close 通知把注册清掉了） | **红**：`the mapping must outlive the sandbox listener's close`（close 把宿主 listener 拆了） |
+| T4 先删 ① | ① 行删掉、其它不动 | **红**：`reused_epoll_wait_rc=0 errno=0`（期望 `-1 errno=22`） | **红**：再 listen 的那只 socket 拿不到宿主连接（accept 永远不被服务） |
+| T2+T3 | 本计划的实现 | **绿** | **绿** |
+
+### 0.3 途中挖出的既有缺陷：inbound 查的是 **real** 端口，不是 virtual 端口
+
+`handle_listen` 原来用 `local_port(dup)`（real 端口）去查 `ns.inbound_map`。而 `port_remap::handle_bind`
+在 `bind()` 撞 EADDRINUSE 时会**用 port 0 重试**并把结果记成 virtual→real 映射 —— 一个沙箱里
+"关掉监听再重新 bind 同一个映射端口"恰好会撞上：宿主 listener 的 eager worker 持有沙箱监听 socket 的
+dup（也让沙箱侧那个端口继续被占），于是第二次 `bind(P)` 拿到的是内核另选的一个真实端口，映射查不到
+（实测 `sandbox_port=32959` → 第二次 `local_port` = `40061`，`host_port=None` ⇒ 这次 listen 建不出映射）。
+修法是用 `PortMap::get_virtual(real).unwrap_or(real)` 翻回沙箱自己认的那个端口（`live_sandbox_port`），
+accept / readiness 两处的用时复核也走同一个函数。
+
+### 0.4 inbound 的落地形态（option (a)）
+
+- `close` 不再进表 ⇒ 映射**跨过**沙箱关闭监听 socket 存活；
+- 再 `listen()` 同一个映射端口（inode 不同）⇒ 先淘汰旧条目（放掉旧宿主 listener 的 fd），再建新的；
+  旧 worker 还攥着宿主 listener 的 dup 最多一个 poll slice（2 s），所以重建走**有界 EADDRINUSE 重试**
+  （≤5 s），并且整段放在 `defer` 里，不占通知循环；
+- 每个使用点（listen/accept/poll/epoll_wait）都复核"活着的 socket 的 virtual 端口 == 条目记的
+  `sandbox_port`"：inode 被内核回收时不会认错。
 
 ## 风险与回退
 
