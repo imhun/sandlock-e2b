@@ -40,3 +40,6 @@ graphify-out/
 # (`third_party/sandlock/target -> /src/target-linux`). Never source.
 /target-linux/
 .venv/
+
+# Isolated worktrees created by agents (never source).
+.worktrees/
