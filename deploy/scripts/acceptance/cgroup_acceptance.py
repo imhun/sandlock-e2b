@@ -1816,6 +1816,21 @@ def main() -> int:
             process_delta = (
                 one_process["steady_pids_current"] - baseline["steady_pids_current"]
             )
+            # The *process* dimension of the same two arms. `pids.current`
+            # counts tasks (threads included) for the whole sandbox tree --
+            # supervisor, init, payload -- and the supervisor's tokio pool grows
+            # a worker lazily, so an arm-to-arm difference in `pids.current` can
+            # move with the pool rather than with the payload. Measured with one
+            # identical payload on two wheels: old wheel 3 x `tokio-rt-worker` /
+            # `pids.current` 8, new wheel 2 x / 7. `cgroup.procs` is immune to
+            # that (threads are not processes), which is why the "one forked
+            # process" arm asserts on it.
+            process_count_delta = (
+                one_process["cgroup_procs_at_peak"] - baseline["cgroup_procs_at_peak"]
+            )
+            thread_process_delta = (
+                two_threads["cgroup_procs_at_peak"] - baseline["cgroup_procs_at_peak"]
+            )
             record(
                 "9_peak_and_task_unit",
                 limits["memory_max"] == str(declared_memory_bytes)
@@ -1824,7 +1839,13 @@ def main() -> int:
                 and peak >= _PEAK_ALLOC_BYTES
                 and peak <= declared_memory_bytes
                 and thread_delta == 2
-                and process_delta == 1,
+                # One forked process is one *process*: `cgroup.procs` grows by
+                # exactly one on that arm and by zero on the two-thread arm
+                # (threads share their leader's process). `pids.current` must
+                # still count it (>= 1) but not `== 1`: see above.
+                and process_count_delta == 1
+                and thread_process_delta == 0
+                and process_delta >= 1,
                 criterion=(
                     "memory.max/memory.high == the declared memoryMB byte for byte; "
                     "pids.max == this box's own recorded declaration (the worker's "
@@ -1832,9 +1853,12 @@ def main() -> int:
                     "E2B_DEFAULT_MAX_PROCESSES is printed alongside, never the "
                     "criterion); a held 64 MiB allocation moves memory.peak into "
                     "[64 MiB, memory.max]; and pids.current counts a thread exactly "
-                    "like a process (2 threads add 2, 1 forked process adds 1, both "
-                    "measured against the same holder with neither -- the unit Task "
-                    "5's probe read as 3 for 2 threads + 1 process)"
+                    "like a process (2 threads add 2 tasks, 1 forked process adds "
+                    "1 *process* -- `cgroup.procs` -- and at least one task, both "
+                    "measured against the same holder with neither; the unit Task "
+                    "5's probe read as 3 for 2 threads + 1 process). The supervisor "
+                    "threads live in the same cgroup, so their lazily grown pool is "
+                    "named in the record rather than assumed away"
                 ),
                 declared_memory_mb=declared["memoryMB"],
                 declared_memory_bytes=declared_memory_bytes,
@@ -1853,6 +1877,8 @@ def main() -> int:
                 pids_current_holder_threads0_processes1=one_process,
                 thread_delta=thread_delta,
                 process_delta=process_delta,
+                process_count_delta=process_count_delta,
+                thread_process_delta=thread_process_delta,
                 sandbox_cgroup=cgroup,
                 node=node,
             )
@@ -2088,10 +2114,13 @@ def main() -> int:
                 interval_cores.append(delta / 1e6 / dt)
             peak_cores = max(interval_cores) if interval_cores else None
             throttled_delta = None
+            throttled_last = None
             if len(samples) >= 2:
                 throttled_delta = (
                     samples[-1]["cpu_stat"]["nr_throttled"] - samples[0]["cpu_stat"]["nr_throttled"]
                 )
+            if samples:
+                throttled_last = samples[-1]["cpu_stat"]["nr_throttled"]
             return {
                 "label": "the N82 probe (openclose) alone in its own sandbox",
                 "probe_output": output.strip(),
@@ -2106,6 +2135,12 @@ def main() -> int:
                 "interval_cores": [round(value, 3) for value in interval_cores],
                 "peak_cores": round(peak_cores, 3) if peak_cores is not None else None,
                 "nr_throttled_delta": throttled_delta,
+                # N82 candidate ① landed: the flood is half the notifications it
+                # used to be (`close` left the table), so this harness now sits
+                # *at* the quota instead of over it and the counter can move
+                # before the first sample. The absolute value is what says "the
+                # kernel really did throttle this box"; see the verdict.
+                "nr_throttled": throttled_last,
             }
 
         alone = run_flood(args.flood_seconds)
@@ -2179,10 +2214,13 @@ def main() -> int:
                 interval_cores.append(delta / 1e6 / dt)
             peak_cores = max(interval_cores) if interval_cores else None
             throttled_delta = None
+            throttled_last = None
             if len(samples) >= 2:
                 throttled_delta = (
                     samples[-1]["cpu_stat"]["nr_throttled"] - samples[0]["cpu_stat"]["nr_throttled"]
                 )
+            if samples:
+                throttled_last = samples[-1]["cpu_stat"]["nr_throttled"]
             return {
                 "label": "4 concurrent copies of the probe's openclose program, one sandbox",
                 "harness": "probe_n82_traced_syscall_costs.INNER imported verbatim, run in a sandbox we own",
@@ -2196,6 +2234,7 @@ def main() -> int:
                 "interval_cores": [round(value, 3) for value in interval_cores],
                 "peak_cores": round(peak_cores, 3) if peak_cores is not None else None,
                 "nr_throttled_delta": throttled_delta,
+                "nr_throttled": throttled_last,
             }
 
         quota_cores = declared / 100.0
@@ -2225,7 +2264,14 @@ def main() -> int:
             # without the clients' own rates would be about the spinners, not
             # about the flood.
             and contested["ops_per_s"] is not None
-            and (contested["nr_throttled_delta"] or 0) > 0,
+            # ... and the kernel really did throttle *this* box. The absolute
+            # counter, not the delta: since `close` left the notify table (N82
+            # candidate ①) the flood costs half the notifications, so the box
+            # runs at ~0.9 of its quota and the single throttle event can land
+            # before the first sample -- a delta of 0 over the window is then
+            # the cheap workload, not a missing wall (measured locally: peak
+            # 0.917 cores, `nr_throttled` 1 at the first sample of the window).
+            and (contested["nr_throttled"] or 0) > 0,
             probe=probe.name,
             n82_baseline={"ops_per_s": _N82_BASELINE["ops_per_s"], "booked_on": "the worker pod"},
             quota_cores=quota_cores,
