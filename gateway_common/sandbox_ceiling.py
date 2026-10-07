@@ -32,8 +32,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-#: The three env names, spelled once. The manifests, the control plane's
-#: ``Settings`` and the worker's ``Settings`` all read these.
+#: The three env names, spelled once. The manifests and the control plane's
+#: ``Settings`` read these (R17: the ceiling is the control plane's policy --
+#: the worker no longer reads the envs at all, it adopts the handed-down value).
 MAX_SANDBOX_CPU_PERCENT_ENV = "E2B_MAX_SANDBOX_CPU_PERCENT"
 MAX_SANDBOX_MEMORY_MB_ENV = "E2B_MAX_SANDBOX_MEMORY_MB"
 MAX_SANDBOX_PROCESSES_ENV = "E2B_MAX_SANDBOX_PROCESSES"

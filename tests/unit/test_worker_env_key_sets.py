@@ -305,9 +305,23 @@ CEILING_KEYS = (
 
 CONTROL_PLANE_STACKS = (
     ("deploy/k8s/control-plane.yaml", None),
+    ("deploy/k8s-k0s/control-plane-capacity.patch.yaml", None),
     ("deploy/compose/docker-compose.multinode.yml", "control-plane"),
     ("deploy/compose/docker-compose.prod.yml", "control-plane"),
     ("deploy/stack/docker-compose.prod.yml", "control-plane"),
+)
+
+#: The k8s **worker**-shaped files whose env lists are pinned too. The base
+#: manifest is the reference key set the per-stack whitelists are compared
+#: against -- and the k0s overlay patches it, so both are manifests an operator
+#: reads while deploying. `deploy/k8s-k0s/worker-capacity.patch.yaml` is
+#: otherwise only read for its `resources.limits` (the D5b counterpart), so
+#: without this list the ceiling trio could be put back into it and nothing
+#: would go red -- behaviourally harmless, but it would tell the reader the
+#: worker owns the policy.
+WORKER_MANIFESTS = (
+    "deploy/k8s/worker.yaml",
+    "deploy/k8s-k0s/worker-capacity.patch.yaml",
 )
 
 #: Keys a *stack* declares that the k8s manifest does not, in exactly one named
@@ -562,13 +576,15 @@ def test_the_three_multinode_workers_declare_the_same_env_keys() -> None:
 
 def test_the_ceiling_trio_lives_on_the_control_plane() -> None:
     """N83 phase 2 / ruling R17: the policy keys are the control plane's, and
-    no worker-shaped stack declares them any more.
+    no worker-shaped manifest declares them any more.
 
     The ceiling is one deployment fact -- the control plane writes it into every
     node record and hands it down in the register/heartbeat answer -- so a
     worker manifest that declares it can only mislead an operator. Both halves
-    are pinned exactly: every lane's *control-plane* service names all three,
-    and every *worker* service names none.
+    are pinned exactly: every lane's *control-plane* service (the k0s overlay
+    patch included) names all three, and every *worker* service -- the compose
+    services, the k8s base manifest and the k0s worker overlay patch -- names
+    none.
     """
     for relative, service in CONTROL_PLANE_STACKS:
         if service is None:
@@ -580,6 +596,9 @@ def test_the_ceiling_trio_lives_on_the_control_plane() -> None:
     for path, env in _worker_envs().items():
         declared = [key for key in CEILING_KEYS if key in env]
         assert declared == [], (path, declared)
+    for relative in WORKER_MANIFESTS:
+        declared = [key for key in CEILING_KEYS if key in _k8s_env(relative)]
+        assert declared == [], (relative, declared)
 
 
 def _resource_limits(relative: str, container: str) -> dict[str, str]:

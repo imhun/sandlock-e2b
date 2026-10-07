@@ -1202,6 +1202,102 @@ def test_a_non_positive_kernel_reading_is_refused_by_name(workspace) -> None:
     assert record.kernel_cpu_percent is None
 
 
+def test_an_old_workers_first_registration_stores_only_its_kernel_reading(
+    workspace,
+) -> None:
+    """The five-key report is read on the **register** path as well.
+
+    An older worker's *first* beat **is** its registration -- there is no
+    earlier heartbeat for the new ``kernelCeiling`` key to have arrived on --
+    so the register path has to accept that shape, and read it the same way the
+    heartbeat path does: the kernel pair is the reading, the policy trio is
+    another process's opinion about a number this control plane owns and is
+    dropped (a ``0`` there would otherwise read as "one sandbox may take
+    everything"). The answer is the hand-down, exactly as for a new worker.
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
+
+    registered = asyncio.run(
+        _register_node(
+            app,
+            body={
+                "nodeID": NODE_ID,
+                "address": NODE_ENDPOINT.address,
+                "totalMemoryMB": 1024,
+                "totalCPUPercent": 100,
+                "totalDiskMB": 1024,
+                "totalProcesses": 64,
+                "workerUID": WORKER_UID,
+                "workerGID": WORKER_GID,
+                "sandboxCeiling": {
+                    "cpuPercent": 0,
+                    "memoryMB": 65536,
+                    "processes": 4096,
+                    "kernelCpuPercent": 400,
+                    "kernelMemoryMB": 4096,
+                },
+            },
+        )
+    )
+
+    assert registered.status_code == 200
+    assert registered.json() == {"nodeID": NODE_ID, "sandboxCeiling": HAND_DOWN}
+    record = app.state.nodes.get(NODE_ID)
+    assert record.sandbox_cpu_percent_max == 200
+    assert record.sandbox_memory_mb_max == 2048
+    assert record.sandbox_processes_max == 256
+    assert record.kernel_cpu_percent == 400
+    assert record.kernel_memory_mb == 4096
+
+
+def test_a_malformed_kernel_reading_in_the_old_shape_is_refused_by_name(
+    workspace,
+) -> None:
+    """The refusal names the key it read the reading from (``sandboxCeiling.``).
+
+    The two shapes are one meaning, but the *message* has to point at the
+    worker's own spelling: "sandboxCeiling.kernelCpuPercent" is what an operator
+    running an older worker has in front of them.
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
+
+    registered = asyncio.run(
+        _register_node(
+            app,
+            body={
+                "nodeID": NODE_ID,
+                "address": NODE_ENDPOINT.address,
+                "totalMemoryMB": 1024,
+                "totalCPUPercent": 100,
+                "totalDiskMB": 1024,
+                "totalProcesses": 64,
+                "workerUID": WORKER_UID,
+                "workerGID": WORKER_GID,
+                "sandboxCeiling": {
+                    "cpuPercent": 200,
+                    "memoryMB": 2048,
+                    "processes": 256,
+                    "kernelCpuPercent": 0,
+                    "kernelMemoryMB": 4096,
+                },
+            },
+        )
+    )
+
+    assert registered.status_code == 400
+    assert registered.json() == {
+        "code": 400,
+        "message": (
+            "sandboxCeiling.kernelCpuPercent must be a positive integer or "
+            "null: null is the kernel's own 'max' (this worker's container "
+            "cgroup sets no limit on that dimension)"
+        ),
+    }
+    assert app.state.nodes.get(NODE_ID) is None
+
+
 # ------------- N83 phase 2 (Task 5): the kernel's per-sandbox event counters
 #
 # ``sbx_<id>/memory.events`` counts the SIGKILLs (``oom_kill`` /

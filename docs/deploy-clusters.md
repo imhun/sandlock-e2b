@@ -3130,8 +3130,11 @@ worker 侧对应的是**内核**那一半：`deploy/k8s/worker.yaml` 的 pod lim
 - **两段式车道**（计划 Task 7 Step 3）：先用 `off` 滚完冒烟，再翻 `required` —— Phase 2 的
   `memory.*`/`pids.max`/事件采样只在 `required` 上生效（`off` 那条车道逐字节回到 Phase 1 之前）；
   请求侧的尺寸解析与单箱上限是**车道无关**的（见下一条）。
-- **回退杆**：把 `E2B_SANDBOX_CGROUP` 那一条的 `value` 翻回 `"off"`（`deploy/k8s-k0s/worker-capacity.patch.yaml:47-48`，§7.49 用过、实测有效的那一杆；compose 是 `deploy/compose/docker-compose.multinode.yml` 里的 env）⇒ 不再写 `memory.*`/`pids.max`、不建事件采样循环；内存退回 fork 的中介记账（超预算**杀分配者 + 答 `ENOMEM`**，账只覆盖载荷），任务数退回 clone 族计数（`EAGAIN`）；**请求侧不受这条回退影响**（`cpuCount`/`memoryMB` 的具名 400/503 读的是心跳里的
-  `sandboxCeiling`，`off` 车道照带，见 R11）。
+- **回退杆**：把 `E2B_SANDBOX_CGROUP` 那一条的 `value` 翻回 `"off"`（`deploy/k8s-k0s/worker-capacity.patch.yaml:47-48`，§7.49 用过、实测有效的那一杆；compose 是 `deploy/compose/docker-compose.multinode.yml` 里的 env）⇒ 不再写 `memory.*`/`pids.max`、不建事件采样循环；内存退回 fork 的中介记账（超预算**杀分配者 + 答 `ENOMEM`**，账只覆盖载荷），任务数退回 clone 族计数（`EAGAIN`）；**请求侧不受这条回退影响**（`cpuCount`/`memoryMB` 的超限仍是那两条具名 `400`：上限是**控制面自己的策略**，R17 之后与这个开关无关；R12 那条"节点没上报上限 ⇒ 503"的分支已经删掉）。
+- **改下发数字的代价（R17）**：worker 的 D5b 交叉校验按**下发值**记结果，一次失败会**粘**在那个值上
+  —— 改控制面的 `E2B_MAX_SANDBOX_*` 会换来一个**新的**下发值、worker 下一拍就重判；而只改容器那一侧
+  （下发数字没变）时，worker 会一直保持"没有上限 ⇒ 建箱全拒"，直到**重启 worker** 或换一个下发值。
+  方向仍是 fail-closed：它绝不会因此无额度放行。
 - **一条不可自动收回的差别**：`required` 上箱内 `/proc/meminfo` 的 `MemFree` 不再跟中介账本
   （账本退役），恒等于全额；`MemTotal`/`sysinfo.totalram` 照旧报声明额度。两档读数（同一支探针）：
   `MemTotal` 1048576 kB、`totalram` 1073741824 B 都不变，`MemFree` 从 `off` 的 1025559 kB 变成

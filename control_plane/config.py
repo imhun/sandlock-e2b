@@ -18,7 +18,12 @@ from gateway_common.env import (
     _env_json,
     _env_list,
 )
-from gateway_common.sandbox_ceiling import resolve_sandbox_ceiling
+from gateway_common.sandbox_ceiling import (
+    MAX_SANDBOX_CPU_PERCENT_ENV,
+    MAX_SANDBOX_MEMORY_MB_ENV,
+    MAX_SANDBOX_PROCESSES_ENV,
+    resolve_sandbox_ceiling,
+)
 
 #: Default per-key budget for the *resource-creating* control-plane endpoints
 #: (sandbox create, snapshot create, volume create). One constant so the three
@@ -216,16 +221,18 @@ class Settings:
     #: every worker in the register/heartbeat response. The worker no longer
     #: reads these names at all -- a create request's ``cpuCount``/``memoryMB``
     #: is the *requirement*, and ``requirement <= ceiling`` is the whole rule.
-    #: The resolution rule itself still lives in
+    #: The names come from `gateway_common.sandbox_ceiling` (the three
+    #: ``MAX_SANDBOX_*_ENV`` constants), so the env spelling has exactly one
+    #: definition in the tree; the resolution rule is
     #: `gateway_common.sandbox_ceiling.resolve_sandbox_ceiling`.
     max_sandbox_cpu_percent: int = field(
-        default_factory=lambda: _env_int("E2B_MAX_SANDBOX_CPU_PERCENT", 0)
+        default_factory=lambda: _env_int(MAX_SANDBOX_CPU_PERCENT_ENV, 0)
     )
     max_sandbox_memory_mb: int = field(
-        default_factory=lambda: _env_int("E2B_MAX_SANDBOX_MEMORY_MB", 0)
+        default_factory=lambda: _env_int(MAX_SANDBOX_MEMORY_MB_ENV, 0)
     )
     max_sandbox_processes: int = field(
-        default_factory=lambda: _env_int("E2B_MAX_SANDBOX_PROCESSES", 0)
+        default_factory=lambda: _env_int(MAX_SANDBOX_PROCESSES_ENV, 0)
     )
     create_rate_limit_per_min: int = field(
         default_factory=lambda: _env_int(
