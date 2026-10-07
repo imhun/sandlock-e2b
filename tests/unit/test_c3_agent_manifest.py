@@ -651,12 +651,12 @@ def test_the_k8s_control_plane_names_route_b_and_splits_the_cache() -> None:
     # a derived path outside `ControlPaths.roots()` (naming a path is not
     # mounting it: this pod never touches anything under it).
     assert env["E2B_NODE_STATE_BASE"]["value"] == "/var/lib/e2b/state"
-    assert env["E2B_ROUTE_B_TMP_ROOT"]["value"] == "/var/lib/e2b/state/.route-b"
+    assert env["E2B_SLOT_TMP_ROOT"]["value"] == "/var/lib/e2b/state/.route-b"
     # ...and it is the same value the worker names, which is the whole point
     # (`worker.yaml` is the manifest that writes the documents).
     worker = _only(_load_all(WORKER_MANIFEST), "StatefulSet", "e2b-worker")
     worker_env = _env(_containers(worker)["worker"])
-    assert env["E2B_ROUTE_B_TMP_ROOT"]["value"] == worker_env["E2B_ROUTE_B_TMP_ROOT"]["value"]
+    assert env["E2B_SLOT_TMP_ROOT"]["value"] == worker_env["E2B_SLOT_TMP_ROOT"]["value"]
     assert env["E2B_IMAGE_CACHE_DIR"]["value"] == worker_env["E2B_IMAGE_CACHE_DIR"]["value"]
     assert env["E2B_IMAGE_OCI_DIR"]["value"] == worker_env["E2B_IMAGE_OCI_DIR"]["value"]
     # ...and the *root discipline* accepts it: `_require_in_roots` compares the
@@ -679,9 +679,9 @@ def test_the_k8s_control_plane_names_route_b_and_splits_the_cache() -> None:
         # (the worker's name for it is `E2B_SHARED_VOLUME_ROOT`); accept either.
         shared_volume_root=Path(shared_root["value"]),
         image_cache_dir=Path(env["E2B_IMAGE_CACHE_DIR"]["value"]),
-        route_b_tmp_root=Path(env["E2B_ROUTE_B_TMP_ROOT"]["value"]),
+        slot_tmp_root=Path(env["E2B_SLOT_TMP_ROOT"]["value"]),
     )
-    assert roots.contains(Path(env["E2B_ROUTE_B_TMP_ROOT"]["value"])) is True
+    assert roots.contains(Path(env["E2B_SLOT_TMP_ROOT"]["value"])) is True
     # ...and the split is real: the CP's cache is *not* its OCI directory here,
     # which is the property "pointing the cache at the worker's node-local
     # secrets root" would have silently broken.

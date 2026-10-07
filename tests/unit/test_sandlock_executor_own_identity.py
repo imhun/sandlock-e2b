@@ -186,7 +186,7 @@ class FakeExecStdio:
 
 
 @pytest.fixture(autouse=True)
-def _route_b_capable(monkeypatch, tmp_path):
+def _own_identity_capable(monkeypatch, tmp_path):
     """Pretend the wheel ships supervise and the worker is root.
 
     ``sandlock`` itself is Linux-only; route B needs it for the ctypes channel

@@ -276,7 +276,7 @@ services:
       # derives the path of the one the agent scopes to that slot's uid
       # (`scope-slot-document`) -- the worker may not report a path. Unset,
       # that op answers a named 503 and route-B slots never come up.
-      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
+      E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       # Rootfs cache on the shared volume: persists across `up -d` and is
       # shared by every worker, instead of being re-pulled/re-extracted into
       # each container on every recreate (workspace base holds user files,
@@ -539,7 +539,7 @@ services:
       # this used to be), so a default (`/tmp/sandlock-route-b`) outside them
       # leaves the document world-readable instead of group-scoped (N39,
       # measured here 2026-09-26: all three workers `Restarting (1)`).
-      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
+      E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}

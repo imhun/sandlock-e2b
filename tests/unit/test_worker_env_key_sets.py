@@ -266,7 +266,7 @@ KEY_CLASSES: dict[str, set[str]] = {
     "pid_namespace": {"E2B_PID_NS"},
     "netns_pair": {"E2B_ENABLE_NET_ISOLATION", "E2B_FD_INJECT_CONNECT"},
     "egress_switch": {"E2B_ENABLE_NETWORK"},
-    "route_b_root": {"E2B_ROUTE_B_TMP_ROOT"},
+    "slot_tmp_root": {"E2B_SLOT_TMP_ROOT"},
     # N83 phase 1 / Task 2 (2026-10-06): the per-sandbox cgroup switch and the
     # mount root its rw cgroupfs view lands on. The fleet names both
     # (`E2B_SANDBOX_CGROUP=off` in `deploy/k8s/worker.yaml`, flipped to
@@ -434,7 +434,7 @@ _DEMO_MISSING = (
     | KEY_CLASSES["base_image"]
     | KEY_CLASSES["netns_pair"]
     | KEY_CLASSES["egress_switch"]
-    | KEY_CLASSES["route_b_root"]
+    | KEY_CLASSES["slot_tmp_root"]
     | KEY_CLASSES["slot_identity"]
     | KEY_CLASSES["sandbox_cgroup"]
 )
@@ -450,7 +450,7 @@ _RUNNER_MISSING = (
     | KEY_CLASSES["node_capacity"]
     | KEY_CLASSES["netns_pair"]
     | KEY_CLASSES["egress_switch"]
-    | KEY_CLASSES["route_b_root"]
+    | KEY_CLASSES["slot_tmp_root"]
     | KEY_CLASSES["slot_identity"]
     | KEY_CLASSES["sandbox_cgroup"]
 )
@@ -716,3 +716,51 @@ def test_the_shared_workspace_disk_budget_is_still_declared() -> None:
 
     overlay = _k8s_env("deploy/k8s-k0s/control-plane-nfs.patch.yaml")
     assert overlay["E2B_MAX_TOTAL_DISK_MB"] == "10240"
+
+
+# ------------------------------------------------------------------ Task 3
+# The pool knobs take the slot namespace (``E2B_SLOT_*`` / ``E2B_MAX_SLOTS``),
+# and the shared root key is the one entry that moves in a manifest.
+
+
+def _envd_settings():
+    from envd_service.config import Settings
+
+    return Settings()
+
+
+def test_the_slot_tmp_root_carries_the_new_name(monkeypatch) -> None:
+    monkeypatch.setenv("E2B_SLOT_TMP_ROOT", "/var/lib/e2b/state/.route-b")
+    # The field resolves (its docstring: ``tmp/`` and the cluster's NFS export
+    # both carry symlinks), so the expected side resolves too -- on Linux
+    # ``/var/lib/e2b/state/.route-b`` is already normal, on macOS ``/var`` is a
+    # symlink to ``/private/var``.
+    assert _envd_settings().slot_tmp_root == Path(
+        "/var/lib/e2b/state/.route-b"
+    ).resolve()
+
+
+def test_the_pool_knobs_carry_the_slot_names(monkeypatch) -> None:
+    monkeypatch.setenv("E2B_MAX_SLOTS", "7")
+    monkeypatch.setenv("E2B_SLOT_TRANSPORT", "path")
+    monkeypatch.setenv("E2B_SLOT_VERB_TIMEOUT_S", "9.5")
+    settings = _envd_settings()
+    assert settings.max_slots == 7
+    assert settings.slot_transport == "path"
+    assert settings.slot_verb_timeout_s == 9.5
+
+
+def test_the_env_key_table_names_the_slot_root() -> None:
+    assert KEY_CLASSES["slot_tmp_root"] == {"E2B_SLOT_TMP_ROOT"}
+
+
+def test_per_sandbox_uid_is_not_part_of_this_rename() -> None:
+    """The uid question ("which uid is this sandbox") is orthogonal.
+
+    It answers *which* uid the sandbox gets, not *whose identity* the work runs
+    under, so both names must stay independently searchable: the fleet manifest
+    still spells ``E2B_PER_SANDBOX_UID``.
+    """
+    assert "E2B_PER_SANDBOX_UID" in Path(REPO / "deploy/k8s/worker.yaml").read_text(
+        encoding="utf-8"
+    )

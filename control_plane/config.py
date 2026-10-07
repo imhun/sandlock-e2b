@@ -688,17 +688,17 @@ class Settings:
     node_state_base: str | None = field(
         default_factory=lambda: os.getenv("E2B_NODE_STATE_BASE")
     )
-    #: Route B's scratch root -- where the per-slot ``policy.json`` /
+    #: The slot pool's scratch root -- where the per-slot ``policy.json`` /
     #: ``program.json`` documents live, and therefore the directory the C3
     #: agent has to scope to each slot's uid (C3 Task 4's
     #: ``scope-slot-document``). The *worker* names the same root with the same
-    #: variable (``E2B_ROUTE_B_TMP_ROOT``); the control plane has to know it
+    #: variable (``E2B_SLOT_TMP_ROOT``); the control plane has to know it
     #: too, because the worker may not report a path (hard rule 3 / §14.4).
     #: Unset means "this control plane cannot derive a slot document's path",
     #: and that op then fails closed by name rather than guessing the worker's
     #: layout -- the shipped manifests set it (Task 4 slice B).
-    route_b_tmp_root: str = field(
-        default_factory=lambda: os.getenv("E2B_ROUTE_B_TMP_ROOT", "")
+    slot_tmp_root: str = field(
+        default_factory=lambda: os.getenv("E2B_SLOT_TMP_ROOT", "")
     )
     # Tenant isolation (E3.1). When E2B_TENANTS is unset the control plane
     # runs in single-tenant compatible mode: all keys share every resource

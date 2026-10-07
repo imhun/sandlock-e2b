@@ -488,10 +488,12 @@ class Settings:
     # so the uid-reuse window is the number of concurrently live slots
     # (docs/superpowers/plans/2026-09-09-envd-route-b-wiring.md). ``0`` means
     # "no extra cap": the per-sandbox host uid pool bounds concurrency by
-    # construction, and ``E2B_ROUTE_B_SLOTS>0`` is also an explicit opt-in for
+    # construction, and ``E2B_MAX_SLOTS>0`` is also an explicit opt-in for
     # shapes ``auto`` would leave on the in-process path.
-    route_b_slots: int = field(
-        default_factory=lambda: _env_int("E2B_ROUTE_B_SLOTS", 0)
+    max_slots: int = field(
+        default_factory=lambda: int(
+            env_alias.read("E2B_MAX_SLOTS", legacy="E2B_ROUTE_B_SLOTS", default="0")
+        )
     )
     # Scratch root for the per-slot policy/program documents (never the
     # channel path: the registered socket lives in the fork's per-uid
@@ -501,19 +503,31 @@ class Settings:
     # channel token ever appears in the slot's argv (world-readable
     # /proc/<pid>/cmdline); ``path`` attaches to a registered slot started by
     # an external fleet.
-    route_b_transport: str = field(
-        default_factory=lambda: os.getenv("E2B_ROUTE_B_TRANSPORT", "fd").lower()
+    slot_transport: str = field(
+        default_factory=lambda: env_alias.read(
+            "E2B_SLOT_TRANSPORT", legacy="E2B_ROUTE_B_TRANSPORT", default="fd"
+        ).lower()
     )
     # Per-verb response deadline on the slot channel, in seconds. One verb
     # that outlives it retires the session and the executor restarts the slot
     # once, so this is the "a wedged generation must not hang the worker"
     # bound -- not a command timeout (that is E2B_MAX_COMMAND_TIMEOUT_S).
-    route_b_verb_timeout_s: float = field(
-        default_factory=lambda: _env_float("E2B_ROUTE_B_VERB_TIMEOUT_S", 15.0)
+    slot_verb_timeout_s: float = field(
+        default_factory=lambda: float(
+            env_alias.read(
+                "E2B_SLOT_VERB_TIMEOUT_S",
+                legacy="E2B_ROUTE_B_VERB_TIMEOUT_S",
+                default="15.0",
+            )
+        )
     )
-    route_b_tmp_root: Path = field(
+    slot_tmp_root: Path = field(
         default_factory=lambda: Path(
-            os.getenv("E2B_ROUTE_B_TMP_ROOT", "/tmp/sandlock-route-b")
+            env_alias.read(
+                "E2B_SLOT_TMP_ROOT",
+                legacy="E2B_ROUTE_B_TMP_ROOT",
+                default="/tmp/sandlock-route-b",
+            )
         ).resolve()
     )
     # C3 Task 3 (ruling D9.1): how a slot gets its identity. ``agent-grant`` is

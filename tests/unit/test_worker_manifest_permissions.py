@@ -865,7 +865,7 @@ def test_k0s_overlay_sinks_the_tree_root_and_keeps_state_as_a_sibling() -> None:
     # node-local base -- the shared state base is still named (it is where the
     # records live) and no longer holds any of them.
     assert env["E2B_NODE_STATE_BASE"] == "/var/lib/e2b/state"
-    assert env["E2B_ROUTE_B_TMP_ROOT"] == "/var/lib/e2b/state/.route-b"
+    assert env["E2B_SLOT_TMP_ROOT"] == "/var/lib/e2b/state/.route-b"
     assert env["E2B_STATE_BASE"] != env["E2B_NODE_STATE_BASE"]
     # N27 (Task 5 follow-up): the export root is named as the *third* broker
     # root, because the tree root no longer is it -- `_volumes`/`_images` would
@@ -1652,8 +1652,8 @@ def _k8s_env_value(text: str, key: str) -> str:
     return value_line[len("value: ") :].strip().strip('"')
 
 
-def _stack_worker_route_b_root() -> str:
-    """The stack compose's `E2B_ROUTE_B_TMP_ROOT`, from its **worker** anchor.
+def _stack_worker_slot_tmp_root() -> str:
+    """The stack compose's `E2B_SLOT_TMP_ROOT`, from its **worker** anchor.
 
     Not a whole-file search: Task 4 slice B gave the stack's *control plane*
     the same key (it derives `scope-slot-document` from it), so the file
@@ -1666,14 +1666,14 @@ def _stack_worker_route_b_root() -> str:
     found = [
         line.strip().split(":", 1)[1].strip().strip('"')
         for line in worker.splitlines()
-        if line.strip().startswith("E2B_ROUTE_B_TMP_ROOT:")
+        if line.strip().startswith("E2B_SLOT_TMP_ROOT:")
     ]
     assert len(found) == 1, found
     return found[0]
 
 
-def _fleet_route_b_roots() -> dict[str, str]:
-    """`E2B_ROUTE_B_TMP_ROOT` as each fleet manifest spells it.
+def _fleet_slot_roots() -> dict[str, str]:
+    """`E2B_SLOT_TMP_ROOT` as each fleet manifest spells it.
 
     Both manifests are read, not just the compose one: the retired pool's
     alignment test learned that reading one leaves the other free to drift
@@ -1682,14 +1682,14 @@ def _fleet_route_b_roots() -> dict[str, str]:
     actually runs.
     """
     return {
-        "deploy/stack/docker-compose.prod.yml": _stack_worker_route_b_root(),
+        "deploy/stack/docker-compose.prod.yml": _stack_worker_slot_tmp_root(),
         "deploy/k8s/worker.yaml": _k8s_env_value(
-            K8S_WORKER, "E2B_ROUTE_B_TMP_ROOT"
+            K8S_WORKER, "E2B_SLOT_TMP_ROOT"
         ),
     }
 
 
-def _compose_prod_worker_route_b_root() -> dict[str, str]:
+def _compose_prod_worker_slot_tmp_root() -> dict[str, str]:
     """The same key, read off the prod example's own worker anchor.
 
     Anchored to the slice every worker inherits (`worker-1: &worker` up to
@@ -1702,15 +1702,15 @@ def _compose_prod_worker_route_b_root() -> dict[str, str]:
     found: dict[str, str] = {}
     for line in worker.splitlines():
         stripped = line.strip()
-        if stripped.startswith("E2B_ROUTE_B_TMP_ROOT:"):
-            found["E2B_ROUTE_B_TMP_ROOT"] = stripped.split(":", 1)[1].strip().strip('"')
+        if stripped.startswith("E2B_SLOT_TMP_ROOT:"):
+            found["E2B_SLOT_TMP_ROOT"] = stripped.split(":", 1)[1].strip().strip('"')
     return found
 
 
-def test_compose_prod_worker_env_carries_the_fleets_route_b_root() -> None:
+def test_compose_prod_worker_env_carries_the_fleets_slot_tmp_root() -> None:
     """N39 at site ①: a from-tree worker refuses to start without this key.
 
-    `E2B_ROUTE_B_TMP_ROOT` defaults to `/tmp/sandlock-route-b`, which is outside
+    `E2B_SLOT_TMP_ROOT` defaults to `/tmp/sandlock-route-b`, which is outside
     the roots the `e2b-maint` file-capability broker may touch, so
     `configure_priv_helpers` refuses the shape by name at startup -- the worker
     crash-loops before it ever listens (measured on this file 2026-09-26 with
@@ -1727,11 +1727,11 @@ def test_compose_prod_worker_env_carries_the_fleets_route_b_root() -> None:
     so the pin below compares each manifest against *its own* bases instead of
     against a single fleet-wide literal.
     """
-    fleet = _fleet_route_b_roots()
+    fleet = _fleet_slot_roots()
     # One base (workspace base == state base), so this file takes the path under
     # it that `deploy/stack/docker-compose.prod.yml:239` explains.
-    assert _compose_prod_worker_route_b_root() == {
-        "E2B_ROUTE_B_TMP_ROOT": fleet["deploy/stack/docker-compose.prod.yml"]
+    assert _compose_prod_worker_slot_tmp_root() == {
+        "E2B_SLOT_TMP_ROOT": fleet["deploy/stack/docker-compose.prod.yml"]
     }
     # Three bases in the k8s manifest since N57 / Task 4: `.route-b` is platform
     # state whose only readers are this node's worker, slot and agent, so it
@@ -1795,22 +1795,22 @@ def test_multinode_example_runs_the_fleet_netns_shape() -> None:
         assert f"\n      E2B_NODE_ID: {name}\n" in block, name
 
 
-def _multinode_worker_route_b_root(name: str) -> str:
-    """`E2B_ROUTE_B_TMP_ROOT` as one worker block spells it, quotes stripped."""
+def _multinode_worker_slot_tmp_root(name: str) -> str:
+    """`E2B_SLOT_TMP_ROOT` as one worker block spells it, quotes stripped."""
     block = _multinode_worker_block(name)
     found = [
         line.strip().split(":", 1)[1].strip().strip('"')
         for line in block.splitlines()
-        if line.strip().startswith("E2B_ROUTE_B_TMP_ROOT:")
+        if line.strip().startswith("E2B_SLOT_TMP_ROOT:")
     ]
-    assert len(found) == 1, f"expected exactly one E2B_ROUTE_B_TMP_ROOT: {found}"
+    assert len(found) == 1, f"expected exactly one E2B_SLOT_TMP_ROOT: {found}"
     return found[0]
 
 
-def test_multinode_worker_env_carries_the_fleets_route_b_root() -> None:
+def test_multinode_worker_env_carries_the_fleets_slot_tmp_root() -> None:
     """N39 at site ④: the same wall ① hit, measured on this file 2026-09-26.
 
-    `E2B_ROUTE_B_TMP_ROOT` defaults to `/tmp/sandlock-route-b`, which is outside
+    `E2B_SLOT_TMP_ROOT` defaults to `/tmp/sandlock-route-b`, which is outside
     the roots the `e2b-maint` file-capability broker may touch, so
     `configure_priv_helpers` refuses the shape by name at startup and every
     worker crash-loops before it ever listens (measured here: all three
@@ -1824,10 +1824,10 @@ def test_multinode_worker_env_carries_the_fleets_route_b_root() -> None:
     to carry is the compose stack's, not the k8s manifest's (which sinks the
     tree root and puts `.route-b` under `E2B_STATE_BASE`).
     """
-    fleet = _fleet_route_b_roots()
+    fleet = _fleet_slot_roots()
     fleet_root = fleet["deploy/stack/docker-compose.prod.yml"]
     for name in ("worker-1", "worker-2", "worker-3"):
-        assert _multinode_worker_route_b_root(name) == fleet_root, name
+        assert _multinode_worker_slot_tmp_root(name) == fleet_root, name
 
 
 STACK_ENV_EXAMPLE = (REPO / "deploy" / "stack" / ".env.example").read_text(

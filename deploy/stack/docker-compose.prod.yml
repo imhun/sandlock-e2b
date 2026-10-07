@@ -318,7 +318,7 @@ services:
       # what derives the path of the one the agent scopes to that slot's uid
       # (`scope-slot-document`) -- the worker may not report a path. Unset, that
       # op answers a named 503 and route-B slots never come up.
-      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
+      E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       # That directory is in the volume's *unlimited* project (``_images`` is a
       # reserved platform namespace, not a sandbox tree), so the resolver
       # bounds the cache itself: completed entries beyond this cap are evicted
@@ -568,7 +568,7 @@ services:
       # whose whitelist this used to be); anywhere else the document could only
       # fall back to a world-readable 0444 one that carries the egress-proxy
       # credentials, so keep it under a named root.
-      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
+      E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       # The registry host the pull credentials below belong to. Without it
       # registry_credential_host() returns None and the resolver stops scoping
       # the credential to its own registry: the ACR username/password are then

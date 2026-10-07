@@ -71,7 +71,7 @@ def _envd_settings(workspace: Path) -> EnvdSettings:
         # root; it is inside the workspace base so the node agent's whitelist
         # (the same roots the worker's own file steps used to be scoped to)
         # covers them when it scopes the documents to the slot's uid.
-        route_b_tmp_root=workspace / ".route-b",
+        slot_tmp_root=workspace / ".route-b",
     )
 
 

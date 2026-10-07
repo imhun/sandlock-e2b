@@ -44,7 +44,7 @@ def _settings(tmp_path: Path, **overrides):
         workspace_base=tmp_path / "sandboxes",
         uid_pool_start=10000,
         uid_pool_size=1000,
-        route_b_tmp_root=tmp_path / "sandboxes" / ".route-b",
+        slot_tmp_root=tmp_path / "sandboxes" / ".route-b",
     )
     fields.update(overrides)
     return Settings(**fields)

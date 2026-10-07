@@ -81,7 +81,7 @@ def _executor(
     return executor
 
 
-def _route_b_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExecutor:
+def _own_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExecutor:
     """The deployed identity shape for route B (§2.4.1, 决定 #1).
 
     **Host-side the sandbox runs at the pooled uid; inside its namespace it is
@@ -106,7 +106,7 @@ def _route_b_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExec
         own_identity="on",
         uid_pool_start=pooled_uid,
         uid_pool_size=1,
-        route_b_tmp_root=scratch,
+        slot_tmp_root=scratch,
     )
     apply_sandbox_ownership(workspace, pooled_uid)
     return SandlockExecutor(
@@ -328,7 +328,7 @@ async def test_sandbox_child_runs_unprivileged():
     from tests.security.conftest import require_mediation_capable
 
     ws = str(sandbox_tmpdir(suffix="-identity", uid=POOLED_UID))
-    executor = _route_b_identity_executor(Path(ws), POOLED_UID)
+    executor = _own_identity_executor(Path(ws), POOLED_UID)
     require_mediation_capable(executor)
     try:
         exit_code, out, err = await _run(

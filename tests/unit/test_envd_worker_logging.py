@@ -41,7 +41,7 @@ class _Capture(logging.Handler):
         self.messages.append(record.getMessage())
 
 
-def test_route_b_ready_info_line_is_emitted(restore_root_logging) -> None:
+def test_own_identity_ready_info_line_is_emitted(restore_root_logging) -> None:
     capture = _Capture()
     logging.getLogger().addHandler(capture)
 

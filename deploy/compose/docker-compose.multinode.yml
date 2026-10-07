@@ -264,7 +264,7 @@ services:
       # C3 (Task 4 slice B): route B's scratch root, the path the control plane
       # derives `scope-slot-document` from (the worker writes the documents but
       # may not name a path).
-      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
+      E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       # Bounded by the resolver itself (`_images` sits in the volume's
       # unlimited project) and owned by the worker uid, so both the root-run
@@ -455,7 +455,7 @@ services:
       # deployment names (N52 retired the worker-side broker whose whitelist
       # this used to be), so a default (`/tmp/sandlock-route-b`) outside them
       # leaves the document world-readable instead of group-scoped.
-      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
+      E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
@@ -563,7 +563,7 @@ services:
       # deployment names (N52 retired the worker-side broker whose whitelist
       # this used to be), so a default (`/tmp/sandlock-route-b`) outside them
       # leaves the document world-readable instead of group-scoped.
-      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
+      E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
@@ -671,7 +671,7 @@ services:
       # deployment names (N52 retired the worker-side broker whose whitelist
       # this used to be), so a default (`/tmp/sandlock-route-b`) outside them
       # leaves the document world-readable instead of group-scoped.
-      E2B_ROUTE_B_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
+      E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}

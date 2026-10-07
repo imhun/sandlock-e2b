@@ -73,7 +73,7 @@ class _FakeChannel:
 
 
 @pytest.fixture(autouse=True)
-def _route_b_capable(monkeypatch, tmp_path):
+def _own_identity_capable(monkeypatch, tmp_path):
     """The same off-Linux stand-ins ``test_sandlock_executor_route_b`` uses."""
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     binary = tmp_path / "sandlock-supervise"
@@ -99,7 +99,7 @@ def _pool(tmp_path: Path) -> W1SlotPool:
         # (``<state base>/.route-b``), and the reason the CP's root check can
         # accept the derived path at all (N39's startup self-check refuses any
         # other layout).
-        tmp_root=_route_b_root(tmp_path),
+        tmp_root=_slot_tmp_root(tmp_path),
         supervise_bin=tmp_path / "sandlock-supervise",
         spawner=lambda **kwargs: _FakeProcess(),
         channel_factory=lambda handle: _FakeChannel(
@@ -136,7 +136,7 @@ def _executor(sandbox_id: str, tmp_path: Path):
             slots=0,
             uid_start=HOST_UID,
             uid_size=2,
-            tmp_root=_route_b_root(tmp_path),
+            tmp_root=_slot_tmp_root(tmp_path),
             # agent-grant is the only slot-identity mode left (N52); this case
             # is about the slot's *path*, so the grant is a no-op stand-in.
             identity_reporter=lambda *a: {},
@@ -144,7 +144,7 @@ def _executor(sandbox_id: str, tmp_path: Path):
     )
 
 
-def _route_b_root(tmp_path: Path) -> Path:
+def _slot_tmp_root(tmp_path: Path) -> Path:
     return tmp_path / "state" / ".route-b"
 
 
@@ -152,7 +152,7 @@ def _cp_paths(tmp_path: Path) -> ControlPaths:
     return ControlPaths(
         workspace_base=tmp_path / "workspaces",
         state_base=tmp_path / "state",
-        route_b_tmp_root=_route_b_root(tmp_path),
+        slot_tmp_root=_slot_tmp_root(tmp_path),
     )
 
 
@@ -171,7 +171,7 @@ async def test_the_slot_directory_is_what_the_control_plane_derives(
         )
     )
 
-    uid_dir = _route_b_root(tmp_path) / str(HOST_UID)
+    uid_dir = _slot_tmp_root(tmp_path) / str(HOST_UID)
     created = sorted(entry.name for entry in uid_dir.iterdir())
     assert created == [own_identity_instance_name(sandbox_id)]
     slot_dir = uid_dir / created[0]
@@ -216,7 +216,7 @@ def test_the_name_less_fallback_is_refused_in_the_agent_shape(
 
     monkeypatch.setattr(agent_fileops, "_ACTIVE", [_Stub()])
     # The ``rb-`` spelling: what a name-less caller's directory is called.
-    document = _route_b_root(tmp_path) / str(HOST_UID) / "rb-sbx_docs" / "policy.json"
+    document = _slot_tmp_root(tmp_path) / str(HOST_UID) / "rb-sbx_docs" / "policy.json"
     document.parent.mkdir(parents=True)
     document.write_text("{}", encoding="utf-8")
     with pytest.raises(priv_helpers.PrivHelperError) as excinfo:
@@ -249,7 +249,7 @@ def test_a_copy_under_another_uids_directory_is_refused_too(
             self.calls.append((sandbox_id, name))
 
     monkeypatch.setattr(agent_fileops, "_ACTIVE", [_Stub()])
-    stale = _route_b_root(tmp_path) / str(HOST_UID + 1) / "sbx_docs" / "policy.json"
+    stale = _slot_tmp_root(tmp_path) / str(HOST_UID + 1) / "sbx_docs" / "policy.json"
     stale.parent.mkdir(parents=True)
     stale.write_text("{}", encoding="utf-8")
     with pytest.raises(priv_helpers.PrivHelperError) as excinfo:

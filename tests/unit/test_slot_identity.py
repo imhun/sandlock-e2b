@@ -95,12 +95,12 @@ class FakeChannel:
 def _settings(**overrides) -> SimpleNamespace:
     values = dict(
         own_identity="on",
-        route_b_slots=0,
+        max_slots=0,
         uid_pool_start=20000,
         uid_pool_size=8,
-        route_b_tmp_root="/tmp/c3-slot-identity-test",
-        route_b_transport="fd",
-        route_b_verb_timeout_s=15.0,
+        slot_tmp_root="/tmp/c3-slot-identity-test",
+        slot_transport="fd",
+        slot_verb_timeout_s=15.0,
         slot_identity="agent-grant",
         control_plane_url=CONTROL_PLANE_URL,
         node_id=NODE_ID,

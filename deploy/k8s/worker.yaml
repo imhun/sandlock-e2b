@@ -321,7 +321,7 @@ spec:
             # `scope-slot-document`'s path; the worker may not report one), so
             # `deploy/k8s/control-plane.yaml` has to carry the same string --
             # `tests/unit/test_c3_agent_manifest.py` pins the two together.
-            - name: E2B_ROUTE_B_TMP_ROOT
+            - name: E2B_SLOT_TMP_ROOT
               value: /var/lib/e2b/state/.route-b
             # C3 (Task 4 slice B): **the agent shape** -- this worker holds no
             # privileged binary at all (the image ships no `/var/lib/e2b-priv/`)

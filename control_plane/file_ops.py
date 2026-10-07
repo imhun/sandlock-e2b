@@ -178,7 +178,7 @@ class ControlPaths:
     node_state_base: Path | None = None
     image_cache_dir: Path | None = None
     shared_volume_root: Path | None = None
-    route_b_tmp_root: Path | None = None
+    slot_tmp_root: Path | None = None
     volume_paths: Mapping[str, Path] = field(default_factory=dict)
     #: Per-sandbox quota (MB) per volume id, read from the *same* records as
     #: ``volume_paths``. :func:`derive_materialize` needs it: a volume with no
@@ -250,7 +250,7 @@ def control_paths(state, settings) -> ControlPaths:
     node_state = getattr(settings, "node_state_base", None) or getattr(
         state, "node_state_base", None
     )
-    own_identity = getattr(settings, "route_b_tmp_root", "") or ""
+    slot_root = getattr(settings, "slot_tmp_root", "") or ""
     return ControlPaths(
         workspace_base=workspace_base,
         state_base=state_base,
@@ -259,7 +259,7 @@ def control_paths(state, settings) -> ControlPaths:
         if getattr(settings, "image_cache_dir", None)
         else None,
         shared_volume_root=Path(shared) if shared else None,
-        route_b_tmp_root=Path(own_identity) if own_identity else None,
+        slot_tmp_root=Path(slot_root) if slot_root else None,
         volume_paths=volume_paths,
         volume_quota_mb=volume_quota_mb,
     )
@@ -634,10 +634,10 @@ def _slot_document(
             + ", ".join(sorted(SLOT_DOCUMENTS)),
             status_code=400,
         )
-    if paths.route_b_tmp_root is None:
+    if paths.slot_tmp_root is None:
         raise FileOpRefusal(
-            "this control plane names no route-B scratch root "
-            "(E2B_ROUTE_B_TMP_ROOT), so it cannot derive a slot document's "
+            "this control plane names no slot-pool scratch root "
+            "(E2B_SLOT_TMP_ROOT), so it cannot derive a slot document's "
             "path: refusing",
             status_code=503,
         )
@@ -648,7 +648,7 @@ def _slot_document(
     # nowhere -- the slot's own ``policy.json``/``program.json``, which is the
     # document carrying the egress-proxy credentials.
     return (
-        paths.route_b_tmp_root
+        paths.slot_tmp_root
         / str(host_uid)
         / own_identity_instance_name(sandbox_id)
         / name

@@ -2275,19 +2275,19 @@ class OwnIdentityConfig:
         slot_identity = raw_slot_identity
         return cls(
             mode=str(getattr(settings, "own_identity", "auto")).lower(),
-            slots=int(getattr(settings, "route_b_slots", 0) or 0),
+            slots=int(getattr(settings, "max_slots", 0) or 0),
             uid_start=int(getattr(settings, "uid_pool_start", 10000)),
             uid_size=int(getattr(settings, "uid_pool_size", 1000)),
             tmp_root=Path(
-                getattr(settings, "route_b_tmp_root", "/tmp/sandlock-route-b")
+                getattr(settings, "slot_tmp_root", "/tmp/sandlock-route-b")
             ),
             # No broker spawner: ``agent-grant`` starts the unprivileged
             # unshare-and-poll child, and a spawner here would put the retired
             # privileged step back in front of it.
             spawner=None,
-            transport=str(getattr(settings, "route_b_transport", "fd")).lower(),
+            transport=str(getattr(settings, "slot_transport", "fd")).lower(),
             verb_timeout_s=float(
-                getattr(settings, "route_b_verb_timeout_s", 15.0)
+                getattr(settings, "slot_verb_timeout_s", 15.0)
             ),
             slot_identity=slot_identity,
             identity_reporter=build_identity_reporter(settings),

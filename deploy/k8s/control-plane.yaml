@@ -417,7 +417,7 @@ spec:
             # N57 (Task 4): the node-local base, named here **only** so the
             # control plane's root discipline agrees with the worker's about
             # `.route-b`: `_slot_document` derives a slot document's path from
-            # `E2B_ROUTE_B_TMP_ROOT` and `_require_in_roots` refuses a path
+            # `E2B_SLOT_TMP_ROOT` and `_require_in_roots` refuses a path
             # outside `ControlPaths.roots()` -- a named node-local base gives
             # the derivation its root (the fifth one, Task 0). This pod never
             # reads or writes anything under it (the worker writes the
@@ -432,10 +432,10 @@ spec:
             # (`scope-slot-document`) -- the worker may not report a path (hard
             # rule 3 / §14.4). Unset, that op answers a named 503 and route-B
             # slots never come up; the value is the worker's own
-            # `E2B_ROUTE_B_TMP_ROOT` (N57 / Task 4 puts `.route-b` under the
+            # `E2B_SLOT_TMP_ROOT` (N57 / Task 4 puts `.route-b` under the
             # *node-local* state base, which is why the privileged helpers grew
             # that root; before Task 4 it was under the shared state base).
-            - name: E2B_ROUTE_B_TMP_ROOT
+            - name: E2B_SLOT_TMP_ROOT
               value: /var/lib/e2b/state/.route-b
             # Track Z / Z-F7 + C3 Task 4 slice B: the control plane's cache
             # directory and the workers' OCI directory are **split**, exactly

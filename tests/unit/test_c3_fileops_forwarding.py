@@ -112,15 +112,15 @@ class _C3Shape:
         self.state_base = workspace / "state"
         self.image_cache = workspace / "_images"
         self.shared_root = workspace
-        self.own_identity = workspace / "state" / ".route-b"
-        for path in (self.workspace_base, self.state_base, self.image_cache, self.own_identity):
+        self.slot_root = workspace / "state" / ".route-b"
+        for path in (self.workspace_base, self.state_base, self.image_cache, self.slot_root):
             path.mkdir(parents=True, exist_ok=True)
         self.settings = _settings(
             workspace_base=self.workspace_base,
             state_base=self.state_base,
             image_cache_dir=self.image_cache,
             shared_volume_root=str(self.shared_root),
-            route_b_tmp_root=str(self.own_identity),
+            slot_tmp_root=str(self.slot_root),
         )
         self.volumes = VolumeRegistry(workspace / "_volumes_base")
         self.volume = self.volumes.create(name=VOLUME_NAME)
@@ -150,7 +150,7 @@ class _C3Shape:
         # rule (D20) -- not ``rb-<id>``, which was this test's own copy of a
         # rule the worker never used.
         return (
-            self.own_identity / str(UID_X) / own_identity_instance_name(SANDBOX) / name
+            self.slot_root / str(UID_X) / own_identity_instance_name(SANDBOX) / name
         )
 
 
@@ -1021,11 +1021,11 @@ async def test_a_slot_document_that_is_not_one_is_refused(workspace) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_control_plane_without_a_route_b_root_refuses_by_name(
+async def test_a_control_plane_without_a_slot_root_refuses_by_name(
     workspace,
 ) -> None:
     shape = _C3Shape(workspace)
-    shape.settings.route_b_tmp_root = ""
+    shape.settings.slot_tmp_root = ""
     agent = _StubAgentClient()
     app = _app(shape, client=agent)
     await _enroll(app)
@@ -1041,8 +1041,8 @@ async def test_a_control_plane_without_a_route_b_root_refuses_by_name(
     assert resp.json() == {
         "code": 503,
         "message": (
-            "this control plane names no route-B scratch root "
-            "(E2B_ROUTE_B_TMP_ROOT), so it cannot derive a slot document's "
+            "this control plane names no slot-pool scratch root "
+            "(E2B_SLOT_TMP_ROOT), so it cannot derive a slot document's "
             "path: refusing"
         ),
     }

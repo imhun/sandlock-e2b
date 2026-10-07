@@ -121,7 +121,7 @@ async def test_nonexistent_binary_exits_127_with_no_output(workspace) -> None:
         executor="sandlock",
         per_sandbox_uid=True,
         own_identity="on",
-        route_b_tmp_root=sandbox_tmpdir(suffix="-route-b"),
+        slot_tmp_root=sandbox_tmpdir(suffix="-route-b"),
         # The slot segment has to contain the uid the record carries (the
         # pool refuses a uid outside it, by name).
         uid_pool_start=SANDBOX_UID,
