@@ -3128,6 +3128,17 @@ worker 侧对应的是**内核**那一半：`deploy/k8s/worker.yaml` 的 pod lim
   register/heartbeat 的**响应**里下发给 worker。所以**先滚控制面、再滚 worker**：新控制面 + 旧 worker
   无害（旧 worker 忽略响应里的新字段，用自己的那份 env），旧控制面 + 新 worker ⇒ worker 拿不到上限、
   **按设计全拒**（方向是 fail-closed，不是静默放行）。
+- **顺序靠人，脚本不替你排（整支评审 2026-10-07 补）**：`deploy/k8s-k0s/apply.sh` 把
+  `kubectl kustomize` 渲出的**整套**清单**一次 `kubectl apply -f -`** 打上去（渲染结果里控制面
+  Deployment 与 worker StatefulSet 是同一批，脚本只在 `ds/e2b-c3-agent` 与 `statefulset/e2b-worker`
+  之间有闸），**没有任何东西等控制面 Deployment 滚完** —— 照脚本一口气走 = 控制面与 worker 同时滚、
+  先回来的 worker 心跳拿不到下发 ⇒ **建箱全拒**（fail-closed，但正是本节要测量的那个窗口）。上面那条
+  顺序要靠**分两次 apply**（或等 `kubectl -n sandlock rollout status deploy/control-plane` 收敛）
+  来保证。**第一段是手改**：把 `deploy/k8s-k0s/worker-capacity.patch.yaml:48` 的
+  `value: "required"` 改成 `"off"` 再 apply（那一行同时也写着下面那条回退杆 —— 第一段与回退是同一次
+  手改的两个方向）。滚 worker 之前先做一个**便宜的正向检查**：`GET /internal/nodes`（舰队内部 key）
+  里该节点的 `sandboxCPUPercentMax` / `sandboxMemoryMBMax` / `sandboxProcessesMax` 已经**带上了下发
+  上限**（非空的正数）—— 记录里盖过章，才说明新控制面已经滚完并接管了这个节点。
 - **两段式车道**（计划 Task 7 Step 3）：先用 `off` 滚完冒烟，再翻 `required` —— Phase 2 的
   `memory.*`/`pids.max`/事件采样只在 `required` 上生效（`off` 那条车道逐字节回到 Phase 1 之前）；
   请求侧的尺寸解析与单箱上限是**车道无关**的（见下一条）。

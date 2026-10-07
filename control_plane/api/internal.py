@@ -221,7 +221,7 @@ def _control_plane_ceiling(
 
 
 def _kernel_ceiling_fields(body: dict[str, Any]) -> dict[str, Any] | None:
-    """The worker's **kernel** reading, or a named refusal (D5b, R17).
+    """The worker's **kernel** reading, or ``None`` (D5b, R17).
 
     Two accepted shapes, one meaning:
 
@@ -238,9 +238,23 @@ def _kernel_ceiling_fields(body: dict[str, Any]) -> dict[str, Any] | None:
     ``null`` is the kernel's own ``max`` (no limit on that dimension), which is
     the compose lanes' measured shape. Absent in both shapes is **not** an
     error: a worker that reports nothing leaves the record's kernel reading
-    alone (the same rule the identity fields above follow). Present but
-    malformed is refused by name -- including a ``0``, which is not a limit the
-    kernel can set.
+    alone (the same rule the identity fields above follow).
+
+    A **dimension** that is present but is neither a positive integer nor
+    ``null`` is dropped from the answer, so that dimension reads as "no reading
+    this beat" and the record keeps what it already holds, plus one WARN naming
+    the field and the raw value. That covers both the wrong types (a string, a
+    float, a ``true``) and the literal a container's cgroup can carry that this
+    ledger still cannot use: a ``0`` -- everywhere else in this repo ``0``
+    means "that dimension is not policed", so it can never stand in for a
+    ceiling. Refusing the whole *beat* instead would cost the node its
+    liveness -- a worker whose heartbeats are refused goes stale, and a stale
+    node's live sandboxes are orphaned (the same consequence
+    :func:`_sandbox_event_fields` cites) -- while this section **grants
+    nothing**: the policy half is the control plane's own
+    (:func:`_control_plane_ceiling`), so dropping a reading cannot admit work.
+    The **section** itself is still shape-checked: a non-object is refused by
+    name, exactly as ``sandboxEvents`` is.
     """
     value = body.get("kernelCeiling")
     wire_names = ("cpuPercent", "memoryMB")
@@ -264,12 +278,15 @@ def _kernel_ceiling_fields(body: dict[str, Any]) -> dict[str, Any] | None:
             kernel[stored] = None
             continue
         if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
-            raise OfficialError(
-                400,
-                f"{label}.{wire} must be a positive integer or null: null is "
-                "the kernel's own 'max' (this worker's container cgroup sets "
-                "no limit on that dimension)",
+            logger.warning(
+                "internal API: %s.%s is not a positive integer or null (%r); "
+                "leaving the node's stored kernel reading for that dimension "
+                "alone",
+                label,
+                wire,
+                raw,
             )
+            continue
         kernel[stored] = raw
     return kernel
 

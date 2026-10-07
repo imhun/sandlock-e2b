@@ -1413,27 +1413,98 @@ def test_a_workers_own_policy_report_grants_nothing(workspace) -> None:
     assert record.kernel_memory_mb == 4096
 
 
-def test_a_non_positive_kernel_reading_is_refused_by_name(workspace) -> None:
-    """The kernel half is shape-checked too: ``0`` is not a limit a kernel sets."""
+def test_a_non_positive_kernel_reading_costs_only_that_dimension(
+    workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reading that cannot be read is "no reading", not a refused beat.
+
+    A container's cgroup can be written with a literal that the worker reads as
+    ``0`` (``memory.max=0``), and ``0`` elsewhere in this repo means "that
+    dimension is not policed" -- so it can never stand in for a ceiling.
+    Refusing the **beat** over it would stale the node, and a stale node's live
+    sandboxes are reaped as orphans -- the exact consequence ``sandboxEvents``
+    cites for choosing per-entry tolerance. The kernel half grants nothing (the
+    policy half is this control plane's own), so the bad dimension is simply
+    dropped: the record keeps what it already holds and one WARN names the
+    field and the raw value.
+    """
     agent = _StubDelegateClient()
     app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
-    asyncio.run(_enroll_node(app))
+    asyncio.run(_enroll_node(app, kernel_ceiling=KERNEL_CEILING))
 
-    resp = asyncio.run(
-        _heartbeat_node(app, {"kernelCeiling": {"cpuPercent": 0, "memoryMB": 2048}})
-    )
+    with caplog.at_level(logging.WARNING, logger="control_plane.api.internal"):
+        resp = asyncio.run(
+            _heartbeat_node(
+                app, {"kernelCeiling": {"cpuPercent": 400, "memoryMB": 0}}
+            )
+        )
+
+    assert resp.status_code == 200
+    record = app.state.nodes.get(NODE_ID)
+    # The dimension beside it still lands; the unreadable one keeps 4096.
+    assert record.kernel_cpu_percent == 400
+    assert record.kernel_memory_mb == 4096
+    assert _warnings_from(caplog, "control_plane.api.internal") == [
+        "internal API: kernelCeiling.memoryMB is not a positive integer or "
+        "null (0); leaving the node's stored kernel reading for that "
+        "dimension alone",
+    ]
+
+
+def test_a_wrong_typed_kernel_reading_is_dropped_the_same_way(
+    workspace, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other arm of the same rule: a string is not a reading either.
+
+    ``"400"`` must not be coerced into a ceiling, and it must not cost the
+    beat: it is the same "no reading on this dimension" as the ``0`` above, so
+    the record keeps the number the enrollment gave it.
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
+    asyncio.run(_enroll_node(app, kernel_ceiling=KERNEL_CEILING))
+
+    with caplog.at_level(logging.WARNING, logger="control_plane.api.internal"):
+        resp = asyncio.run(
+            _heartbeat_node(
+                app, {"kernelCeiling": {"cpuPercent": "400", "memoryMB": 4096}}
+            )
+        )
+
+    assert resp.status_code == 200
+    record = app.state.nodes.get(NODE_ID)
+    assert record.kernel_cpu_percent == 400
+    assert record.kernel_memory_mb == 4096
+    assert _warnings_from(caplog, "control_plane.api.internal") == [
+        "internal API: kernelCeiling.cpuPercent is not a positive integer or "
+        "null ('400'); leaving the node's stored kernel reading for that "
+        "dimension alone",
+    ]
+
+
+def test_a_non_object_kernel_ceiling_section_is_refused_by_name(workspace) -> None:
+    """A section of the wrong *shape* is still refused, like ``sandboxEvents``.
+
+    Only a per-dimension value is tolerant: a ``kernelCeiling`` that is not a
+    JSON object at all is a typo, and it must not read as "no kernel reading
+    this beat" (that would leave the record silently describing the old
+    container).
+    """
+    agent = _StubDelegateClient()
+    app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
+    asyncio.run(_enroll_node(app, kernel_ceiling=KERNEL_CEILING))
+
+    resp = asyncio.run(_heartbeat_node(app, {"kernelCeiling": []}))
 
     assert resp.status_code == 400
     assert resp.json() == {
         "code": 400,
-        "message": (
-            "kernelCeiling.cpuPercent must be a positive integer or null: null "
-            "is the kernel's own 'max' (this worker's container cgroup sets no "
-            "limit on that dimension)"
-        ),
+        "message": "kernelCeiling must be a JSON object",
     }
+    # The refusal is the whole beat's: the kernel reading is not touched.
     record = app.state.nodes.get(NODE_ID)
-    assert record.kernel_cpu_percent is None
+    assert record.kernel_cpu_percent == 400
+    assert record.kernel_memory_mb == 4096
 
 
 def test_an_old_workers_first_registration_stores_only_its_kernel_reading(
@@ -1485,51 +1556,60 @@ def test_an_old_workers_first_registration_stores_only_its_kernel_reading(
     assert record.kernel_memory_mb == 4096
 
 
-def test_a_malformed_kernel_reading_in_the_old_shape_is_refused_by_name(
-    workspace,
+def test_a_malformed_kernel_reading_in_the_old_shape_names_that_spelling(
+    workspace, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The refusal names the key it read the reading from (``sandboxCeiling.``).
+    """The tolerance is the same read through the old five-field report.
 
-    The two shapes are one meaning, but the *message* has to point at the
-    worker's own spelling: "sandboxCeiling.kernelCpuPercent" is what an operator
-    running an older worker has in front of them.
+    The two shapes are one meaning, and the *message* has to point at the
+    worker's own spelling: "sandboxCeiling.kernelCpuPercent" is what an
+    operator running an older worker has in front of them. The bad dimension
+    is dropped (this is the node's **first** beat, so there is nothing stored
+    to keep) and one WARN names it; the policy trio in the same body still
+    grants nothing.
     """
     agent = _StubDelegateClient()
     app = _delegation_app(workspace, client=agent, settings=_ceiling_settings())
 
-    registered = asyncio.run(
-        _register_node(
-            app,
-            body={
-                "nodeID": NODE_ID,
-                "address": NODE_ENDPOINT.address,
-                "totalMemoryMB": 1024,
-                "totalCPUPercent": 100,
-                "totalDiskMB": 1024,
-                "totalProcesses": 64,
-                "workerUID": WORKER_UID,
-                "workerGID": WORKER_GID,
-                "sandboxCeiling": {
-                    "cpuPercent": 200,
-                    "memoryMB": 2048,
-                    "processes": 256,
-                    "kernelCpuPercent": 0,
-                    "kernelMemoryMB": 4096,
+    with caplog.at_level(logging.WARNING, logger="control_plane.api.internal"):
+        registered = asyncio.run(
+            _register_node(
+                app,
+                body={
+                    "nodeID": NODE_ID,
+                    "address": NODE_ENDPOINT.address,
+                    "totalMemoryMB": 1024,
+                    "totalCPUPercent": 100,
+                    "totalDiskMB": 1024,
+                    "totalProcesses": 64,
+                    "workerUID": WORKER_UID,
+                    "workerGID": WORKER_GID,
+                    "sandboxCeiling": {
+                        "cpuPercent": 0,
+                        "memoryMB": 65536,
+                        "processes": 4096,
+                        "kernelCpuPercent": 0,
+                        "kernelMemoryMB": 4096,
+                    },
                 },
-            },
+            )
         )
-    )
 
-    assert registered.status_code == 400
-    assert registered.json() == {
-        "code": 400,
-        "message": (
-            "sandboxCeiling.kernelCpuPercent must be a positive integer or "
-            "null: null is the kernel's own 'max' (this worker's container "
-            "cgroup sets no limit on that dimension)"
-        ),
-    }
-    assert app.state.nodes.get(NODE_ID) is None
+    assert registered.status_code == 200
+    assert registered.json() == {"nodeID": NODE_ID, "sandboxCeiling": HAND_DOWN}
+    record = app.state.nodes.get(NODE_ID)
+    # The policy trio in the same body is still the worker's opinion, not a
+    # grant: the record carries the control plane's own numbers.
+    assert record.sandbox_cpu_percent_max == 200
+    assert record.sandbox_memory_mb_max == 2048
+    assert record.sandbox_processes_max == 256
+    assert record.kernel_cpu_percent is None
+    assert record.kernel_memory_mb == 4096
+    assert _warnings_from(caplog, "control_plane.api.internal") == [
+        "internal API: sandboxCeiling.kernelCpuPercent is not a positive "
+        "integer or null (0); leaving the node's stored kernel reading for "
+        "that dimension alone",
+    ]
 
 
 # ------------- N83 phase 2 (Task 5): the kernel's per-sandbox event counters
