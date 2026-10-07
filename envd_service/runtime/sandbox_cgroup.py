@@ -342,7 +342,7 @@ def read_sandbox_events(directory: Path) -> dict[str, int]:
     }
 
 
-def _path_is_there(path: Path) -> bool:
+def _path_is_there(path: Path, *, reason: str = "release-stat") -> bool:
     """``path`` exists, decided by an explicit ``stat`` and never by ``exists()``.
 
     The same split :func:`_event_counters` makes for a counter file, for the
@@ -355,7 +355,13 @@ def _path_is_there(path: Path) -> bool:
     ``False`` means *absent*. A path that is there but cannot be looked at is a
     named :class:`CgroupRefusal` carrying the underlying error; each caller
     decides what to do with that (``release`` logs it by name and finishes the
-    teardown anyway).
+    teardown anyway; ``attach`` lets it refuse the create, which costs nothing
+    because the probe runs before the box is created). ``reason`` names the
+    step in that refusal, so an unreadable box is never reported as some
+    *other* step's failure: ``attach`` used ``Path.exists()`` until Task 13,
+    and Python 3.12's ``EACCES`` came out of its outer ``except OSError`` as
+    ``attach-io`` -- a write path that had not run and had nothing to do with
+    the failure.
     """
     try:
         path.stat()
@@ -363,7 +369,7 @@ def _path_is_there(path: Path) -> bool:
         return False
     except OSError as exc:
         raise CgroupRefusal(
-            f"cgroup-refusal release-stat: {path} ({exc.strerror or exc})"
+            f"cgroup-refusal {reason}: {path} ({exc.strerror or exc})"
         ) from exc
     return True
 
@@ -763,7 +769,9 @@ class SandboxCgroups:
         ``None`` for either of the last two is "the caller did not declare this
         dimension": the per-sandbox ceiling this worker holds (the handed-down
         policy) is then written, which is a bound and the only value in sight
-        that nobody had to invent.
+        that nobody had to invent. A ceiling that carries no number for *that*
+        dimension either leaves nothing to bound the box with, and that is
+        refused by name (see :meth:`_checked_declared_sizes`).
 
         Before anything is created, all three are checked against the policy
         ceiling injected into this handle (R3, the worker's second gate -- the
@@ -783,7 +791,11 @@ class SandboxCgroups:
         target = parent / f"{_SANDBOX_PREFIX}{sandbox_id}"
         created = False
         try:
-            if target.exists():
+            # Task 13 item 1: the same explicit ``stat`` ``release`` uses, so a
+            # directory that cannot be looked at is named as *that* -- not as
+            # the ``attach-io`` the old ``exists()`` probe turned into once
+            # Python 3.12 re-raised ``EACCES`` into the outer ``except OSError``.
+            if _path_is_there(target, reason="attach-stat"):
                 held = _cgroup_pids(target)
                 if held:
                     raise CgroupRefusal(
@@ -885,13 +897,23 @@ class SandboxCgroups:
         half is the hand-down cross-check's business, and a kernel that sets no
         limit is a legal lane where the policy is the only bound left.
 
-        Three outcomes, none of them silent:
+        Four outcomes, none of them silent:
 
         * a declared dimension is above the ceiling -- one named refusal naming
           every offending dimension and its value (no clamp: the API promise
           and the kernel have to agree);
         * a dimension nobody declared -- the ceiling is written, so the sandbox
           is still bounded by the deployment's own number;
+        * a dimension nobody declared **and** no number for it on the ceiling
+          either -- refused by name (Task 13 item 2). Production cannot reach
+          it (the hand-down this worker adopts is always three positive
+          numbers, ``agent._ceiling_from_response``), but a ceiling built by
+          hand -- an embedder's, a test's -- used to feed ``None`` into
+          :func:`memory_max_for`/``pids_max_for``: a bare ``TypeError``, or the
+          literal string ``"None"`` on the ``pids.max`` path, either of which
+          breaks the module's contract that *every* failure is a named
+          :class:`CgroupRefusal` -- and a box with no number on a dimension is
+          exactly the fail-open direction this module exists to close;
         * no ceiling on this handle at all (no hand-down has arrived, or the one
           that arrived was refused) -- refused by name, because "checked against
           nothing" is the fail-open direction this whole module exists to close.
@@ -909,6 +931,22 @@ class SandboxCgroups:
             )
         memory = ceiling.memory_mb if memory_mb is None else int(memory_mb)
         processes = ceiling.processes if max_processes is None else int(max_processes)
+        unbounded = [
+            name
+            for name, value in (("memoryMB", memory), ("maxProcesses", processes))
+            if value is None
+        ]
+        if unbounded:
+            raise CgroupRefusal(
+                f"cgroup-refusal ceiling-unbounded: sandbox {sandbox_id} "
+                f"declares no {' or '.join(unbounded)}, and the per-sandbox "
+                "ceiling this handle carries sets no number for "
+                f"{'them' if len(unbounded) > 1 else 'it'} either -- that "
+                "ceiling was built by hand (the control plane's hand-down is "
+                "always three positive numbers), so there is no value in sight "
+                "that anybody chose: refusing the create rather than building "
+                "a box with an unbounded dimension"
+            )
         above: list[str] = []
         if ceiling.cpu_percent is not None and int(cpu_percent) > ceiling.cpu_percent:
             above.append(

@@ -7,6 +7,16 @@ from sandlock.supervise import SuperviseChannel
 
 SLOT_UID, OTHER_UID = 21500, 21501
 BASE = Path("/var/lib/e2b-sandboxes/_test-runtime/rb-token-probe")
+#: Task 13 item 3: the sizes this probe **declares** for its box.
+#: ``W1SlotPool.acquire`` reads an undeclared ``memory_mb``/``max_processes``
+#: as "the caller did not say", and the cgroup module then writes the
+#: per-sandbox *ceiling* -- so a probe that declares nothing asks for the
+#: biggest box the node allows (4096 MiB / 1024 tasks on the k0s lane) without
+#: saying so. Nothing in this script applies a per-sandbox quota: the pool is
+#: built by hand, without a cgroup handle. Read these two numbers as the
+#: probe's own declaration -- not as evidence about what the slot really got.
+DECLARED_MEMORY_MB = 4096
+DECLARED_MAX_PROCESSES = 1024
 POLICY = {
     "fs_readable": ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
     "fs_writable": [str(BASE)],
@@ -34,7 +44,12 @@ async def main():
     BASE.mkdir(parents=True, exist_ok=True)
     os.chmod(BASE, 0o777)
     pool = W1SlotPool(uid_start=SLOT_UID, size=1, tmp_root=BASE / "slots")
-    handle = await pool.acquire("sbx_token_probe", POLICY)
+    handle = await pool.acquire(
+        "sbx_token_probe",
+        POLICY,
+        memory_mb=DECLARED_MEMORY_MB,
+        max_processes=DECLARED_MAX_PROCESSES,
+    )
     pid, sock, token = handle.process.pid, str(handle.sock_path), handle.token
     print(f"slot pid={pid} uid={handle.uid} worker-uid-allowlist=[0] sock={sock}")
 

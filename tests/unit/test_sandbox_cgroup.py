@@ -492,6 +492,58 @@ def test_attach_refuses_when_an_existing_target_cannot_be_read(tmp_path: Path) -
     assert target.exists() is True
 
 
+def test_attach_names_a_target_that_cannot_be_looked_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 13 item 1: "I cannot look at it" is not an ``attach-io`` failure.
+
+    ``release`` stopped trusting ``Path.exists()`` in Task 11 (Python 3.12
+    re-raises ``EACCES`` from it, earlier versions silently answer ``False``,
+    and neither tells "absent" from "not allowed to look"), but ``attach``'s
+    reuse probe was still the old form: the ``EACCES`` travelled to the outer
+    ``except OSError`` and came out as ``attach-io`` -- a step that never ran.
+    The probe is the same explicit ``stat`` now, so the refusal names the real
+    failure. The direction does not change: the create is still refused, and
+    nothing is created.
+    """
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=POLICY_CEILING,
+    )
+    cg.setup(wait_s=0.2)
+    before = sorted(child.name for child in parent.iterdir())
+    target = parent / "sbx_alpha"
+    real_stat = Path.stat
+
+    def refusing(self: Path, *args: object, **kwargs: object):
+        if self == target:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", refusing)
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(
+            sandbox_id="alpha",
+            pid=4242,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=64,
+        )
+
+    assert str(excinfo.value) == (
+        f"cgroup-refusal attach-stat: {target} (Permission denied)"
+    )
+    # ``Path.stat`` is the faked call here, so absence is read with the real
+    # one: no box was created, and nothing else in the delegated tree moved.
+    assert os.path.exists(target) is False
+    assert sorted(child.name for child in parent.iterdir()) == before
+
+
 def test_release_refuses_when_cgroup_kill_cannot_be_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -745,6 +797,134 @@ def test_attach_refuses_a_declared_size_above_the_handed_down_ceiling(
     # No half-built box, and nothing else in the delegated subtree moved.
     assert sorted(child.name for child in parent.iterdir()) == before
     assert (parent / "sbx_alpha").exists() is False
+
+
+def test_a_hand_built_ceiling_silent_on_a_declared_dimension_is_refused_by_name(
+    tmp_path: Path,
+) -> None:
+    """Task 13 item 2: the module's contract survives a hand-built ceiling.
+
+    ``SandboxCeiling.memory_mb``/``.processes`` are ``int | None``, and the
+    "nobody declared this dimension" branch fed the ceiling's own value
+    straight into ``memory_max_for``/``pids_max_for``. With a ceiling built by
+    hand -- all ``None`` -- that raised a bare ``TypeError``, which is not one
+    of the module's refusals: the documented contract is that *every* failure
+    is a named ``CgroupRefusal``, and it has to hold even for a shape the
+    production hand-down never sends (the control plane's answer is always
+    three positive numbers, ``agent._ceiling_from_response``).
+
+    Nothing was declared on either side, so there is no number in sight that
+    anybody chose: the create is refused by name -- the fail-closed direction,
+    and the same one ``ceiling-unavailable`` takes one rung up.
+    """
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=SandboxCeiling(),
+    )
+    cg.setup(wait_s=0.2)
+    before = sorted(child.name for child in parent.iterdir())
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(
+            sandbox_id="alpha",
+            pid=4242,
+            cpu_percent=100,
+            memory_mb=None,
+            max_processes=None,
+        )
+
+    assert str(excinfo.value) == (
+        "cgroup-refusal ceiling-unbounded: sandbox alpha declares no memoryMB "
+        "or maxProcesses, and the per-sandbox ceiling this handle carries sets "
+        "no number for them either -- that ceiling was built by hand (the "
+        "control plane's hand-down is always three positive numbers), so there "
+        "is no value in sight that anybody chose: refusing the create rather "
+        "than building a box with an unbounded dimension"
+    )
+    # Refused before anything was built, and nothing else moved.
+    assert sorted(child.name for child in parent.iterdir()) == before
+    assert (parent / "sbx_alpha").exists() is False
+
+
+def test_a_ceiling_silent_on_one_dimension_names_exactly_that_one(
+    tmp_path: Path,
+) -> None:
+    """The same case, half-declared: the refusal names the dimension at fault.
+
+    A ceiling that carries a number for memory but none for pids is a legal
+    shape (the ``SandboxCeiling`` dataclass documents ``None`` as "this caller
+    does not police that dimension"), so a *declared* size on the silent
+    dimension is the caller's own bound and is written. Only the one dimension
+    with no number anywhere is refused -- and the message says which.
+    """
+    mount = _pod_mount(tmp_path)
+    parent = mount / "worker-container"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=tmp_path / "proc",
+        policy_ceiling=SandboxCeiling(cpu_percent=400, memory_mb=2048),
+    )
+    cg.setup(wait_s=0.2)
+
+    with pytest.raises(CgroupRefusal) as excinfo:
+        cg.attach(
+            sandbox_id="alpha",
+            pid=4242,
+            cpu_percent=100,
+            memory_mb=512,
+            max_processes=None,
+        )
+
+    assert str(excinfo.value) == (
+        "cgroup-refusal ceiling-unbounded: sandbox alpha declares no "
+        "maxProcesses, and the per-sandbox ceiling this handle carries sets no "
+        "number for it either -- that ceiling was built by hand (the control "
+        "plane's hand-down is always three positive numbers), so there is no "
+        "value in sight that anybody chose: refusing the create rather than "
+        "building a box with an unbounded dimension"
+    )
+    assert (parent / "sbx_alpha").exists() is False
+
+
+def test_a_ceiling_silent_on_a_dimension_the_caller_declared_still_builds(
+    tmp_path: Path,
+) -> None:
+    """No over-refusal: a declared size is a bound even where the ceiling is silent.
+
+    The refusal above is only for "no number anywhere". A ceiling that polices
+    one dimension and is silent on another leaves the declared sizes as the
+    only bound there -- which is a bound, so the box is built with exactly the
+    numbers the caller declared.
+    """
+    mount = _pod_mount(tmp_path)
+    proc_root = tmp_path / "proc"
+    cg = SandboxCgroups(
+        mount=mount,
+        worker_uid=os.getuid(),
+        proc_root=proc_root,
+        policy_ceiling=SandboxCeiling(cpu_percent=400),
+    )
+    cg.setup(wait_s=0.2)
+    _write(proc_root / "4242" / "cgroup", "0::/sbx_alpha\n")
+
+    target = Path(
+        cg.attach(
+            sandbox_id="alpha",
+            pid=4242,
+            cpu_percent=100,
+            memory_mb=2048,
+            max_processes=256,
+        )
+    )
+
+    assert (target / "memory.high").read_text() == memory_max_for(2048)
+    assert (target / "memory.max").read_text() == memory_max_for(2048)
+    assert (target / "pids.max").read_text() == pids_max_for(256)
 
 
 def test_attach_refuses_when_the_handle_carries_no_ceiling(tmp_path: Path) -> None:

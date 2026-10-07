@@ -111,6 +111,21 @@ def _run_exec(ch, code: str, shared: str, evidence: str) -> dict:
     return status
 
 
+#: Task 13 item 3: the sizes these cases **declare** for the boxes they build.
+#: ``W1SlotPool.acquire`` reads an undeclared ``memory_mb``/``max_processes``
+#: as "the caller did not say", and the cgroup module then writes the
+#: per-sandbox *ceiling* -- so a case that declares nothing builds (or, on this
+#: lane, documents) the biggest box the node allows (4096 MiB / 1024 tasks on
+#: the k0s lane) without saying so. These cases are about sticky directories
+#: and uid reuse, not sizes, so they declare exactly what the ceiling would
+#: have supplied. Neither pool here is built with a cgroup handle, so the two
+#: numbers are the declaration and not an applied quota; the pin in
+#: ``test_the_hand_built_pool_probes_declare_the_sizes_of_the_box_they_build``
+#: keeps every ``acquire`` call in this file saying so.
+DECLARED_MEMORY_MB = 4096
+DECLARED_MAX_PROCESSES = 1024
+
+
 def _policy(shared: Path, evidence: Path) -> dict:
     return {
         "fs_readable": [
@@ -146,9 +161,19 @@ async def test_w1_slot_pool_two_uids_share_sticky_dir_through_python_client():
         tmp_root=base / "slots",
     )
     try:
-        sx = await pool.acquire("sbx_x", _policy(shared, evidence))
+        sx = await pool.acquire(
+            "sbx_x",
+            _policy(shared, evidence),
+            memory_mb=DECLARED_MEMORY_MB,
+            max_processes=DECLARED_MAX_PROCESSES,
+        )
         assert sx.uid == UID_X
-        sy = await pool.acquire("sbx_y", _policy(shared, evidence))
+        sy = await pool.acquire(
+            "sbx_y",
+            _policy(shared, evidence),
+            memory_mb=DECLARED_MEMORY_MB,
+            max_processes=DECLARED_MAX_PROCESSES,
+        )
         assert sy.uid == UID_Y
         # Transport 1 invariants: the credential is a descriptor, so there is
         # no path to guess and no secret in the slot's argv.
@@ -193,14 +218,29 @@ async def test_w1_pool_refuses_live_uid_reuse_and_exhausts_cleanly():
             "fs_writable": [str(base)],
             "env": {"PATH": "/usr/local/bin:/usr/bin:/bin"},
         }
-        sx = await pool.acquire("sbx_only", policy)
+        sx = await pool.acquire(
+            "sbx_only",
+            policy,
+            memory_mb=DECLARED_MEMORY_MB,
+            max_processes=DECLARED_MAX_PROCESSES,
+        )
         assert sx.uid == UID_X
         with pytest.raises(RuntimeError, match="exhausted"):
-            await pool.acquire("sbx_second", policy)
+            await pool.acquire(
+                "sbx_second",
+                policy,
+                memory_mb=DECLARED_MEMORY_MB,
+                max_processes=DECLARED_MAX_PROCESSES,
+            )
         # Release returns the uid and a second sandbox can take it (W1
         # restart-in-place semantics).
         await pool.release("sbx_only")
-        sx2 = await pool.acquire("sbx_second", policy)
+        sx2 = await pool.acquire(
+            "sbx_second",
+            policy,
+            memory_mb=DECLARED_MEMORY_MB,
+            max_processes=DECLARED_MAX_PROCESSES,
+        )
         assert sx2.uid == UID_X
         await pool.release("sbx_second")
     finally:
