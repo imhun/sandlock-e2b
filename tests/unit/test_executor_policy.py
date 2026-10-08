@@ -336,7 +336,14 @@ def test_port_mappings_require_net_isolation(tmp_path: Path) -> None:
 def test_mcp_gateway_netns_identity_mapping(tmp_path: Path) -> None:
     """E7.1: under net_isolation the MCP gateway port is mapped onto the
     sandbox's own listener (host 50005+ -> same sandbox port), so the /mcp
-    proxy keeps dialing 127.0.0.1:<port> on the worker."""
+    proxy keeps dialing 127.0.0.1:<port> on the worker.
+
+    N89: the mapping travels with bind injection now. Without it the mapping
+    would be served from the supervisor's host listener, where only a
+    blocking/threaded ``accept()`` works -- an event-loop gateway (uvicorn in
+    the MCP image) would hang with no error anywhere -- so that combination is
+    refused by name instead (``MAPPED_SANDBOX_NEEDS_INJECTION``).
+    """
     rootfs = tmp_path / "rootfs"
     rootfs.mkdir()
     ws = tmp_path / "ws"
@@ -355,11 +362,12 @@ def test_mcp_gateway_netns_identity_mapping(tmp_path: Path) -> None:
         enable_net_isolation=True,
         fd_inject_connect=True,
         pid_ns=False,
-        bind_inject=False,
+        bind_inject=True,
     )
     executor.set_mcp_bind_port(51234)
     sb = _policy(executor)
     assert sb.net_isolation is True
+    assert getattr(sb, "net_bind_inject", False) is True
     assert sb.fd_inject_connect is True
     assert sb.net_allow_bind == [51234]
     assert sb.port_mappings == {51234: 51234}

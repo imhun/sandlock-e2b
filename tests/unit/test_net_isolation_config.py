@@ -135,14 +135,12 @@ def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
     assert executor._port_mappings == {50006: 8080}
 
 
-def test_policy_ceiling_requests_bind_injection(monkeypatch) -> None:
-    """S2.5 bind injection is requested exactly when mappings + switch agree.
+def _mapped_executor(monkeypatch, *, bind_inject: bool, port_mappings):
+    """A sandbox executor whose sandbox will carry one inbound mapping.
 
-    The flag is what moves the MCP port out of the host-listener mapping path
-    (and therefore out of the event loop's readiness interception): the
-    supervisor replaces the sandbox's socket with a host-loopback one at
-    ``bind()`` time instead. Setting it without ``port_mappings`` is refused by
-    the fork's own validation, so the two must travel together.
+    ``set_mcp_bind_port`` is what a sandbox that asks for the MCP gateway gets,
+    and it is why the guard below cannot be a global-switch check: the mapping
+    is added per sandbox.
     """
     import envd_service.executors.factory as factory_mod
 
@@ -150,44 +148,88 @@ def test_policy_ceiling_requests_bind_injection(monkeypatch) -> None:
     monkeypatch.setattr(factory_mod, "_sandlock_available", lambda: True)
     monkeypatch.setattr(factory_mod, "_landlock_ok", lambda: True)
 
-    def build(*, bind_inject: bool, port_mappings):
-        settings = SimpleNamespace(
-            executor="sandlock",
-            enable_network=True,
-            enable_netns=False,
-            enable_net_isolation=True,
-            fd_inject_connect=True,
-            pid_ns=False,
-            net_bind_inject=bind_inject,
-            port_mappings=port_mappings,
-            network_deny_cidrs=(),
-            sandbox_notify_rate_limit=0,
-            iam_signing_key="k",
-            image_cache_dir=Path("tmp/cache"),
-            pure_rootfs="off",
-            pure_rootfs_dir=Path("tmp/cache/pure"),
-            command_stream_limit_mb=32,
-        )
-        executor = create_executor(
-            settings,
-            workspace_dir="/tmp/ws",
-            base_image=None,
-            memory_mb=512,
-            cpu_percent=100,
-            disk_mb=1024,
-            max_processes=64,
-            max_open_files=4096,
-            allow_internet_access=False,
-            network=None,
-        )
-        executor.set_mcp_bind_port(61001)
-        return executor._build_instance_policy()
+    settings = SimpleNamespace(
+        executor="sandlock",
+        enable_network=True,
+        enable_netns=False,
+        enable_net_isolation=True,
+        fd_inject_connect=True,
+        pid_ns=False,
+        net_bind_inject=bind_inject,
+        port_mappings=port_mappings,
+        network_deny_cidrs=(),
+        sandbox_notify_rate_limit=0,
+        iam_signing_key="k",
+        image_cache_dir=Path("tmp/cache"),
+        pure_rootfs="off",
+        pure_rootfs_dir=Path("tmp/cache/pure"),
+        command_stream_limit_mb=32,
+    )
+    return create_executor(
+        settings,
+        workspace_dir="/tmp/ws",
+        base_image=None,
+        memory_mb=512,
+        cpu_percent=100,
+        disk_mb=1024,
+        max_processes=64,
+        max_open_files=4096,
+        allow_internet_access=False,
+        network=None,
+    )
 
-    injected = build(bind_inject=True, port_mappings={"61001": "61001"})
+
+def test_policy_ceiling_requests_bind_injection(monkeypatch) -> None:
+    """S2.5 bind injection travels with the mapping.
+
+    The flag is what keeps the mapped port off the host-listener path: the
+    supervisor replaces the sandbox's socket with a host-loopback one at
+    ``bind()`` time instead. Setting it without ``port_mappings`` is refused by
+    the fork's own validation, so the two must travel together.
+    """
+    executor = _mapped_executor(monkeypatch, bind_inject=True, port_mappings={"61001": "61001"})
+    executor.set_mcp_bind_port(61001)
+    injected = executor._build_instance_policy()
+
     assert getattr(injected, "net_bind_inject", False) is True
     assert injected.port_mappings == {61001: 61001}
     assert injected.net_isolation is True
 
-    off = build(bind_inject=False, port_mappings={"61001": "61001"})
-    assert getattr(off, "net_bind_inject", False) is False
-    assert off.port_mappings == {61001: 61001}
+
+def test_a_mapped_sandbox_without_injection_is_refused_by_name(monkeypatch) -> None:
+    """N89: the host-listener mapping serves blocking accept only.
+
+    Before this guard the create succeeded and the sandbox got a host-listener
+    mapping -- which, with the readiness synthesis retired, means an
+    *event-loop* server (uvicorn/asyncio, Node) silently never answers: the
+    connection queues host-side and the sandbox never calls ``accept()``. The
+    refusal has to fire per sandbox, because the mapping a sandbox gets can be
+    added by the sandbox itself (the MCP gateway port), not only by the
+    worker-wide ``E2B_PORT_MAPPINGS``.
+    """
+    # The worker-wide half of this guard is the startup refusal (next test), so
+    # the case that has to reach a *create* is the mapping the sandbox itself
+    # brought: no `E2B_PORT_MAPPINGS` at all, injection off, and the MCP gateway
+    # port added per sandbox.
+    executor = _mapped_executor(monkeypatch, bind_inject=False, port_mappings={})
+    executor.set_mcp_bind_port(61001)
+    with pytest.raises(RuntimeError) as excinfo:
+        executor._build_instance_policy()
+    message = str(excinfo.value)
+    assert "61001" in message, message
+    assert "E2B_NET_BIND_INJECT" in message, message
+    assert "readiness" in message, message
+
+
+def test_injection_off_with_worker_wide_mappings_fails_at_startup(monkeypatch) -> None:
+    """The deterministic half of the same guard: no mapping can ever be served.
+
+    A worker whose ``E2B_PORT_MAPPINGS`` is non-empty with injection off cannot
+    build any of those sandboxes, so it refuses at construction (named) rather
+    than at the first create.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _mapped_executor(monkeypatch, bind_inject=False, port_mappings={"50006": "8080"})
+    message = str(excinfo.value)
+    assert "50006" in message, message
+    assert "E2B_NET_BIND_INJECT" in message, message

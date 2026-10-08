@@ -670,10 +670,15 @@ root-in-userns 自带 `CAP_NET_BIND_SERVICE`；k8s 清单 2026-09-17（N5）切 
   路；`net_isolation` 单开（不带 `pid_ns`）在**这个镜像/profile 下建不起来**，报 `sandlock_create
   failed`（没有更细的原因）。fleet 的 worker env 今天两者都开着，因此线上不受影响 —— 但任何把
   `E2B_PID_NS` 关掉、或想只开 `E2B_ENABLE_NET_ISOLATION` 的车道会全线建箱失败；
-* **readiness 合成在生产默认形状下不走**：`E2B_NET_BIND_INJECT` 默认 `true`（fleet 的 env 里没
-  声明它 ⇒ 取默认），MCP 入站端口走 bind 注入 —— 同一台 worker 上量：bind 注入往返 **0.4 ms**、
-  宿主 listener + readiness 合成 **81 ms**（5 次 4-byte 往返的中位）。这条差距就是 §2.4.7 当初选
-  注入的理由，也意味着 `network::readiness` 现在只服务 `E2B_NET_BIND_INJECT=0` 的车道；
+* **readiness 合成在生产默认形状下不走 —— N89 起它已经不存在**：`E2B_NET_BIND_INJECT` 默认
+  `true`（fleet 的 env 里没声明它 ⇒ 取默认），MCP 入站端口走 bind 注入 —— 同一台 worker 上量：
+  bind 注入往返 **0.4 ms**、宿主 listener + readiness 合成 **81 ms**（5 次 4-byte 往返的中位）。
+  这条差距就是 §2.4.7 当初选注入的理由。**2026-10-08（N89）**：那条合成（`network/readiness.rs`，
+  `poll`/`ppoll`/`epoll_wait`/`epoll_pwait` 的就绪合成）整条退役 —— 它只服务
+  `E2B_NET_BIND_INJECT=0` 的车道，而那条路上的"按事件循环迭代 `pidfd_getfd` 复制子进程 fd、把
+  events 写进子进程内存"是当时唯一一条不做 allow/deny 的特权操作。**口径改为：非注入映射 =
+  只支持阻塞/线程式 `accept()`**；E2B 侧对"会带映射的沙箱 + `E2B_NET_BIND_INJECT=0`"**建箱即具名
+  拒绝**（`MAPPED_SANDBOX_NEEDS_INJECTION`，见下端"E2B 侧开关"）；
 * **入站映射的生命周期（N88 ②(a)，2026-10-08 起）**：宿主侧那个 `127.0.0.1:<host_port>` listener
   在沙箱 `listen()` 映射端口时建立，**不再随沙箱关掉监听 socket 释放**；它在**沙箱退出**、或
   **后来有 socket 再 listen 同一个映射端口**（那时旧条目被替换、新 listener 顶上）时才释放/替换。
@@ -771,9 +776,10 @@ netns 箱内 DNS 是"快速失败"（0.4 ms，不是解析）。⇒ 每请求 ~3
 inode 命中映射表）复制 fd 做端口复核 + 照旧给每个被监视 fd 复制一份去 poll"，即单次等待的成本与
 当时同量级、没有变贵，但也没有变便宜。`ppoll` 那条 (pid, fd) 小缓存仍未做；
 ③ 从设计上消掉这条映射。**已做（落成"bind 注入"而不是 socketpair）**：见下方 `net_bind_inject`，
-它现在是 worker 的默认（`E2B_NET_BIND_INJECT` 默认 true）⇒ 线上 MCP 入站不经这条路，
-`network::readiness` 只服务显式关掉注入的车道（对比读数：注入 0.4 ms vs 合成 81.4 ms，见 §2.4.7
-末尾 2026-10-08 那两条与 `docs/deploy-clusters.md` §7.55）。
+它现在是 worker 的默认（`E2B_NET_BIND_INJECT` 默认 true）⇒ 线上 MCP 入站不经这条路
+（对比读数：注入 0.4 ms vs 合成 81.4 ms，见 §2.4.7 末尾 2026-10-08 那两条与
+`docs/deploy-clusters.md` §7.55）。**那条合成已于 2026-10-08 随 N89 整条退役**：显式关掉注入的
+车道现在只有阻塞/线程式 `accept()`，任何带映射的沙箱都被 E2B 具名拒绝（见下）。
 
 **另有一件已做并上线（A，2026-10-08，fork `dda8dd7` / `0.1.0-1144-g31e39d8-20261008-110003`）**：入站那组系统调用原来只要沙箱**有映射**就都入表
 （`inbound_port_map` = `net_bind_map` 非空），可注入形状下它们一条都做不了事 —— 宿主 listener 不存在，
@@ -817,8 +823,19 @@ no-op，只多一次 `getsockname` 往返）。
 
 E2B 侧开关：`E2B_NET_BIND_INJECT`（默认 `true`，`envd_service/config.py`），经
 `factory.py` → `SandlockExecutor(bind_inject=...)` → 策略里出现 `net_bind_inject`（
-`own_identity.py` 的 wire 字段白名单同步加了这个键）。回滚只需把该变量设为 `false` 并重建 worker
-镜像/重启，策略立刻回到主机监听器映射。
+`own_identity.py` 的 wire 字段白名单同步加了这个键）。
+
+**N89 之后它不再是一个可以随便关的开关**：`false` 只对**不带映射**的沙箱无害。守卫按**沙箱**
+判（不能只看全局开关，因为 MCP 网关的映射是每个沙箱自己加的）——
+`envd_service/executors/sandlock.py::_publish_inbound_mapping`：
+
+* 沙箱会带映射（`E2B_PORT_MAPPINGS` 或它自己通过 `set_mcp_bind_port` 加的那条）而注入关着
+  ⇒ **建箱具名拒绝**（`MAPPED_SANDBOX_NEEDS_INJECTION`，点名沙箱、端口与两个开关）；
+* 而 worker 全局 `E2B_PORT_MAPPINGS` 非空时关着注入 ⇒ **启动即拒**（同样的文案，语义是"这些
+  映射永远服务不了"）。
+
+**回滚**：要么把 `E2B_NET_BIND_INJECT` 设回 `true`，要么把注入关掉**同时**清空所有映射 —— 单把
+它设成 `false` 而沙箱还在要映射，现在会被当场拒绝（这是 N89 想要的 fail-closed，不是静默挂死）。
 
 **上线实测（2026-09-16，随 `0.1.0-297-g15d4726` 发布，worker-2 仍是唯一 netns 节点）**：
 同一条按节点 A/B（`deploy/scripts/acceptance/netns-node-compare.py`）在修复前后对比：

@@ -735,6 +735,25 @@ NET_ISOLATION_PAIRING_ERROR = (
     "egress at all is what you want."
 )
 
+#: N89 (2026-10-08): the readiness synthesis that used to wake an *event-loop*
+#: consumer of a host-listener inbound mapping is retired, so a sandbox that
+#: carries a mapping while bind injection is off can only be served through a
+#: blocking/threaded ``accept()``. That is not something the worker can decide
+#: for the workload, so it refuses **by name** instead -- at startup when the
+#: worker-wide mappings can never be served, and per sandbox when the mapping is
+#: the MCP gateway's (which is added per sandbox, so the switch alone says
+#: nothing about whether *this* create needs the host-listener path).
+MAPPED_SANDBOX_NEEDS_INJECTION = (
+    "refusing to build sandbox {sandbox}: it carries inbound port mappings "
+    "{ports} while bind injection is off (E2B_NET_BIND_INJECT=0). Without "
+    "injection the mapping is served by a supervisor-side host listener, and "
+    "the readiness synthesis that used to wake an event-loop server waiting on "
+    "such a listener is retired (N89) -- only a blocking/threaded accept() "
+    "works, and a sandbox whose server waits in poll/epoll would hang with no "
+    "error anywhere. Set E2B_NET_BIND_INJECT=1 (the default), or drop the "
+    "mapping."
+)
+
 
 #: N14 S5 (2026-10-04): the two retro levers are **retired**. They were the
 #: ways back to the shape this change deletes -- `E2B_PURE_ROOTFS=off` (N15's

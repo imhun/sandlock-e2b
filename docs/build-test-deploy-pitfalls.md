@@ -60,6 +60,20 @@ sandlock-dev:latest sh scripts/test-all.sh`；该镜像 entrypoint 自动降到 
 编译那个 crate。做法：**新增字段时按"谁构造这个结构体"全局搜**（`rg -n "Req::RunExec \{" crates/`），
 而不是只搜 fork 自己那两棵 crate —— 上一条做法里那句 `rg` 要按字段所在的结构体改，不是照抄。
 
+**这一类现在有结构性的钉子（2026-10-08，N89 T1）**：`sandlock-core` 里新增了两条用例，一条是
+**跨表钉子** —— `seccomp::dispatch::handler_tests::every_trapped_syscall_has_a_handler_chain`
+对 13 个形状断言"**凡被 BPF 通知表 trap 的 nr，dispatch 表里必有 handler chain**"（两侧都从
+同一个 `ResolvedSandbox` 推）；另一条是"poll 族在任何形状都不在表里"。它的可证伪性有两处：
+往 filter 里塞一个没人处理的号（`nrs.push(libc::SYS_syncfs)`）当场红，以及常驻的
+`the_cross_table_check_catches_a_missing_chain` 自测。
+**第一次跑就抓到一条真的**：`fchmodat2`（452）在 `chroot_path_syscalls()` 与
+`cow_path_syscalls()` 里一直被 trap，`handle_chroot_write` 也早就写了它那一支，但
+`register_chroot_handlers` 与 `register_cow_handlers` 两张注册表都漏了这个号 —— 于是每个
+chroot/COW 沙箱的 `chmod`（glibc 用的拼写）通知进来**没有 handler**：mediator 的写 gate 与 COW
+的 copy-up 都没跑，每次还白付一次往返与预算。同一天修（两组各加一行 + COW 侧补
+`parse_cow_write` 分支）。教训仍是 A6：**注册表与 BPF 列表是两份清单**，靠人眼对账迟早漏；
+现在漏了会被钉子抓住。
+
 **A7. sandlock 构建的唯一口径：在 `third_party/sandlock` 里跑，仓库根不再产出任何 target。**
 （2026-09-30 立此条：当天从根目录 + fork 里一共清掉 **86 GB** 构建产物，并把两个把产物写到根目录
 的接线改掉了。没有这条记录，下一个人只能从零把下面这些重新推一遍。）

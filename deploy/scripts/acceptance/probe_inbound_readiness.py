@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
-"""N88 ②: does the fdinfo-based readiness synthesis serve a mapped listener?
+"""The two inbound-mapping shapes, measured inside a worker pod (N89 re-read).
 
 Runs INSIDE a worker pod (or any container with the sandlock wheel) as the
 worker's own uid. It builds a `net_isolation` sandbox with a host-listener port
 mapping and drives a small series of 4-byte echo round trips from the
 container's own network namespace.
 
-Why this shape:
+Arms:
 
-* bind injection is left OFF, so the sandbox's `listen()` goes through
-  `network::inbound`'s host listener and `network::readiness`' synthesis -- the
-  code N88 ② rewrote. The second half of the run repeats it with injection ON,
-  which is what the worker ships (`E2B_NET_BIND_INJECT` defaults to true), as
-  the contrast;
-* the server is `asyncio` (epoll), so the wakeup has to come from the kernel's
-  own `/proc/<pid>/fdinfo/<epfd>` rather than from the sandbox's backlog;
-* the child dumps its *own* epoll fdinfo, which is the file the supervisor
-  reads and parses -- so the format assumption is visible on the kernel and
-  architecture under test, not only on the developer's machine.
+* **host-listener** (`net_bind_inject=false`): the mapping is served from the
+  supervisor's host listener, and the sandbox accepts from it with a
+  **blocking** `accept()`. That is the only server shape this arm supports
+  since N89 retired the readiness synthesis (`network/readiness.rs`): an
+  event-loop server waits on its own listener, which never becomes readable
+  from a connection queued supervisor-side, so it would hang with no error
+  anywhere. E2B therefore refuses to build a mapped sandbox with injection off
+  (`MAPPED_SANDBOX_NEEDS_INJECTION`); this arm measures what still works, which
+  is the blocking/threaded server.
+* **bind-injection** (`net_bind_inject=true`, the fleet default): the sandbox's
+  own listener *is* a host-loopback socket, so an `asyncio` (epoll) server is
+  woken by the kernel and every wait is ordinary kernel work. The injected arm
+  is the one production uses, and N89's T5 re-reads its round-trip.
 
 `pid_ns=True` is not decoration in this image: the shipped worker seccomp
 profile (`sandlock-worker.json`) allows `clone3` but **not** `unshare`, so a
@@ -33,13 +36,15 @@ Usage:
     kubectl -n sandlock exec -i e2b-worker-0 -c worker -- python3 - \
         < deploy/scripts/acceptance/probe_inbound_readiness.py
 
-Readings (2026-10-08, fleet arm64 / Rocky 6.12, e2b-worker-0, 5 rounds each;
-the fleet's MCP path ships `E2B_NET_BIND_INJECT=true`, so the second row is
-what production actually uses and the first is the path N88 ② rewrote):
-    host-listener (readiness synthesis): 72.1 / 81.3 / 81.2 / 81.2 / 81.2 ms
-    bind-injection (E2B default)        : 0.5 / 0.4 / 0.3 / 0.3 / 0.3 ms
-which is why the fleet ships injection on, and what N88 ② must keep working
-when it is off.
+Readings (2026-10-08, fleet arm64 / Rocky 6.12, e2b-worker-0, 5 rounds each,
+**before** N89; the fleet's MCP path ships `E2B_NET_BIND_INJECT=true`, so the
+second row is what production actually uses):
+    host-listener + asyncio (the retired synthesis): 72.1 / 81.3 / 81.2 / 81.2 / 81.2 ms
+    bind-injection (E2B default)                  : 0.5 / 0.4 / 0.3 / 0.3 / 0.3 ms
+The 81 ms row is history: N89 deleted the synthesis that produced it, and that
+shape is refused at create now. Re-run this probe to record the
+blocking-accept row for the host-listener arm, which is what the shape supports
+after N89.
 """
 
 import os
@@ -56,15 +61,16 @@ ROUNDS = int(os.environ.get("N88_ROUNDS", "5"))
 
 SERVER = r'''
 import asyncio
-import os
 import selectors
 import socket
 import sys
 
 port = int(sys.argv[1])
 
-# Evidence 1: this kernel's own epoll fdinfo spelling (the supervisor reads the
-# same file for the child's epoll fd and parses the `tfd:` line).
+# This kernel's own epoll fdinfo spelling. N89 retired the supervisor-side
+# reader (`network/readiness.rs`), so this is now only an observation of the
+# kernel under test -- kept because it is cheap and it is the file any future
+# reader would parse.
 a, b = socket.socketpair()
 sel = selectors.DefaultSelector()
 sel.register(a, selectors.EVENT_READ)
@@ -91,6 +97,28 @@ async def main():
 asyncio.run(main())
 '''
 
+# The host-listener arm's server: a blocking `accept()`. The supervisor owns the
+# host socket and hands the accepted connection over as this accept's result,
+# which is the contract N89 left in place.
+SERVER_BLOCKING = r'''
+import socket
+import sys
+
+port = int(sys.argv[1])
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", port))
+listener.listen(8)
+sys.stdout.write("listening\n")
+sys.stdout.flush()
+
+while True:
+    conn, _ = listener.accept()
+    data = conn.recv(4)
+    conn.sendall(data)
+    conn.close()
+'''
+
 
 def drain(stream, seconds):
     """Read whatever is ready on `stream` for at most `seconds`."""
@@ -110,7 +138,7 @@ def drain(stream, seconds):
     return out
 
 
-def one_shape(label, host_port, bind_inject):
+def one_shape(label, host_port, bind_inject, server=SERVER):
     sb = Sandbox(
         fs_readable=["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"],
         fs_writable=["/tmp"],
@@ -125,7 +153,7 @@ def one_shape(label, host_port, bind_inject):
 
     conn = None
     with sb.popen(
-        [sys.executable, "-c", SERVER, str(SANDBOX_PORT)],
+        [sys.executable, "-c", server, str(SANDBOX_PORT)],
         stdout=StdioMode.PIPED,
         stderr=StdioMode.PIPED,
     ) as proc:
@@ -180,10 +208,16 @@ def one_shape(label, host_port, bind_inject):
 
 def main():
     print(f"uid={os.getuid()} sandbox_port={SANDBOX_PORT}", flush=True)
-    # The path N88 ② rewrote: host listener + readiness synthesis.
-    one_shape("host-listener (readiness synthesis)", HOST_PORT, bind_inject=False)
-    # The fleet's shipped default, for contrast.
-    one_shape("bind-injection (E2B default)  ", HOST_PORT + 1, bind_inject=True)
+    # The surviving host-listener shape: a blocking accept() (N89).
+    one_shape(
+        "host-listener (blocking accept)   ",
+        HOST_PORT,
+        bind_inject=False,
+        server=SERVER_BLOCKING,
+    )
+    # The fleet's shipped default: the sandbox's own listener is a host socket,
+    # so an event loop is served by the kernel.
+    one_shape("bind-injection + asyncio       ", HOST_PORT + 1, bind_inject=True)
     return 0
 
 

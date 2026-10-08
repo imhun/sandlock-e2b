@@ -32,6 +32,7 @@ from pathlib import Path
 from gateway_common.errors import ConnectError, unimplemented
 from gateway_common.network import NetworkUpdateConflictError
 from gateway_common.paths import own_identity_instance_name
+from envd_service.config import MAPPED_SANDBOX_NEEDS_INJECTION
 from envd_service.executors.base import ExecConfig, Executor, RunningProcess
 from envd_service.process.stream_budget import (
     STREAM_LIMIT_DEFAULT,
@@ -902,6 +903,30 @@ class SandlockExecutor(Executor):
                 "port_mappings require net isolation "
                 "(E2B_ENABLE_NET_ISOLATION=true): host ports in the 50005+ "
                 "range map onto the sandbox's own netns listeners"
+            )
+        if self._port_mappings and not self._bind_inject:
+            # N89: with the readiness synthesis retired, a host-listener
+            # mapping serves blocking/threaded accept() only. A worker whose
+            # worker-wide mappings are non-empty and injection is off can never
+            # serve them, so it refuses here rather than at the first create
+            # (the per-sandbox half of the same guard is in
+            # `_apply_inbound_mapping`, because the MCP gateway adds a mapping
+            # per sandbox).
+            raise ValueError(
+                MAPPED_SANDBOX_NEEDS_INJECTION.format(
+                    sandbox="<worker>", ports=dict(sorted(self._port_mappings.items()))
+                )
+            )
+        if not self._bind_inject and not getattr(
+            type(self), "_mapping_without_injection_warned", False
+        ):
+            type(self)._mapping_without_injection_warned = True
+            logger.warning(
+                "E2B_NET_BIND_INJECT=0: inbound mappings are served by a "
+                "supervisor-side host listener, which since N89 only supports "
+                "a blocking/threaded accept(). A sandbox that ends up with a "
+                "mapping anyway (the MCP gateway adds one for the sandbox that "
+                "asks for it) will be refused by name at create."
             )
         self._network_deny_cidrs = tuple(network_deny_cidrs)
         self._notify_rate_limit = notify_rate_limit
@@ -2703,16 +2728,7 @@ class SandlockExecutor(Executor):
             )
         if self._enable_net_isolation:
             kwargs["net_isolation"] = True
-            if self._port_mappings:
-                kwargs["port_mappings"] = dict(self._port_mappings)
-                if self._bind_inject:
-                    # S2.5 bind injection: the mapped port becomes a socket the
-                    # sandbox itself listens on (created in the worker netns and
-                    # injected at bind() time), so the supervisor leaves the
-                    # accept/readiness path -- no host listener, no eager-accept
-                    # worker, no poll/epoll_wait interception. Measured cost of
-                    # the mapping path it replaces: ~390 ms per MCP request.
-                    kwargs["net_bind_inject"] = True
+            self._publish_inbound_mapping(kwargs)
             if self._fd_inject_connect:
                 kwargs["fd_inject_connect"] = True
             elif not getattr(type(self), "_netns_no_inject_warned", False):
@@ -2811,6 +2827,37 @@ class SandlockExecutor(Executor):
 
             return SimpleNamespace(**kwargs)
         return SandlockSandbox(**kwargs)
+
+    def _publish_inbound_mapping(self, kwargs: dict) -> None:
+        """Publish this sandbox's inbound mappings, or refuse by name (N89).
+
+        The decision is per sandbox: the mapping a sandbox carries can come from
+        the worker-wide ``E2B_PORT_MAPPINGS`` *or* from the sandbox itself (the
+        MCP gateway's port is added by `set_mcp_bind_port`), so the injection
+        switch on its own says nothing about whether this create needs the
+        host-listener path.
+
+        With injection on, the mapped port becomes a socket the sandbox itself
+        listens on (created in the worker netns and injected at `bind()` time),
+        so the supervisor leaves the host-listener path entirely -- no host
+        listener, no eager-accept worker. With injection off the mapping would
+        be served from a host listener, which since N89 only serves a
+        blocking/threaded `accept()`: an event-loop server would hang with no
+        error anywhere, so that shape is refused instead of built.
+        """
+        if not self._port_mappings:
+            return
+        if not self._bind_inject:
+            raise RuntimeError(
+                MAPPED_SANDBOX_NEEDS_INJECTION.format(
+                    sandbox=self._sandbox_id or "<unnamed>",
+                    ports=dict(sorted(self._port_mappings.items())),
+                )
+            )
+        kwargs["port_mappings"] = dict(self._port_mappings)
+        # S2.5 bind injection. Measured cost of the mapping path it replaces:
+        # ~390 ms per MCP request (docs/e2b-integration.md S2.1-S2.5).
+        kwargs["net_bind_inject"] = True
 
     def _build_sandbox(self, config: ExecConfig):
         """One-shot per-command ``Sandbox`` policy builder.
@@ -2949,16 +2996,7 @@ class SandlockExecutor(Executor):
             )
         if self._enable_net_isolation:
             kwargs["net_isolation"] = True
-            if self._port_mappings:
-                kwargs["port_mappings"] = dict(self._port_mappings)
-                if self._bind_inject:
-                    # S2.5 bind injection: the mapped port becomes a socket the
-                    # sandbox itself listens on (created in the worker netns and
-                    # injected at bind() time), so the supervisor leaves the
-                    # accept/readiness path -- no host listener, no eager-accept
-                    # worker, no poll/epoll_wait interception. Measured cost of
-                    # the mapping path it replaces: ~390 ms per MCP request.
-                    kwargs["net_bind_inject"] = True
+            self._publish_inbound_mapping(kwargs)
             if self._fd_inject_connect:
                 kwargs["fd_inject_connect"] = True
             elif not getattr(type(self), "_netns_no_inject_warned", False):
