@@ -3486,6 +3486,22 @@ allowlist 404 个名字）里**没有 `unshare`**。pod 里直接量：`unshare(
 profile 跑 `net_isolation` 单开的车道，都会撞上 `sandlock_create failed`（错误文本就是这个，没有更
 细的原因）。口径已写进 `docs/production-deployment-requirements.md` §2.4.7。
 
+**补读数之二（2026-10-08，A：入站那组 trap 收窄到"真的用宿主 listener"的形状）** —— 量上面那条
+注入形状时顺带发现：只要沙箱**有映射**，`listen`/`accept4`/`poll`/`ppoll`/`epoll_wait`/`epoll_pwait`
+就都在通知表里，而注入形状下它们一条都做不了事（宿主 listener 不存在）⇒ 每次事件循环等待白付一跳。
+改法是条件化（`inbound_port_map && !net_bind_inject`，fork `dda8dd7`，**待发版**），量法
+`deploy/scripts/acceptance/probe_eventloop_trap_cost.py`（pod 里 20000 轮 `epoll_wait(0)`）：
+
+| 形状（同一台 `e2b-worker-0`） | 出厂 wheel（`97718d8`） | 本树 wheel（`dda8dd7`） |
+|---|---|---|
+| 映射 + 注入（生产 MCP 形状） | **16.33 µs/次** | **0.49 µs/次** |
+| `net_isolation`、无映射（不拦，控制档） | 0.49 µs/次 | 0.49 µs/次 |
+| MCP 往返（`probe_inbound_readiness.py` 注入档） | 0.4 ms | **0.3 ms** |
+| 宿主 listener + readiness 档 | 81.4 ms | **81.3 ms**（不受影响） |
+
+新 wheel 用的是"拷进 pod、`pip install --target` + `PYTHONPATH`"（不推镜像、不动 fleet），跑完已把
+pod 里的临时目录清掉。
+
 ### 7.54 N88 选项 ① 的修复：**已构建待发**（版本 `0.1.0-1134-g1b99eeb-20261007-214216`；apply 被跳板机不可达挡住）
 
 **这一节是"没滚成"的如实记录**：镜像已构建并推送，`apply` 一步没做（集群一个 pod 未动）。

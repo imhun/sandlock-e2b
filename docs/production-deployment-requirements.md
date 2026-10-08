@@ -775,6 +775,18 @@ inode 命中映射表）复制 fd 做端口复核 + 照旧给每个被监视 fd 
 `network::readiness` 只服务显式关掉注入的车道（对比读数：注入 0.4 ms vs 合成 81.4 ms，见 §2.4.7
 末尾 2026-10-08 那两条与 `docs/deploy-clusters.md` §7.55）。
 
+**另有一件已做（A，2026-10-08，fork `dda8dd7`）**：入站那组系统调用原来只要沙箱**有映射**就都入表
+（`inbound_port_map` = `net_bind_map` 非空），可注入形状下它们一条都做不了事 —— 宿主 listener 不存在，
+映射端口就是内核在打交道的宿主 socket。于是每次事件循环等待都白付一跳：集群实测（arm64/6.12，
+20000 轮 `epoll_wait(0)`）**16.33 µs/次** vs 同形状无映射 **0.49 µs/次**（**33×**）。现在条件是
+`inbound_port_map && !net_bind_inject`（BPF 表与 dispatch 表同一条谓词）：注入形状**整组不入表**，
+宿主 listener 形状一字不变。`listen`/`accept4` 必须跟着走，不只是省钱 —— 注入过的 socket 已经绑在
+**host** 端口上，拦住 `listen` 会让它去走宿主 listener 那条路、在同一端口建第二个 listener
+（`host_port == sandbox_port` 时正好可达，而这正是 E2B MCP 网关的分配形状），`EADDRINUSE` 会打断
+沙箱的 `listen()`；新的钉子先红后绿抓到的就是这个。集群复验（同一台 worker，pod 里把新 wheel 挂
+到 `PYTHONPATH`）：注入形状 **0.49 µs/次**（与控制档齐平）、MCP 往返 **0.3 ms**、宿主 listener 档
+**81 ms** —— 两条老读数都没动。量法 `deploy/scripts/acceptance/probe_eventloop_trap_cost.py`。
+
 修完要重跑同一条 A/B（`deploy/scripts/acceptance/netns-node-compare.py`）确认收敛，才谈 worker-1 全量与撤
 `ip_unprivileged_port_start`。
 
