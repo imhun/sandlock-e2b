@@ -129,8 +129,9 @@ def test_create_executor_passes_net_isolation_flags(monkeypatch) -> None:
     assert executor._enable_net_isolation is True
     assert executor._fd_inject_connect is True
     # S2.5 bind injection: the mapped port is served by a socket the sandbox
-    # itself listens on, so the supervisor never traps the event loop's
-    # readiness syscalls (see docs/production-deployment-requirements.md).
+    # itself listens on, so the supervisor stays out of the accept path
+    # (docs/production-deployment-requirements.md §2.4.7; since N89 the
+    # host-listener shape serves a blocking accept loop only).
     assert executor._bind_inject is True
     assert executor._port_mappings == {50006: 8080}
 
@@ -221,13 +222,38 @@ def test_a_mapped_sandbox_without_injection_is_refused_by_name(monkeypatch) -> N
     assert "readiness" in message, message
 
 
-def test_injection_off_with_worker_wide_mappings_fails_at_startup(monkeypatch) -> None:
-    """The deterministic half of the same guard: no mapping can ever be served.
+def test_injection_off_with_worker_wide_mappings_is_refused_at_startup() -> None:
+    """The deterministic half of the same guard, at the place startup checks live.
 
-    A worker whose ``E2B_PORT_MAPPINGS`` is non-empty with injection off cannot
-    build any of those sandboxes, so it refuses at construction (named) rather
-    than at the first create.
+    `create_app` already owns this class of refusal (`check_net_isolation_pairing`,
+    `refuse_retired_root_levers`, `check_seccomp_filter`), for one reason: a
+    misconfigured worker must not come up *looking* healthy. The executor is
+    built lazily per sandbox and its construction failure is deliberately
+    swallowed by `_prime_runtime_context`, so a worker with `E2B_PORT_MAPPINGS`
+    set and injection off would otherwise start, heartbeat, and then fail every
+    create (or, for a sandbox that never asks for a mapping, the first command).
     """
+    from envd_service.config import (
+        MAPPED_SANDBOX_NEEDS_INJECTION,
+        check_mapping_needs_injection,
+    )
+
+    def _settings(mappings, inject):
+        return SimpleNamespace(port_mappings=mappings, net_bind_inject=inject)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        check_mapping_needs_injection(_settings({"50006": "8080"}, False))
+    assert str(excinfo.value) == MAPPED_SANDBOX_NEEDS_INJECTION.format(
+        sandbox="<worker>", ports={50006: 8080}
+    )
+
+    # Injection on, or nothing mapped: no refusal to make.
+    assert check_mapping_needs_injection(_settings({"50006": "8080"}, True)) is None
+    assert check_mapping_needs_injection(_settings({}, False)) is None
+
+
+def test_the_executor_refuses_worker_wide_mappings_without_injection_too(monkeypatch) -> None:
+    """Belt and braces: the same refusal when a context is built outside `create_app`."""
     with pytest.raises(ValueError) as excinfo:
         _mapped_executor(monkeypatch, bind_inject=False, port_mappings={"50006": "8080"})
     message = str(excinfo.value)

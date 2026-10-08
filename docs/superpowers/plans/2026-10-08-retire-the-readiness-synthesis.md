@@ -65,9 +65,10 @@
 
 ## 执行记录（2026-10-08，T1–T4 完成；T5 未开工）
 
-**T1–T4 的提交**：fork `8396264`（T1 两枚钉子 + 钉子第一次跑抓到的既有缺陷，见下）→
-fork `ff0b8e7`（T2 删 1422 行/加 116 行）→ fork `67da4eb`（T4 基线）→ 父仓一笔（T3 守卫 +
-docs + submodule 指针）。
+**T1–T4 + 评审修复批的提交**：fork `8396264`（T1 两枚钉子 + 钉子第一次跑抓到的既有缺陷，见下）→
+fork `ff0b8e7`（T2 删 1422 行/加 116 行）→ fork `67da4eb`（T4 基线）→ 父仓 `6f3d169`（T3 守卫 +
+docs + submodule 指针）→ 评审修复批（见文件末"评审与修复"，含第三枚钉子
+`the_cross_table_check_catches_a_missing_chain` 与 `create_app` 的真正启动闸门）。
 
 **判据读数（四条，逐条对上面「登记时的判据」）**：
 
@@ -82,7 +83,8 @@ docs + submodule 指针）。
    **它第一次跑就抓到一条既有的真问题** → 见 N92（`fchmodat2` 被 trap 没有 chain）。
 4. 十一档门禁与基线一致（**全部实测**）：core_lib 944 / core_integ 573 / ffi 104 / cli 100 /
    supervise 57 / supervise_cost 3 / cli_build 0 / python 465 / oci 157 / supervise_root 4 /
-   mediation_2uid 9。两格基线按"实测 − 删掉/新增"解释清楚后刷新（946→944、578→573）。
+   mediation_2uid 9。两格基线按"实测 − 删掉/新增"解释清楚后刷新（946 − 5 条 readiness 单测 +
+   3 枚钉子 = 944；578 − 5 条集成测试 = 573）。
 
 **T2 一处比计划多做（已记账）**：`InboundListener.pending` 是只有合成器读的状态，随合成一起删。
 

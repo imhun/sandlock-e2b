@@ -279,8 +279,9 @@ def test_net_isolation_fd_inject_and_port_mappings_passthrough(tmp_path: Path) -
     assert sb.net_isolation is True
     assert sb.fd_inject_connect is True
     # S2.5 bind injection rides with the mappings: the mapped port becomes a
-    # socket the sandbox itself listens on, so the supervisor leaves the
-    # accept/readiness path.
+    # socket the sandbox itself listens on, so the supervisor leaves the accept
+    # path (and, since N89, it is the only way a mapped sandbox serves an
+    # event-loop server).
     assert sb.net_bind_inject is True
     assert sb.port_mappings == {50006: 8080}
 

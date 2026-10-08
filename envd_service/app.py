@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from envd_service.config import (
     Settings,
+    check_mapping_needs_injection,
     check_net_isolation_pairing,
     check_seccomp_filter,
     refuse_retired_root_levers,
@@ -235,6 +236,14 @@ def create_app(
     # worker whose network looks "down" with nothing in its logs. The
     # intentional no-egress shape sets E2B_NET_ISOLATION_ALLOW_LOOPBACK_ONLY=1.
     check_net_isolation_pairing(settings)
+    # N89 guard (2026-10-08): the readiness synthesis is retired, so a
+    # supervisor-side host-listener mapping serves a blocking/threaded
+    # `accept()` only. Worker-wide mappings with injection off can therefore
+    # never be served -- the executor would refuse each of those sandboxes
+    # lazily (its construction failure is swallowed by
+    # `_prime_runtime_context`), so the worker would look healthy and fail
+    # every create. Refuse here, by name, like the pairing guard above.
+    check_mapping_needs_injection(settings)
     # N16 pairing guard (2026-09-26): `E2B_PURE_ROOTFS=synth` gets its binds
     # from the real-root path only, so without `E2B_REAL_ROOT` the skeleton
     # stays empty and every sandbox it builds dies on its own `/bin/sh`

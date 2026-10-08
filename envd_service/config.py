@@ -248,12 +248,14 @@ class Settings:
     # S2.5 bind injection (fork `net_bind_inject`): the mapped inbound port is
     # answered by replacing the sandbox's socket with a supervisor-created
     # host-loopback one at `bind()` time, so the sandbox `listen()`s/`accept()`s
-    # on a real host-netns socket and the supervisor never traps
-    # `poll`/`ppoll`/`epoll_wait` for readiness synthesis. Measured on the
-    # deployment (2026-09-16): an MCP request cost ~390 ms per request with the
-    # host-listener mapping and ~8 ms with injection. Requires
-    # `port_mappings` + `net_isolation`; setting it without the mapping is
-    # refused by the fork's own validation (fail closed).
+    # on a real host-netns socket. (It used to be described as "the supervisor
+    # never traps poll/epoll_wait for readiness synthesis"; N89 retired that
+    # synthesis outright, and with it the host-listener shape's event-loop
+    # support -- this switch is now the only way a mapped sandbox can serve
+    # an event-loop server.) Measured on the deployment (2026-09-16): an MCP
+    # request cost ~390 ms per request with the host-listener mapping and ~8 ms
+    # with injection. Requires `port_mappings` + `net_isolation`; setting it
+    # without the mapping is refused by the fork's own validation (fail closed).
     net_bind_inject: bool = field(
         default_factory=lambda: _env_bool("E2B_NET_BIND_INJECT", True)
     )
@@ -1008,6 +1010,36 @@ def check_net_isolation_pairing(settings: Settings) -> None:
     if getattr(settings, "allow_loopback_only", False):
         return
     raise RuntimeError(NET_ISOLATION_PAIRING_ERROR)
+
+
+def check_mapping_needs_injection(settings: Settings) -> None:
+    """Refuse a worker whose worker-wide mappings can never be served (N89).
+
+    ``E2B_PORT_MAPPINGS`` non-empty with ``E2B_NET_BIND_INJECT=0`` is the one
+    half of N89's guard that is deterministic at startup: injection off means
+    every mapping is served from a supervisor-side host listener, and the
+    readiness synthesis that used to wake an event-loop consumer of such a
+    listener is retired -- since N89 those listeners serve a blocking/threaded
+    ``accept()`` only. The per-sandbox half (the MCP gateway adds a mapping per
+    sandbox) lives in
+    :meth:`envd_service.executors.sandlock.SandlockExecutor._publish_inbound_mapping`,
+    because only the sandbox knows whether it will carry one.
+
+    Called from ``create_app`` beside its siblings, for the same reason they
+    exist: a misconfigured worker must fail by name at startup rather than look
+    healthy and fail every create (the executor is built lazily, and that
+    failure is deliberately swallowed on the create path).
+    """
+    if not getattr(settings, "port_mappings", None):
+        return
+    if getattr(settings, "net_bind_inject", True):
+        return
+    raise RuntimeError(
+        MAPPED_SANDBOX_NEEDS_INJECTION.format(
+            sandbox="<worker>",
+            ports={int(k): int(v) for k, v in settings.port_mappings.items()},
+        )
+    )
 
 
 def refuse_retired_root_levers(settings: Settings) -> None:

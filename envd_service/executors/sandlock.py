@@ -908,10 +908,11 @@ class SandlockExecutor(Executor):
             # N89: with the readiness synthesis retired, a host-listener
             # mapping serves blocking/threaded accept() only. A worker whose
             # worker-wide mappings are non-empty and injection is off can never
-            # serve them, so it refuses here rather than at the first create
-            # (the per-sandbox half of the same guard is in
-            # `_apply_inbound_mapping`, because the MCP gateway adds a mapping
-            # per sandbox).
+            # serve them. `create_app` refuses this shape at startup
+            # (`check_mapping_needs_injection`); this is the same refusal for a
+            # context built outside `create_app`, and the per-sandbox half of
+            # the guard is `_publish_inbound_mapping` below (the MCP gateway
+            # adds a mapping per sandbox, so a global switch cannot decide).
             raise ValueError(
                 MAPPED_SANDBOX_NEEDS_INJECTION.format(
                     sandbox="<worker>", ports=dict(sorted(self._port_mappings.items()))
