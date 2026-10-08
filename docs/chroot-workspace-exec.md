@@ -1101,11 +1101,14 @@ guest 内核 ≥6.10、工作区必须在 guest 本机文件系统、`/tmp` 重�
 **899/4**，四条红**全部**落在"按架构写死的表"上，其中一条是**产品 bug**：
 
 * **`struct epoll_event` 在 aarch64 上是 16 字节、`data` 在偏移 8**（x86_64 才是 packed 的 12/4；
-  两边都用 C 探针量过）。`network/readiness.rs` 把 `12/4` 写死了 ⇒ **入站映射**（拦截
-  `epoll_ctl(ADD|MOD)` 并合成 `epoll_wait` 结果那条路）在 aarch64 上读错半个记录、写回内核不认的
-  记录。真内核上 RED 到位：解析出 `data = 0x0b0a090800000000`，真值是 `0x0f0e0d0c0b0a0908`。
+  两边都用 C 探针量过）。`network/readiness.rs` 把 `12/4` 写死了 ⇒ **入站映射**（当时那条路还要
+  读回子进程的 `struct epoll_event`，并把合成的 events 写回去）在 aarch64 上读错半个记录、写回内核
+  不认的记录。真内核上 RED 到位：解析出 `data = 0x0b0a090800000000`，真值是 `0x0f0e0d0c0b0a0908`。
   **这条与 C/R 无关、但与生产同源** —— 线上 worker 是 aarch64，任何走 epoll 入站映射的负载都会
-  踩到它。已在两架构上 GREEN（fork `5937df0`）。
+  踩到它。已在两架构上 GREEN（fork `5937df0`）。**N88 ② 之后这条只保证一半**：**读**那一半整个没了
+  （注册表改从内核自己的 `/proc/<pid>/fdinfo/<epfd>` 取），**写回**那一半仍然要靠 `EPOLL_EVENT_SIZE`
+  / `EPOLL_EVENT_DATA_OFFSET` 按 ABI 摆对（`encoded_epoll_events_land_in_the_arch_layout` 钉着它，
+  x86_64 12/4、其余 LP64 16/8）。
 * `sys/path_surface.rs` 的三个横切检查按 x86_64 的**名字**比对，而 `chroot_path_syscalls()` 本就是
   **数字**表（`arch::sys_*()` 在 generic ABI 上返回 `None`）：aarch64 上 `open/stat/...` 根本不存在
   ⇒ 改成"按数字比对 + 每个 ABI 相关行由 arch helper 双向背书"。产品行为未变（fork `8a7e225`）。

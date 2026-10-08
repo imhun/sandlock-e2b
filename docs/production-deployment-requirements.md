@@ -660,7 +660,7 @@ root-in-userns 自带 `CAP_NET_BIND_SERVICE`；k8s 清单 2026-09-17（N5）切 
 2026-09-26：`deploy/compose` 的两个本地示例与 `autoscaler/backends/local.py` 也切到同一
 形态（见 §2.4.3 末尾），仓库里只剩 arm lane 的 Rust 套件还跑共享 netns。
 
-**2026-10-08 补的两条现场事实**（k0s fleet 的 worker pod，量法见
+**2026-10-08 补的三条现场事实**（k0s fleet 的 worker pod，量法见
 `deploy/scripts/acceptance/{probe_inbound_readiness,sandbox_shape_matrix}.py`，读数与全文见
 `docs/deploy-clusters.md` §7.55 的"补读数"）：
 
@@ -673,7 +673,16 @@ root-in-userns 自带 `CAP_NET_BIND_SERVICE`；k8s 清单 2026-09-17（N5）切 
 * **readiness 合成在生产默认形状下不走**：`E2B_NET_BIND_INJECT` 默认 `true`（fleet 的 env 里没
   声明它 ⇒ 取默认），MCP 入站端口走 bind 注入 —— 同一台 worker 上量：bind 注入往返 **0.4 ms**、
   宿主 listener + readiness 合成 **81 ms**（5 次 4-byte 往返的中位）。这条差距就是 §2.4.7 当初选
-  注入的理由，也意味着 `network::readiness` 现在只服务 `E2B_NET_BIND_INJECT=0` 的车道。
+  注入的理由，也意味着 `network::readiness` 现在只服务 `E2B_NET_BIND_INJECT=0` 的车道；
+* **入站映射的生命周期（N88 ②(a)，2026-10-08 起）**：宿主侧那个 `127.0.0.1:<host_port>` listener
+  在沙箱 `listen()` 映射端口时建立，**不再随沙箱关掉监听 socket 释放**；它在**沙箱退出**、或
+  **后来有 socket 再 listen 同一个映射端口**（那时旧条目被替换、新 listener 顶上）时才释放/替换。
+  语义上的差别只有一条：沙箱关掉监听 socket 后，宿主端口会多占一会儿 —— 而该端口本来就是平台分给
+  这个沙箱的（`50005+`），不与别的沙箱抢。**为什么这么改**：原来靠"每次 `close` 来一条通知"撤映射，
+  那是把沙箱里最热的系统调用整条挂到通知表上（实测 `openclose` 阶梯从 ~5000 掉到 ~2500 op/s）；
+  现在 `close` 与 `epoll_ctl` 都彻底不在通知表里，代价是"映射活得比监听 socket 久"。失效的映射
+  条目由**用到时的复核**淘汰（拿活 socket 的 virtual 端口跟条目里记的 sandbox 端口对，inode 被内核
+  回收也不会认错）。
 
 以下为灰度期的记录，保留作追溯：**形态**：`deploy/stack/docker-compose.prod.yml` 里**只有 worker-2** 带
 `E2B_ENABLE_NET_ISOLATION=true` + `E2B_FD_INJECT_CONNECT=true`（默认即 true，可用
@@ -753,13 +762,18 @@ netns 箱内 DNS 是"快速失败"（0.4 ms，不是解析）。⇒ 每请求 ~3
 这也解释了为什么只有 MCP 路径慢：命令 RTT（34 ms，两形态一致）与 stdio server 自身
 （0.2 ms）都不带被映射的 listener，不触发拦截；401 只走少数几次迭代（~75 ms）。
 
-修复方向（fork 侧，任选其一或组合）：
+修复方向（fork 侧，任选其一或组合）—— **2026-10-08 的状态**：
 ① 快路径先行——进入切片循环前先以 timeout=0 试探一次复制 fd 与 `pending`，就绪即立刻返回，
-不再 `Defer`；
-② 去掉每次调用的 `dup_fd_from_pid` + `socket_ino` + 网络锁（epoll 路径已有 `epoll_ctl`
-注册表可缓存 inode；`ppoll` 可按 (pid, fd) 做小缓存）；
-③ 从设计上消掉这条映射——让网关改用 supervisor 交付的 socketpair 而不是在沙箱 netns 里
-bind+listen，则 `inbound_port_map` 关掉、拦截整体消失（改动最大，收益也最彻底）。
+不再 `Defer`。**未做**；
+② 去掉每次调用的 `dup_fd_from_pid` + `socket_ino` + 网络锁。**建议本身已过时**：它指的"epoll 路径
+已有 `epoll_ctl` 注册表可缓存 inode"在 N88 ② 之后不存在了（那张表整个删掉，`epoll_wait` 改读内核
+自己的 `/proc/<pid>/fdinfo/<epfd>`）；现在的形状是"**一次 fdinfo 读** + 只对候选（fdinfo 报出的
+inode 命中映射表）复制 fd 做端口复核 + 照旧给每个被监视 fd 复制一份去 poll"，即单次等待的成本与
+当时同量级、没有变贵，但也没有变便宜。`ppoll` 那条 (pid, fd) 小缓存仍未做；
+③ 从设计上消掉这条映射。**已做（落成"bind 注入"而不是 socketpair）**：见下方 `net_bind_inject`，
+它现在是 worker 的默认（`E2B_NET_BIND_INJECT` 默认 true）⇒ 线上 MCP 入站不经这条路，
+`network::readiness` 只服务显式关掉注入的车道（对比读数：注入 0.4 ms vs 合成 81.4 ms，见 §2.4.7
+末尾 2026-10-08 那两条与 `docs/deploy-clusters.md` §7.55）。
 
 修完要重跑同一条 A/B（`deploy/scripts/acceptance/netns-node-compare.py`）确认收敛，才谈 worker-1 全量与撤
 `ip_unprivileged_port_start`。
