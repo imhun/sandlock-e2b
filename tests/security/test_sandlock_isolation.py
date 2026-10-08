@@ -10,7 +10,7 @@ import pytest
 from tests.security.conftest import (
     require_mediation_capable,
     resolve_test_rootfs,
-    route_b_sandbox,
+    own_identity_sandbox,
     run_sh,
     sandbox_tmpdir,
 )
@@ -25,9 +25,9 @@ def _one_shot(sh: str) -> tuple[int, bytes, bytes]:
     a shape a deployment has when N15 made the pure shape mediated: on a root
     worker the fork now refuses in-process mediation (SL-1), so the assertions
     below would have been measuring the harness. Going through
-    `route_b_sandbox` means they measure the product again.
+    `own_identity_sandbox` means they measure the product again.
     """
-    executor, workspace = route_b_sandbox(None, None, workspace=sandbox_tmpdir())
+    executor, workspace = own_identity_sandbox(None, None, workspace=sandbox_tmpdir())
     try:
         require_mediation_capable(executor)
         return asyncio.run(run_sh(executor, workspace, sh))
@@ -75,7 +75,7 @@ def test_install_to_system_path_denied():
 @pytest.mark.usefixtures("require_sandlock", "require_sandbox_file_ownership")
 def test_user_cli_install_within_workspace_persists():
     """User-level installs into the sandbox dir survive across commands."""
-    executor, workspace = route_b_sandbox(None, None, workspace=sandbox_tmpdir())
+    executor, workspace = own_identity_sandbox(None, None, workspace=sandbox_tmpdir())
     try:
         require_mediation_capable(executor)
 
@@ -111,10 +111,10 @@ async def test_dev_shm_absent_but_dev_null_writable():
     Built through the worker's own path (pooled host uid + ``E2B_OWN_IDENTITY=auto``
     slot): this is the mediated chroot shape, and mediation now runs as the
     sandbox's host uid, not as the worker -- see
-    ``tests/security/conftest.py::route_b_sandbox``.
+    ``tests/security/conftest.py::own_identity_sandbox``.
     """
     rootfs = resolve_test_rootfs("python:3.11-slim")
-    executor, workspace = route_b_sandbox("python:3.11-slim", rootfs)
+    executor, workspace = own_identity_sandbox("python:3.11-slim", rootfs)
     probe = (
         "test -e /dev/shm && echo SHM_VISIBLE || echo SHM_ABSENT; "
         "if echo x > /dev/null 2>/dev/null; then echo DEV_NULL_WRITABLE; "

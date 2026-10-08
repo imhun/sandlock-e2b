@@ -281,19 +281,19 @@ def test_the_security_helper_ignores_the_retired_shape_switch(
 ) -> None:
     """One shape: the helper synthesizes the root whatever the env says.
 
-    `route_b_sandbox` is the only place the security suite builds a shape. It
+    `own_identity_sandbox` is the only place the security suite builds a shape. It
     used to *read* `E2B_PURE_ROOTFS`, which would build the retired identity
     root for a lane that still set `off` -- measuring the shape the app refuses
     at startup while reporting on the deployment. The retired value now has no
     effect here; the directory knob is still honoured.
     """
-    from tests.security.conftest import route_b_sandbox
+    from tests.security.conftest import own_identity_sandbox
 
     calls = _stub_probe(monkeypatch)
     monkeypatch.setenv("E2B_PURE_ROOTFS", "off")
     monkeypatch.setenv("E2B_PURE_ROOTFS_DIR", str(tmp_path / "_pure_rootfs"))
     monkeypatch.delenv("E2B_REAL_ROOT", raising=False)
-    executor, _workspace = route_b_sandbox(None, None)
+    executor, _workspace = own_identity_sandbox(None, None)
     try:
         assert executor._has_sandbox_root is True
         assert executor._synthetic_rootfs.parent == tmp_path / "_pure_rootfs"
@@ -306,12 +306,12 @@ def test_the_security_helper_ignores_the_retired_shape_switch(
 def test_the_security_helper_defaults_to_the_synthesized_root(
     monkeypatch, tmp_path
 ) -> None:
-    from tests.security.conftest import route_b_sandbox
+    from tests.security.conftest import own_identity_sandbox
 
     calls = _stub_probe(monkeypatch)
     monkeypatch.delenv("E2B_PURE_ROOTFS", raising=False)
     monkeypatch.delenv("E2B_REAL_ROOT", raising=False)
-    executor, _workspace = route_b_sandbox(None, None)
+    executor, _workspace = own_identity_sandbox(None, None)
     try:
         assert executor._has_sandbox_root is True
         assert calls == ["probed"]

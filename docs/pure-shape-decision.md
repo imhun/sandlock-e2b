@@ -90,7 +90,7 @@ exec 的 `PT_INTERP` 补丁 + memfd 那套可删（内核按新根解析解释�
    代价与前置也随之确定：**pure 形态从此需要 own identity 槽位**（否则中介以 euid 0 跑被
    SL-1 守卫拒 → fail closed，与既有纪律一致），因此**第一步是把 29 条假定"纯形态不中介"
    的测试迁移过来**（清单与证据见 backlog N15 行：8 个 security 文件里直接构造
-   `SandlockExecutor` 的用例改用 `route_b_sandbox(None, None)`、选择矩阵那条改成"自动上
+   `SandlockExecutor` 的用例改用 `own_identity_sandbox(None, None)`、选择矩阵那条改成"自动上
    槽位"、另有 4 条形态差异），迁移后跑 **gate B（`E2B_BASE_IMAGE=""`）+ 默认档**双复验。
    验收线照 chroot 形态的现有契约等强 —— 宿主文件的存在性/大小/时间戳/inode/链接目标/
    xattr/事件都不可见，且 `diskMB` 那层账本在该形态下也有等价物。
@@ -220,7 +220,7 @@ container 崩塌 ⇒ 之后每个 verb 都答 `InstanceClosed`（security 两态
 用户裁定（本条）：**默认切成 `synth`** —— 残差的成因是"没有根"本身（§5 第 2 条），所以消掉它只能
 靠默认档换根。切换前 lane 三档的复核（`synth` 档 `chain=PASS`、默认 identity 档 `LEAK
 ["_secrets","state"]`、legacy 反例 `exit 1`）证据见 §5 第 2 条与 `docs/deploy-clusters.md` §11.2。
-**切换后（2026-09-28）在 lane 上复核过默认档本身**：不设任何键 = `route_b_active=True has_root=True`、
+**切换后（2026-09-28）在 lane 上复核过默认档本身**：不设任何键 = `own_identity_active=True has_root=True`、
 `stat=PASS`/`chain=PASS`/`exit 0`，而 `E2B_PURE_ROOTFS=off` 仍 `LEAK ["_secrets","state"]`/`exit 1`
 （日志 `tmp/n27-default-synth-lane.log` / `tmp/n27-off-identity-lane.log`）；同一轮修掉探针在浅路径上
 （沙箱里那份 `/home/user/n27-checker.py`）算 `parents[3]` 的 `IndexError`，pin 见

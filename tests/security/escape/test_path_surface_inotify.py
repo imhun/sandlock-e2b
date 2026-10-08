@@ -31,7 +31,7 @@ import pytest
 from tests.security.conftest import (
     require_mediation_capable,
     resolve_test_rootfs,
-    route_b_sandbox,
+    own_identity_sandbox,
     run_sh,
 )
 
@@ -161,7 +161,7 @@ async def _await_path(path: Path, *, what: str, timeout: float = 120.0) -> None:
 def test_mediated_shape_resolves_the_watch_inside_the_virtual_root():
     """Host paths are refused; a path inside the sandbox still watches."""
     rootfs = resolve_test_rootfs("python:3.11-slim")
-    executor, workspace = route_b_sandbox("python:3.11-slim", rootfs)
+    executor, workspace = own_identity_sandbox("python:3.11-slim", rootfs)
     host_only = Path(HOST_ONLY_DIR)
     try:
         require_mediation_capable(executor)
@@ -202,7 +202,7 @@ def test_the_pure_shape_is_mediated_too_and_the_watch_stays_inside():
     """
     host_only = Path(HOST_ONLY_DIR)
     host_only.mkdir(parents=True, exist_ok=True)
-    executor, workspace = route_b_sandbox(None, None)
+    executor, workspace = own_identity_sandbox(None, None)
     try:
         require_mediation_capable(executor)
         leaked = _drive(executor, workspace, HOST_ONLY_DIR, host_only / "HOST_FILE")

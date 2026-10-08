@@ -2250,7 +2250,7 @@ phase 1 `1683 passed, 6 skipped, 1 xfailed`，phase 2（uid 65534 + broker）`51
 | 失败 | 真因 | 修法 |
 |---|---|---|
 | `test_disk_budget_enforcement` ×2 | 断言的是**旧语义**（超预算 ⇒ 暂停 + 退回预留），而 N25 已改成"阻止写入、不暂停" | 改成钉住当前语义：`running` 不变、预留不变、无暂停日志；另一条改钉"越界上报 + 回落即消失"（`disk_overrun_stats`） |
-| `test_uid_permissions` / `test_nonroot_route_b` / `test_shared_volume_relative_cwd` ×5 | OBS-9 之后 uid 由**控制面**分配，而夹具只给 worker 配了池 ⇒ `500 uid 10000 is outside this worker's pool`；两个文件共用一段 uid 时还会撞"一个 uid 一个活槽位"（表现为 `exit 127`） | 控制面与 worker 配同一段；`test_shared_volume_relative_cwd` 单独用 22000；记录路径改用 `sandbox_record_path`（`_runtime/<id>/`） |
+| `test_uid_permissions` / `test_nonroot_own_identity` / `test_shared_volume_relative_cwd` ×5 | OBS-9 之后 uid 由**控制面**分配，而夹具只给 worker 配了池 ⇒ `500 uid 10000 is outside this worker's pool`；两个文件共用一段 uid 时还会撞"一个 uid 一个活槽位"（表现为 `exit 127`） | 控制面与 worker 配同一段；`test_shared_volume_relative_cwd` 单独用 22000；记录路径改用 `sandbox_record_path`（`_runtime/<id>/`） |
 | `test_volume_quota` ×1 | 断言 `perSandboxQuotaMb == 0`，而 N28/C（`78285fa`）之后该值**原样透传**（`single_file_ceiling_bytes` 要用它，0 = 无限制） | 期望改成 `512` 并写明理由 |
 | `test_quota_agent_client` ×1 / `test_migration_volume_quota` ×2 | 是上面两条的**连带**（428/500 改变了全局状态与告警顺序），修完自动转绿 | — |
 

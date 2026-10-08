@@ -37,7 +37,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.security.conftest import route_b_sandbox, run_sh
+from tests.security.conftest import own_identity_sandbox, run_sh
 
 UID_A = 10000
 UID_B = 10001
@@ -53,7 +53,7 @@ def _run(workspace: str, uid: int, cmd: list[str]):
     between two ``0770 <uid>:<worker gid>`` trees) is untouched by that; only
     the route is.
     """
-    executor, _ = route_b_sandbox(None, None, host_uid=uid, workspace=workspace)
+    executor, _ = own_identity_sandbox(None, None, host_uid=uid, workspace=workspace)
     try:
         shell = cmd[2] if cmd[:2] == ["/bin/sh", "-c"] else " ".join(cmd)
         code, out, err = asyncio.run(run_sh(executor, workspace, shell))

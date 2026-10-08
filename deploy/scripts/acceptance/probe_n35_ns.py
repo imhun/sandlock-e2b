@@ -134,7 +134,7 @@ async def main_async() -> int:
     try:
         require_mediation_capable(executor)
         print(
-            "== shape=" + shape + " route_b_active=" + str(executor._own_identity_active)
+            "== shape=" + shape + " own_identity_active=" + str(executor._own_identity_active)
             + " real_root=" + str(executor._has_sandbox_root)
             + " id=" + token
         )

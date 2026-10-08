@@ -39,7 +39,7 @@ import pytest
 
 @pytest.mark.usefixtures("require_sandlock")
 def test_statfs_reports_the_published_accounting():
-    from tests.security.conftest import route_b_sandbox, run_sh, sandbox_tmpdir
+    from tests.security.conftest import own_identity_sandbox, run_sh, sandbox_tmpdir
 
     ws = Path(sandbox_tmpdir())
     # Beside the sandbox's tree, not in it -- the sandbox must not be able to
@@ -55,7 +55,7 @@ def test_statfs_reports_the_published_accounting():
     )
     (ws / "statfs_probe.py").write_text(probe)
 
-    executor, workspace = route_b_sandbox(
+    executor, workspace = own_identity_sandbox(
         None, None, workspace=ws, disk_stats_path=str(stats)
     )
     code, out, err = asyncio.run(
@@ -91,7 +91,7 @@ def test_the_numbers_the_worker_publishes_are_what_the_sandbox_sees():
     from gateway_common.paths import sandbox_disk_stats_path
     from tests.security.conftest import (
         make_sandbox_visible,
-        route_b_sandbox,
+        own_identity_sandbox,
         run_sh,
         sandbox_tmpdir,
     )
@@ -134,7 +134,7 @@ def test_the_numbers_the_worker_publishes_are_what_the_sandbox_sees():
         "print(f.f_frsize, f.f_blocks, f.f_bfree, f.f_bavail)\n"
     )
     (ws / "statfs_probe.py").write_text(probe)
-    executor, workspace = route_b_sandbox(None, None, workspace=ws, disk_stats_path=str(stats))
+    executor, workspace = own_identity_sandbox(None, None, workspace=ws, disk_stats_path=str(stats))
     try:
         code, out, err = asyncio.run(
             run_sh(executor, workspace, "/usr/local/bin/python3 /workspace/statfs_probe.py")

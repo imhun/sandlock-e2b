@@ -1,7 +1,7 @@
 """Probe: which shape did a route-B sandbox actually get?
 
 The pid_ns acceptance (`tests/contract/test_nonroot_own_identity.py::
-test_route_b_restores_guest_root_with_and_without_pid_ns`) asserts `id -u` == 0,
+test_own_identity_restores_guest_root_with_and_without_pid_ns`) asserts `id -u` == 0,
 but that is also what the *default* (pid_ns off) shape reports -- so a green
 run is only evidence for pid_ns if the run really enabled it. This probe prints
 the three observables side by side, to be run twice in the prod-shaped lane:
@@ -28,7 +28,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.contract.test_nonroot_route_b import _make_apps, _ready_fields
+from tests.contract.test_nonroot_own_identity import _make_apps, _ready_fields
 from tests.contract.test_uid_permissions import _result, _run_cmd
 
 ROUTE_B_LOGGER = "envd_service.executors.sandlock"

@@ -27,7 +27,7 @@
 # `E2B_PURE_ROOTFS_DIR` is deliberately left unset so the helper's own
 # `sandbox_tmpdir(suffix="-pure-rootfs")` default applies (a directory the
 # sandbox uid can walk into); set it to pin one, as the deployment does with
-# `<workspace_base>/_pure_rootfs`. `tests/security/conftest.py::route_b_sandbox`
+# `<workspace_base>/_pure_rootfs`. `tests/security/conftest.py::own_identity_sandbox`
 # -- the security suite's only shape entry point (Task 5b, de0a817) -- reads
 # the *directory* knob and synthesizes the root unconditionally since N14 S5.
 #

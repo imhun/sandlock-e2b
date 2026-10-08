@@ -38,7 +38,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.contract.test_nonroot_route_b import _make_apps, _ready_fields
+from tests.contract.test_nonroot_own_identity import _make_apps, _ready_fields
 from tests.contract.test_uid_permissions import _result, _run_cmd
 
 ROUTE_B_LOGGER = "envd_service.executors.sandlock"

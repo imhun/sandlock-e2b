@@ -296,7 +296,7 @@ fork `1f41f1a` 关闭了。OCI 那句拒绝描述的是**另一条 E2B 不使用
 | **S0** | ✅ 修掉守卫用例里过时的架构说法（它仍写着"引擎只支持 x86_64/riscv64、aarch64 要先移植"，而 aarch64 的 S0–S5 2026-09-24 已落地） | 用例文本与代码一致 |
 | **S1a** | ✅ fork：slot 加 `checkpoint` verb（写 blob 到调用方指定的路径）—— fork `e76cb2f`，主仓 pin `82a26df` | fork 的 supervise 相位 **31 passed / 0 failed**，新用例钉住"镜像是引擎格式"与"捕获不是 kill" |
 | **S1b** | ✅ fork：**从镜像起一个 slot**（`Checkpoint::load` → 用镜像里的 policy 起沙箱 → `restore_interactive`），服务 `config`/`stats`/`shutdown`、**按名拒绝 exec**（照 OCI 的既有语义）。不是 verb，是启动模式 | fork `58264eb`，supervise 相位 **32 passed / 0 failed**。用例钉住：恢复出的进程**真的在跑**（计数器继续前进）、`stats.restored` 可辨、`exec` 得到引擎原话、`shutdown` 干净退出、**进程死后报 `Exited` 而不是 `Live`**（僵尸那个 bug 就是这一步量出来的）。**警告**：workload 必须是 §1(e) 那格里"能恢复"的类型 |
-| **S2** | ✅ **已完成**：worker：agent 端点（`/checkpoint`、`/restore`）+ D1/D2/D8 的落地 + **D3 的平台账与拒绝路径**（`runtime/checkpoint_store.py`、`runtime/platform_disk.py`、`route_b.OwnIdentityInstance` 的两个 verb 客户端、`executors/sandlock.py` 的两个能力入口） | 单测：blob 落在 `_runtime`、目录 0700 且属主是**沙箱自己的池 uid**（D2 的修正；无池 uid 时才留在 worker，`test_checkpoint_store.py:150-160`/`:193-204`）、沙箱树一个字节不动、**平台账计入且用户的 `diskMB` 不变**、账满时**先拒**（一条 verb 都不发）、写超了**删掉再拒**、refusal 带原因、teardown 删净 —— `tests/unit/test_checkpoint_store.py`（16 条）+ `tests/unit/test_agent_checkpoint_restore.py`（11 条）+ `tests/unit/test_sandlock_executor_own_identity.py` 的 6 条 verb 用例 |
+| **S2** | ✅ **已完成**：worker：agent 端点（`/checkpoint`、`/restore`）+ D1/D2/D8 的落地 + **D3 的平台账与拒绝路径**（`runtime/checkpoint_store.py`、`runtime/platform_disk.py`、`own_identity.OwnIdentityInstance` 的两个 verb 客户端、`executors/sandlock.py` 的两个能力入口） | 单测：blob 落在 `_runtime`、目录 0700 且属主是**沙箱自己的池 uid**（D2 的修正；无池 uid 时才留在 worker，`test_checkpoint_store.py:150-160`/`:193-204`）、沙箱树一个字节不动、**平台账计入且用户的 `diskMB` 不变**、账满时**先拒**（一条 verb 都不发）、写超了**删掉再拒**、refusal 带原因、teardown 删净 —— `tests/unit/test_checkpoint_store.py`（16 条）+ `tests/unit/test_agent_checkpoint_restore.py`（11 条）+ `tests/unit/test_sandlock_executor_own_identity.py` 的 6 条 verb 用例 |
 | **S3** | ✅ **完成**：`pause` 先捕获再冻结、`resume` 先解冻/恢复再改状态，`E2B_PAUSE_CHECKPOINT` 默认关 | 单测把两条顺序钉成事实（事件序列 `["executor.capture_checkpoint", "ctx.pause"]` / `["executor.restore_checkpoint", "ctx.resume"]`，`test_agent_checkpoint_restore.py`）。**集群验收见 §6(g)：全绿** —— 起一个跑着的沙箱 → 重启它的 worker → resume → **进程状态还在、还能 exec**（中途那段"恢复了但进程不见"是验收脚本自己的命令形状，见 §6(g) 第三轮） |
 | **S4** | ✅ **已完成**：`restore_skipped` 的对外语义（D6） | `unrecoveredFds` 随 `/restore` 与 `resume` 的结果返回、逐条进日志（用例断言的是**整句**日志文本，不是子串），文档在这一节与 §6(e) 里明说"恢复的沙箱没有原有的网络连接" |
 
@@ -334,7 +334,7 @@ fork `1f41f1a` 关闭了。OCI 那句拒绝描述的是**另一条 E2B 不使用
 | 层 | 落点 | 它决定 |
 |---|---|---|
 | 引擎 | fork `sandlock-supervise` 的 `checkpoint`/`restore` verb | 捕获那个进程、把它恢复成会话的孩子 |
-| 传输 | `route_b.OwnIdentityInstance.capture_checkpoint/restore_checkpoint` | verb 的线上形状；**refusal 原样抛**，由上层判断它是"没有这个能力"还是"这次不行" |
+| 传输 | `own_identity.OwnIdentityInstance.capture_checkpoint/restore_checkpoint` | verb 的线上形状；**refusal 原样抛**，由上层判断它是"没有这个能力"还是"这次不行" |
 | 能力 | `executors/sandlock.py::capture_checkpoint/restore_checkpoint` | 把三类"做不了"翻译成**带原因的结果**（`{"captured": false, "reason": ...}`）：中介形态、本机没有活会话、slot 拒绝（含旧 wheel 的 `unknown verb`）。**捕获从不租 slot，恢复一定租** —— 后者正是 (b) 的形状 |
 | 存储/账 | `runtime/checkpoint_store.py` + `runtime/platform_disk.py` | 图放哪、谁付钱、什么时候删、平台账满时怎么拒 |
 | 对外 | `agent.py` 的 `/agent/sandboxes/{id}/checkpoint`、`/restore`，以及 `pause`/`resume` 的接线 | 200 + 数字（无活会话/超账/refusal 都是**正常答案**）、401/404 的投递契约 |

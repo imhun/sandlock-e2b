@@ -68,7 +68,7 @@ def test_default_denylist_keeps_public_internet_open():
 def test_loopback_spellings_cannot_reach_a_worker_local_listener():
     """The reproducer, as a live assertion: a listener bound to the worker's
     loopback must be unreachable from the sandbox under every spelling."""
-    from tests.security.conftest import route_b_sandbox, run_sh, sandbox_tmpdir
+    from tests.security.conftest import own_identity_sandbox, run_sh, sandbox_tmpdir
 
     servers: list[socket.socket] = []
 
@@ -119,7 +119,7 @@ print(json.dumps(out, sort_keys=True))
     # probe source carries quotes and newlines that a `sh -c` string would eat.
     ws = Path(sandbox_tmpdir())
     (ws / "loopback_probe.py").write_text(probe)
-    executor, workspace = route_b_sandbox(
+    executor, workspace = own_identity_sandbox(
         None,
         None,
         workspace=ws,
@@ -162,7 +162,7 @@ def test_explicit_allowout_cannot_reach_a_protected_range():
       only the deny filter on the resolved address keeps it out -- the shape a
       DNS name that answers with a protected address would take.
     """
-    from tests.security.conftest import route_b_sandbox, run_sh, sandbox_tmpdir
+    from tests.security.conftest import own_identity_sandbox, run_sh, sandbox_tmpdir
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -205,7 +205,7 @@ print(json.dumps(out, sort_keys=True))
 
     ws = Path(sandbox_tmpdir())
     (ws / "allowlist_probe.py").write_text(probe)
-    executor, workspace = route_b_sandbox(
+    executor, workspace = own_identity_sandbox(
         None,
         None,
         workspace=ws,

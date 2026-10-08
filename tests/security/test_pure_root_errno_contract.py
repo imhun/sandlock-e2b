@@ -19,7 +19,7 @@ resolves in the tree the shape gives the sandbox.
   about. (Both spellings were measured 2026-09-26; the identity half is gone
   with the identity root, and what is left is what is pinned here.)
 
-Run through ``route_b_sandbox(None, None)`` so the shape comes from the same
+Run through ``own_identity_sandbox(None, None)`` so the shape comes from the same
 entry point every other security case uses (``tests/security/conftest.py``,
 which synthesizes the one pure root unconditionally since N14 S5).
 
@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.security.conftest import require_mediation_capable, route_b_sandbox, run_sh
+from tests.security.conftest import require_mediation_capable, own_identity_sandbox, run_sh
 
 
 @pytest.mark.usefixtures("require_sandlock")
@@ -47,7 +47,7 @@ async def test_the_errno_for_a_path_outside_every_grant_is_pinned(workspace):
     # and exactly the trap this assertion exists to avoid. Under TMP_ROOT the
     # parents are in no tree the skeleton has, which is what produces the
     # ENOENT half of the contract.
-    executor, workspace = route_b_sandbox(None, None, workspace=workspace)
+    executor, workspace = own_identity_sandbox(None, None, workspace=workspace)
     # Prove the shape before asserting on it: the helper is the only place a
     # security case gets a shape, and a rootless one (the retired identity
     # shape) would make the ENOENT assertion below vacuous.

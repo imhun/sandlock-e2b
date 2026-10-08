@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.security.conftest import route_b_sandbox, sandbox_tmpdir
+from tests.security.conftest import own_identity_sandbox, sandbox_tmpdir
 
 from envd_service.executors.base import ExecConfig
 from envd_service.executors.sandlock import SandlockExecutor
@@ -111,12 +111,12 @@ class OriginServer:
 def _executor(ws, network, secrets_dir: Path | None = None) -> SandlockExecutor:
     """A pure sandbox with this network policy, in the deployment's shape.
 
-    Built through `route_b_sandbox` rather than hand-built (N15): the pure
+    Built through `own_identity_sandbox` rather than hand-built (N15): the pure
     shape is mediated now, and a hand-built one on a root worker is the shape
     the fork refuses (SL-1 -- the mediation would run as the host root while
     the sandbox has its own uid).
     """
-    executor, _ = route_b_sandbox(
+    executor, _ = own_identity_sandbox(
         None,
         None,
         workspace=ws,

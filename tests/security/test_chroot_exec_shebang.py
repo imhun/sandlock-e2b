@@ -3,7 +3,7 @@
 Two measurements of the same workflow ("a file lands in the sandbox, then the
 sandbox runs it"), both on the production path -- pooled per-sandbox host uid
 plus an ``E2B_OWN_IDENTITY=auto`` slot, which is the only identity that mediations
-run as (see ``tests/security/conftest.py::route_b_sandbox``):
+run as (see ``tests/security/conftest.py::own_identity_sandbox``):
 
 * a **dynamic ELF binary** copied into the workspace runs. It only runs because
   the mediator handles the ``execve`` by opening the target itself, copying it
@@ -38,7 +38,7 @@ import pytest
 from tests.security.conftest import (
     require_mediation_capable,
     resolve_test_rootfs,
-    route_b_sandbox,
+    own_identity_sandbox,
     run_sh,
 )
 
@@ -98,7 +98,7 @@ def _static_elf() -> tuple[Path, str, tuple[str, ...], bytes] | None:
 
 def _chroot_sandbox():
     rootfs = resolve_test_rootfs(IMAGE)
-    executor, workspace = route_b_sandbox(IMAGE, rootfs)
+    executor, workspace = own_identity_sandbox(IMAGE, rootfs)
     require_mediation_capable(executor)
     return executor, workspace
 

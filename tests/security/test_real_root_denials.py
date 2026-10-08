@@ -18,7 +18,7 @@ import pytest
 from tests.security.conftest import (
     require_mediation_capable,
     resolve_test_rootfs,
-    route_b_sandbox,
+    own_identity_sandbox,
     run_sh,
 )
 
@@ -29,7 +29,7 @@ IMAGE = "python:3.11-slim"
 async def test_denied_paths_are_denied_under_the_real_root():
     """One sandbox, four probes: the kernel-side denials a policy promises."""
     rootfs = resolve_test_rootfs(IMAGE)
-    executor, workspace = route_b_sandbox(IMAGE, rootfs)
+    executor, workspace = own_identity_sandbox(IMAGE, rootfs)
     try:
         require_mediation_capable(executor)
         measured = {}

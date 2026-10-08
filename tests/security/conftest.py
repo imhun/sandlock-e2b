@@ -92,7 +92,7 @@ def sandbox_owns_files_it_creates() -> tuple[bool, str]:
     (SL-1), and its ``exit_code=-1`` would have been read as "this storage does
     not support ownership" -- skipping the very tests this fixture guards.
     """
-    executor, workspace = route_b_sandbox(None, None, workspace=sandbox_tmpdir())
+    executor, workspace = own_identity_sandbox(None, None, workspace=sandbox_tmpdir())
     try:
         code, _out, err = asyncio.run(
             run_sh(executor, workspace, "printf x > tool && chmod 700 tool && echo CHOWNED")
@@ -142,12 +142,12 @@ def require_sandlock():
     # below pass vacuously.
     #
     # N15: the probe goes through the *deployment's* entry point
-    # (`route_b_sandbox`) rather than a bare executor. The pure shape is
+    # (`own_identity_sandbox`) rather than a bare executor. The pure shape is
     # mediated now, so a bare executor on a root worker is exactly the shape the
     # fork refuses (SL-1: the mediation would run as the host root and the
     # sandbox's own writes would belong to it). Probing a shape no deployment
     # has would turn every isolation assertion below into a setup error.
-    executor, workspace = route_b_sandbox(None, None)
+    executor, workspace = own_identity_sandbox(None, None)
     code, out, err = asyncio.run(
         run_sh(executor, workspace, "/bin/echo ok")
     )
@@ -220,11 +220,11 @@ def _lane_identity_reporter(uid_start: int, uid_size: int):
     return report
 
 
-def route_b_sandbox(
+def own_identity_sandbox(
     image: str | None,
     rootfs: Path | None,
     *,
-    with_route_b: bool = True,
+    with_own_identity: bool = True,
     host_uid: int | None = SANDBOX_UID if os.geteuid() == 0 else None,
     per_sandbox_uid: bool = True,
     workspace: str | Path | None = None,
@@ -238,7 +238,7 @@ def route_b_sandbox(
     this helper is also the way a test asks for "the deployment's shape" rather
     than for one particular mediation state.
 
-    ``with_route_b`` mirrors the production default (``E2B_OWN_IDENTITY=auto``): the
+    ``with_own_identity`` mirrors the production default (``E2B_OWN_IDENTITY=auto``): the
     mediated shape is exactly the one auto engages a slot for. ``False`` stands
     for an operator who set ``E2B_OWN_IDENTITY=off``.
 
@@ -285,7 +285,7 @@ def route_b_sandbox(
         enable_network=False,
         sandbox_id=f"sbx_slot_{next(_slot_serial)}",
         own_identity=OwnIdentityConfig(
-            mode="auto" if with_route_b else "off",
+            mode="auto" if with_own_identity else "off",
             uid_start=host_uid if host_uid is not None else SANDBOX_UID,
             uid_size=2,
             tmp_root=sandbox_tmpdir(suffix="-route-b"),

@@ -6,7 +6,7 @@
       ③ pure + 合成根 + E2B_REAL_ROOT=1（真根）
 每条差异都要能归因到"路径缺失"或"errno 变化"，归不到就是 bug。
 
-用 `tests/security/conftest.py` 的 `route_b_sandbox` / `run_sh`：那是本仓库把形状接到
+用 `tests/security/conftest.py` 的 `own_identity_sandbox` / `run_sh`：那是本仓库把形状接到
 真实 worker 形态上的唯一入口（它镜像 E2B_REAL_ROOT 与 E2B_PURE_ROOTFS），所以这个脚本
 量的就是产品形态，不是另搭的一套。
 
@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.security.conftest import route_b_sandbox, run_sh  # noqa: E402
+from tests.security.conftest import own_identity_sandbox, run_sh  # noqa: E402
 
 COMMANDS = [
     "echo hi",
@@ -82,7 +82,7 @@ def scratch_dir() -> Path:
 
 
 async def run_shape(label: str) -> tuple[dict[str, list], dict]:
-    executor, workspace = route_b_sandbox(None, None)
+    executor, workspace = own_identity_sandbox(None, None)
     shape = {
         "E2B_PURE_ROOTFS": os.environ.get("E2B_PURE_ROOTFS"),
         "E2B_REAL_ROOT": os.environ.get("E2B_REAL_ROOT"),

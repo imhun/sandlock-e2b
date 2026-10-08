@@ -138,7 +138,7 @@ async def run_case(
     report(
         case=label,
         perms=perms,
-        route_b_active=ex._own_identity_active,
+        own_identity_active=ex._own_identity_active,
         alias=alias,
         exit=code,
         steps=steps,

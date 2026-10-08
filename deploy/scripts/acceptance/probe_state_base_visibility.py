@@ -459,7 +459,7 @@ def lane_main(args: argparse.Namespace) -> int:
     from tests.security.conftest import (
         SANDBOX_UID,
         make_sandbox_visible,
-        route_b_sandbox,
+        own_identity_sandbox,
         run_sh,
     )
 
@@ -522,12 +522,12 @@ def lane_main(args: argparse.Namespace) -> int:
     )
 
     async def run() -> int:
-        executor, ws = route_b_sandbox(
+        executor, ws = own_identity_sandbox(
             None, None, workspace=workspace, host_uid=SANDBOX_UID
         )
         try:
             print(
-                f"LANE route_b_active={executor._own_identity_active} "
+                f"LANE own_identity_active={executor._own_identity_active} "
                 f"decline={executor._own_identity_decline} "
                 f"has_root={executor._has_sandbox_root} "
                 f"chroot={executor._chroot_root}"

@@ -74,7 +74,7 @@ class _FakeChannel:
 
 @pytest.fixture(autouse=True)
 def _own_identity_capable(monkeypatch, tmp_path):
-    """The same off-Linux stand-ins ``test_sandlock_executor_route_b`` uses."""
+    """The same off-Linux stand-ins ``test_sandlock_executor_own_identity`` uses."""
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     binary = tmp_path / "sandlock-supervise"
     binary.write_text("#!/bin/sh\nexit 0\n")

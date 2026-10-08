@@ -23,7 +23,7 @@ from envd_service.executors.base import ExecConfig
 from envd_service.own_identity import OwnIdentityConfig, SlotDeadError, SlotHandle
 from gateway_common.network import NetworkUpdateConflictError
 
-WORKSPACE = "/var/lib/e2b-sandboxes/sbx_route_b/workspace"
+WORKSPACE = "/var/lib/e2b-sandboxes/sbx_own_identity/workspace"
 ROOTFS = Path("tmp/unit-route-b-rootfs")
 HOST_UID = 20007
 
@@ -245,7 +245,7 @@ def _executor(monkeypatch, *, own_identity, base_image="python:3.11-slim",
         "max_open_files": 1024,
         "allow_internet_access": False,
         "enable_network": False,
-        "sandbox_id": "sbx_route_b",
+        "sandbox_id": "sbx_own_identity",
         "own_identity": own_identity,
     }
     kwargs.update(over)
@@ -318,7 +318,7 @@ def _exec_cmd(cmd=None, **over) -> ExecConfig:
         ),
     ],
 )
-def test_route_b_selection_matrix(monkeypatch, case) -> None:
+def test_own_identity_selection_matrix(monkeypatch, case) -> None:
     shape = {k: v for k, v in case.items() if k != "want"}
     ex = _executor(monkeypatch, **shape)
     assert ex._own_identity_active is case["want"]
@@ -345,7 +345,7 @@ def test_a_worker_without_a_reporter_stays_in_process_and_says_why(monkeypatch) 
     assert engaged._own_identity_active is True
 
 
-def test_forced_route_b_without_a_reporter_fails_loudly(monkeypatch) -> None:
+def test_forced_own_identity_without_a_reporter_fails_loudly(monkeypatch) -> None:
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     with pytest.raises(
         RuntimeError,
@@ -357,7 +357,7 @@ def test_forced_route_b_without_a_reporter_fails_loudly(monkeypatch) -> None:
         )
 
 
-def test_agent_grant_engages_route_b_without_root_or_a_broker(monkeypatch) -> None:
+def test_agent_grant_engages_own_identity_without_root_or_a_broker(monkeypatch) -> None:
     """C3 Task 3: the unprivileged worker runs slots through the agent.
 
     Nothing in this process changes an identity any more, so root is not the
@@ -372,7 +372,7 @@ def test_agent_grant_engages_route_b_without_root_or_a_broker(monkeypatch) -> No
     assert engaged._own_identity_active is True
 
 
-def test_forced_route_b_without_a_host_uid_fails_loudly(monkeypatch) -> None:
+def test_forced_own_identity_without_a_host_uid_fails_loudly(monkeypatch) -> None:
     with pytest.raises(
         RuntimeError,
         match=r"^route B was requested \(E2B_OWN_IDENTITY=on / E2B_MAX_SLOTS>0\) "
@@ -386,9 +386,9 @@ def test_an_old_wheel_without_the_fd_client_falls_back(monkeypatch) -> None:
     transport-1 client. `auto` keeps the in-process backend rather than
     silently downgrading to a token-in-argv registered lease; a forced request
     says what to rebuild."""
-    import envd_service.own_identity as route_b_mod
+    import envd_service.own_identity as own_identity_mod
 
-    monkeypatch.setattr(route_b_mod, "fd_client_available", lambda: False)
+    monkeypatch.setattr(own_identity_mod, "fd_client_available", lambda: False)
     ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     assert ex._own_identity_active is False
     with pytest.raises(
@@ -499,11 +499,11 @@ async def test_first_exec_leases_this_sandbox_uid_with_the_full_ceiling(
     )
     assert pool.acquire_calls == [
         {
-            "sandbox_id": "sbx_route_b",
+            "sandbox_id": "sbx_own_identity",
             "policy": rb.supervise_policy_document(ex._policy_ceiling()),
             "program": None,
             "uid": HOST_UID,
-            "name": "sbx_route_b",
+            "name": "sbx_own_identity",
             # N83 phase 1: the sandbox's declared share rides the lease, so the
             # pool can write it into ``sbx_<id>``'s ``cpu.max``.
             "cpu_percent": 100,
@@ -636,13 +636,13 @@ async def test_a_dead_slot_is_leased_again_before_the_exec_retries(
     at the same uid (W1), never a fall back to the in-process mediator."""
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
-    pool.replies["exec"] = SlotDeadError("route-B instance sbx_route_b is dead")
+    pool.replies["exec"] = SlotDeadError("route-B instance sbx_own_identity is dead")
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
     ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     with pytest.raises(SlotDeadError, match="is dead"):
         await ex.start(_exec_cmd())
     assert len(pool.acquire_calls) == 2
-    assert pool.retired == ["sbx_route_b"]
+    assert pool.retired == ["sbx_own_identity"]
 
 
 async def test_slot_that_never_starts_is_restarted_once_then_reported(
@@ -698,7 +698,7 @@ async def test_close_ends_the_generation_and_frees_the_uid(monkeypatch) -> None:
     assert ex.instance_handle is inst
     ex.close()
     ex.close()
-    assert pool.retired == ["sbx_route_b"]
+    assert pool.retired == ["sbx_own_identity"]
     assert ex.instance_handle is None
     with pytest.raises(RuntimeError, match="shut down"):
         await ex.start(_exec_cmd())
@@ -741,7 +741,7 @@ async def test_a_checkpoint_goes_to_the_slot_with_the_workers_own_path(
     """
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
-    image = "/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/latest"
+    image = "/var/lib/e2b-sandboxes/_runtime/sbx_own_identity/checkpoint/latest"
     pool.replies["checkpoint"] = {
         "dir": image,
         "name": "latest",
@@ -773,11 +773,11 @@ async def test_a_checkpoint_goes_to_the_slot_with_the_workers_own_path(
 
     # No name means no `name` field at all: the slot's own default is the
     # image's business, not something this side spells out.
-    ex.capture_checkpoint("/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/other")
+    ex.capture_checkpoint("/var/lib/e2b-sandboxes/_runtime/sbx_own_identity/checkpoint/other")
     assert pool.log[-1] == (
         "checkpoint",
         {
-            "dir": "/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/other",
+            "dir": "/var/lib/e2b-sandboxes/_runtime/sbx_own_identity/checkpoint/other",
             "exclude_main": True,
         },
         (),
@@ -853,7 +853,7 @@ async def test_a_restore_leases_the_session_and_hands_over_the_image(monkeypatch
     """
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
-    image = "/var/lib/e2b-sandboxes/_runtime/sbx_route_b/checkpoint/latest"
+    image = "/var/lib/e2b-sandboxes/_runtime/sbx_own_identity/checkpoint/latest"
     pool.replies["restore"] = {
         "dir": image,
         "child_id": 5,
@@ -865,7 +865,7 @@ async def test_a_restore_leases_the_session_and_hands_over_the_image(monkeypatch
 
     reply = ex.restore_checkpoint(image)
 
-    assert [c["sandbox_id"] for c in pool.acquire_calls] == ["sbx_route_b"]
+    assert [c["sandbox_id"] for c in pool.acquire_calls] == ["sbx_own_identity"]
     assert pool.log[-1] == ("restore", {"dir": image}, ())
     assert reply == {
         "restored": True,

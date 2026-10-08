@@ -628,7 +628,7 @@ def test_the_control_plane_is_given_the_agent_channel_and_a_sized_limit() -> Non
     }
 
 
-def test_the_k8s_control_plane_names_route_b_and_splits_the_cache() -> None:
+def test_the_k8s_control_plane_names_own_identity_and_splits_the_cache() -> None:
     """Task 4 slice B's two CP-side values, both of which are file-op inputs.
 
     `scope-slot-document`'s path is derived by the *control plane* (the worker

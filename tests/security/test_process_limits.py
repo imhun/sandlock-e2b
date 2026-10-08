@@ -9,7 +9,7 @@ import pytest
 
 from tests.security.conftest import (
     require_mediation_capable,
-    route_b_sandbox,
+    own_identity_sandbox,
     run_sh,
     sandbox_tmpdir,
 )
@@ -63,7 +63,7 @@ def test_max_processes_limits_forks():
     # carried by the instance, and a hand-built in-process one is refused on a
     # root worker now that the pure shape is mediated (SL-1). The probe goes
     # from a file because it carries newlines a `sh -c` string would eat.
-    executor, workspace = route_b_sandbox(
+    executor, workspace = own_identity_sandbox(
         None, None, workspace=sandbox_tmpdir(), max_processes=8
     )
     try:

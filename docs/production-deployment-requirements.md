@@ -1095,7 +1095,7 @@ user.is_some() && real_uid != 0` ⇒ `write_id_maps(real_uid, real_gid, 0, 0)`�
 `0 -> RunAs`，由父进程经握手管道写；其余 ⇒ `real_uid -> real_uid`），**没有第三种自映射分支**
 （`crates/sandlock-core/src/sandbox.rs` 的 pid-ns 中间进程段）。所以 own-identity 箱在 pid_ns 下起来
 就是宿主槽位 uid：`E2B_PID_NS=1` 实测 `id -u` = `21000`（契约测试
-`tests/contract/test_nonroot_own_identity.py::test_route_b_restores_guest_root_with_and_without_pid_ns`
+`tests/contract/test_nonroot_own_identity.py::test_own_identity_restores_guest_root_with_and_without_pid_ns`
 钉的就是这条，此前它按设计是红的）。
 
 修法（fork `5b16855`）：中间进程按 `confine_child` 的同一套三选一挑映射 —— `userns_self_map`

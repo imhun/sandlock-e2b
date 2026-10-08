@@ -3,7 +3,7 @@
 Written for the SEC-K0S-007 correction (2026-10-01). The audit had concluded
 "a route-B payload receives no seccomp notifications at all"; the shape here is
 the one the `statfs` acceptance case builds
-(``tests/security/conftest.py::route_b_sandbox(None, None)`` = pure rootfs +
+(``tests/security/conftest.py::own_identity_sandbox(None, None)`` = pure rootfs +
 route B), and the four readings in one run tell the whole story:
 
 * ``HOST``/``STATVFS``: the payload's numbers, against the *host's* control the
@@ -42,7 +42,7 @@ for _root in (os.getcwd(), os.environ.get("E2B_HOST_PROJECT", "")):
     if _root and os.path.isdir(_root) and _root not in sys.path:
         sys.path.insert(0, _root)
 
-from tests.security.conftest import route_b_sandbox, run_sh, sandbox_tmpdir  # noqa: E402
+from tests.security.conftest import own_identity_sandbox, run_sh, sandbox_tmpdir  # noqa: E402
 
 PAYLOAD = r'''
 import ctypes, json, os, platform
@@ -153,7 +153,7 @@ def main() -> int:
         MIN_PAYLOAD if os.environ.get("PROBE_KIND") == "min" else PAYLOAD
     )
 
-    executor, workspace = route_b_sandbox(
+    executor, workspace = own_identity_sandbox(
         None, None, workspace=ws, disk_stats_path=str(stats)
     )
     try:

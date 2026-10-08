@@ -76,7 +76,7 @@ def _envd_settings(workspace: Path) -> EnvdSettings:
 
 
 @pytest.fixture()
-def route_b_workspace() -> Path:
+def own_identity_workspace() -> Path:
     """A worker workspace base on **container-native** storage.
 
     Not the shared ``workspace`` fixture: that one lives under
@@ -185,11 +185,11 @@ def _ready_fields(message: str) -> dict[str, str]:
     return match.groupdict()
 
 
-async def test_nonroot_worker_runs_route_b_with_pooled_uids(
-    route_b_workspace, caplog, monkeypatch
+async def test_nonroot_worker_runs_own_identity_with_pooled_uids(
+    own_identity_workspace, caplog, monkeypatch
 ) -> None:
     _require_lane_grant()
-    workspace = route_b_workspace
+    workspace = own_identity_workspace
     caplog.set_level(logging.INFO, logger=ROUTE_B_LOGGER)
     control, envd = _make_apps(workspace, monkeypatch)
 
@@ -209,12 +209,12 @@ async def test_nonroot_worker_runs_route_b_with_pooled_uids(
             # without X-Sandbox-Id fails fast with 428 instead of warming.
             # Distinct ids per sandbox keep the two creates independent while
             # making a rerun of this test idempotent (the id is the sandbox id).
-            headers={"X-API-Key": "local-key", "X-Sandbox-Id": "sbx_route_b_pool_a"},
+            headers={"X-API-Key": "local-key", "X-Sandbox-Id": "sbx_own_identity_pool_a"},
             json={"templateID": "base", "timeout": 300, "volumeMounts": mount},
         )
         b = await client.post(
             "/sandboxes",
-            headers={"X-API-Key": "local-key", "X-Sandbox-Id": "sbx_route_b_pool_b"},
+            headers={"X-API-Key": "local-key", "X-Sandbox-Id": "sbx_own_identity_pool_b"},
             json={"templateID": "base", "timeout": 300, "volumeMounts": mount},
         )
         assert (a.status_code, b.status_code) == (201, 201)
@@ -360,8 +360,8 @@ async def test_nonroot_worker_runs_route_b_with_pooled_uids(
         assert argv[argv.index("--policy") + 1].startswith(str(workspace / ".route-b"))
 
 
-async def test_route_b_restores_guest_root_with_and_without_pid_ns(
-    route_b_workspace, monkeypatch
+async def test_own_identity_restores_guest_root_with_and_without_pid_ns(
+    own_identity_workspace, monkeypatch
 ) -> None:
     """Guest uid stays 0 (host side stays the pooled slot uid) under pid_ns.
 
@@ -380,7 +380,7 @@ async def test_route_b_restores_guest_root_with_and_without_pid_ns(
     *host* slot uid (e.g. 10000) instead of 0, and every "am I root?" behaviour
     changes (apt-get, chown, ports below 1024).
     """
-    workspace = route_b_workspace
+    workspace = own_identity_workspace
     _require_lane_grant()
     control, envd = _make_apps(workspace, monkeypatch)
     async with httpx.AsyncClient(

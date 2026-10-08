@@ -23,7 +23,7 @@ import textwrap
 from tests.security.conftest import (
     require_mediation_capable,
     resolve_test_rootfs,
-    route_b_sandbox,
+    own_identity_sandbox,
     run_sh,
 )
 
@@ -33,10 +33,10 @@ def main() -> int:
     iterations = int(sys.argv[2]) if len(sys.argv) > 2 else 50
     if shape == "chroot":
         rootfs = resolve_test_rootfs("python:3.11-slim")
-        executor, workspace = route_b_sandbox("python:3.11-slim", rootfs)
+        executor, workspace = own_identity_sandbox("python:3.11-slim", rootfs)
         tool = "/workspace/tool_{i}"
     elif shape == "pure":
-        executor, workspace = route_b_sandbox(None, None)
+        executor, workspace = own_identity_sandbox(None, None)
         tool = "{ws}/tool_{{i}}".format(ws=workspace)
     else:
         raise SystemExit(f"unknown shape {shape!r}")

@@ -43,7 +43,7 @@ from tests.security.conftest import sandlock_ready
 #: machine with no sandlock wheel at all -- the test then died inside
 #: ``create_executor`` ("the sandlock package is not installed") instead of
 #: skipping, which is the same environment gate its sibling contracts
-#: (``test_pure_shape_workspace_ownership``, ``test_route_b_executor``) carry.
+#: (``test_pure_shape_workspace_ownership``, ``test_own_identity_executor``) carry.
 pytestmark = pytest.mark.skipif(
     not sandlock_ready(),
     reason=(

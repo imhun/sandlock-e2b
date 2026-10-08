@@ -33,7 +33,7 @@ container-escape potential. A sandbox that can open an `AF_RXRPC` socket, or an
 input path for one of them.
 
 The suite runs one shape since N14 S5: the real root, through
-`tests/security/conftest.py::route_b_sandbox`.
+`tests/security/conftest.py::own_identity_sandbox`.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import pytest
 from tests.security.conftest import (
     require_mediation_capable,
     resolve_test_rootfs,
-    route_b_sandbox,
+    own_identity_sandbox,
     run_sh,
 )
 
@@ -119,7 +119,7 @@ print("END_JSON")
 def surface():
     """One sandbox, probed once -- each of these costs a sandbox creation."""
     rootfs = resolve_test_rootfs(IMAGE)
-    executor, workspace = route_b_sandbox(IMAGE, rootfs)
+    executor, workspace = own_identity_sandbox(IMAGE, rootfs)
     require_mediation_capable(executor)
     b64 = base64.b64encode(PROBE.encode()).decode()
     _code, out, err = asyncio.run(

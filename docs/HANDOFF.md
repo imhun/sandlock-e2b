@@ -21,7 +21,7 @@
   file … Permission denied`）。
 * 路由：`auto` 在所有形态上槽位化；`_in_process_mediation_is_refused` 不再对 pure 短路 ⇒
   **"共享 uid 的 root worker + pure" 这条能跑但不中介的路消失**（SL-1 fail closed）。
-* 测试：29 条同族 + 夹具迁到 `route_b_sandbox`（唯一入口，可传 workspace/构造参数）；
+* 测试：29 条同族 + 夹具迁到 `own_identity_sandbox`（唯一入口，可传 workspace/构造参数）；
   六条 `test_sandlock_isolation` 原先靠"create 失败的 -1"**假绿**，现在测产品；
   `test_pure_shape_inotify_still_reaches_the_host_root` 从 `xfail(strict)` 转成**正向验收**。
 * fork 两个真 bug（都带回归用例）：`compose_virtual_etc_hosts` 在 `root="/"` 时读**宿主**
@@ -447,7 +447,7 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
    `# HEAD=a063dafe6835d4cf3cfdd259d4c1b1156f54df30`，与 fork 侧
    `third_party/sandlock/wheels/SHA256SUMS.supervise` 一致，
    `SHA256SUMS.supervise` 与 supervise 二进制三方指纹见 §3）。
-3. **`route_b.supervise_policy_document()` 的 drop-guard 删除**：该键已不在
+3. **`own_identity.supervise_policy_document()` 的 drop-guard 删除**：该键已不在
    `SUPERVISE_POLICY_FIELDS`（与 fork `policy.rs::POLICY_FIELDS` 逐名相等，53→52），
    所以 ceiling 若还带它会被**按名拒绝**（fail-closed），而不是被静默丢掉。
 4. root worker + chroot 形态的四条硬前置（wheel 带 supervise、`E2B_OWN_IDENTITY≠off`、
@@ -502,12 +502,12 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
   **对照组**（同 worker、同 host uid、同镜像，只去掉 chroot）正常起箱
   （客体内 `id -u`=0、宿主属主=沙箱 uid）⇒ 证据落在中介规则上，而不是
   「这台 runner 什么都建不出来」。
-- 连带清理：`route_b.supervise_policy_document()` 仍丢 `mediation_run_as`，注释改成
+- 连带清理：`own_identity.supervise_policy_document()` 仍丢 `mediation_run_as`，注释改成
   「守卫（执行器已不再下发）」；两处 `fs_denied` 的旧注释（「文件属主变成 supervisor」）
  改为按后端说明归属（槽位=沙箱 host uid；进程内特权中介=被拒）。
   **（B3 2026-09-11 更新）**：守卫已按上文第 3 点删除——该键连 fork 的 wire 表一起
   没了，带它的 ceiling 现在按名拒绝，不需要也不再留一行专门丢它。
-  另外 `tests/security/conftest.py` 长出四个共用件（`route_b_sandbox` /
+  另外 `tests/security/conftest.py` 长出四个共用件（`own_identity_sandbox` /
   `run_sh` / `require_mediation_capable` / `resolve_test_rootfs`）——**mediated chroot
   形态从此在测试里也只有一条正确搭法**，别再手搓一个进程内实例去「测」它。
 
@@ -519,7 +519,7 @@ cbindgen 头 / CLI `--mediation-run-as` / Python 取值校验 / `stats()` 的
   真按 `--user 65534:65534 --cap-drop ALL` 跑，并加
   `test_unprivileged_worker_still_mediates_the_chroot` 钉住「chroot 仍限制路径空间 +
   `_in_process_mediation_is_refused()` 为假」。
-  配套两件事：`route_b_sandbox` 的默认 `host_uid` 跟随 worker 特权（与 `app.py` 关池
+  配套两件事：`own_identity_sandbox` 的默认 `host_uid` 跟随 worker 特权（与 `app.py` 关池
   的行为一致 —— 第一次跑就撞出「非 root 传 pool uid ⇒ fork 拒 `RunAs`」这条真约束）；
   `require_route_b_slot` 改名 `require_mediation_capable`，判据从「租不到槽位就跳」
   改成「两个后端都建不了才跳」，否则无特权那一相会把自己的用例跳没。
@@ -753,9 +753,9 @@ chroot（image-rootfs）形态的沙箱现在跑在**每沙箱一只 `sandlock-s
   host_uid + chroot 形态 + wheel 带 supervise」成立时启用；显式 `on`/`SLOTS>0` 而前置
   不满足 ⇒ 建箱直接报错（route A/B 是部署决策，绝不静默降级）。
 - **实现**：`_build_instance_policy()` 拆出 `_policy_ceiling()`（kwargs）→
-  `route_b.supervise_policy_document()`（`fs_mount` 转 `VIRT:HOST`、丢 `None` 与
+  `own_identity.supervise_policy_document()`（`fs_mount` 转 `VIRT:HOST`、丢 `None` 与
   `mediation_run_as`、未知字段按名拒绝；字段表由单测与 fork
-  `policy.rs::POLICY_FIELDS` 逐名钉住，53 项）；`route_b.OwnIdentityInstance` /
+  `policy.rs::POLICY_FIELDS` 逐名钉住，53 项）；`own_identity.OwnIdentityInstance` /
   `OwnIdentityExecProcess` 复刻 `SandboxInstance`/`ExecProcess` 面
   （exec/wait_child/kill_child/update_network/shutdown），executor **只剩一条代码路径**；
   建槽/收槽走 `asyncio.to_thread`（不阻塞事件循环），`_CommandGate` 语义不变。

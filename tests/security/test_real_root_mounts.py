@@ -20,7 +20,7 @@ import pytest
 from tests.security.conftest import (
     require_mediation_capable,
     resolve_test_rootfs,
-    route_b_sandbox,
+    own_identity_sandbox,
     run_sh,
 )
 
@@ -37,7 +37,7 @@ async def test_creating_and_destroying_sandboxes_leaves_no_mounts_behind():
     before = _mount_lines()
     rootfs = resolve_test_rootfs(IMAGE)
     for _ in range(3):
-        executor, workspace = route_b_sandbox(IMAGE, rootfs)
+        executor, workspace = own_identity_sandbox(IMAGE, rootfs)
         try:
             require_mediation_capable(executor)
             code, out, err = await run_sh(executor, workspace, "echo alive")

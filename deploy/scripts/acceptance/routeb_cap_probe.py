@@ -125,7 +125,7 @@ async def main():
 
     # 1) route B + chroot（形态就是线上的形态）
     ex, ws = build("python:3.11-slim", rootfs, UID, "auto")
-    report(case="routeb-selected", route_b_active=ex._own_identity_active, decline=ex._own_identity_decline)
+    report(case="routeb-selected", own_identity_active=ex._own_identity_active, decline=ex._own_identity_decline)
     await run_case("routeB+chroot", ex, ws)
     ex.close()
 

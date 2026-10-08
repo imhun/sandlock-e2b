@@ -29,7 +29,7 @@ from tests.security.conftest import (
     SANDBOX_UID,
     require_mediation_capable,
     resolve_test_rootfs,
-    route_b_sandbox,
+    own_identity_sandbox,
     run_sh,
 )
 
@@ -54,7 +54,7 @@ async def test_image_rootfs_execution():
     marker.write_text("IN_IMAGE_ROOTFS")
     os.chmod(marker, 0o644)
 
-    executor, workspace = route_b_sandbox(image, rootfs)
+    executor, workspace = own_identity_sandbox(image, rootfs)
     try:
         require_mediation_capable(executor)
         code, out, err = await run_sh(
@@ -79,7 +79,7 @@ async def test_image_rootfs_cannot_reach_host_filesystem():
     """The chroot restricts the path space: host paths are not visible, and
     the Landlock "/" rule only covers the image rootfs, not the host root."""
     rootfs = resolve_test_rootfs()
-    executor, workspace = route_b_sandbox(IMAGE, rootfs)
+    executor, workspace = own_identity_sandbox(IMAGE, rootfs)
     # A directory this test really created on the host: probing a path that
     # never existed would say "hidden" even with no chroot at all.
     host_marker = Path(tempfile.mkdtemp(prefix="e2b-host-marker-"))
@@ -123,7 +123,7 @@ async def test_in_process_chroot_is_refused_without_a_slot(caplog):
     # already disclosed the shape for another sandbox; reset it to pin this one.
     SandlockExecutor._mediation_shape_disclosed = False
     with caplog.at_level(logging.ERROR, logger="envd_service.executors.sandlock"):
-        executor, workspace = route_b_sandbox(IMAGE, rootfs, with_route_b=False)
+        executor, workspace = own_identity_sandbox(IMAGE, rootfs, with_own_identity=False)
     try:
         assert executor._own_identity_active is False
         assert executor._own_identity_decline == "E2B_OWN_IDENTITY=off"
@@ -154,7 +154,7 @@ async def test_in_process_chroot_is_refused_without_a_slot(caplog):
     # pure shape, route B off). N15 made that shape mediated too -- the host
     # root as the mediator's root -- so it is refused for exactly the same
     # reason, and the control had to move to the axis that still differs.
-    plain, plain_ws = route_b_sandbox(None, None)
+    plain, plain_ws = own_identity_sandbox(None, None)
     try:
         require_mediation_capable(plain)
         code, out, err = await run_sh(
@@ -188,7 +188,7 @@ async def test_unprivileged_worker_still_mediates_the_chroot():
     marker.write_text("IN_IMAGE_ROOTFS")
     os.chmod(marker, 0o644)
 
-    executor, workspace = route_b_sandbox(IMAGE, rootfs, host_uid=None)
+    executor, workspace = own_identity_sandbox(IMAGE, rootfs, host_uid=None)
     try:
         assert executor._own_identity_active is False
         assert executor._in_process_mediation_is_refused() is False
