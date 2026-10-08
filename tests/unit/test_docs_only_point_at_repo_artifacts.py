@@ -242,6 +242,12 @@ ALLOWED_TMP_REFERENCES = {
     "tmp/stat_stall_hunt.py": "一次性线上卡顿取证（需集群 + API key）：前台 stat 循环标出 >20 ms 的调用；结论见 docs/benchmarks.md §③",
     "tmp/host_sampler.py": "一次性线上卡顿取证（需 kubectl exec 进 hostPID 的 c3-agent pod）：宿主侧 200 ms 采样，与 stat_stall_hunt 同源时间戳对齐",
     "tmp/stall_snapshot.py": "一次性线上卡顿取证（需 kubectl exec 进 hostPID 的 c3-agent pod）：卡顿瞬间的 /proc 现场快照（谁烧 CPU、supervisor wchan）",
+    # N80 的进程合并取证（2026-10-05）：unshare(CLONE_NEWUSER) 对多线程调用方 EINVAL，
+    # 而 clone3 一次带 CLONE_NEWUSER+CLONE_NEWPID 两臂都成功 —— 三条都得在 worker 容器里跑
+    # （agent pod 的 unshare 直接 EPERM，到不了线程检查），脱离当时那套部署不可复现。
+    # 结论与代码出处见 docs/open-issues.md 的 N80 行、docs/isolation-boundaries.md §4。
+    "tmp/userns_thread_probe.py": "一次性内核实测（需 kubectl exec 进 e2b-worker-0）：unshare(CLONE_NEWUSER) 单/多线程对照，EINVAL 那一臂是 N80 的硬约束",
+    "tmp/clone3_probe.py": "一次性内核实测（需 kubectl exec 进 e2b-worker-0）：clone3 一次带 CLONE_NEWUSER+CLONE_NEWPID 的单/多线程对照",
 }
 
 
