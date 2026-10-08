@@ -95,7 +95,11 @@
   轮停顿**（① 那版 29019 / 0/581）、四路并发 24511 op/s、峰值 1.063 核、`nr_throttled +181`；
   两台 worker `E2B_SANDBOX_CGROUP=required` 且 `E2B_SANDBOX_NOTIFY_RATE_LIMIT` **unset**。
   （线上没有 `E2B_PORT_MAPPINGS`，所以那一跑量的是"普通形状无回归"；② 的收益形状是带映射的，
-  读数在本地那一对。）
+  读数在本地那一对。**2026-10-08 补齐**：在 worker pod 里直接建带映射的沙箱、关掉 bind 注入
+  （`deploy/scripts/acceptance/probe_inbound_readiness.py`），在 arm64/6.12 上走完整条 readiness 路
+  —— 中位 **81.4 ms**（同机 bind 注入 0.4 ms），沙箱自己的 epoll fdinfo 也长成 parser 假设的样子；
+  顺带量到 pod 的 seccomp profile 没有 `unshare`（`sandbox_shape_matrix.py`）⇒ 这个镜像下
+  `net_isolation` 必须与 `pid_ns` 成对。读数全文见 §7.55 的"补读数"与 §2.4.7。）
 
 ## 实施记录（2026-10-07）
 
