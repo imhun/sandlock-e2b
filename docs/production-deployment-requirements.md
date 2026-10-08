@@ -798,6 +798,13 @@ inode 命中映射表）复制 fd 做端口复核 + 照旧给每个被监视 fd 
 `NetworkState::inbound` 里），**supervisor 彻底离开数据面与就绪面**，主机监听器 / eager-accept
 队列 / `poll`·`epoll_wait` 拦截全部不再参与。
 
+**2026-10-08 补的两条口径（N90/N91 的修复）**：① 映射端口**不能同时出现在 `net_deny_bind`** ——
+这两个字段对同一个端口说反话（映射 = 授予入口，deny = 不许绑），以前由 handler 顺序悄悄判给映射
+（注入 handler 排在 denylist 检查之前），现在**建箱即拒**并点名端口（N90）；② 注入过的
+`bind()` 现在会记 virtual→real，且 `getsockname` 的翻译 handler 对注入形状也注册 ⇒ `host_port !=
+sandbox_port` 时沙箱读到的仍是**它自己绑的那个端口**（N91；host == sandbox 的 MCP 分配下翻译是
+no-op，只多一次 `getsockname` 往返）。
+
 边界与保证（同一次改动里写死）：
 
 - **只对已映射的 TCP 端口生效**：其它 family / 临时端口 / 未映射端口一律 `Continue`，原有
