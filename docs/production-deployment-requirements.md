@@ -660,6 +660,21 @@ root-in-userns 自带 `CAP_NET_BIND_SERVICE`；k8s 清单 2026-09-17（N5）切 
 2026-09-26：`deploy/compose` 的两个本地示例与 `autoscaler/backends/local.py` 也切到同一
 形态（见 §2.4.3 末尾），仓库里只剩 arm lane 的 Rust 套件还跑共享 netns。
 
+**2026-10-08 补的两条现场事实**（k0s fleet 的 worker pod，量法见
+`deploy/scripts/acceptance/{probe_inbound_readiness,sandbox_shape_matrix}.py`，读数与全文见
+`docs/deploy-clusters.md` §7.55 的"补读数"）：
+
+* **`net_isolation` 必须与 `pid_ns` 成对**：pod 的 seccomp profile（`sandlock-worker.json`，
+  `defaultAction: SCMP_ACT_ERRNO`）里**没有 `unshare`**（实测 `unshare(CLONE_NEWUSER|NEWNS|NEWNET)`
+  全是 `EPERM`），`clone3` 有。所以 netns 只能来自"一次 `clone3` 同时建 NEWUSER+NEWPID(+NEWNET)"那条
+  路；`net_isolation` 单开（不带 `pid_ns`）在**这个镜像/profile 下建不起来**，报 `sandlock_create
+  failed`（没有更细的原因）。fleet 的 worker env 今天两者都开着，因此线上不受影响 —— 但任何把
+  `E2B_PID_NS` 关掉、或想只开 `E2B_ENABLE_NET_ISOLATION` 的车道会全线建箱失败；
+* **readiness 合成在生产默认形状下不走**：`E2B_NET_BIND_INJECT` 默认 `true`（fleet 的 env 里没
+  声明它 ⇒ 取默认），MCP 入站端口走 bind 注入 —— 同一台 worker 上量：bind 注入往返 **0.4 ms**、
+  宿主 listener + readiness 合成 **81 ms**（5 次 4-byte 往返的中位）。这条差距就是 §2.4.7 当初选
+  注入的理由，也意味着 `network::readiness` 现在只服务 `E2B_NET_BIND_INJECT=0` 的车道。
+
 以下为灰度期的记录，保留作追溯：**形态**：`deploy/stack/docker-compose.prod.yml` 里**只有 worker-2** 带
 `E2B_ENABLE_NET_ISOLATION=true` + `E2B_FD_INJECT_CONNECT=true`（默认即 true，可用
 `E2B_ENABLE_NET_ISOLATION_WORKER2`/`E2B_FD_INJECT_CONNECT_WORKER2` 覆盖），worker-1 保持共享

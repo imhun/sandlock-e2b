@@ -3423,13 +3423,68 @@ epoll fd 没有可用的 identity，于是 readiness 改成读内核自己的 `f
 | 车道 | 两台 worker `E2B_SANDBOX_CGROUP=required`、**`E2B_SANDBOX_NOTIFY_RATE_LIMIT` unset**（出厂默认 5000）、`E2B_CGROUP_MOUNT=/pod-cgroup` |
 | ①–⑨ | 其余八条同形全过（含 ⑥ 内存上限真杀、⑦ 任务预算 `EAGAIN`、⑧ 越界具名 400） |
 
-**线上为什么只验到普通形状**：k0s 上没有 `E2B_PORT_MAPPINGS`（生产用 MCP 网关那条路是**按沙箱**
-在 `_mcp_bind_port` 上 `setdefault` 的），而验收探针建的沙箱不带映射 ⇒ 线上这一跑量的是"普通形状
-没有回归"；**① 与 ② 的差别只在带映射的形状**，那条车道读数取自上面本地那一对。
+**线上为什么只验到普通形状**：验收探针建的沙箱不带 `mcp=`，所以它没有 `port_mappings`（MCP 网关那条路是**按沙箱**在 `_mcp_bind_port` 上 `setdefault` 的），这一跑量的是"普通形状
+没有回归"；**① 与 ② 的差别只在带映射的形状**，那条车道读数取自上面本地那一对。**注意 worker 本身是开着 net_isolation 的**（见下节补读数：`E2B_ENABLE_NET_ISOLATION=true` + `E2B_PID_NS=true` + `E2B_FD_INJECT_CONNECT=true` 都在镜像/清单里），所以带映射形状在生产是**存在**的 —— 只是被 `E2B_NET_BIND_INJECT`（默认 true）挡在 readiness 那条路之外。
 
 **回退杆**：把 ① 那一行 `if features.inbound_port_map { nrs.push(libc::SYS_close) }` 加回
 `seccomp_plan.rs`（回到 ① 的形状，一行）→ 重建 wheel → 重滚；更保守的是整条 `close` 加回
 `NETLINK_NOTIF_SYSCALLS`（③）。
+
+**补读数（2026-10-08）：集群上的入站映射路径** —— 上一节末尾那条"线上没有 `E2B_PORT_MAPPINGS`，
+所以那一跑只证明普通形状没回归"留了个缺口：N88 ② 重写的 readiness 那条路（fdinfo 取注册表 +
+宿主 listener）在**目标内核/架构上**一次都没跑过（本地车道是 OrbStack 7.0.14-orbstack，线上是
+arm64 / Rocky 6.12）。补法不是翻车道开关，而是**在 worker pod 里直接建一个沙箱**（零配置变更、
+零影响其他租户），两支探针都已进仓：
+
+```bash
+export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
+kubectl -n sandlock exec -i e2b-worker-0 -c worker -- python3 - \
+    < deploy/scripts/acceptance/probe_inbound_readiness.py      # 入站映射往返
+kubectl -n sandlock exec -i e2b-worker-0 -c worker -- python3 - \
+    < deploy/scripts/acceptance/sandbox_shape_matrix.py         # 哪些形状建得起来
+```
+
+**读数（`e2b-worker-0`，每档 5 次 4 字节往返，asyncio/epoll 服务端）**：
+
+| 形状 | 往返 | 环境（`E2B_NET_BIND_INJECT`） |
+|---|---|---|
+| **宿主 listener + readiness 合成**（② 重写的那条） | 71.5 / 81.5 / 81.4 / 81.3 / 81.5 ms，中位 **81.4** | off |
+| **bind 注入**（出厂默认） | 0.4 / 0.4 / 0.3 / 0.3 / 0.4 ms，中位 **0.4** | 默认 on ⇒ 线上 MCP 走这条 |
+
+沙箱内进程自己打的 epoll fdinfo（就是 supervisor 读的那个文件）在**这台内核上也长这样**：
+
+```
+pos:	0
+flags:	02000002
+mnt_id:	17
+ino:	67
+tfd:        3 events:       19 data:     ffff00000003  pos:0 ino:5c747b7 sdev:9
+```
+
+`tfd:` 行、`data:` 十六进制、`ino:`（被监视 socket 的 inode，十六进制）都在 ⇒ ② 的 parse 假设
+在 arm64/6.12 上成立，且那一跑真的走完"宿主 connect → eager worker → readiness 合成唤醒
+asyncio 的 epoll → 沙箱 accept() 注入 fd → 回程"整条路。
+
+**顺带挖出一个形状前置（`sandbox_shape_matrix.py` 的读数）**：
+
+| 形状 | 结果 |
+|---|---|
+| `plain` / `pid_ns` | OK |
+| `net_isolation`（不带 `pid_ns`） | **FAIL `sandlock_create failed`** |
+| `net_isolation` + `port_mappings`（不带 `pid_ns`） | **FAIL**（同一条） |
+| `net_isolation` + `pid_ns`（± 映射） | OK |
+
+根因是**worker pod 的 seccomp profile**：`sandlock-worker.json`（`defaultAction: SCMP_ACT_ERRNO`，
+allowlist 404 个名字）里**没有 `unshare`**。pod 里直接量：`unshare(CLONE_NEWUSER)` → `EPERM`
+（`NEWNS` / `NEWNET` 同样）。而 `clone3` 在 allowlist 里（N80 加的注释就是为这个），所以**netns 只能
+来自"一次 `clone3` 同时建 NEWUSER+NEWPID（+NEWNET）"那条路**。
+
+**fleet 本身不受影响**：worker 的 env 里 `E2B_ENABLE_NET_ISOLATION=true`、`E2B_PID_NS=true`、
+`E2B_FD_INJECT_CONNECT=true`、`E2B_ENABLE_NETWORK=true` 全都在（清单里就有），所以线上每个沙箱都
+带"自己的 netns + pid ns"，走的正是 clone3 那条路。这条前置真正的含义是：**在这个镜像/profile 下，
+"net_isolation 但不开 pid_ns" 这个组合建不起来** —— 任何未来把 `E2B_PID_NS` 关掉、或想用这里的
+profile 跑 `net_isolation` 单开的车道，都会撞上 `sandlock_create failed`（错误文本就是这个，没有更
+细的原因）。口径已写进 `docs/production-deployment-requirements.md` §2.4.7。
 
 ### 7.54 N88 选项 ① 的修复：**已构建待发**（版本 `0.1.0-1134-g1b99eeb-20261007-214216`；apply 被跳板机不可达挡住）
 
