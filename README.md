@@ -12,11 +12,11 @@ notification）在自己机器的 Linux 内核上跑用户代码 —— 不需�
   **纵深加固**的进程：没有 guest 内核、没有虚拟化内存开销，普通 Linux 服务器就能跑。
 - **换三个环境变量就能迁过来。** 官方 SDK 零代码修改：沙箱、命令与 PTY、文件、卷、快照与 fork、
   暂停/恢复、网络策略、模板构建、MCP 网关全部兼容。
-- **默认最小权限，纵深防御。** 沙箱内是 root，落到宿主机上只是它**自己的隔离身份**；每沙箱独立的
+- **沙箱默认只有最小权限，靠多层隔离做纵深防御。** 沙箱内是 root，落到宿主机上只是它**自己的隔离身份**；每沙箱独立的
   PID 与网络命名空间，文件访问受内核级白名单约束，出站必须过策略（默认拒绝直连内网）。
 - **平台自己也不能提权。** 执行节点非特权运行、**不带任何特权二进制**，特权动作收拢到每节点一个
   受控组件且只按平台记录执行 —— 攻下一个沙箱也换不到别的租户。
-- **生产可用，失败可见。** 调度、配额、暂停/恢复、快照与 fork、自愈、扩缩容、指标全在仓库内闭环；
+- **生产可用，失败会显式暴露。** 调度、配额、暂停/恢复、快照与 fork、自愈、扩缩容、指标全在仓库内闭环；
   未实现的 API 明确报错，测不到的数值报 `unknown` 而不是 `0`。
 
 **关键读数**（出厂集群 2 节点 arm64，一条命令可复跑）：建箱 p50 **75 / 71 ms**（客户端边界两轮，
@@ -57,7 +57,7 @@ kernel —— **外层 seccomp profile（B-2）是沙箱到宿主之间唯一的
 1. SDK → 控制面 `POST /sandboxes`；调度器选节点、预留配额、登记记录。
 2. 控制面 → 目标 worker 的 `POST /agent/sandboxes`（内部 key）；worker 建工作目录
    （`0770 owner=<沙箱 uid> group=<worker gid>`）、挂卷、按需解包镜像 rootfs。
-3. 第一条命令触发 **route B 槽位**：worker fork 的子进程自己 `unshare(CLONE_NEWUSER)` 并上报
+3. 第一条命令触发 **own identity 槽位**：worker fork 的子进程自己 `unshare(CLONE_NEWUSER)` 并上报
    `{sandbox_id, pid}` → 控制面按记录查出 uid → 指令本节点 agent **写 `uid_map`** → 子进程
    `setresuid(X)` 后 exec `sandlock-supervise`。
 4. `sandlock-supervise` 在镜像 rootfs（chroot）里按 Landlock/seccomp 策略跑命令，路径中介负责
