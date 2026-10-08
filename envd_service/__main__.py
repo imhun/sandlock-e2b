@@ -16,8 +16,8 @@ def _configure_logging(settings: Settings) -> int:
 
     ``uvicorn.run(log_level=...)`` only configures the ``uvicorn*`` loggers;
     ``envd_service.*`` inherits the root logger, whose default WARNING level
-    drops every INFO line -- including the route-B readiness line
-    (``route-B instance ready ...``) and ``worker image warmed`` -- and makes
+    drops every INFO line -- including the own-identity readiness line
+    (``own-identity instance ready ...``) and ``worker image warmed`` -- and makes
     ``E2B_LOG_LEVEL=DEBUG`` a no-op. This entry point is the worker image's own
     process (``CMD ["python", "-m", "envd_service"]``), so raising the root
     level cannot pollute control-plane output.

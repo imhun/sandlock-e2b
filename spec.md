@@ -626,7 +626,7 @@ E2B_NODE_*)`，**CPU = `E2B_NODE_*` 说了算（允许超过容器 `cpu.max`，�
 不 WARN；此后该 worker 没有上限 ⇒ 建箱一律**具名拒绝**，绝不无额度放行），**内核 = `max` ⇒ 采纳 +
 一行 WARN**（只比 `cpu.max`/`memory.max` 两维；`pids.max` 的 `max` 是 k8s 实测形状、故意不比 ——
 `envd_service/runtime/sandbox_cgroup.py::check_policy_ceiling`；compose 三条车道实测就是这两维都 `max`）。
-**收到下发之前没有上限**：worker 的 route-B 句柄带 `None`，`attach` 按名拒绝
+**收到下发之前没有上限**：worker 的 own-identity 句柄带 `None`，`attach` 按名拒绝
 （`cgroup-refusal ceiling-unavailable`）。请求里的是**单箱需求**（`cpuCount`/`memoryMB`），判据只有一条
 `需求 <= 上限`：超过**落点节点**的上限 ⇒ 具名 `400`（数字取自记录，而记录由控制面写）。worker 自己再声明
 这三个 env 不改变任何东西（它不再读它们）。**上线顺序随之变成先滚控制面、再滚 worker**：新控制面 + 旧

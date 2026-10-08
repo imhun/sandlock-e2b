@@ -11,7 +11,7 @@ in the pod could bind low ports). N5/N10 closed on 2026-09-17; the tests below
 pin the new shape so neither the window nor a half-switch can come back.
 
 Track F (Task F1) adds the other half: a non-root worker gets per-sandbox host
-uids and route-B slots from the two file-capability brokers, and the kernel
+uids and own-identity slots from the two file-capability brokers, and the kernel
 refuses to exec them unless their capabilities are inside the container's
 *bounding* set. So the manifests now declare exactly those four caps (SETUID,
 SETGID, CHOWN, DAC_OVERRIDE) -- ``capabilities.add`` grants a non-root process
@@ -626,7 +626,7 @@ def test_the_worker_profile_denies_unshare_outright() -> None:
 
     The engine creates the user, PID, mount and network namespaces with one
     clone3 call. The two capability probes (the seccomp self-check and the
-    real-root check) were rewritten to probe with clone3. And route B's slot
+    real-root check) were rewritten to probe with clone3. And own identity's slot
     identity handshake -- the last caller -- creates its user namespace with
     clone3 too: it waits for the granted identity *without* exec'ing, because
     `execve` clears the fresh namespace's capabilities, which is exactly what
@@ -1521,7 +1521,7 @@ def test_k0s_overlay_sets_a_node_liveness_window_wider_than_placement() -> None:
     * ``PLACEMENT_MAX_HEARTBEAT_AGE_S`` (15s, in code) stops *new work* going to a
       node that went quiet. Being wrong here costs the caller a 502.
     * ``E2B_NODE_HEARTBEAT_TIMEOUT`` declares the node *gone*, and reaping marks
-      its live sandboxes orphaned -- their route-B slots go with them. Being wrong
+      its live sandboxes orphaned -- their own-identity slots go with them. Being wrong
       here loses sandboxes that were fine (the N18 failure).
 
     So the overlay's window has to be the wider one, and it has to stay wide enough
@@ -1814,7 +1814,7 @@ def test_multinode_worker_env_carries_the_fleets_slot_tmp_root() -> None:
     the roots the `e2b-maint` file-capability broker may touch, so
     `configure_priv_helpers` refuses the shape by name at startup and every
     worker crash-loops before it ever listens (measured here: all three
-    `Restarting (1)` with `route-B scratch root /tmp/sandlock-route-b is outside
+    `Restarting (1)` with `own-identity scratch root /tmp/sandlock-route-b is outside
     the privileged helper roots (/var/lib/e2b-sandboxes)`; `docs/open-issues.md`
     N39 is the same wall). The value is taken from the fleet manifests, not
     written a fourth time -- the same comparison ①'s pin makes, and it is per

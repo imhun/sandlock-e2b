@@ -400,7 +400,7 @@ def _stage_entry(cache_dir: Path, entry_name: str) -> Path:
     filesystem, and the shared volume is the one the entry has to land on.
 
     ``mkdtemp`` creates it ``0700``, but the mode is *published* with the
-    entry: the sandbox uid (a per-sandbox host uid under route B, uid 1000
+    entry: the sandbox uid (a per-sandbox host uid under own identity, uid 1000
     under the test harness) has to traverse ``<entry>/rootfs`` to chroot into
     it, and the cache owner has to be able to write it. The rename keeps the
     directory's own mode, so it is set to the shared-cache contract here (0755,

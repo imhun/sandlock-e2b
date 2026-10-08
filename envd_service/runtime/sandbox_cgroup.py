@@ -1001,7 +1001,7 @@ class SandboxCgroups:
         **A reading that cannot be taken costs the reading, not the teardown**
         (Task 5 review, fix 1). Nothing in this worker reclaims a leftover
         ``sbx_*`` directory, so keeping a box alive "until the account can be
-        read" is a permanent leak: the caller (route-B's retire) logs one
+        read" is a permanent leak: the caller (own-identity's retire) logs one
         warning and returns the uid, and there is no retry. A failed read is
         therefore logged as one named WARNING -- sandbox id, path, and the
         refusal that carries the underlying error -- and ``cgroup.kill`` +

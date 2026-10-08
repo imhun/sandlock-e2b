@@ -1,4 +1,4 @@
-"""Probe: which shape did a route-B sandbox actually get?
+"""Probe: which shape did an own-identity sandbox actually get?
 
 The pid_ns acceptance (`tests/contract/test_nonroot_own_identity.py::
 test_own_identity_restores_guest_root_with_and_without_pid_ns`) asserts `id -u` == 0,
@@ -9,7 +9,7 @@ the three observables side by side, to be run twice in the prod-shaped lane:
     E2B_PID_NS=1 ... ./deploy/scripts/test-prod-shaped.sh tmp/pidns-shape-probe.py -k pidns_shape_probe
     E2B_PID_NS=  ... ./deploy/scripts/test-prod-shaped.sh tmp/pidns-shape-probe.py -k pidns_shape_probe
 
-  * `guest-uid` from the worker's route-B ready line (`uid-0-in-userns` is the
+  * `guest-uid` from the worker's own-identity ready line (`uid-0-in-userns` is the
     F18 self-map the fork reports through `stats`);
   * `id -u` inside the sandbox (the guest identity);
   * `nspid_levels` -- the kernel's own NSpid depth for the sandbox's own
@@ -31,7 +31,7 @@ import pytest
 from tests.contract.test_nonroot_own_identity import _make_apps, _ready_fields
 from tests.contract.test_uid_permissions import _result, _run_cmd
 
-ROUTE_B_LOGGER = "envd_service.executors.sandlock"
+OWN_IDENTITY_LOGGER = "envd_service.executors.sandlock"
 
 #
 # The pid-namespace observable is a `kill(2)` probe of a pid that is outside the
@@ -62,7 +62,7 @@ def probe_workspace() -> Path:
 
 
 async def test_pidns_shape_probe(probe_workspace, caplog) -> None:
-    caplog.set_level(logging.INFO, logger=ROUTE_B_LOGGER)
+    caplog.set_level(logging.INFO, logger=OWN_IDENTITY_LOGGER)
     control, envd = _make_apps(probe_workspace)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=control), base_url="http://test"
@@ -82,8 +82,8 @@ async def test_pidns_shape_probe(probe_workspace, caplog) -> None:
         messages = await _run_cmd(envd_client, payload, shape_cmd(os.getpid()))
     code, out, err = _result(messages)
 
-    ready = [r.getMessage() for r in caplog.records if "route-B instance ready" in r.getMessage()]
-    assert ready, "the worker never logged a route-B ready line"
+    ready = [r.getMessage() for r in caplog.records if "own-identity instance ready" in r.getMessage()]
+    assert ready, "the worker never logged an own-identity ready line"
     fields = _ready_fields(ready[-1])
     print(f"PROBE guest-uid={fields['guest_uid']} slot-uid={fields['uid']}")
     print(f"PROBE id -u -> code={code} out={out!r} err={err!r}")

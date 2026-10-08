@@ -13,7 +13,7 @@ Requires a root worker + sandlock (the privileged S1.2 RunAs path).
 
 The image-rootfs (chroot) shape of the ownership assertions below is the T5
 regression suite: there mediation runs in a ``sandlock-supervise`` slot whose
-euid *is* the sandbox host uid (route B, ``envd_service/own_identity.py``) instead
+euid *is* the sandbox host uid (own identity, ``envd_service/own_identity.py``) instead
 of in the root worker process, so a mediated write lands owned by the sandbox
 in both shapes.
 """
@@ -80,10 +80,10 @@ def _envd_settings(
 ) -> EnvdSettings:
     """Worker settings on ``uid_pool_start`` (default: this file's POOL_START).
 
-    The pool is a parameter because route-B leases **one live slot per uid**:
+    The pool is a parameter because own-identity leases **one live slot per uid**:
     a file that runs its own sandboxes needs its own range, or a create on a
     uid whose sandbox from another file is still alive fails inside the
-    sandbox (exit 127, ``route-B uid N already has a live slot``).
+    sandbox (exit 127, ``own-identity uid N already has a live slot``).
     """
     return EnvdSettings(
         executor="sandlock",
@@ -225,7 +225,7 @@ async def test_volume_shared_rw_across_distinct_uids(make_apps, workspace):
         # A's sandbox host uid as the owner. Assert that instead of assuming it
         # -- the measurement that used to surface T5 in the image-rootfs
         # shape (supervisor-tier mediation attributed the write to the worker
-        # instead); route B leases a supervise slot at this sandbox's own host
+        # instead); own identity leases a supervise slot at this sandbox's own host
         # uid for that shape, so the same assertion now holds in both shapes.
         assert written_by == ra.host_uid, (
             f"sandbox writes landed owned by uid {written_by}, not the sandbox "

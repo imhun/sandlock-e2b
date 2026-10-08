@@ -81,7 +81,7 @@
 | `phase1-probe2.sh` | —（头部没写） | —（头部无 Usage 行；见脚本头部） |
 | `phase2.sh` | test-prod-shaped.sh's phase 2 (the unprivileged worker), runnable on its own. | `sh deploy/scripts/acceptance/phase2.sh <log>` |
 | `pidns-cost-probe.py` | Probe: what does `pid_ns` cost on the syscalls it traps? | `Run in the prod-shaped lane, both shapes, same image:` |
-| `pidns-shape-probe.py` | Probe: which shape did a route-B sandbox actually get? | 头部示例（旧拼写）`./deploy/scripts/test-prod-shaped.sh tmp/pidns-shape-probe.py -k pidns_shape_probe` |
+| `pidns-shape-probe.py` | Probe: which shape did an own-identity sandbox actually get? | 头部示例（旧拼写）`./deploy/scripts/test-prod-shaped.sh tmp/pidns-shape-probe.py -k pidns_shape_probe` |
 | `prepare_phase_cost_probe.py` | Task 4：建箱 `prepare` 那一段单独多贵 —— 直打 worker 的 agent 口，`phase: prepare` 计时、`phase: cancel` 收回（不落记录、不建树、不留沙箱）。Task 1 的基线 72–76 ms，Task 4 之后期望 ~10 ms；比 `E2B_CREATE_TRACE=1` 好在不用改 statefulset，也比整条建箱更窄（floor 是 `max(materialize, prepare)`）。 | `kubectl -n sandlock exec -i <cp-pod> -c control-plane -- python3 - "$E2B_API_KEY" "$E2B_INTERNAL_API_KEY" --n 10 < deploy/scripts/acceptance/prepare_phase_cost_probe.py` |
 | `probe-pure-realroot.py` | pure 能不能走真根？把 pivot_root 的两种用法实测一遍。 | —（头部无 Usage 行；见脚本头部） |
 | `probe-pure-restore-synthroot.sh` | pure + 合成根下的 pause/resume：restore stub 从"根内"变成"根外"。 | `用法：probe-pure-restore-synthroot.sh <log>` |
@@ -118,17 +118,17 @@
 | `rb_token_probe.py` | What actually leaks when the channel token travels in supervise's argv. | —（头部无 Usage 行；见脚本 `--help`） |
 | `red-routeb-stderr-drain.py` | RED/GREEN check for the slot-stderr drain (N35 side quest). | `sh tmp/k0s/n35-lane.sh python3 -u tmp/k0s/red-routeb-stderr-drain.py`（旧拼写） |
 | `relay_probe.py` | N37 end-to-end: a 60 s idle cut in front of the local stack. | `Run it twice: once with the keepalive removed (RED), once as shipped (GREEN).` |
-| `routeb_cap_probe.py` | 机制级探针：在给定 capset 的容器里，逐项问 route B / 进程内后端「还活着吗」。 | —（头部无 Usage 行；见脚本 `--help`） |
+| `routeb_cap_probe.py` | 机制级探针：在给定 capset 的容器里，逐项问 own identity / 进程内后端「还活着吗」。 | —（头部无 Usage 行；见脚本 `--help`） |
 | `run-f31.sh` | Sequential re-verification (f31) on the final bytes, one container per phase. | —（头部无 Usage 行；见脚本头部） |
 | `run.sh` | The local aarch64 lane's kernel: qemu-system-aarch64 under TCG (this host is | —（头部无 Usage 行；见脚本头部） |
 | `sdkflake-cacheprobe.py` | Measure the image-cache maintenance walk that sits inside the first-command path. | `Usage: python tmp/sdkflake-cacheprobe.py [cache-dir]`（旧拼写） |
 | `sec-run-probe.sh` | Reusable runner: the prod-shaped capability set the sandlock create path needs. | —（头部无 Usage 行；见脚本头部） |
-| `slot_cap_probe.py` | 量一件事：route-B 槽位（=路径中介进程）与被 confine 的子进程各自持有哪些 cap。 | —（头部无 Usage 行；见脚本 `--help`） |
+| `slot_cap_probe.py` | 量一件事：own-identity 槽位（=路径中介进程）与被 confine 的子进程各自持有哪些 cap。 | —（头部无 Usage 行；见脚本 `--help`） |
 | `snapshot_tar_roundtrip_probe.py` | Task 2 上线验收的"形状"那一腿：新快照卷上是 `fs.tar`、建箱回到树根、链接仍是链接；`--modes` 报恢复后的模式（`data` filter 的夹取读数）；`--fifo --expect-fifo-refusal` 报"捕获成功 / 恢复具名拒绝"。 | `tmp/venv/bin/python deploy/scripts/acceptance/snapshot_tar_roundtrip_probe.py --modes`（要 `E2B_API_URL`/`E2B_SANDBOX_URL`/`E2B_API_KEY`；`--keep` 留下快照） |
 | `sync-seccomp-installer.py` | Re-embed `deploy/seccomp/sandlock-worker.json` into the ConfigMap installer. | `python3 tmp/k0s/sync-seccomp-installer.py`（dry run）/ `… --write`（旧拼写） |
 | `t1-ownership-probe.py` | O1/T1 re-measurement on the live fleet: who owns a file the sandbox writes? | —（头部无 Usage 行；见脚本 `--help`） |
 | `task8_fup3_probe.py` | M4 Task 8 (FUP-E3) Step 1 probe: record the exact rejection shape. | —（头部无 Usage 行；见脚本 `--help`） |
-| `unprivileged_userns_probe.py` | Can a route-B slot (euid == the sandbox host uid) map 0 -> X in its own | —（头部无 Usage 行；见脚本 `--help`） |
+| `unprivileged_userns_probe.py` | Can an own-identity slot (euid == the sandbox host uid) map 0 -> X in its own | —（头部无 Usage 行；见脚本 `--help`） |
 | `verify-arena-live.py` | Post-deploy: the MCP stdio server's ceiling with the pinned arena. | —（头部无 Usage 行；见脚本 `--help`） |
 | `vol_fs_mount_probe.py` | Mechanism probe: why does the chroot volume view fail without SYS_ADMIN? | —（头部无 Usage 行；见脚本 `--help`） |
 | `x86-run-py.sh` | Run one python file in the production-shaped root worker, x86_64. | 头部：`Run one python file in the production-shaped root worker, x86_64.` |

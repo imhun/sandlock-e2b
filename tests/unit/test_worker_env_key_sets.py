@@ -227,7 +227,7 @@ KEY_CLASSES: dict[str, set[str]] = {
     # worker's, and only the k8s worker's. C3 Task 7 retired it with the broker
     # DaemonSet, so there is no key to classify any more -- the manifest pin
     # that it stays gone lives in `test_c3_agent_manifest.py`.
-    # C3 (Task 3): which path grants a route-B slot its identity. The k8s worker
+    # C3 (Task 3): which path grants an own-identity slot its identity. The k8s worker
     # and the two separated production compose stacks (the ones that ship a
     # `c3-agent` service) run `agent-grant`; the arm-lane fleet stack, the
     # single-machine example and the test runner have no agent and keep the

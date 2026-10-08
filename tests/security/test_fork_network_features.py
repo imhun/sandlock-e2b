@@ -30,7 +30,7 @@ from envd_service.executors.sandlock import SandlockExecutor
 
 #: The pooled host uid this file's identity contract runs the sandbox at. The
 #: value is arbitrary (any uid outside the runner's own), it only has to be the
-#: uid the route-B slot and the workspace ownership agree on.
+#: uid the own-identity slot and the workspace ownership agree on.
 POOLED_UID = 10000
 
 
@@ -82,7 +82,7 @@ def _executor(
 
 
 def _own_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExecutor:
-    """The deployed identity shape for route B (§2.4.1, 决定 #1).
+    """The deployed identity shape for own identity (§2.4.1, 决定 #1).
 
     **Host-side the sandbox runs at the pooled uid; inside its namespace it is
     uid 0** (the fork's F18 self-map of the single-entry userns). There is one
@@ -315,7 +315,7 @@ async def test_header_inject_and_host_mask_on_the_wire(tmp_path, monkeypatch):
 async def test_sandbox_child_runs_unprivileged():
     """S1.2 identity semantics **in the deployed shape** (§2.4.1, 决定 #1).
 
-    ``E2B_PER_SANDBOX_UID`` + route B: the sandbox's *host* uid is the pooled
+    ``E2B_PER_SANDBOX_UID`` + own identity: the sandbox's *host* uid is the pooled
     uid and its single-entry namespace maps that uid to 0 (fork F18 self-map),
     so the child sees ``0 0`` while everything it writes on the host belongs
     to the pooled uid. Both halves are asserted below — the in-namespace
@@ -336,7 +336,7 @@ async def test_sandbox_child_runs_unprivileged():
         )
         assert exit_code == 0, err.decode()
         assert out.decode().strip() == "0 0"
-        # The identity came from a route-B slot leased at the pooled uid (not
+        # The identity came from an own-identity slot leased at the pooled uid (not
         # from an in-process fallback that would leave the worker's identity).
         assert executor._own_identity_active is True
         assert executor._instance._handle.uid == POOLED_UID

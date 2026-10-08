@@ -1,6 +1,6 @@
 """The unprivileged half of C3 Task 3's identity hand-off (ruling D9.1).
 
-The old route-B starter needed a privileged step ("start this process as uid
+The retired slot starter needed a privileged step ("start this process as uid
 X"), which is why a non-root worker carried ``e2b-slot-spawn``. On the C3 path
 the worker performs **none** of it:
 
@@ -209,7 +209,7 @@ def identity_wait_timeout_s() -> float:
 
     Named apart from ``spawn_child``'s ``timeout_s`` argument on purpose: the
     argument shadows this function inside that body, and calling the argument
-    (``None`` by default, and route B never passes one) as if it were the helper
+    (``None`` by default, and own identity never passes one) as if it were the helper
     killed every child with ``os._exit(4)`` before its first ``setresuid``.
     """
     raw = env_alias.read(

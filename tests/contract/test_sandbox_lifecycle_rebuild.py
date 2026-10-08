@@ -109,11 +109,11 @@ async def test_nonexistent_binary_exits_127_with_no_output(workspace) -> None:
         pytest.skip("needs Linux + sandlock (Docker test runner)")
     runtime_registry = RuntimeRegistry(workspace)
     # The sandbox is registered directly (no provisioning), so no host uid was
-    # allocated: hand it the pooled uid and let route B lease a slot, which is
+    # allocated: hand it the pooled uid and let own identity lease a slot, which is
     # the shape every deployment runs since N15 made *both* mediation shapes
     # mediate (the legacy shared-uid shape on a root worker is refused now --
     # the fork will not attribute a sandbox's mediated writes to root). The
-    # route-B counterpart of this contract is
+    # own-identity counterpart of this contract is
     # tests/contract/test_own_identity_executor.py::test_missing_binary_exits_127_through_the_slot
     from tests.security.conftest import SANDBOX_UID, sandbox_tmpdir
 

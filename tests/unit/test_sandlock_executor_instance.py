@@ -243,7 +243,7 @@ def test_message_text_never_decides_the_rebuild(monkeypatch, caplog) -> None:
     prose = (
         "sandlock_instance_launch failed: process error: child process error: "
         "the init channel closed after the main-exit container end / dead "
-        "listener: see route B for the remedy"
+        "listener: see own identity for the remedy"
     )
 
     class _ProseLaunchFailure(_FakeInstance):
@@ -256,7 +256,7 @@ def test_message_text_never_decides_the_rebuild(monkeypatch, caplog) -> None:
     with caplog.at_level(
         logging.WARNING, logger="envd_service.executors.sandlock"
     ):
-        with pytest.raises(RuntimeError, match="route B for the remedy") as info:
+        with pytest.raises(RuntimeError, match="own identity for the remedy") as info:
             ex._ensure_instance()
     assert not isinstance(info.value, (_FakeClosedError, _FakeDeadError))
     assert attempts[0] == 1, "a text match must not trigger a rebuild"
@@ -621,7 +621,7 @@ async def test_consume_filters_internal_eof_markers() -> None:
 
 
 # --------------------------------------------------------------------------
-# Route-B refusals: classified by the fork's stable refusal *code*
+# Own identity refusals: classified by the fork's stable refusal *code*
 # --------------------------------------------------------------------------
 #
 # A ``sandlock-supervise`` slot is a separate process, so its refusal cannot

@@ -31,7 +31,7 @@ What is left here is the worker's own side of the contract:
   sandbox's uid/gid out of the worker's own trust boundary.
 
 A root worker is untouched by any of this: root already has the capabilities,
-and route B keeps using its own privileged starter.
+and own identity keeps using its own privileged starter.
 """
 
 from __future__ import annotations
@@ -363,7 +363,7 @@ def helpers_unavailable_reason(settings) -> str | None:
 
     One shape can perform those steps now -- C3's agent -- so this is the line
     for a worker that names neither an agent nor a root identity: it keeps the
-    in-process (E5.1) model, which means no per-sandbox host uid and no route-B
+    in-process (E5.1) model, which means no per-sandbox host uid and no own-identity
     slots, and the caller logs it once at startup rather than letting the
     difference be discovered from a sandbox that behaves differently.
     """
@@ -374,7 +374,7 @@ def helpers_unavailable_reason(settings) -> str | None:
     return (
         "this worker has no privileged file-step path: no per-node agent is "
         "configured, so it keeps the in-process (E5.1) shape (no per-sandbox "
-        "host uids, no route-B slots)"
+        "host uids, no own-identity slots)"
     )
 
 

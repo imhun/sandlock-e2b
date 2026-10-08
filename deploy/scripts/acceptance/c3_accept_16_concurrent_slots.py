@@ -17,7 +17,7 @@ N is read from the shape's own worker count (three for
 ``docker-compose.multinode.yml``), not hard-coded.
 
 **What a "slot start" is on this shape.** A create does *not* start a slot: the
-worker forks the slot's child when the sandbox is first used (route B's
+worker forks the slot's child when the sandbox is first used (own identity's
 ``acquire``, ``envd_service/executors/sandlock.py``). So each round is "create
 one sandbox on each worker, then start its slot", and the measured phase is the
 slot start -- the one that carries the CP→agent hop. Both halves are reported.

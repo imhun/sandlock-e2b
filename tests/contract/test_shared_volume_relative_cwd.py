@@ -82,12 +82,12 @@ ALIAS_POOL_SIZE = 16
 @pytest.mark.asyncio
 @_ROOTED_SHAPE_ONLY
 async def test_volume_visible_from_both_workspace_aliases(make_apps, workspace):
-    # This file gets its **own** uid pool. Route-B leases one live slot per
+    # This file gets its **own** uid pool. Own identity leases one live slot per
     # uid, and the suite's other ownership contracts run on 20000/21000: a
     # second sandbox on a uid whose sandbox from another file is still alive
     # cannot lease a slot at all, and the create then fails inside the
     # sandbox with exit 127 and this only visible on stderr --
-    # "route-B uid 20000 already has a live slot (sandbox …); W1 recycles a
+    # "own-identity uid 20000 already has a live slot (sandbox …); W1 recycles a
     # uid only by restarting its process, never by sharing it"
     # (measured 2026-09-21). Per-file ranges are the suite's existing
     # convention for exactly this reason.
@@ -143,7 +143,7 @@ async def test_volume_visible_from_both_workspace_aliases(make_apps, workspace):
         # at all -- it answers "can't cd to /home/user" and its `pwd` is the
         # host workspace path (same probe) -- which is why it is skipped above.
         # The sandbox above is reused on purpose: one sandbox per test file
-        # keeps the worker's per-uid route-B slot ledger free of cross-test
+        # keeps the worker's per-uid own-identity slot ledger free of cross-test
         # leases.
         code, stdout, stderr = _result(
             await _run_cmd(client, payload, "pwd && pwd -P")
@@ -153,7 +153,7 @@ async def test_volume_visible_from_both_workspace_aliases(make_apps, workspace):
             b"/home/user\n/home/user\n",
             b"",
         )
-    # Release the sandbox, its pooled host uid and its route-B slot: the
+    # Release the sandbox, its pooled host uid and its own-identity slot: the
     # worker's slot fleet is process-global, so a sandbox left alive here
     # would collide with the next file's uid-20000 sandbox in one pytest run.
     async with httpx.AsyncClient(

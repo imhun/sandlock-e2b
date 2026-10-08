@@ -1,4 +1,4 @@
-"""T5 route-B evidence at the envd layer (backlog #5).
+"""T5 own-identity evidence at the envd layer (backlog #5).
 
 The envd W1 slot pool starts two ``sandlock-supervise`` slots at two
 distinct host uids over the shared 1777+sticky directory, and the worker
@@ -34,7 +34,7 @@ from tests.security.conftest import sandlock_ready
 pytestmark = pytest.mark.skipif(
     os.geteuid() != 0 or not sandlock_ready(),
     reason=(
-        "route-B slot tests need a root worker + sandlock wheel with the "
+        "own-identity slot tests need a root worker + sandlock wheel with the "
         "supervise binary (run inside the privileged Docker test runner)"
     ),
 )

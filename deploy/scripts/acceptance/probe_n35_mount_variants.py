@@ -1,6 +1,6 @@
 """Which mount operations work for the *sandbox's* identity (uid 1000 + userns)?
 
-Route A wants the sandbox process itself to build its root: unshare a user
+The in-process shape wants the sandbox process itself to build its root: unshare a user
 namespace (so it has CAP_SYS_ADMIN of its own), unshare a mount namespace, bind
 the host workspace and volumes into the image rootfs, then pivot into it.
 
@@ -377,7 +377,7 @@ def main() -> int:
 
     # 1. The privileged baseline: container root maps itself to itself.
     child("V1 root + map 0->0 + bind /tmp/a -> /tmp/b", None, work / "a", work / "b")
-    # 2. The shape route A needs: the slot uid maps itself to guest root.
+    # 2. The shape the in-process mediator needs: the slot uid maps itself to guest root.
     child("V2 uid1000 + map 0->1000 + bind /tmp/a -> /tmp/b",
           SLOT_UID, work / "a", work / "b")
     # 3. Same identity, but the source lives inside the image rootfs.

@@ -304,7 +304,7 @@ spec:
             # docs/production-deployment-requirements.md §2.7.1.
             - name: E2B_IMAGE_CACHE_OWNER_UID
               value: "65534"
-            # Route B's scratch root (the per-slot policy/program documents).
+            # Own identity's scratch root (the per-slot policy/program documents).
             # N57 (Task 4) puts it under the **node-local** state base: the
             # writer is this worker, the reader is this node's slot, and the
             # only other process that touches a document is this node's agent
@@ -336,7 +336,7 @@ spec:
             # refusal by name, not a silent downgrade.
             - name: E2B_PRIV_HELPER_TRANSPORT
               value: agent
-            # C3 (Task 3): route B's slot identity now comes from the per-node
+            # C3 (Task 3): own identity's slot identity now comes from the per-node
             # agent, not from a file-capability binary in this image.
             #
             # The worker forks the slot, lets it `unshare` a user namespace and

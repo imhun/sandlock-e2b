@@ -49,7 +49,7 @@ backend).
 | syscall | upstream default | here | why |
 |---|---|---|---|
 | `pidfd_getfd` | gated on `CAP_SYS_PTRACE` | unconditional | sandlock picks up the child's seccomp-notification fd with it (`crates/sandlock-core/src/sandbox.rs::dup_child_fd`). Neither worker shape carries `CAP_SYS_PTRACE`, so the gate refused it and **the sandbox could not be created at all** (measured: create fails, exit `-1`, no child output). |
-| `unshare` | gated on `CAP_SYS_ADMIN` | allowed only for the namespace types this deployment builds | The worker builds a user namespace for the per-sandbox host uid (E3.2, and the route-B slot's F18 self-map), plus net/pid/mount namespaces for `E2B_ENABLE_NET_ISOLATION` / `pid_ns` / the real-root shapes. See "The `unshare` mask" below. |
+| `unshare` | gated on `CAP_SYS_ADMIN` | allowed only for the namespace types this deployment builds | The worker builds a user namespace for the per-sandbox host uid (E3.2, and the own-identity slot's F18 self-map), plus net/pid/mount namespaces for `E2B_ENABLE_NET_ISOLATION` / `pid_ns` / the real-root shapes. See "The `unshare` mask" below. |
 | `ptrace`, `process_vm_readv`, `process_vm_writev` | gated on `CAP_SYS_PTRACE` in older profile revisions | unconditional | Current daemons already allow these unconditionally (measured on the local engine with `CapEff` lacking `CAP_SYS_PTRACE`); kept aligned so this file matches the shape the deployment is verified against. |
 
 **Not** relaxed: `keyctl`, `bpf`, `clone3`, `setns`, `perf_event_open`, … — the
@@ -129,7 +129,7 @@ so `pidfd_getfd` was added to `DEFAULT_BLOCKLIST_SYSCALLS` (fork `a21a507`; whee
 and images rebuilt). Re-measured after that deploy, same probe: `pidfd_getfd` is
 now **`EPERM`** as well, and the supervisor's own use is unaffected (it runs
 outside this filter — the worker's log shows no `pidfd_getfd` failure, and
-route-B slots still hand off their descriptor).
+own-identity slots still hand off their descriptor).
 
 `process_vm_writev` is the single candidate for going *below* the default
 (checkpoint restore is not part of what E2B exposes); that would be a deliberate
@@ -216,7 +216,7 @@ End-to-end (real sandbox create + command execution, same image):
 
 So `pidfd_getfd` is what the *base* path needs; `unshare` is what the
 namespace-bearing paths need. Both are in this file because the deployed
-worker runs with `E2B_PER_SANDBOX_UID` (default on) and route-B slots.
+worker runs with `E2B_PER_SANDBOX_UID` (default on) and own-identity slots.
 
 Security boundary — the sandbox does **not** inherit the relaxation: a
 sandboxed process calling `unshare(CLONE_NEWUSER)` gets `EPERM` both under this

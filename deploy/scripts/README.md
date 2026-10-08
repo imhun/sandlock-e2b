@@ -110,7 +110,7 @@ done
 * 只迁移 `sbx_*` 顶层目录：卷根保持 `1777`，`_volumes`/`_snapshots`/`_migrate`
   不动（它们本来就归 worker）。
 * 迁移后 worker 侧数据面（files API / watcher / 命令日志 / 快照）才可用；不迁移时
-  这些路径会 EACCES，route-B 槽位与命令执行不受影响。
+  这些路径会 EACCES，own-identity 槽位与命令执行不受影响。
 
 ## 常用参数
 

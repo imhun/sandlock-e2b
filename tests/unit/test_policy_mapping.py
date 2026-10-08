@@ -150,11 +150,11 @@ def test_chroot_policy_sends_no_mediation_tier(monkeypatch, tmp_path) -> None:
     ceiling = executor._policy_ceiling()
     assert "mediation_run_as" not in ceiling
     # Mediation really is in play in this shape -- which is why the fork's
-    # default would refuse it in-process, and why route B exists.
+    # default would refuse it in-process, and why own identity exists.
     assert ceiling["fs_denied"] == ["/proc/kcore", "/sys"]
     assert ceiling["chroot"] == str(rootfs)
     assert executor._own_identity_active is False, (
-        "no route-B config was passed here, so this is the disclosed shape"
+        "no own-identity config was passed here, so this is the disclosed shape"
     )
 
 

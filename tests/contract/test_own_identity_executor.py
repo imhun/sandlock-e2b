@@ -1,4 +1,4 @@
-"""The SandlockExecutor driving a real supervise slot (route B, end to end).
+"""The SandlockExecutor driving a real supervise slot (own identity, end to end).
 
 ``tests/contract/test_own_identity_slot_pool.py`` proves the slot pool and the
 Python channel client work at two distinct uids;
@@ -10,7 +10,7 @@ process manager makes, against a slot that really runs as the sandbox host uid.
 What is only checkable here (not off-Linux, not with a faked fleet):
 
 * the generation's parking main program costs nothing -- a parked tree that
-  burns CPU would tax every route-B sandbox for its whole lifetime;
+  burns CPU would tax every own-identity sandbox for its whole lifetime;
 * the child really executes as the leased uid, including through PTY mode;
 * PTY window sizes set on the worker's master reach the child;
 * ``close()`` leaves the uid clean: process gone, registered socket gone
@@ -49,7 +49,7 @@ UID = 21200
 pytestmark = pytest.mark.skipif(
     os.geteuid() != 0 or not sandlock_ready(),
     reason=(
-        "route-B executor tests need a root worker, Linux and the sandlock "
+        "own-identity executor tests need a root worker, Linux and the sandlock "
         "wheel's supervise binary (privileged Docker test runner)"
     ),
 )
@@ -104,10 +104,10 @@ def _tree_pids(root_pid: int) -> list[int]:
 
 
 def _executor(workspace: Path, sandbox_id: str) -> SandlockExecutor:
-    """A pure-shape executor forced onto route B (``mode="on"``).
+    """A pure-shape executor forced onto own identity (``mode="on"``).
 
     The chroot shape's identity evidence is covered by
-    ``test_uid_permissions``; forcing route B here keeps the slot behaviour
+    ``test_uid_permissions``; forcing own identity here keeps the slot behaviour
     under test independent of whether the runner pulled a base image.
     """
     # The workspace arrives on the runner's ownership-capable storage (the
@@ -162,7 +162,7 @@ async def test_executor_command_runs_in_the_leased_generation(workspace) -> None
     Inside its namespace the workload is uid 0 (fork F18's self-map: the same
     in-guest identity a privileged supervisor produces by writing `0 -> host_uid`
     for the child), while on the host everything it writes belongs to the
-    sandbox's own uid -- the fact route B exists to establish. Asserting only
+    sandbox's own uid -- the fact own identity exists to establish. Asserting only
     one of the two would let the other regress unnoticed: no self-map and the
     guest sees its host uid; a map without the dropped privilege and the writes
     come back owned by root.
@@ -240,7 +240,7 @@ async def test_parked_main_program_costs_nothing(workspace) -> None:
         after = _clock_ticks(*_tree_pids(slot.process.pid))
         assert after - before <= 2, (
             f"the parked generation burned {after - before} clock ticks in "
-            "1 s of wall time; route-B slots must park at zero cost"
+            "1 s of wall time; own-identity slots must park at zero cost"
         )
     finally:
         ex.close()
@@ -279,7 +279,7 @@ def test_parked_main_survives_stray_catchable_signals() -> None:
     exits 143 (SIGTERM) on SIGCONT after SIGTERM-while-stopped; the shipped one
     is still parked and still costs zero clock ticks.
 
-    That distinction is the whole ballgame for a route-B sandbox: the M0 main
+    That distinction is the whole ballgame for an own-identity sandbox: the M0 main
     exiting is a *container end* (``ChildKind::Main``), after which every verb
     on that generation -- every later command of that sandbox -- is refused
     with the unified closed-instance code.
@@ -327,7 +327,7 @@ async def test_collapsed_generation_is_rebuilt_once_not_permanent(
 
     The generation is a container: when its M0 main exits, init collapses
     every group and the *slot process keeps serving* -- answering every verb
-    with the unified closed-instance refusal. That refusal crosses the route-B
+    with the unified closed-instance refusal. That refusal crosses the own-identity
     channel as ``err`` prose plus a stable ``code`` (fork F19/SL-13); before
     the code it was prose only, the executor's typed session-gone mapping
     never saw it, and the sandbox stayed dead for good (production symptom:
@@ -630,7 +630,7 @@ async def test_missing_binary_exits_127_through_the_slot(workspace) -> None:
     """A missing in-sandbox executable is the child's exit status (127, no
     output), not an exception -- the same fork execvp semantics the in-process
     instance has (``test_sandbox_lifecycle_rebuild``), now pinned across the
-    channel because route B is the chroot shape's default backend.
+    channel because own identity is the chroot shape's default backend.
 
     The path sits **inside** the sandbox's readable set on purpose. N15 gave
     the pure shape a real policy (the host root, identity translation), so a
@@ -827,7 +827,7 @@ GUEST_IDENTITY_CODE = (
 async def test_slot_restores_in_guest_root_without_device_nodes(workspace) -> None:
     """Parity for the guest identity, and the one thing it buys back is fenced.
 
-    A route-B slot mediator *is* the sandbox uid, so nobody can write maps for
+    An own-identity slot mediator *is* the sandbox uid, so nobody can write maps for
     it the way a privileged supervisor writes them for its child; without help
     the guest would see its own host uid instead of uid 0 (fork F18 self-maps
     `0 -> euid` inside the sandbox's namespace, matching the in-process shape).

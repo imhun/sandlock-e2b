@@ -271,11 +271,11 @@ services:
       # only switches routes (no archive transfer).
       E2B_SHARED_WORKSPACE_ROOT: /var/lib/e2b-sandboxes
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
-      # C3 (Task 4 slice B): route B's scratch root. The worker writes the
+      # C3 (Task 4 slice B): own identity's scratch root. The worker writes the
       # per-slot `policy.json`/`program.json` here, but the *control plane*
       # derives the path of the one the agent scopes to that slot's uid
       # (`scope-slot-document`) -- the worker may not report a path. Unset,
-      # that op answers a named 503 and route-B slots never come up.
+      # that op answers a named 503 and own-identity slots never come up.
       E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       # Rootfs cache on the shared volume: persists across `up -d` and is
       # shared by every worker, instead of being re-pulled/re-extracted into
@@ -456,7 +456,7 @@ services:
     # existing root-owned volume once.
     #
     # E3.2 per-sandbox host uids are on by default (E2B_PER_SANDBOX_UID, plus
-    # route B's per-uid supervise slot). They *used* to auto-disable themselves
+    # own identity's per-uid supervise slot). They *used* to auto-disable themselves
     # on a 65534 worker, because the worker's own `setuid`/`chown` are EPERM;
     # under C3 the privileged steps are the **agent's** (the worker asks the
     # control plane, which instructs the per-host `c3-agent-maint`), so a
@@ -482,7 +482,7 @@ services:
       E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
       E2B_NODE_ADDRESS: http://worker-1:49983
       E2B_NODE_ID: worker-1
-      # C3 (Task 3): route B's slot identity comes from the per-host agent, not
+      # C3 (Task 3): own identity's slot identity comes from the per-host agent, not
       # from a file-capability binary in this image. The worker reports
       # `{sandbox_id, pid}` to the **control plane** and never to the agent
       # (`worker <-> agent` does not exist), and this container carries no agent
@@ -531,7 +531,7 @@ services:
       E2B_PID_NS: ${E2B_PID_NS:-true}
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE:-registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
-      # Route B's scratch root (the per-slot policy/program documents). The
+      # Own identity's scratch root (the per-slot policy/program documents). The
       # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
       # the k8s pod template names the same path. The per-node agent scopes
       # those documents to the slot's uid (0440) and only touches roots the

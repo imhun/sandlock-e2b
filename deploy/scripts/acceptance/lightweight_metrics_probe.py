@@ -146,7 +146,7 @@ def main() -> int:
     # 2. 命令往返：SDK 一次 commands.run 的端到端耗时。
     box = _create(Sandbox)
     print(f"command probe sandbox -> {route_of(box.sandbox_id)}")
-    # 丢弃第一条：它包含 route-B 槽位的租用（第一个 exec 才建实例），
+    # 丢弃第一条：它包含 own-identity 槽位的租用（第一个 exec 才建实例），
     # 那是"沙箱启动"的成本，不是"命令往返"的。
     box.commands.run("/bin/echo warm-up")
     rtt_ms: list[float] = []

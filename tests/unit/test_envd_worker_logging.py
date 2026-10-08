@@ -2,11 +2,11 @@
 
 ``uvicorn.run(log_level=...)`` only configures the ``uvicorn*`` loggers, so
 before this the worker's own loggers inherited the root logger's default
-WARNING level: ``route-B instance ready ...`` (and every other INFO line on
+WARNING level: ``own-identity instance ready ...`` (and every other INFO line on
 the worker start path) was dropped, and ``E2B_LOG_LEVEL=DEBUG`` changed
 nothing. ``envd_service.__main__._configure_logging`` is what the real worker
 process (``python -m envd_service``) runs before serving; these tests pin its
-level contract and that the route-B message is actually emitted.
+level contract and that the own-identity message is actually emitted.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import pytest
 from envd_service.__main__ import _configure_logging
 from envd_service.config import Settings as EnvdSettings
 
-ROUTE_B_LOGGER = "envd_service.executors.sandlock"
+OWN_IDENTITY_LOGGER = "envd_service.executors.sandlock"
 
 
 @pytest.fixture()
@@ -46,8 +46,8 @@ def test_own_identity_ready_info_line_is_emitted(restore_root_logging) -> None:
     logging.getLogger().addHandler(capture)
 
     _configure_logging(EnvdSettings(log_level="INFO"))
-    logging.getLogger(ROUTE_B_LOGGER).info(
-        "route-B instance ready sandbox_id=%s instance_name=%s uid=%s "
+    logging.getLogger(OWN_IDENTITY_LOGGER).info(
+        "own-identity instance ready sandbox_id=%s instance_name=%s uid=%s "
         "slot=%s channel=%s guest-uid=%s",
         "sbx_f4",
         "sbx_f4-1",
@@ -58,7 +58,7 @@ def test_own_identity_ready_info_line_is_emitted(restore_root_logging) -> None:
     )
 
     assert capture.messages == [
-        "route-B instance ready sandbox_id=sbx_f4 instance_name=sbx_f4-1 "
+        "own-identity instance ready sandbox_id=sbx_f4 instance_name=sbx_f4-1 "
         "uid=10000 slot=slot-10000 channel=fd-handoff(pid 42) "
         "guest-uid=uid-0-in-userns"
     ]
@@ -69,7 +69,7 @@ def test_default_level_is_info_and_drops_debug(restore_root_logging) -> None:
 
     assert level == logging.INFO
     assert logging.getLogger().level == logging.INFO
-    logger = logging.getLogger(ROUTE_B_LOGGER)
+    logger = logging.getLogger(OWN_IDENTITY_LOGGER)
     assert logger.isEnabledFor(logging.INFO) is True
     assert logger.isEnabledFor(logging.DEBUG) is False
 
@@ -79,7 +79,7 @@ def test_env_log_level_debug_reaches_envd_loggers(restore_root_logging) -> None:
 
     assert level == logging.DEBUG
     assert logging.getLogger().level == logging.DEBUG
-    assert logging.getLogger(ROUTE_B_LOGGER).isEnabledFor(logging.DEBUG) is True
+    assert logging.getLogger(OWN_IDENTITY_LOGGER).isEnabledFor(logging.DEBUG) is True
 
 
 def test_unknown_level_name_falls_back_to_info(restore_root_logging) -> None:

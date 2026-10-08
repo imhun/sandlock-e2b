@@ -313,11 +313,11 @@ services:
       # registry configured it exports locally built template images as OCI
       # layout tars into ``_images/_oci/`` for the workers to resolve.
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
-      # C3 (Task 4 slice B): route B's scratch root. The worker writes each
+      # C3 (Task 4 slice B): own identity's scratch root. The worker writes each
       # slot's `policy.json`/`program.json` under it, but the control plane is
       # what derives the path of the one the agent scopes to that slot's uid
       # (`scope-slot-document`) -- the worker may not report a path. Unset, that
-      # op answers a named 503 and route-B slots never come up.
+      # op answers a named 503 and own-identity slots never come up.
       E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       # That directory is in the volume's *unlimited* project (``_images`` is a
       # reserved platform namespace, not a sandbox tree), so the resolver
@@ -516,7 +516,7 @@ services:
       E2B_CONTROL_PLANE_URL: ${E2B_CONTROL_PLANE_URL:-http://control-plane:3000}
       E2B_NODE_ADDRESS: http://worker-1:49983
       E2B_NODE_ID: worker-1
-      # C3 (Task 3 + Task 4 slice B): route B's slot identity comes from the
+      # C3 (Task 3 + Task 4 slice B): own identity's slot identity comes from the
       # per-host `c3-agent`, and so does every privileged file step -- the
       # worker image no longer ships `/var/lib/e2b-priv/`. N52 (2026-09-30)
       # retired the `exec`/`socket` transports and the `spawn` identity: those
@@ -553,7 +553,7 @@ services:
       E2B_BASE_IMAGE: ${E2B_BASE_IMAGE}
       E2B_TEMPLATE_IMAGES: ${E2B_TEMPLATE_IMAGES:-}
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
-      # E3.2 per-sandbox host uids (and route B's per-uid supervise slot).
+      # E3.2 per-sandbox host uids (and own identity's per-uid supervise slot).
       # Workers that share one workspace volume MUST use disjoint ranges, and
       # the pool must avoid the worker's own uid/gid (65534 here) --
       # priv_helpers.check_worker_identity_outside_pool fails the worker's
@@ -562,7 +562,7 @@ services:
       E2B_PER_SANDBOX_UID: ${E2B_PER_SANDBOX_UID:-true}
       E2B_UID_POOL_START: ${E2B_UID_POOL_START:-10000}
       E2B_UID_POOL_SIZE: ${E2B_UID_POOL_SIZE:-1000}
-      # Route B's scratch root (the per-slot policy/program documents). The
+      # Own identity's scratch root (the per-slot policy/program documents). The
       # per-node agent scopes those documents to the slot's uid (0440) and only
       # touches roots the deployment names (N52 retired the worker-side broker
       # whose whitelist this used to be); anywhere else the document could only

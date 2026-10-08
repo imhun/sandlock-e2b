@@ -1099,7 +1099,7 @@ class RuntimeRegistry:
         the sandbox uid.
 
         Why not ``0700``: the *disk accounting* file beside the record is read
-        by the route-B slot, whose euid is the sandbox's host uid -- a
+        by the own-identity slot, whose euid is the sandbox's host uid -- a
         different uid from the worker's -- so the directory has to be
         traversable for that one read. Measured 2026-10-01: at ``0700`` the
         slot's read failed with EACCES and every ``statfs`` in the sandbox
@@ -1240,7 +1240,7 @@ class RuntimeRegistry:
             # uid is free", which is how two sandboxes end up sharing one
             # host uid with E3.2's isolation silently gone.
             write_json_atomically(path, record.to_dict())
-            # The directory is traversable by name (0711) so the route-B
+            # The directory is traversable by name (0711) so the own-identity
             # slot can reach the disk-accounting file beside this one; the
             # record itself carries the access token, so it is closed by
             # its own mode rather than by the directory (`write_json_

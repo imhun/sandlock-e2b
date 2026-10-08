@@ -632,8 +632,8 @@ def test_the_k8s_control_plane_names_own_identity_and_splits_the_cache() -> None
     """Task 4 slice B's two CP-side values, both of which are file-op inputs.
 
     `scope-slot-document`'s path is derived by the *control plane* (the worker
-    may not report one), so the CP has to know route B's scratch root: unset,
-    that op answers a named 503 and no route-B slot ever comes up.
+    may not report one), so the CP has to know own identity's scratch root: unset,
+    that op answers a named 503 and no own-identity slot ever comes up.
 
     The image cache is subtler. The worker writes each sandbox's secret under
     `<its own E2B_IMAGE_CACHE_DIR>/secrets/<id>/` -- the **node-local**
@@ -660,10 +660,10 @@ def test_the_k8s_control_plane_names_own_identity_and_splits_the_cache() -> None
     assert env["E2B_IMAGE_CACHE_DIR"]["value"] == worker_env["E2B_IMAGE_CACHE_DIR"]["value"]
     assert env["E2B_IMAGE_OCI_DIR"]["value"] == worker_env["E2B_IMAGE_OCI_DIR"]["value"]
     # ...and the *root discipline* accepts it: `_require_in_roots` compares the
-    # derived path against the roots this pod declares, so a route-B root under
+    # derived path against the roots this pod declares, so an own-identity root under
     # a base the control plane never names (the shape a half-moved `.route-b`
     # produces, e.g. value moved but `E2B_NODE_STATE_BASE` forgotten) is a named
-    # 503 and no route-B slot ever comes up. Read the roots off the manifest
+    # 503 and no own-identity slot ever comes up. Read the roots off the manifest
     # itself rather than restating them, so the two cannot drift apart.
     from control_plane.file_ops import ControlPaths
 
@@ -1126,7 +1126,7 @@ def test_the_shapes_excluded_from_c3_declare_that_they_have_no_file_ops() -> Non
     binaries. Task 4 slice B removed them and N52 (2026-09-30) retired the
     knobs that named them, so the example no longer declares any
     privileged-file-op key at all: it runs the in-process (E5.1) shape -- no
-    per-sandbox host uid, no route-B.
+    per-sandbox host uid, no own-identity.
 
     Ruling D23: the shape is excluded from C3's coverage **by name** (like
     `local://`), and has to *declare* its absent file-operation capability in

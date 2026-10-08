@@ -9,7 +9,7 @@ and releases its reservation while it is still working.
 
 Two decisions worth stating, because both have an obvious wrong answer:
 
-* **The per-sandbox host uid is the key** (E3.2). Under route B the slot *is* the
+* **The per-sandbox host uid is the key** (E3.2). Under own identity the slot *is* the
   sandbox's process tree and runs as that pooled uid, so one pass over ``/proc``
   that sums every process's ``utime+stime`` by *owner uid* yields the sandbox's
   CPU without walking a process tree per sandbox. A sandbox with no pooled uid

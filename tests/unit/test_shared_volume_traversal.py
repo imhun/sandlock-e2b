@@ -1,6 +1,6 @@
 """A5: the host volume path must be traversable for tenant uids (o+x).
 
-The mediator opens the volume host path *as the sandbox's own uid* (route-B
+The mediator opens the volume host path *as the sandbox's own uid* (own-identity
 supervise slot), so DAC needs execute on **every** level between ``/`` and the
 volume view -- the volume root alone is not enough. Where it is missing, even
 an absolute volume path fails with EACCES; only the deleted ``mount --bind``

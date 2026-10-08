@@ -36,7 +36,7 @@ class _Instance:
 def _executor(instance) -> SandlockExecutor:
     """The real methods, bound to the smallest object they need.
 
-    The constructor decides route-B shape, allocates uid pools and touches the
+    The constructor decides own-identity shape, allocates uid pools and touches the
     filesystem; none of that is what these tests are about, and a stub keeps
     them honest about which object's behaviour is under test.
     """

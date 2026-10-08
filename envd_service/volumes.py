@@ -77,7 +77,7 @@ def _volume_fs_mount(path: Path, fallback: str | Path) -> Path:
 def _ensure_traversable(path: Path) -> None:
     """Give tenant uids a way *through* every ancestor of a volume view.
 
-    The mediator opens the volume host path as the sandbox's own uid (route-B
+    The mediator opens the volume host path as the sandbox's own uid (own-identity
     slot / RunAs), so DAC needs o+x on each ancestor. Traverse-only (0111)
     where the tenant must not list, otherwise keep what is there.
 

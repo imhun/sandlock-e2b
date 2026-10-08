@@ -355,7 +355,7 @@ spec:
               mkdir -p "$state"
               # N57 / Task 4: the **node-local** half of that state. The worker
               # writes the create's `.creating` marker and `disk-stats` seed
-              # under `<node_state>/_runtime/<id>/`, and the route-B slot
+              # under `<node_state>/_runtime/<id>/`, and the own-identity slot
               # documents go to `<node_state>/.route-b/...`. (N57: the pool's
               # own `.uid_pool.lock` / `.uid_reservations/` are *not* here --
               # they live on the shared `E2B_STATE_BASE` so `acquire`'s
@@ -389,7 +389,7 @@ spec:
               # root could fail to chown -- a node that cannot is broken, and a
               # world-writable state base would hide that instead of naming it.
               if [ "$node_state_owner" != "65534" ]; then
-                echo "workspace-root-init: FATAL: $node_state is owned by uid $node_state_owner, not the worker uid 65534: the worker writes every create's marker and accounting seed under it (and the route-B slot documents), so every Sandbox.create() would fail with EACCES" >&2
+                echo "workspace-root-init: FATAL: $node_state is owned by uid $node_state_owner, not the worker uid 65534: the worker writes every create's marker and accounting seed under it (and the own-identity slot documents), so every Sandbox.create() would fail with EACCES" >&2
                 echo "workspace-root-init: fix it once on the node: chown 65534:65534 $node_state" >&2
                 exit 1
               fi

@@ -205,7 +205,7 @@ def fixtures(worker_uid: int, worker_gid: int, pool_uid: int,
 
 
 def _become(identity: Identity) -> None:
-    """Drop to ``identity`` the way a route-B slot does: no supplementary groups."""
+    """Drop to ``identity`` the way an own-identity slot does: no supplementary groups."""
     os.setgroups([])
     os.setgid(identity.gid)
     os.setuid(identity.uid)

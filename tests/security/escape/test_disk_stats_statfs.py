@@ -9,7 +9,7 @@ worker publishes both and the fork reports them on each call.
 This is the executor-side end of that: the path the platform hands the
 executor must reach the fork, and the numbers must come back through `df`.
 
-At first this case was `xfail(strict=True)` with the reading "a route-B payload
+At first this case was `xfail(strict=True)` with the reading "an own-identity payload
 receives no seccomp notifications at all, so no notif-based mediation can apply
 to it" (SEC-K0S-007, 2026-10-01). That reading was wrong, and the 2026-10-01
 re-measurement says what actually happened: the payload *is* notified in this
@@ -26,7 +26,7 @@ Fixed in `third_party/sandlock` by registering the accounting handler before
 the chroot path handlers. Pinned by the fork's
 `test_procfs::test_statfs_accounting_wins_over_the_chroot_handler` (red before
 the fix with the node's numbers, green after) and by this case, which is the
-route-B end-to-end acceptance the audit named.
+own-identity end-to-end acceptance the audit named.
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ def test_the_numbers_the_worker_publishes_are_what_the_sandbox_sees():
     """The production chain: worker publishes, *another uid* reads it.
 
     The path is only half of the wiring. The worker writes as its own uid and
-    the route-B slot -- the process that answers `statfs` -- runs at the
+    the own-identity slot -- the process that answers `statfs` -- runs at the
     sandbox's host uid, so the directory chain has to be traversable by name
     and the file readable. Measured 2026-10-01: with the runtime directory at
     its historical ``0700`` the slot's read failed with EACCES and every

@@ -94,7 +94,7 @@ def sandlock_missing_error(mode: str, detail: str) -> RuntimeError:
 
 
 def _sandbox_cgroup_mode(settings) -> str:
-    """``E2B_SANDBOX_CGROUP`` normalized the way route B reads it.
+    """``E2B_SANDBOX_CGROUP`` normalized the way own identity reads it.
 
     ``getattr`` keeps a settings double that predates the N83 field on the old
     behaviour, exactly like ``own_identity.sandbox_cgroup_mode``; an unknown value is
@@ -109,7 +109,7 @@ def sandbox_cgroup_local_error(mode: str) -> RuntimeError:
 
     N83 phase 1, final review Important 2. ``required`` promises that no sandbox
     runs without a per-sandbox cgroup. The sandlock executor enforces that
-    through route B's slot pool -- and its in-process mediator refuses by name
+    through own identity's slot pool -- and its in-process mediator refuses by name
     (``SandlockExecutor._refuse_in_process_without_a_quota``) -- but the
     *executor factory* could still answer :class:`LocalExecutor` and that class
     never reads ``settings.sandbox_cgroup``: for an explicit

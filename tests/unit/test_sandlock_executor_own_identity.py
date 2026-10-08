@@ -1,4 +1,4 @@
-"""SandlockExecutor on route B: the supervise slot as the exec instance.
+"""SandlockExecutor on own identity: the supervise slot as the exec instance.
 
 The native ``sandlock-supervise`` binary is Linux-only and needs privilege to
 start at another uid, so the *fleet* is faked here and the assertions are
@@ -189,7 +189,7 @@ class FakeExecStdio:
 def _own_identity_capable(monkeypatch, tmp_path):
     """Pretend the wheel ships supervise and the worker is root.
 
-    ``sandlock`` itself is Linux-only; route B needs it for the ctypes channel
+    ``sandlock`` itself is Linux-only; own identity needs it for the ctypes channel
     client, so the tests stand in for the parts the executor uses.
     """
     monkeypatch.setattr(os, "geteuid", lambda: 0)
@@ -349,7 +349,7 @@ def test_forced_own_identity_without_a_reporter_fails_loudly(monkeypatch) -> Non
     monkeypatch.setattr(os, "geteuid", lambda: 65534)
     with pytest.raises(
         RuntimeError,
-        match=r"^route B was requested but E2B_IDENTITY_GRANT=agent-grant needs "
+        match=r"^own identity was requested but E2B_IDENTITY_GRANT=agent-grant needs "
         r"the control-plane reporter",
     ):
         _executor(
@@ -375,7 +375,7 @@ def test_agent_grant_engages_own_identity_without_root_or_a_broker(monkeypatch) 
 def test_forced_own_identity_without_a_host_uid_fails_loudly(monkeypatch) -> None:
     with pytest.raises(
         RuntimeError,
-        match=r"^route B was requested \(E2B_OWN_IDENTITY=on / E2B_MAX_SLOTS>0\) "
+        match=r"^own identity was requested \(E2B_OWN_IDENTITY=on / E2B_MAX_SLOTS>0\) "
         r"but no per-sandbox host uid",
     ):
         _executor(monkeypatch, own_identity=_config(mode="on"), host_uid=None)
@@ -394,7 +394,7 @@ def test_an_old_wheel_without_the_fd_client_falls_back(monkeypatch) -> None:
     with pytest.raises(
         RuntimeError,
         match=(
-            r"^route B was requested with transport=fd, but the installed "
+            r"^own identity was requested with transport=fd, but the installed "
             r"sandlock wheel has no sandlock_supervise_connect_fd"
         ),
     ):
@@ -636,7 +636,7 @@ async def test_a_dead_slot_is_leased_again_before_the_exec_retries(
     at the same uid (W1), never a fall back to the in-process mediator."""
     ROOTFS.mkdir(parents=True, exist_ok=True)
     pool = FakePool()
-    pool.replies["exec"] = SlotDeadError("route-B instance sbx_own_identity is dead")
+    pool.replies["exec"] = SlotDeadError("own-identity instance sbx_own_identity is dead")
     monkeypatch.setattr(sl, "slot_pool_for", lambda cfg: pool)
     ex = _executor(monkeypatch, own_identity=_config(mode="auto"))
     with pytest.raises(SlotDeadError, match="is dead"):
@@ -668,7 +668,7 @@ async def test_slot_that_never_starts_is_restarted_once_then_reported(
         attempts.append(uid)
         if len(attempts) == 1:
             raise SlotDeadError(
-                f"route-B slot {name} (uid {uid}) exited before binding: boom"
+                f"own-identity slot {name} (uid {uid}) exited before binding: boom"
             )
         return record(
             sandbox_id,
@@ -909,7 +909,7 @@ def test_in_process_chroot_shape_is_disclosed(monkeypatch, caplog) -> None:
     messages = [r.message for r in caplog.records if r.levelno == logging.ERROR]
     assert len(messages) == 1, messages
     assert "runs in-process, not on a supervise slot" in messages[0]
-    assert "the worker passed no route-B config" in messages[0]
+    assert "the worker passed no own-identity config" in messages[0]
     assert "E2B_PER_SANDBOX_UID" in messages[0]
 
     # Disclosed once per process, and not at all when a slot is in use.
@@ -982,7 +982,7 @@ def test_the_refusal_predicate_tracks_the_forks_privilege_rule(
 
 # ------------------------------------- N83 phase 1: the declared cpu share
 
-#: Route B's own words for the only decline these cases reach: a worker that
+#: The backend's own words for the only decline these cases reach: a worker that
 #: knows no control plane cannot report a slot identity (C3: the child
 #: unshares and the agent writes it), so the slot is declined.
 NO_REPORTER_DECLINE = (
@@ -1026,7 +1026,7 @@ def test_an_in_process_sandbox_is_refused_when_the_cgroup_is_required(
 ) -> None:
     """Plan Review Focus 4: no slot means no cgroup, and ``required`` means no.
 
-    A sandbox that route B declines runs under the in-process mediator, which
+    A sandbox that own identity declines runs under the in-process mediator, which
     has no per-sandbox cgroup at all -- so a deployment that asked for one must
     fail the create by name instead of starting an uncapped sandbox.
     """
@@ -1046,7 +1046,7 @@ def test_an_in_process_sandbox_is_refused_when_the_cgroup_is_required(
     assert str(excinfo.value) == (
         "E2B_SANDBOX_CGROUP=required refuses an in-process sandbox: this "
         "sandbox would run without a per-sandbox cgroup "
-        f"({NO_REPORTER_DECLINE}). Give the sandbox a route-B slot (per-sandbox "
+        f"({NO_REPORTER_DECLINE}). Give the sandbox an own-identity slot (per-sandbox "
         "host uid + the control-plane reporter), or set "
         "E2B_SANDBOX_CGROUP=off to accept uncapped sandboxes."
     )

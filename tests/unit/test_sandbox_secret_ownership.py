@@ -2,14 +2,14 @@
 
 ``_materialize_http_inject`` writes ``<secrets>/<sandbox>/<name>.secret`` in
 mode 0600 and then hands it to the sandbox's pooled host uid. The **slot** is
-what reads it (route B runs ``sandlock-supervise`` as that same uid), so a file
-left owned by the worker is one the supervisor cannot open: the route-B policy
+what reads it (own identity runs ``sandlock-supervise`` as that same uid), so a file
+left owned by the worker is one the supervisor cannot open: the own-identity policy
 then fails validation (``invalid sandbox: credential file ... Permission
 denied``) and the sandbox never starts.
 
 Until this task the hand-over was ``if os.geteuid() == 0 and identity`` -- on a
 non-root worker it was skipped in silence, which is the shape the production
-non-root deployment uses (per-sandbox uid + route B).
+non-root deployment uses (per-sandbox uid + own identity).
 
 **Ordering is the property these cases pin**, not just the call shape: once the
 uid has been handed over the worker is neither the owner nor ``CAP_FOWNER``, so
@@ -276,7 +276,7 @@ def test_nonroot_worker_sets_the_mode_then_hands_the_file_over(tmp_path, monkeyp
 def test_a_rebuilt_policy_rewrites_the_secret_it_handed_over(tmp_path, monkeypatch):
     """The second build of the same secret is the normal path, not a corner.
 
-    ``_policy_ceiling()`` is not cached: every route-B open and every reopen
+    ``_policy_ceiling()`` is not cached: every own-identity open and every reopen
     (idle expiry, a dead machinery, a fresh ceiling) materializes the
     ``http_inject`` entries again. The file on disk is the *pool uid's* by then,
     so a worker that only knows how to ``open(w)`` it would die with EACCES on

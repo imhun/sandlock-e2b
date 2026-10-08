@@ -1,6 +1,6 @@
-"""Route B from a **non-root** worker, end to end, in the C3 shape.
+"""Own identity from a **non-root** worker, end to end, in the C3 shape.
 
-The deployed worker runs as uid 65534 with no effective capabilities. Route B
+The deployed worker runs as uid 65534 with no effective capabilities. Own identity
 still has to start one ``sandlock-supervise`` per sandbox *as that sandbox's
 own host uid*, and E3.2 still has to own the sandbox's ``0770`` workspace. The
 one shape that does it now (C3, open-issues N52) is the identity **grant**: the
@@ -10,7 +10,7 @@ used to do it from the worker itself are retired. This contract drives the
 real worker path (control plane create -> agent create -> first exec) and
 asserts, in the shape the process actually runs in:
 
-① the worker logs ``route-B instance ready …`` with the pooled host uid (the
+① the worker logs ``own-identity instance ready …`` with the pooled host uid (the
    F4 log fix is what makes the line visible at all);
 ② the slot process is ``sandlock-supervise --uid <that sandbox's uid>``;
 ③ the two sandboxes' workspaces are owned by **two different** pool uids;
@@ -47,14 +47,14 @@ from tests.security.conftest import sandlock_ready
 
 POOL_START = 21000
 POOL_SIZE = 16
-ROUTE_B_LOGGER = "envd_service.executors.sandlock"
+OWN_IDENTITY_LOGGER = "envd_service.executors.sandlock"
 
 # Mirrors tests/contract/test_shared_volume_relative_cwd.py: ⑤ is about the
 # image-rootfs (chroot) shape, whose workspace alias is /home/user.
 pytestmark = pytest.mark.skipif(
     not sandlock_ready() or not os.environ.get("E2B_BASE_IMAGE"),
     reason=(
-        "the route-B contract needs the sandlock wheel (with the supervise "
+        "the own-identity contract needs the sandlock wheel (with the supervise "
         "binary) and the image-rootfs shape (E2B_BASE_IMAGE)"
     ),
 )
@@ -67,7 +67,7 @@ def _envd_settings(workspace: Path) -> EnvdSettings:
         uid_pool_start=POOL_START,
         uid_pool_size=POOL_SIZE,
         workspace_base=workspace,
-        # The slot's policy/program documents live under the route-B scratch
+        # The slot's policy/program documents live under the own-identity scratch
         # root; it is inside the workspace base so the node agent's whitelist
         # (the same roots the worker's own file steps used to be scoped to)
         # covers them when it scopes the documents to the slot's uid.
@@ -94,14 +94,14 @@ def own_identity_workspace() -> Path:
 def _require_lane_grant() -> None:
     """The lane's stand-in for the node agent needs root.
 
-    Route B's identity is *granted*: someone privileged writes the forked
+    The slot's identity is *granted*: someone privileged writes the forked
     child's ``uid_map``/``gid_map``. In production that is the node's agent; in
     this lane it is ``tests/security/conftest._lane_identity_reporter``, which
     performs the identical write in-process -- and that needs euid 0.
     """
     if os.geteuid() != 0:
         pytest.skip(
-            "route B's identity is granted by the node agent and this lane has "
+            "own identity's identity is granted by the node agent and this lane has "
             "none: its in-process stand-in writes /proc/<pid>/uid_map, which "
             "needs root"
         )
@@ -164,7 +164,7 @@ def _supervise_argv(uid: int) -> list[str]:
             return argv
     raise AssertionError(
         f"no live 'sandlock-supervise --uid {uid}' slot process found; "
-        "route B did not lease a slot for this sandbox"
+        "own identity did not lease a slot for this sandbox"
     )
 
 
@@ -175,7 +175,7 @@ def _ready_fields(message: str) -> dict[str, str]:
     is a regex rather than a ``key=value`` token split.
     """
     match = re.match(
-        r"^route-B instance ready sandbox_id=(?P<sandbox_id>\S+) "
+        r"^own-identity instance ready sandbox_id=(?P<sandbox_id>\S+) "
         r"instance_name=(?P<instance_name>\S+) uid=(?P<uid>\d+) "
         r"slot=(?P<slot>\S+) channel=(?P<channel>.+) "
         r"guest-uid=(?P<guest_uid>\S+)$",
@@ -190,7 +190,7 @@ async def test_nonroot_worker_runs_own_identity_with_pooled_uids(
 ) -> None:
     _require_lane_grant()
     workspace = own_identity_workspace
-    caplog.set_level(logging.INFO, logger=ROUTE_B_LOGGER)
+    caplog.set_level(logging.INFO, logger=OWN_IDENTITY_LOGGER)
     control, envd = _make_apps(workspace, monkeypatch)
 
     async with httpx.AsyncClient(
@@ -250,7 +250,7 @@ async def test_nonroot_worker_runs_own_identity_with_pooled_uids(
             await _run_cmd(client, a_payload, "echo owned-by-a > mnt/data/a.txt")
         )
         assert (code_a, out_a, err_a) == (0, b"", b"")
-        # The write is what leases A's route-B slot (the first exec creates the
+        # The write is what leases A's own-identity slot (the first exec creates the
         # instance), so the slot assertions come after it.
         written_by = (vol_path / "a.txt").stat().st_uid
         assert written_by == POOL_START
@@ -336,8 +336,8 @@ async def test_nonroot_worker_runs_own_identity_with_pooled_uids(
     ready = [
         record.getMessage()
         for record in caplog.records
-        if record.name == ROUTE_B_LOGGER
-        and record.getMessage().startswith("route-B instance ready")
+        if record.name == OWN_IDENTITY_LOGGER
+        and record.getMessage().startswith("own-identity instance ready")
     ]
     assert len(ready) == 2, ready
     fields = [_ready_fields(message) for message in ready]
@@ -365,11 +365,11 @@ async def test_own_identity_restores_guest_root_with_and_without_pid_ns(
 ) -> None:
     """Guest uid stays 0 (host side stays the pooled slot uid) under pid_ns.
 
-    Route B's whole point is "the sandbox looks like a privileged-supervisor
+    Own identity's whole point is "the sandbox looks like a privileged-supervisor
     sandbox": the child self-maps ``0 -> euid`` in its user namespace, so the
     guest is root while every host-side file it touches stays owned by its
     pooled slot uid (fork F18, asserted for the *in-process* shape in
-    tests/security/test_template_isolation.py — this is the supervised route-B
+    tests/security/test_template_isolation.py — this is the supervised own-identity
     shape, which no test covered until now).
 
     With ``E2B_PID_NS=1`` the user namespace is created by the fork's

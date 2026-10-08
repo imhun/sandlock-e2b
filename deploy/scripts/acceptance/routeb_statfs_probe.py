@@ -1,10 +1,10 @@
-"""Route-B: does the payload get seccomp notifications, and does statfs reach the handler?
+"""Own identity: does the payload get seccomp notifications, and does statfs reach the handler?
 
 Written for the SEC-K0S-007 correction (2026-10-01). The audit had concluded
-"a route-B payload receives no seccomp notifications at all"; the shape here is
+"an own-identity payload receives no seccomp notifications at all"; the shape here is
 the one the `statfs` acceptance case builds
 (``tests/security/conftest.py::own_identity_sandbox(None, None)`` = pure rootfs +
-route B), and the four readings in one run tell the whole story:
+own identity), and the four readings in one run tell the whole story:
 
 * ``HOST``/``STATVFS``: the payload's numbers, against the *host's* control the
   probe prints first. With the accounting reachable they differ (the ledger);
@@ -188,7 +188,7 @@ def main() -> int:
                         print("LIVE disc:", data.get("disk_stats_path"))
             except Exception as exc:  # noqa: BLE001
                 print("LIVE-CONFIG failed:", exc)
-        cfg = getattr(executor, "_route_b", None)
+        cfg = getattr(executor, "_own_identity", None)
         tmp_root = getattr(cfg, "tmp_root", None)
         if tmp_root is not None:
             root = __import__("pathlib").Path(tmp_root)

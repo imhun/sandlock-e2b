@@ -367,8 +367,9 @@ BARE_NAME_ALLOWANCES = {
         "（载体 C 由控制面直接送指令，不再有票据端点）：两份建箱计划都在叙述"
         "这次删除，不是在让人去跑它"
     ),
-    # route B -> own_identity 改名（2026-10-07）：三份**冻结目录**（docs/
-    # superpowers/plans、docs/reports 之外的历史）与发版记录
+    # 按本质改名（2026-10-07：后端选型 / 进程池 / 身份授予三个词各自归位，
+    # 旧标识符 `route_b*`、`slot_identity*` 与新名并存一段）：三份**冻结目录**
+    # （docs/superpowers/plans、docs/reports 之外的历史）与发版记录
     # docs/deploy-clusters.md 里引用的旧文件名。这些目录记的是当时的事实
     # （见 docs/superpowers/plans/2026-10-06-route-b-rename-to-own-identity.md
     # 的「历史文档不改」），所以按名引用的是**改名之前**的那个文件，而不是

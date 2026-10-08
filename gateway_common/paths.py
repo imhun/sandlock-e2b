@@ -278,7 +278,7 @@ COMMAND_LOG_NAME = "command-logs.jsonl"
 #: :data:`UNTRUSTED_TREE_DIR`.
 CHECKPOINT_ROOT_NAME = ".checkpoints"
 
-#: How many bytes of a sandbox id may become a route-B **instance name**
+#: How many bytes of a sandbox id may become an own-identity **instance name**
 #: (:func:`own_identity_instance_name`). Longer ids are replaced by their hash: a
 #: filename is bounded by ``NAME_MAX``, and the name is also the slot's
 #: unix-socket path component in the registered transport.
@@ -286,7 +286,7 @@ OWN_IDENTITY_INSTANCE_NAME_MAX_BYTES = 64
 
 
 def own_identity_instance_name(sandbox_id: str) -> str:
-    """The route-B **instance name** for a sandbox -- one rule, two consumers.
+    """The own-identity **instance name** for a sandbox -- one rule, two consumers.
 
     It is the slot's identity in the pool (``W1SlotPool.acquire_sync``'s
     ``name``) *and* the leaf of the directory that holds the slot's
@@ -548,7 +548,7 @@ def sandbox_disk_stats_path(
     NAS round trip bought for no cross-node reader (Task 4). The *record* it
     sits next to stays shared -- that is the half the fleet reads.
 
-    The **reader is not the writer**: in the route-B shape the supervisor is the
+    The **reader is not the writer**: in the own-identity shape the supervisor is the
     slot process at the sandbox's own host uid, while the file is written by the
     worker. The directory therefore has to stay traversable by name (``0711``)
     and the file readable (``0644``) -- see
@@ -619,7 +619,7 @@ def sandbox_checkpoint_dir(
     owns, and on the shared volume so another node can resume it), but as a
     **sibling** of the runtime dir rather than a child of it. That split is what
     makes the capture possible at all: the image is written *by the sandbox's own
-    slot* -- route B runs it as the sandbox's pooled uid, and that is the only
+    slot* -- own identity runs it as the sandbox's pooled uid, and that is the only
     process that owns the address space being captured -- so the directory has to
     belong to that uid, while ``_runtime/<id>`` itself holds the runtime record
     and the command log, which are the worker's own files and stay ``0700``

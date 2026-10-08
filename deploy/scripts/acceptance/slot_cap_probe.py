@@ -1,4 +1,4 @@
-"""量一件事：route-B 槽位（=路径中介进程）与被 confine 的子进程各自持有哪些 cap。
+"""量一件事：own-identity 槽位（=路径中介进程）与被 confine 的子进程各自持有哪些 cap。
 worker 自己若持有 SYS_ADMIN，会不会顺着 setpriv 漏给沙箱侧。"""
 import asyncio
 import json

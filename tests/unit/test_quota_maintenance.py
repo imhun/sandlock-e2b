@@ -1527,7 +1527,7 @@ def test_create_app_nonroot_discloses_direct_quota_downgrade(
     assert [r.message for r in caplog.records if r.name == "envd_service.app"] == [
         "this worker has no privileged file-step path: no per-node agent is "
         "configured, so it keeps the in-process (E5.1) shape (no per-sandbox "
-        "host uids, no route-B slots)",
+        "host uids, no own-identity slots)",
         app_module.PER_UID_NONROOT_WARNING,
         f"{xfs_quota.NONROOT_DIRECT_QUOTA_REASON} (direct xfs_quota requires "
         "root/CAP_SYS_ADMIN; per-sandbox disk hard limits are disabled while "

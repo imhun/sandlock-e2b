@@ -6,7 +6,7 @@
 # uid/gid map, which Docker's default profile would block), image rootfs pulled
 # directly from the OCI registry — then run representative tests:
 #
-#   * the deployed identity shape: pooled host uid + route-B slot, uid 0 inside
+#   * the deployed identity shape: pooled host uid + own-identity slot, uid 0 inside
 #     the namespace, host-side owner = the pooled uid (§2.4.1 / 决定 #1);
 #   * a real image-rootfs sandbox (chroot + CA splice)
 #   * the SOCKS5 egress on-behalf path (sandbox network)

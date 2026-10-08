@@ -261,7 +261,7 @@ services:
       E2B_CONTROL_PLANE_URL: http://control-plane:3000
       E2B_GATEWAY_URL: http://control-plane:3000
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
-      # C3 (Task 4 slice B): route B's scratch root, the path the control plane
+      # C3 (Task 4 slice B): own identity's scratch root, the path the control plane
       # derives `scope-slot-document` from (the worker writes the documents but
       # may not name a path).
       E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
@@ -448,7 +448,7 @@ services:
       E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
-      # Route B's scratch root (the per-slot policy/program documents). The
+      # Own identity's scratch root (the per-slot policy/program documents). The
       # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
       # these workers are uid 65534 like the fleet's. The per-node agent scopes
       # those documents to the slot's uid (0440) and only touches roots the
@@ -556,7 +556,7 @@ services:
       E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
-      # Route B's scratch root (the per-slot policy/program documents). The
+      # Own identity's scratch root (the per-slot policy/program documents). The
       # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
       # these workers are uid 65534 like the fleet's. The per-node agent scopes
       # those documents to the slot's uid (0440) and only touches roots the
@@ -664,7 +664,7 @@ services:
       E2B_BASE_IMAGE: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
       E2B_INTERNAL_API_KEY: internal-key
       E2B_WORKSPACE_BASE: /var/lib/e2b-sandboxes
-      # Route B's scratch root (the per-slot policy/program documents). The
+      # Own identity's scratch root (the per-slot policy/program documents). The
       # fleet value, copied from deploy/stack/docker-compose.prod.yml:239 --
       # these workers are uid 65534 like the fleet's. The per-node agent scopes
       # those documents to the slot's uid (0440) and only touches roots the

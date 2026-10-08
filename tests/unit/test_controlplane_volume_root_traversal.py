@@ -2,7 +2,7 @@
 
 ``VolumeRegistry.create`` makes ``<volume root>`` in the control-plane
 process and shares it with sandboxes through ``chmod 1777``, but the sandbox
-opens that host path *as its own uid* (E3.2 / route-B slot), so DAC needs
+opens that host path *as its own uid* (E3.2 / own-identity slot), so DAC needs
 ``o+x`` on **every** ancestor as well -- the root alone is not enough (A5,
 ``docs/production-deployment-requirements.md`` §2.4.2). A stack deployment
 gets that from the worker's mount path (``envd_service.volumes``); the

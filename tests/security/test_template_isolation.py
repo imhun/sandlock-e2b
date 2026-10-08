@@ -2,7 +2,7 @@
 
 The chroot (image-rootfs) shape is the only shape where E2B asks the fork for
 path mediation -- ``fs_denied`` + chroot -- and mediation now has exactly one
-identity: the sandbox's own host uid, which a route-B supervise slot provides.
+identity: the sandbox's own host uid, which an own-identity supervise slot provides.
 E2B stopped asking for the fork's supervisor downgrade tier on 2026-09-10 and
 fork B3 deleted that field outright (2026-09-11), so a privileged worker
 mediating in-process no longer gets a silent, supervisor-owned sandbox (T5):
@@ -151,7 +151,7 @@ async def test_in_process_chroot_is_refused_without_a_slot(caplog):
     # runner that cannot create any sandbox at all.
     #
     # This control used to be "the same shape with the mediation removed" (the
-    # pure shape, route B off). N15 made that shape mediated too -- the host
+    # pure shape, own identity off). N15 made that shape mediated too -- the host
     # root as the mediator's root -- so it is refused for exactly the same
     # reason, and the control had to move to the axis that still differs.
     plain, plain_ws = own_identity_sandbox(None, None)

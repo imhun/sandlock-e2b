@@ -15,7 +15,7 @@ vocabulary for these images -- storage, the platform account, the pause/resume
 lifecycle -- so the word is prose and the scan is about **call sites**.
 
 What must still never appear is a direct call into those bindings, and the reason
-is structural rather than stylistic: under route B the `Sandbox` belongs to the
+is structural rather than stylistic: under own identity the `Sandbox` belongs to the
 `sandlock-supervise` slot, so the worker drives a checkpoint through the slot's
 verb. An in-process call from envd would have no live sandbox to act on.
 
@@ -107,7 +107,7 @@ def test_no_worker_source_calls_the_fork_checkpoint_restore_api() -> None:
     offenders = _offenders(REPO)
     assert offenders == [], (
         "envd reached into the fork's checkpoint/restore bindings directly. Under "
-        "route B the `Sandbox` lives in the slot, so a checkpoint or a restore has "
+        "own identity the `Sandbox` lives in the slot, so a checkpoint or a restore has "
         "to go through the slot's verbs (`checkpoint` / `restore`) -- an in-process "
         "call has no live sandbox to act on. If this fired for a real reason, the "
         "shape in docs/checkpoint-restore-e2b-half.md §(g) was bypassed: "

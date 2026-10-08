@@ -41,7 +41,7 @@ import pytest
 from tests.contract.test_nonroot_own_identity import _make_apps, _ready_fields
 from tests.contract.test_uid_permissions import _result, _run_cmd
 
-ROUTE_B_LOGGER = "envd_service.executors.sandlock"
+OWN_IDENTITY_LOGGER = "envd_service.executors.sandlock"
 
 PROGRAM = '''\
 import os, statistics, time
@@ -118,7 +118,7 @@ def probe_workspace() -> Path:
 
 
 async def test_pidns_cost_probe(probe_workspace, caplog) -> None:
-    caplog.set_level(logging.INFO, logger=ROUTE_B_LOGGER)
+    caplog.set_level(logging.INFO, logger=OWN_IDENTITY_LOGGER)
     control, envd = _make_apps(probe_workspace)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=control), base_url="http://test"
@@ -136,8 +136,8 @@ async def test_pidns_cost_probe(probe_workspace, caplog) -> None:
         messages = await _run_cmd(envd_client, payload, cost_cmd())
     code, out, err = _result(messages)
 
-    ready = [r.getMessage() for r in caplog.records if "route-B instance ready" in r.getMessage()]
-    assert ready, "the worker never logged a route-B ready line"
+    ready = [r.getMessage() for r in caplog.records if "own-identity instance ready" in r.getMessage()]
+    assert ready, "the worker never logged an own-identity ready line"
     fields = _ready_fields(ready[-1])
     print(f"PROBE guest-uid={fields['guest_uid']} slot-uid={fields['uid']} pid_ns={os.environ.get('E2B_PID_NS', '<unset>')}")
     print(f"PROBE code={code} err={err!r}")

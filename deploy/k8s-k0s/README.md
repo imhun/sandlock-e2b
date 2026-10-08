@@ -244,8 +244,8 @@ control-plane 的 `:3000`，与基线那个 ClusterIP `gateway` 同一个后端�
   搬进了 agent pod（`storage-init` + `workspace-root-init`），见
   `docs/deploy-clusters.md` §7.9 与 `docs/production-deployment-requirements.md` §5.4(b)。
   * 历史口径（已作废，留档）：此前 worker 自己 `runAsUser: 0`、`runAsGroup: 65534` 读挂载上的树，
-    会打 `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 的告警，非 route-B 路径的模板沙箱可能
-    因此受影响（见 backlog N18）；route B 与 per-sandbox host uid 在两种 transport 下都成立。
+    会打 `E2B_PER_SANDBOX_UID … without CAP_SYS_PTRACE` 的告警，非 own-identity 路径的模板沙箱可能
+    因此受影响（见 backlog N18）；own identity 与 per-sandbox host uid 在两种 transport 下都成立。
 
 ## 一组验证脚本（跑在真集群上）
 

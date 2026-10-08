@@ -1,4 +1,4 @@
-"""N80 收尾：route B 的 slot 能不能用 clone3 建 userns，然后立刻 exec 出干净进程。
+"""N80 收尾：own identity 的 slot 能不能用 clone3 建 userns，然后立刻 exec 出干净进程。
 
 要验证的链（改后的 `identity_grant.spawn_child` 会走的形状）：
 

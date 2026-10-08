@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 #: E3.2 is on by default, and a non-root worker cannot honour it (no uid map,
 #: no chown). Said out loud on purpose: the thing being lost is per-tenant
-#: host-uid isolation, which shared volumes and route B both depend on.
+#: host-uid isolation, which shared volumes and own identity both depend on.
 PER_UID_NONROOT_WARNING = (
     "E2B_PER_SANDBOX_UID is enabled but the worker is not running "
     "as root; per-sandbox host uids are disabled (non-root workers "
@@ -57,7 +57,7 @@ PER_UID_NO_PTRACE_WARNING = (
     "E2B_PER_SANDBOX_UID is enabled on a root worker without CAP_SYS_PTRACE: "
     "the in-process RunAs path cannot write the sandbox's uid_map, so "
     "sandboxes that are not routed through a supervise slot will fail to "
-    "start (add CAP_SYS_PTRACE, or keep chroot sandboxes on route B -- "
+    "start (add CAP_SYS_PTRACE, or keep chroot sandboxes on own identity -- "
     "E2B_OWN_IDENTITY=auto/on -- whose slot self-maps and needs no ptrace)"
 )
 
@@ -330,7 +330,7 @@ def create_app(
             # Writing a *child's* uid_map needs CAP_SETUID **and** ptrace access
             # to that child, so a root worker with a hardened capability set
             # cannot remap sandboxes in-process -- measured: every create fails
-            # with the fork's generic `sandlock_create failed`. Route B is not
+            # with the fork's generic `sandlock_create failed`. Own identity is not
             # affected (its slot already *is* the sandbox uid and self-maps), so
             # this is a disclosure with a remedy, not a new failure mode.
             logger.warning(PER_UID_NO_PTRACE_WARNING)

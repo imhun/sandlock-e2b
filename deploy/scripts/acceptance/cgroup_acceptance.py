@@ -1475,7 +1475,7 @@ def main() -> int:
             # check reads either, exactly, and never a substring.
             #
             # The box is sampled *while* the hog runs, not only after it: an
-            # OOM kill can cost the route-B slot its control stream, and the
+            # OOM kill can cost the own-identity slot its control stream, and the
             # worker then rebuilds the instance -- which is a fresh
             # ``sbx_<id>`` directory with its counters back at zero (measured:
             # the control plane logged ``oom_kill grew from 0 to 1`` for a box
@@ -1919,7 +1919,7 @@ def main() -> int:
         # ---- check 1: the quota is real ----------------------------------
         first = create({"n83_acceptance": "spinner"})
         boxes.append((first, {}))
-        # Route B's slot -- and with it the sandbox cgroup -- is built by the
+        # Own identity's slot -- and with it the sandbox cgroup -- is built by the
         # *first command*, not by create (plan §4): measure the round trip
         # first (which is also the "quiet" baseline for check 1's neighbor
         # comparison), then look for the cgroup the command caused.

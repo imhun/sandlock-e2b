@@ -359,7 +359,7 @@ def test_registry_persists_host_uid(tmp_path):
     assert payload["host_uid"] == POOL_START
     assert not (tmp_path / "sbx_a" / "sandbox.json").exists()
     # Traversable **by name** (0711), not listable: the sandbox's own uid is
-    # not the owner, so 0700 kept it out -- and also kept out the route-B slot
+    # not the owner, so 0700 kept it out -- and also kept out the own-identity slot
     # that has to read the disk-accounting file beside this record. What closes
     # the record is its own mode, not the directory (see
     # ``test_disk_stats_publish.test_only_the_ledger_is_world_readable_in_the_runtime_dir``).
@@ -804,7 +804,7 @@ def test_legacy_run_as_falls_back_to_worker_identity_when_non_root(
 
 def test_per_sandbox_uid_is_the_deployment_default(monkeypatch) -> None:
     """E3.2 identity is the base the rest of the isolation model sits on
-    (shared-volume sticky protection, and route B's per-uid supervise slot),
+    (shared-volume sticky protection, and own identity's per-uid supervise slot),
     so it ships on; the env var stays as the explicit opt-out."""
     from envd_service.config import Settings
 

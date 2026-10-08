@@ -33,7 +33,7 @@ def _widen_ancestors_for_tenant_uids(volume_root: Path) -> None:
     """Give tenant uids a way *through* every ancestor of a volume root.
 
     The volume root is created here, in the control-plane process, but the
-    sandbox opens that host path *as its own uid* (E3.2 / route-B slot), so
+    sandbox opens that host path *as its own uid* (E3.2 / own-identity slot), so
     DAC needs ``o+x`` on every level between ``/`` and the volume view -- the
     ``1777`` on the root alone is not enough (A5,
     ``docs/production-deployment-requirements.md`` §2.4.2). A stack

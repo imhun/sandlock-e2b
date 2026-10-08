@@ -165,7 +165,7 @@ def require_sandlock():
 #
 # The chroot shape is the only one where E2B asks the fork for path mediation
 # (`fs_denied` + chroot), and mediation now runs in the sandbox's own host uid
-# -- inside a route-B `sandlock-supervise` slot. There is no mediation tier to
+# -- inside an own-identity `sandlock-supervise` slot. There is no mediation tier to
 # set any more (E2B stopped sending it 2026-09-10; fork B3 deleted the field
 # 2026-09-11), so an in-process mediated create on a privileged worker is
 # *refused* rather than silently producing supervisor-owned files (T5). Tests
@@ -193,7 +193,7 @@ def _lane_identity_reporter(uid_start: int, uid_size: int):
     ``uid_map``/``gid_map``. The one-shot lane has no agent, but its phase 1
     runs as root -- the same capability the agent has -- so it can perform the
     identical write on the child the pool forked. A non-root lane answers
-    ``None``: route B then declines with its named reason, exactly as a worker
+    ``None``: own identity then declines with its named reason, exactly as a worker
     whose agent is missing would (and `require_mediation_capable` turns that
     into a skip rather than a false pass).
 
@@ -338,7 +338,7 @@ def require_mediation_capable(executor) -> None:
     """
     if not executor._own_identity_active and executor._in_process_mediation_is_refused():
         pytest.skip(
-            "this worker can neither lease a route-B slot nor be accepted by the "
+            "this worker can neither lease an own-identity slot nor be accepted by the "
             f"fork's in-process mediation ({executor._own_identity_decline}); needs a "
             "root worker plus the wheel's sandlock-supervise binary"
         )

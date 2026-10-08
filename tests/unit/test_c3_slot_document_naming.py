@@ -1,4 +1,4 @@
-"""C3 Task 4 / ruling D20: **one** naming rule for the route-B slot directory.
+"""C3 Task 4 / ruling D20: **one** naming rule for the own-identity slot directory.
 
 The slot's documents live in ``<route-b root>/<uid>/<instance name>/``. The
 worker's executor names that directory (``instance_name``), and the control
@@ -10,7 +10,7 @@ long one), the control plane guessed ``rb-<id>`` -- so the op pointed at a
 directory that exists nowhere and the slot could not start.
 
 These tests are pinned to the **peer**, not to either side's assumption: they
-drive the real executor's route-B acquire (a real ``W1SlotPool`` with a faked
+drive the real executor's own-identity acquire (a real ``W1SlotPool`` with a faked
 spawner/channel, the production ``name=`` value) and then compare the directory
 that actually appears on disk with what ``control_plane.file_ops`` derives --
 for a normal sandbox id and for one longer than the rule's byte ceiling. A
@@ -222,7 +222,7 @@ def test_the_name_less_fallback_is_refused_in_the_agent_shape(
     with pytest.raises(priv_helpers.PrivHelperError) as excinfo:
         W1SlotPool._scope_slot_document(document, HOST_UID, sandbox_id="sbx_docs")
     assert str(excinfo.value) == (
-        f"the route-B slot directory for sandbox sbx_docs is "
+        f"the own-identity slot directory for sandbox sbx_docs is "
         f"{HOST_UID}/rb-sbx_docs, but this slot's identity is "
         f"{HOST_UID}/sbx_docs: the control plane derives the slot documents' "
         "path from the shared naming rule and the leased uid, so this "
@@ -255,7 +255,7 @@ def test_a_copy_under_another_uids_directory_is_refused_too(
     with pytest.raises(priv_helpers.PrivHelperError) as excinfo:
         W1SlotPool._scope_slot_document(stale, HOST_UID, sandbox_id="sbx_docs")
     assert str(excinfo.value) == (
-        f"the route-B slot directory for sandbox sbx_docs is "
+        f"the own-identity slot directory for sandbox sbx_docs is "
         f"{HOST_UID + 1}/sbx_docs, but this slot's identity is "
         f"{HOST_UID}/sbx_docs: the control plane derives the slot documents' "
         "path from the shared naming rule and the leased uid, so this "

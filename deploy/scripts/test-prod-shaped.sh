@@ -10,7 +10,7 @@
 # permission set never shows up. This lane drops the privilege and starts from
 # the historical deployed capset (deploy/k8s/worker.yaml before A6: SYS_ADMIN +
 # NET_BIND_SERVICE, seccomp unconfined, running as root so E3.2 per-sandbox host
-# uids and route B are actually in play). A6 removed SYS_ADMIN from the
+# uids and own identity are actually in play). A6 removed SYS_ADMIN from the
 # manifests and A7 pins the no-SYS_ADMIN shape via
 #   PROD_DROP_CAPS=SYS_ADMIN ./deploy/scripts/test-prod-shaped.sh
 # so the cap list below is deliberately a superset today: the default run is
@@ -32,7 +32,7 @@
 #
 # Two phases, because the deployment has two shapes:
 #   1. root worker with the manifests' capability set -- E3.2 per-sandbox uids
-#      and route-B supervise slots are in play, which is where mediated
+#      and own-identity supervise slots are in play, which is where mediated
 #      (chroot) sandboxes get their own mediator.
 #   2. the *unprivileged* worker `docker-compose.prod.yml` runs today
 #      (`user: "65534:65534"`, no CAP_SETUID): no uid pool, no slots, so the
@@ -68,7 +68,7 @@ cap_is_dropped() {
 # SYS_PTRACE is not decoration: writing a *child's* uid_map needs CAP_SETUID and
 # ptrace access to that child, so a root worker without it cannot run the
 # in-process RunAs path (measured: create fails with `sandlock_create failed`).
-# Route B needs no ptrace -- its slot already is the sandbox uid and self-maps --
+# Own identity needs no ptrace -- its slot already is the sandbox uid and self-maps --
 # which is why chroot sandboxes keep working here even when the cap is dropped.
 for cap in SYS_ADMIN SYS_PTRACE NET_BIND_SERVICE NET_RAW SYS_CHROOT CHOWN DAC_OVERRIDE \
            FOWNER FSETID KILL SETGID SETUID SETPCAP AUDIT_WRITE SETFCAP; do
@@ -223,7 +223,7 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
     # caps that let `/var/lib/e2b-priv/e2b-{slot-spawn,maint}` exec. Both
     # binaries are gone: the per-node agent performs every privileged file step
     # in the shipped shapes, and a worker with no agent keeps the in-process
-    # (E5.1) shape -- no uid pool, no route-B slot, the sandbox is the worker's
+    # (E5.1) shape -- no uid pool, no own-identity slot, the sandbox is the worker's
     # own identity and mediation runs in-process as that uid.
     #
     # That E5.1 shape is what this phase still exists to exercise: the unit
@@ -233,7 +233,7 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
     # existed only to open the file-capability gate).
     #
     # `tests/contract/test_nonroot_own_identity.py` is deliberately not in the list
-    # any more: a non-root worker has no route-B capability without the agent,
+    # any more: a non-root worker has no own-identity capability without the agent,
     # which is what that contract used to pin when the brokers supplied it.
     # shellcheck disable=SC2086
     docker run --rm --init --network host --user 65534:65534 \

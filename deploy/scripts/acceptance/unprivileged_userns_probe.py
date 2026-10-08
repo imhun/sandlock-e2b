@@ -1,4 +1,4 @@
-"""Can a route-B slot (euid == the sandbox host uid) map 0 -> X in its own
+"""Can an own-identity slot (euid == the sandbox host uid) map 0 -> X in its own
 userns, i.e. restore "root inside the sandbox, host uid outside" like the
 in-process mediator does today?"""
 import ctypes, os, subprocess, sys

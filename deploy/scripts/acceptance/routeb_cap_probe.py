@@ -1,4 +1,4 @@
-"""机制级探针：在给定 capset 的容器里，逐项问 route B / 进程内后端「还活着吗」。
+"""机制级探针：在给定 capset 的容器里，逐项问 own identity / 进程内后端「还活着吗」。
 只打印结论，不改任何状态。每行一个 JSON。"""
 import asyncio
 import json
@@ -123,10 +123,10 @@ async def main():
         "python:3.11-slim", str(sandbox_tmpdir(suffix="-cache", uid=UID))
     )  # 缓存目录也要能被沙箱 uid 穿过，否则 EACCES 会伪装成权限不足
 
-    # 1) route B + chroot（形态就是线上的形态）
+    # 1) own identity + chroot（形态就是线上的形态）
     ex, ws = build("python:3.11-slim", rootfs, UID, "auto")
     report(case="routeb-selected", own_identity_active=ex._own_identity_active, decline=ex._own_identity_decline)
-    await run_case("routeB+chroot", ex, ws)
+    await run_case("own-identity+chroot", ex, ws)
     ex.close()
 
     # 2) 进程内后端 + chroot（legacy 共享 uid 1000）：这条走 RunAs 映射路径
@@ -134,14 +134,14 @@ async def main():
     await run_case("inproc+chroot(legacy uid1000)", ex2, ws2)
     ex2.close()
 
-    # 3) 进程内后端 + 指定 per-sandbox uid（E3.2 无 route B）
+    # 3) 进程内后端 + 指定 per-sandbox uid（E3.2 无 own identity）
     ex3, ws3 = build("python:3.11-slim", rootfs, UID, "off")
     await run_case("inproc+chroot(uid=21700)", ex3, ws3)
     ex3.close()
 
-    # 4) 纯形态（无中介）+ route B
+    # 4) 纯形态（无中介）+ own identity
     ex4, ws4 = build(None, None, UID, "auto")
-    await run_case("routeB+pure", ex4, ws4)
+    await run_case("own-identity+pure", ex4, ws4)
     ex4.close()
 
 

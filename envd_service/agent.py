@@ -440,7 +440,7 @@ def _node_type() -> str:
 #: N83 phase 2, ruling R17 (2026-10-07): the per-sandbox **policy** ceiling is
 #: the control plane's, and this process holds the copy it handed down. It is a
 #: process-wide fact -- one deployment, one policy, one number -- because every
-#: reader that has to agree about it lives in this process: the route-B pool's
+#: reader that has to agree about it lives in this process: the own-identity pool's
 #: second gate (``attach``'s declared-size check) and the cgroup lane's
 #: startup/positive cross-check against the kernel.
 #:
@@ -1524,7 +1524,7 @@ def _leftover_quota_projid(entry: Path) -> int | None:
     The name still has to be one a sandbox *could* have
     (:func:`gateway_common.paths.validate_sandbox_id`): this exit offers a
     directory to an operator to move, and a name that can never be a sandbox
-    id (``_untrusted.trees`` itself, the route-B scratch root, anything with a
+    id (``_untrusted.trees`` itself, the own-identity scratch root, anything with a
     dot or a space) is platform or foreign storage rather than the leftover of
     a sandbox tree. Its *row* is not forfeited by that -- the fail-safe
     reconcile's carrier search has no name rule and releases those rows -- only
@@ -2210,7 +2210,7 @@ def sample_sandbox_events(settings: Settings) -> dict[str, dict[str, int]]:
     """The per-sandbox kernel event counters to ship with the heartbeat (Task 5).
 
     Resolved through the *same* process-wide handle the startup lane brought up
-    and the route-B pool attaches through (``sandbox_cgroups_for``), because the
+    and the own-identity pool attaches through (``sandbox_cgroups_for``), because the
     ``sbx_<id>`` directories only exist under the parent ``setup`` established.
     ``E2B_SANDBOX_CGROUP=off`` resolves to no handle at all and returns ``{}``
     without touching a cgroup file -- the same "off is byte-identical" rule the
@@ -2260,7 +2260,7 @@ def start_cgroup_lane(
     **It never crashes the worker and never stops retrying.** The plan's ruling
     (and the reason) is explicit: a control plane that is briefly unavailable
     must not turn into a crash loop, so a failed attempt is logged and retried,
-    while the route-B pool keeps refusing every create by name -- ``required``
+    while the own-identity pool keeps refusing every create by name -- ``required``
     never degrades into "run without a quota".
 
     An *unknown* switch value is the one thing refused here, by name: a typo
@@ -2274,7 +2274,7 @@ def start_cgroup_lane(
     and a check against a default would be a check against a number this worker
     invented. It runs at the first hand-down instead
     (:func:`adopt_sandbox_ceiling`, D5b), where both halves exist; until then
-    the lane has no ceiling and the route-B pool refuses every create by name,
+    the lane has no ceiling and the own-identity pool refuses every create by name,
     which is the same fail-closed state a ``setup`` that has not landed leaves.
 
     ``sandbox_cgroups`` is the handle to bring up; the production path leaves it
@@ -3609,7 +3609,7 @@ def _write_disk_stats(
     must never fail a create, and a missing file only means ``statfs`` falls
     back to the kernel's answer.
 
-    **The reader is not the writer.** In the route-B shape the mediator that
+    **The reader is not the writer.** In the own-identity shape the mediator that
     reads this file is the slot process, whose euid is the sandbox's host uid
     (10000+) while the worker writes as 65534 -- so the modes cannot be left to
     the ambient umask. They are the same rules the slot documents follow
@@ -4571,7 +4571,7 @@ async def _checkpoint_before_pause(
     """
     ctx = request.app.state.runtimes.get(sandbox_id)
     # The image has to land where the *slot* can write it, and the slot runs as
-    # the sandbox's pooled uid (route B). ``None`` on a shared-uid worker.
+    # the sandbox's pooled uid (own identity). ``None`` on a shared-uid worker.
     runtime = request.app.state.runtime_registry.get(sandbox_id)
 
     def _store_child_bytes(name: str) -> int | None:

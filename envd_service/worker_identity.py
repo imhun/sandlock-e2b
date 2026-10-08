@@ -162,7 +162,7 @@ def build_identity_reporter(
     given, including an explicit ``""``.
 
     ``None`` is the honest answer for a worker that does not know where its
-    control plane is (or which node it is): route B then declines the
+    control plane is (or which node it is): own identity then declines the
     identity-grant path by name instead of forking a child nobody will grant.
     """
     url = (

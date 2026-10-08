@@ -425,12 +425,12 @@ spec:
             # here and no subPath: naming a path is not mounting it.
             - name: E2B_NODE_STATE_BASE
               value: /var/lib/e2b/state
-            # C3 Task 4 slice B: route B's scratch root, where each slot's
+            # C3 Task 4 slice B: own identity's scratch root, where each slot's
             # `policy.json` / `program.json` live. The *worker* writes those
             # documents, but the control plane is what derives the path of the
             # one the agent has to scope to that slot's uid
             # (`scope-slot-document`) -- the worker may not report a path (hard
-            # rule 3 / §14.4). Unset, that op answers a named 503 and route-B
+            # rule 3 / §14.4). Unset, that op answers a named 503 and own-identity
             # slots never come up; the value is the worker's own
             # `E2B_SLOT_TMP_ROOT` (N57 / Task 4 puts `.route-b` under the
             # *node-local* state base, which is why the privileged helpers grew

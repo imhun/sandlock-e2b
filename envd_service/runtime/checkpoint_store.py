@@ -13,7 +13,7 @@ it (as root, or through the maintenance broker: ``priv_helpers.dir_size`` /
 ``remove_tree``).
 
 **Who can read the image, stated honestly (D2 revised 2026-09-25).** The
-capture is performed *by the sandbox's own process tree* -- under route B the
+capture is performed *by the sandbox's own process tree* -- under own identity the
 slot runs as the sandbox's pooled uid, and that is the only process that owns
 the address space being captured -- so the directory has to be writable by that
 uid. The earlier design said "worker uid, the sandbox never reads it"; that is
@@ -138,7 +138,7 @@ def _prepare_image_parent(
     """The image path, with a ``0700`` parent **the slot can write**.
 
     The directory is created by the worker and then handed to the sandbox's own
-    uid, because that is who writes the image: under route B the slot runs as
+    uid, because that is who writes the image: under own identity the slot runs as
     the sandbox's pooled uid and it is the only process that owns the address
     space being captured. Without the hand-off the capture itself succeeds and
     the *save* dies with EACCES -- measured on the cluster (2026-09-25), which

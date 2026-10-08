@@ -1,4 +1,4 @@
-"""N83 phase 1: the per-sandbox cgroup wired into the route-B slot lifecycle.
+"""N83 phase 1: the per-sandbox cgroup wired into the own-identity slot lifecycle.
 
 The switch is ``E2B_SANDBOX_CGROUP`` (``off`` by default). With it off, nothing
 here -- the pool's acquire path, the retire path, the worker's startup lane --
@@ -14,7 +14,7 @@ the cgroup a *quota* rather than a decoration are pinned:
 * a refusal anywhere on that path fails the create **by name** and leaves
   nothing behind -- no half slot, no reported identity, and never "run without
   a quota";
-* a sandbox that would run **in-process** (route B declined: no host uid, no
+* a sandbox that would run **in-process** (own identity declined: no host uid, no
   reporter, ``E2B_OWN_IDENTITY=off``) is refused by name as well, because the
   in-process mediator has no cgroup at all (plan Review Focus 4).
 
@@ -687,7 +687,7 @@ def test_a_refused_release_is_a_named_warning_and_teardown_still_ends(
         for record in caplog.records
         if record.name == rb.__name__
     ] == [
-        "route-B slot rb-sbx_cgroup: the cgroup for sandbox sbx_cgroup was "
+        "own-identity slot rb-sbx_cgroup: the cgroup for sandbox sbx_cgroup was "
         "not released (cgroup-refusal release-rmdir: busy); the subtree is left "
         "behind -- nothing in this worker reclaims a sbx_* directory, so a "
         "later create under the same id is the only thing that would touch it"

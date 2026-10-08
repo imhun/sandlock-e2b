@@ -48,7 +48,7 @@ def test_pty_echo_resize_exit_on_sandlock_instance(multinode_two_workers) -> Non
             sandbox.pty.send_stdin(pty.pid, b"PS1=\n")
             # Resize *before* asking the child about the window, so the answer
             # is deterministic: 40x120 can only come from a resize that
-            # arrived. (Route B owns the master in the worker process, so this
+            # arrived. (Own identity owns the master in the worker process, so this
             # is the pty path's resize contract.)
             sandbox.pty.resize(pty.pid, PtySize(rows=40, cols=120))
             sandbox.pty.send_stdin(pty.pid, b"stty size; echo pty-ok\n")

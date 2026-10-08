@@ -311,7 +311,7 @@ def test_the_child_half_reaches_the_poll_with_the_modules_own_timeout(
 
     ``spawn_child``'s ``timeout_s`` argument shadows the module function of the
     same name; the default path called the *argument* -- ``None`` -- as if it
-    were the helper, so every real child (route B never passes the argument)
+    were the helper, so every real child (own identity never passes the argument)
     died with ``os._exit(4)`` before its first ``setresuid``. The worker still
     reported the pid, the agent then aimed ``as_uid`` at a dead process, and the
     create failed with "cannot write uid_map for pid N: Permission denied": a
@@ -336,7 +336,7 @@ def test_the_child_half_reaches_the_poll_with_the_modules_own_timeout(
 def test_the_child_half_defaults_to_the_module_default_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The shipped path: route B passes no ``timeout_s`` at all."""
+    """The shipped path: own identity passes no ``timeout_s`` at all."""
     monkeypatch.delenv("E2B_IDENTITY_GRANT_WAIT_TIMEOUT_S", raising=False)
 
     polls, _executed, exits = _drive_the_child_half(monkeypatch)
@@ -356,7 +356,7 @@ def test_the_child_half_clears_close_on_exec_for_the_slots_descriptors(
     ``socket.socketpair()``, which is ``O_CLOEXEC``, so the descriptors
     ``_close_fds_except`` deliberately kept were still closed by ``execvpe`` --
     ``sandlock-supervise`` then died with "control fd 21 is not open: Bad file
-    descriptor", and the create failed with "route-B slot ... exited before
+    descriptor", and the create failed with "own-identity slot ... exited before
     answering on control fd".
     """
     reader, writer = os.pipe()

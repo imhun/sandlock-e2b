@@ -3,7 +3,7 @@
 
 ``E2B_NODE_HEARTBEAT_TIMEOUT`` decides when a node is treated as gone -- and a
 "gone" node has its live sandboxes reaped as orphans (E6.1), which takes their
-route-B slots away. So the window is not a tuning knob, it is the bound on how
+own-identity slots away. So the window is not a tuning knob, it is the bound on how
 long a live worker's heartbeat may be late. Two things make that bound
 non-obvious:
 

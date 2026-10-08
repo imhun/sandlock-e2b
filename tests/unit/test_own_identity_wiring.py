@@ -1,4 +1,4 @@
-"""route-B plumbing: policy wire, W1 slot lease, and the instance shim.
+"""own-identity plumbing: policy wire, W1 slot lease, and the instance shim.
 
 Everything here runs off-Linux: the slot *spawner* and the channel are
 injected, so the assertions cover what the executor will actually put on the
@@ -222,7 +222,7 @@ def test_policy_document_refuses_the_deleted_mediation_tier_by_name():
         supervise_policy_document({"uid": 1, "mediation_run_as": "supervisor"})
     message = str(excinfo.value)
     assert message == (
-        "route-B policy ceiling carries field(s) the supervise wire does not "
+        "own-identity policy ceiling carries field(s) the supervise wire does not "
         "accept: mediation_run_as"
     ), message
 
@@ -230,7 +230,7 @@ def test_policy_document_refuses_the_deleted_mediation_tier_by_name():
 def test_policy_document_refuses_a_field_the_wire_does_not_know():
     with pytest.raises(
         ValueError,
-        match=r"^route-B policy ceiling carries field\(s\) the supervise wire "
+        match=r"^own-identity policy ceiling carries field\(s\) the supervise wire "
         r"does not accept: `name`, `policy_fn`$".replace("`", ""),
     ):
         supervise_policy_document({"name": "sbx", "policy_fn": None or "x"})
@@ -551,7 +551,7 @@ async def test_acquire_refuses_a_uid_outside_the_segment(tmp_path):
     pool, spawned, log, channels = _pool(tmp_path, size=2)
     with pytest.raises(
         ValueError,
-        match=r"^route-B uid 9999 for sandbox sbx_a is outside the slot "
+        match=r"^own-identity uid 9999 for sandbox sbx_a is outside the slot "
         r"segment 20000\.\.20001$",
     ):
         await pool.acquire("sbx_a", {}, uid=9999)
@@ -562,13 +562,13 @@ async def test_a_live_uid_is_never_leased_twice(tmp_path):
     pool, spawned, log, channels = _pool(tmp_path, size=2)
     await pool.acquire("sbx_a", {}, uid=20001)
     with pytest.raises(RuntimeError, match=(
-        r"^route-B uid 20001 already has a live slot \(sandbox sbx_a\); W1 "
+        r"^own-identity uid 20001 already has a live slot \(sandbox sbx_a\); W1 "
         r"recycles a uid only by restarting its process, never by sharing it$"
     )):
         await pool.acquire("sbx_b", {}, uid=20001)
     with pytest.raises(
         ValueError,
-        match=r"^sandbox sbx_a already holds a route-B slot "
+        match=r"^sandbox sbx_a already holds an own-identity slot "
         r"\(one slot per sandbox; release it first\)$",
     ):
         await pool.acquire("sbx_a", {}, uid=20000)
@@ -612,7 +612,7 @@ async def test_stale_socket_is_removed_before_the_spawn(tmp_path, caplog):
         handle = await pool.acquire("sbx_stale", {}, uid=20000)
     assert handle.uid == 20000
     assert any(
-        r.message.startswith("route-B slot rb-sbx_stale: removed stale socket")
+        r.message.startswith("own-identity slot rb-sbx_stale: removed stale socket")
         for r in caplog.records
     )
 
@@ -671,7 +671,7 @@ async def test_release_falls_back_to_kill_when_shutdown_is_refused(tmp_path, cap
         await pool.release("sbx_a")
     assert stubborn.killed == 1
     assert any(
-        "route-B shutdown for sbx_a failed" in r.message for r in caplog.records
+        "own-identity shutdown for sbx_a failed" in r.message for r in caplog.records
     )
     assert pool.acquired_uid("sbx_a") is None
 
@@ -946,7 +946,7 @@ def test_verbs_after_close_never_reach_a_released_slot(tmp_path):
     inst.close()
     assert log == [("shutdown", None, ())]
     assert handle.process.returncode == 0
-    with pytest.raises(RuntimeError, match=r"route-B instance sbx_a is closed"):
+    with pytest.raises(RuntimeError, match=r"own-identity instance sbx_a is closed"):
         inst.stats()
     inst.close()  # idempotent: no second shutdown verb
     assert [v for v, _, _ in log] == ["shutdown"]

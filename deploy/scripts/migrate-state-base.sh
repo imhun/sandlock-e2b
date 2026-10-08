@@ -5,7 +5,7 @@
 #
 #   <export>/workspaces/<id>   ← <export>/<id>          沙箱树（逐条 rename）
 #   <export>/state/_runtime    ← <export>/_runtime      记录 + 命令日志 + .checkpoints
-#   <export>/state/.route-b    ← <export>/.route-b      route-B 槽位
+#   <export>/state/.route-b    ← <export>/.route-b      own-identity 槽位
 #   <export>/state/            （新建 1777）
 #   <export>/workspaces/       （新建 1777）
 #   <export>/.uid_reservations 确认空 → 留在原地（--delete-after 才 rmdir）

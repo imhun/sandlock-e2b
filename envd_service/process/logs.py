@@ -100,7 +100,7 @@ class CommandLogWriter:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with open(self._path, "ab") as f:
                 f.write(raw)
-            # The runtime directory is traversable by name so a route-B slot at
+            # The runtime directory is traversable by name so an own-identity slot at
             # another uid can read the disk accounting file that lives beside
             # this log; the log's own content (command output) stays closed.
             # Idempotent, and it also narrows a file an earlier version left at

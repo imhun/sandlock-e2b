@@ -132,7 +132,7 @@ services:
       # binaries and N52 (2026-09-30) retired the knobs themselves, so the
       # declaration is now the *absence* of any privileged-file-op key. This is
       # what the single-machine example is: the in-process (E5.1) shape, no
-      # per-sandbox host uid, no route-B -- a dev/eval shape, like `local://`,
+      # per-sandbox host uid, no own-identity -- a dev/eval shape, like `local://`,
       # and **excluded from C3's coverage by name** (the coverage list in
       # `docs/superpowers/plans/2026-09-28-c3-privilege-consolidation.md` and
       # `docs/c3-privilege-relocation.md` §11.1 item 4 name it).

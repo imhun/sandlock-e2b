@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""route-B slot pool for the sandlock executor (backlog #5 / T5).
+"""own-identity slot pool for the sandlock executor (backlog #5 / T5).
 
-Route B runs one ``sandlock-supervise`` process per sandbox at the sandbox's
+Own identity runs one ``sandlock-supervise`` process per sandbox at the sandbox's
 host uid, so path mediation (the ``fs_denied`` carve-out family) executes as
 that uid and DAC ownership is correct by construction.  This module is the
 envd-side **W1** slot manager (see
@@ -309,7 +309,7 @@ def _spawn_slot_child(
 
 @dataclass
 class SlotHandle:
-    """A live route-B slot leased to one sandbox.
+    """A live own-identity slot leased to one sandbox.
 
     ``control_socket`` is set for transport 1 (the pool started the slot and
     kept one end of the handoff ``socketpair()``); then ``sock_path``/``token``
@@ -376,7 +376,7 @@ def _registry_sock_path(uid: int, name: str) -> Path:
     )
 
 
-#: How long a route-B child may stay visible in procfs before its waiter
+#: How long an own-identity child may stay visible in procfs before its waiter
 #: gives up polling and uses the slot-blocking ``wait_child`` verb.
 CHILD_POLL_CAP_S = 300.0
 
@@ -489,7 +489,7 @@ def sandbox_cgroups_for(settings) -> SandboxCgroups | None:
     ``off`` returns ``None`` **without constructing anything**: that is what
     makes the default lane byte-identical to the pre-N83 worker. ``required``
     builds (once per mount / worker uid / lane token) the one handle this
-    process uses -- the startup lane calls ``setup()`` on it and the route-B
+    process uses -- the startup lane calls ``setup()`` on it and the own-identity
     pool ``attach()``es through it, and those must be the same object: an
     ``attach`` can only succeed under the parent a ``setup`` established.
 
@@ -576,10 +576,10 @@ def reset_sandbox_cgroups() -> None:
 
 
 class W1SlotPool:
-    """Fixed-uid route-B slot fleet (W1 recycle semantics).
+    """Fixed-uid own-identity slot fleet (W1 recycle semantics).
 
-    Slots are leased **by uid**: a sandbox's route-B mediator must run as that
-    sandbox's own host uid (that identity is the whole point of route B -- see
+    Slots are leased **by uid**: a sandbox's own-identity mediator must run as that
+    sandbox's own host uid (that identity is the whole point of own identity -- see
     ``docs/supervise-identity-handoff.md`` §5), so ``acquire(..., uid=X)``
     targets the uid the worker's host-uid pool allocated for the sandbox. A uid
     with a live slot is never handed out twice; recycle = restart in place.
@@ -616,7 +616,7 @@ class W1SlotPool:
     ) -> None:
         if transport not in ("fd", "path"):
             raise ValueError(
-                "route-B transport must be 'fd' (handoff, the default: no "
+                "own-identity transport must be 'fd' (handoff, the default: no "
                 "registry path and no token in the slot's argv) or 'path' "
                 "(a registered slot an external fleet started)"
             )
@@ -628,7 +628,7 @@ class W1SlotPool:
             # starter lives in this module's history if a deployment ever needs
             # it back.
             raise ValueError(
-                "route-B slot identity must be 'agent-grant' (C3: the child "
+                "own-identity slot identity must be 'agent-grant' (C3: the child "
                 f"unshares and the per-node agent writes its identity); "
                 f"{identity_grant!r} is retired"
             )
@@ -637,11 +637,11 @@ class W1SlotPool:
             # its own deadline and then die. Refusing here names the wiring
             # mistake at construction time instead of at the first create.
             raise ValueError(
-                "route-B slot identity 'agent-grant' needs a reporter "
+                "own-identity slot identity 'agent-grant' needs a reporter "
                 "(envd_service.worker_identity.build_identity_reporter)"
             )
         if size < 1:
-            raise ValueError("route-B slot pool size must be >= 1")
+            raise ValueError("own-identity slot pool size must be >= 1")
         self._uids = list(range(uid_start, uid_start + size))
         self._worker_uid = worker_uid if worker_uid is not None else os.geteuid()
         self._tmp_root = tmp_root or Path("/tmp/sandlock-route-b")
@@ -688,32 +688,32 @@ class W1SlotPool:
         """Pick (and reserve) the uid for a new slot. Caller holds ``_ledger``."""
         if sandbox_id in self._slots:
             raise ValueError(
-                f"sandbox {sandbox_id} already holds a route-B slot "
+                f"sandbox {sandbox_id} already holds an own-identity slot "
                 "(one slot per sandbox; release it first)"
             )
         if uid is None:
             if not self._free:
                 raise RuntimeError(
-                    "route-B slot pool exhausted (all uids live); "
+                    "own-identity slot pool exhausted (all uids live); "
                     "raise E2B_MAX_SLOTS or wait for a release"
                 )
             chosen = self._free.pop(0)
         else:
             if uid not in self._uids:
                 raise ValueError(
-                    f"route-B uid {uid} for sandbox {sandbox_id} is outside the "
+                    f"own-identity uid {uid} for sandbox {sandbox_id} is outside the "
                     f"slot segment {self._uids[0]}..{self._uids[-1]}"
                 )
             live = {slot.uid for slot in self._slots.values()}
             if uid in live:
                 raise RuntimeError(
-                    f"route-B uid {uid} already has a live slot "
+                    f"own-identity uid {uid} already has a live slot "
                     f"(sandbox {self._slot_for_uid_locked(uid)}); W1 recycles a "
                     "uid only by restarting its process, never by sharing it"
                 )
             if uid not in self._free:
                 raise RuntimeError(
-                    f"route-B uid {uid} is not available (already leased or "
+                    f"own-identity uid {uid} is not available (already leased or "
                     "released-but-not-returned)"
                 )
             chosen = uid
@@ -767,7 +767,7 @@ class W1SlotPool:
             uid = self._take_uid_locked(sandbox_id, uid)
         program = program_json or PARKING_PROGRAM
         # ``name`` is the per-instance directory leaf under ``<root>/<uid>/``.
-        # The production caller is the executor's route-B acquire and it always
+        # The production caller is the executor's own-identity acquire and it always
         # passes ``name=self.instance_name`` (``executors/sandlock.py``), which
         # is ``gateway_common.paths.own_identity_instance_name`` -- the same rule the
         # control plane derives the slot documents' path with. The ``rb-``
@@ -816,18 +816,18 @@ class W1SlotPool:
                 # succeed against nothing. Safe to clear: the only way another
                 # live process owns this path is a second worker leasing the
                 # same uid, and the persistent host-uid pool
-                # (``envd_service/uid_pool.py``) refuses that -- route B's
+                # (``envd_service/uid_pool.py``) refuses that -- own identity's
                 # segment *is* that pool's segment.
                 try:
                     sock_path.unlink()
                     logger.warning(
-                        "route-B slot %s: removed stale socket %s",
+                        "own-identity slot %s: removed stale socket %s",
                         slot_name,
                         sock_path,
                     )
                 except OSError as e:
                     raise RuntimeError(
-                        f"route-B slot {slot_name}: stale socket {sock_path} "
+                        f"own-identity slot {slot_name}: stale socket {sock_path} "
                         f"cannot be removed: {e}"
                     ) from e
             try:
@@ -881,7 +881,7 @@ class W1SlotPool:
                     # Fail closed, and leave nothing behind: a child nobody will
                     # ever grant would otherwise poll until its own deadline.
                     logger.error(
-                        "route-B slot %s: the slot-identity report for sandbox "
+                        "own-identity slot %s: the slot-identity report for sandbox "
                         "%s (pid %s) failed; killing the child",
                         slot_name,
                         sandbox_id,
@@ -923,7 +923,7 @@ class W1SlotPool:
         with self._ledger:
             self._slots[sandbox_id] = handle
         logger.info(
-            "route-B slot %s leased uid %d (sandbox %s, instance pid %s)",
+            "own-identity slot %s leased uid %d (sandbox %s, instance pid %s)",
             handle.name,
             uid,
             sandbox_id,
@@ -975,7 +975,7 @@ class W1SlotPool:
             )
         except BaseException:
             logger.error(
-                "route-B slot %s: the sandbox cgroup for %s (pid %s, %d%%, "
+                "own-identity slot %s: the sandbox cgroup for %s (pid %s, %d%%, "
                 "memory_mb=%s, max_processes=%s) could not be attached; killing "
                 "the child -- this create fails rather than run without a quota "
                 "(N83 phase 1/2)",
@@ -1016,7 +1016,7 @@ class W1SlotPool:
             cgroups.release(sandbox_id=handle.sandbox_id)
         except Exception as exc:  # noqa: BLE001 - teardown must not fail here
             logger.warning(
-                "route-B slot %s: the cgroup for sandbox %s was not released "
+                "own-identity slot %s: the cgroup for sandbox %s was not released "
                 "(%s); the subtree is left behind -- nothing in this worker "
                 "reclaims a sbx_* directory, so a later create under the same "
                 "id is the only thing that would touch it",
@@ -1083,7 +1083,7 @@ class W1SlotPool:
                 # an externally started fleet) has no way to scope the group;
                 # say so instead of shipping a silently world-readable policy.
                 logger.warning(
-                    "route-B slot %s: cannot scope %s to gid %d from this "
+                    "own-identity slot %s: cannot scope %s to gid %d from this "
                     "worker; the document is world-readable at mode 0444 "
                     "(run the worker as root or place E2B_SLOT_TMP_ROOT on "
                     "storage the slots own)",
@@ -1118,7 +1118,7 @@ class W1SlotPool:
             # ``e2b-maint chown --worker --gid <uid>`` from the worker's own
             # privileged binary; it is now the agent's ``scope-slot-document``,
             # asked for as ``{sandbox_id, op}`` -- the path (the control
-            # plane's route-B root / the slot's uid / ``rb-<id>``) is derived
+            # plane's own-identity root / the slot's uid / ``rb-<id>``) is derived
             # there, never reported from here.
             if sandbox_id is None:
                 raise PrivHelperError(
@@ -1142,7 +1142,7 @@ class W1SlotPool:
             # the same "wrong path, no error" shape as the original defect.
             if path.parent.name != expected or path.parent.parent.name != str(uid):
                 raise PrivHelperError(
-                    f"the route-B slot directory for sandbox {sandbox_id} is "
+                    f"the own-identity slot directory for sandbox {sandbox_id} is "
                     f"{path.parent.parent.name}/{path.parent.name}, but this "
                     f"slot's identity is {uid}/{expected}: the control plane "
                     "derives the slot documents' path from the shared naming "
@@ -1171,7 +1171,7 @@ class W1SlotPool:
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise SlotDeadError(
-                    f"route-B slot {handle.name} (uid {handle.uid}) exited "
+                    f"own-identity slot {handle.name} (uid {handle.uid}) exited "
                     f"before answering on {where}: {_slot_stderr(handle)}"
                 )
             try:
@@ -1187,7 +1187,7 @@ class W1SlotPool:
             time.sleep(0.05)
         process.kill()
         raise SlotDeadError(
-            f"route-B slot {handle.name} (uid {handle.uid}) never reported a "
+            f"own-identity slot {handle.name} (uid {handle.uid}) never reported a "
             f"launched instance on {where} within {self._socket_timeout_s}s"
             + (f" (last channel error: {last_error})" if last_error else "")
         )
@@ -1252,7 +1252,7 @@ class W1SlotPool:
                     ch.request("shutdown")
             except Exception as e:  # noqa: BLE001 - best-effort teardown
                 logger.warning(
-                    "route-B shutdown for %s failed (%s); killing slot pid %s",
+                    "own-identity shutdown for %s failed (%s); killing slot pid %s",
                     handle.sandbox_id,
                     e,
                     handle.process.pid,
@@ -1261,7 +1261,7 @@ class W1SlotPool:
             handle.process.wait(20)
         except subprocess.TimeoutExpired:
             logger.warning(
-                "route-B slot %s (pid %s) ignored shutdown; sending SIGKILL",
+                "own-identity slot %s (pid %s) ignored shutdown; sending SIGKILL",
                 handle.name,
                 handle.process.pid,
             )
@@ -1270,7 +1270,7 @@ class W1SlotPool:
                 handle.process.wait(10)
             except subprocess.TimeoutExpired:  # pragma: no cover - unkillable
                 logger.error(
-                    "route-B slot %s (pid %s) survived SIGKILL; uid %d stays "
+                    "own-identity slot %s (pid %s) survived SIGKILL; uid %d stays "
                     "reserved (this pool no longer owns it)",
                     handle.name,
                     handle.process.pid,
@@ -1301,7 +1301,7 @@ class W1SlotPool:
         # by restarting the slot and a leaked uid would leak the reuse window.
         self._release_cgroup(handle)
         self._return_uid_locked(handle.uid)
-        logger.info("route-B slot %s released uid %d", handle.name, handle.uid)
+        logger.info("own-identity slot %s released uid %d", handle.name, handle.uid)
 
     async def release(self, sandbox_id: str) -> None:
         await asyncio.to_thread(self.release_sync, sandbox_id)
@@ -1451,7 +1451,7 @@ def supervise_policy_document(ceiling: dict) -> dict:
     unknown = sorted(set(doc) - SUPERVISE_POLICY_FIELDS)
     if unknown:
         raise ValueError(
-            "route-B policy ceiling carries field(s) the supervise wire does "
+            "own-identity policy ceiling carries field(s) the supervise wire does "
             f"not accept: {', '.join(unknown)}"
         )
     return doc
@@ -1461,7 +1461,7 @@ def supervise_policy_document(ceiling: dict) -> dict:
 
 
 class OwnIdentityExecProcess:
-    """A child of a route-B slot, shaped like the fork's ``ExecProcess``.
+    """A child of an own-identity slot, shaped like the fork's ``ExecProcess``.
 
     The executor's ``SandlockRunningProcess`` only uses ``pid``,
     ``child_id``, ``stdin``/``stdout``/``stderr``/``pty`` file objects,
@@ -1597,7 +1597,7 @@ class OwnIdentityExecProcess:
 
 
 class OwnIdentityInstance:
-    """``SandboxInstance``-shaped client for one route-B slot.
+    """``SandboxInstance``-shaped client for one own-identity slot.
 
     ``exec`` / ``update_network`` / ``close`` mean the slot's verbs, so the
     executor keeps one code path for both backends. The channel is the fork's
@@ -1662,7 +1662,7 @@ class OwnIdentityInstance:
                         # A truncated or foreign line is not worth losing the
                         # stream over; the next one is still framed by \n.
                         logger.debug(
-                            "route-B slot %s: unparsable event line %r",
+                            "own-identity slot %s: unparsable event line %r",
                             self.name,
                             line[:120],
                         )
@@ -1676,26 +1676,26 @@ class OwnIdentityInstance:
                         if now - last_tick >= 1.0:
                             last_tick = now
                             logger.info(
-                                "route-B slot %s: watch state %r", self.name, event
+                                "own-identity slot %s: watch state %r", self.name, event
                             )
                         continue
                     seen += 1
                     if seen == 1:
                         logger.info(
-                            "route-B slot %s: first pushed event %r", self.name, line[:160]
+                            "own-identity slot %s: first pushed event %r", self.name, line[:160]
                         )
                     try:
                         on_event(event)
                     except Exception:  # noqa: BLE001 - the pump outlives callers
                         logger.warning(
-                            "route-B slot %s: event consumer raised",
+                            "own-identity slot %s: event consumer raised",
                             self.name,
                             exc_info=True,
                         )
             except OSError as exc:
                 context = self._slot_stderr_now()
                 logger.warning(
-                    "route-B slot %s: events pump ended (%d events): %s%s",
+                    "own-identity slot %s: events pump ended (%d events): %s%s",
                     self.name,
                     seen,
                     exc,
@@ -1704,7 +1704,7 @@ class OwnIdentityInstance:
             else:
                 context = self._slot_stderr_now()
                 logger.warning(
-                    "route-B slot %s: events pump ended after %d events (the slot "
+                    "own-identity slot %s: events pump ended after %d events (the slot "
                     "closed its events descriptor)%s",
                     self.name,
                     seen,
@@ -1852,11 +1852,11 @@ class OwnIdentityInstance:
     def request(self, verb: str, args: dict | None = None, fds=()):
         if self._closed:
             raise RuntimeError(
-                f"route-B instance {self.name} is closed (slot released)"
+                f"own-identity instance {self.name} is closed (slot released)"
             )
         if self._handle.process.poll() is not None:
             raise SlotDeadError(
-                f"route-B instance {self.name} is dead: slot "
+                f"own-identity instance {self.name} is dead: slot "
                 f"{self._handle.name} (pid {self._handle.process.pid}) exited"
             )
         try:
@@ -1884,7 +1884,7 @@ class OwnIdentityInstance:
             # server's text). Classified here rather than propagated as an
             # opaque error; registered as fork issue SL-9.
             raise SlotDeadError(
-                f"route-B instance {self.name} is dead: verb "
+                f"own-identity instance {self.name} is dead: verb "
                 f"{verb!r} lost the slot: {type(exc).__name__}: {exc}"
             ) from exc
 
@@ -2125,10 +2125,10 @@ def slot_pool_for(
     channel_factory: Callable[[str, str], object] | None = None,
     supervise_bin: Path | None = None,
 ) -> W1SlotPool:
-    """The worker's route-B slot fleet (one per uid segment).
+    """The worker's own-identity slot fleet (one per uid segment).
 
     The segment is the host-uid pool itself: a slot is started at the uid the
-    worker already allocated to the sandbox, so route B cannot widen the uid
+    worker already allocated to the sandbox, so own identity cannot widen the uid
     space and ``E2B_UID_POOL_*`` stays the single source of truth for
     identity. ``E2B_MAX_SLOTS`` caps live slots below the segment size.
     """
@@ -2173,7 +2173,7 @@ def slot_pool_for(
 
 @dataclass
 class OwnIdentityConfig:
-    """The worker-side route-B knobs resolved from :class:`Settings`.
+    """The worker-side own-identity knobs resolved from :class:`Settings`.
 
     Built by the executor factory (unit tests construct the executor without
     it, which keeps the in-process backend).  ``spawner`` overrides how a slot
@@ -2212,7 +2212,7 @@ class OwnIdentityConfig:
     #: lane ran ``setup()`` on is the one every pool here attaches through.
     sandbox_cgroups: SandboxCgroups | None = None
     #: N83 phase 1: the switch itself, carried alongside the handle so the
-    #: executor can refuse a sandbox that would run **in-process** (route B
+    #: executor can refuse a sandbox that would run **in-process** (own identity
     #: declined) when the deployment asked for per-sandbox cgroups -- an
     #: in-process mediator has no cgroup to attach to, and ``required`` must
     #: never mean "run without a quota" (plan Review Focus 4).
@@ -2227,7 +2227,7 @@ class OwnIdentityConfig:
         """
         if str(self.identity_grant).strip().lower() != "agent-grant":
             raise ValueError(
-                "route-B slot identity must be 'agent-grant' (C3: the child "
+                "own-identity slot identity must be 'agent-grant' (C3: the child "
                 "unshares and the per-node agent writes its identity); "
                 f"{self.identity_grant!r} is retired (open-issues N52)"
             )
@@ -2251,7 +2251,7 @@ class OwnIdentityConfig:
 
         Every field falls back to the ``Settings`` default, so a caller with a
         partial settings object (the factory's unit stubs) simply gets the
-        documented default -- route B off unless its own switches say
+        documented default -- own identity off unless its own switches say
         otherwise.
 
         There is no privileged starter to resolve any more (C3 Task 7 retired

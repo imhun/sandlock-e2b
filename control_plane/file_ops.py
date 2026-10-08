@@ -23,7 +23,7 @@ re-invented) and onto one target:
 | ``chown-volume-root`` | ``chown`` | ``<volume>`` |
 | ``remove-volume-slice`` | ``rm`` | ``<volume>/<id>`` |
 | ``chown-secret`` | ``chown`` | ``<image cache>/secrets/<id>/<name>.secret`` |
-| ``scope-slot-document`` | ``chown`` | ``<route-B root>/<uid>/<instance name>/<name>``, where the leaf comes from :func:`gateway_common.paths.own_identity_instance_name` -- the **same** function the worker's executor names the slot with (ruling D20) |
+| ``scope-slot-document`` | ``chown`` | ``<own-identity root>/<uid>/<instance name>/<name>``, where the leaf comes from :func:`gateway_common.paths.own_identity_instance_name` -- the **same** function the worker's executor names the slot with (ruling D20) |
 | ``remove-orphan-workspace`` | ``rm`` | ``<workspace base>/<id>`` (**self-heal only**, C3 Task 6): the tree the control plane's records claim nowhere. It is the one op with no record to derive a uid from -- that is its definition -- and the worker surface refuses it by name. |
 | ``materialize-tree`` | ``materialize`` | ``<workspace base>/<id>`` (+ the snapshot copy source and the per-sandbox volume slices). The **create path's** one privileged step, and the only row with **no caller surface at all**: the control plane derives it for itself (`control_plane/api/sandboxes.py::_materialize_remote`) and sends it to the node's agent directly, so no worker request can ever name it. The row lives here because this table is the complete list of what the platform may ask a node to do, and because :func:`derive_materialize` uses it for the root-check refusal. |
 
@@ -139,7 +139,7 @@ FILE_OPS: dict[str, FileOpSpec] = {
 #: ignored, so a caller cannot believe its value was considered.
 FORBIDDEN_KEYS: tuple[str, ...] = ("path", "uid", "gid", "target", "worker")
 
-#: The route-B slot documents. A closed set: they are the only names
+#: The own-identity slot documents. A closed set: they are the only names
 #: ``W1SlotPool._write_slot_documents`` writes.
 SLOT_DOCUMENTS: frozenset[str] = frozenset({"policy.json", "program.json"})
 

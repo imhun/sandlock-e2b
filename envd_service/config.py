@@ -271,7 +271,7 @@ class Settings:
     # the first process of its own PID namespace, so host/other-sandbox pids are
     # invisible from inside and the sandbox gets a real pid-1 reaper. Off by
     # default -- and that is a *deployment* decision (N3), not a capability
-    # limit: the route-B self-map this path used to be missing landed in fork
+    # limit: the own-identity self-map this path used to be missing landed in fork
     # `5b16855` (2026-09-16), so turning it on no longer costs the guest its root
     # identity. Measured on the fleet (which runs with this on): a sandbox still
     # reads `id` = `0:0` while the host owner of a file it writes is the
@@ -436,7 +436,7 @@ class Settings:
     # sandbox gets a distinct host uid from the pool and its workspace is
     # `0770 <uid>:<worker gid>` (fix round 1 / c1). That identity is what makes the rest of
     # the isolation story work: shared volumes protect each other with real
-    # 1777+sticky DAC, and (route B) the sandbox's `sandlock-supervise` slot
+    # 1777+sticky DAC, and (own identity) the sandbox's `sandlock-supervise` slot
     # runs as *that* uid, so path mediation lands writes on the sandbox
     # instead of the worker (T5).
     #
@@ -450,7 +450,7 @@ class Settings:
         default_factory=lambda: _env_bool("E2B_PER_SANDBOX_UID", True)
     )
     # C3 (2026-09-30, open-issues N52): the file-capability brokers that used
-    # to let a non-root worker perform route B's setuid and E3.2's chown are
+    # to let a non-root worker perform own identity's setuid and E3.2's chown are
     # retired -- the per-node agent performs both now, and
     # ``E2B_PRIV_HELPER_TRANSPORT`` (see ``envd_service.priv_helpers``) is the
     # switch that names that shape. The old ``E2B_PRIV_HELPERS`` knob is gone
@@ -467,7 +467,7 @@ class Settings:
     uid_reconcile_on_startup: bool = field(
         default_factory=lambda: _env_bool("E2B_UID_RECONCILE_ON_STARTUP", True)
     )
-    # Route B (backlog #5 / T5): run each sandbox's path mediator as its own
+    # Own identity (backlog #5 / T5): run each sandbox's path mediator as its own
     # ``sandlock-supervise`` process whose euid IS the sandbox host uid, so
     # mediated (``fs_denied`` carve-out) writes are owned by the sandbox and
     # 1777+sticky per-uid volume protection holds. ``auto`` starts a slot for
@@ -476,8 +476,8 @@ class Settings:
     # the pure shape; ``off`` keeps the in-process ``SandboxInstance``.
     # Starting a slot at another uid needs a privileged starter, so a non-root
     # worker stays on the in-process path in ``auto``/``off`` and fails loudly
-    # in ``on`` (route A vs route B is a deployment decision, never a silent
-    # downgrade -- docs/supervise-identity-handoff.md §8).
+    # in ``on`` (the in-process mediator vs own identity is a deployment
+    # decision, never a silent downgrade -- docs/supervise-identity-handoff.md §8).
     own_identity: str = field(
         default_factory=lambda: env_alias.read(
             "E2B_OWN_IDENTITY", legacy="E2B_ROUTE_B", default="auto"
@@ -560,11 +560,11 @@ class Settings:
     )
     # N83 phase 1: the per-sandbox cgroup lane. ``off`` (the default) leaves the
     # worker byte-for-byte as it was -- no delegation request, no cgroup handle,
-    # and the route-B slot lifecycle never touches a cgroup. ``required`` turns
+    # and the own-identity slot lifecycle never touches a cgroup. ``required`` turns
     # the lane on: the worker asks the control plane for its container cgroup
     # (the agent's one-shot delegation), builds its ``sbx_<id>`` subtree under
     # it, and every path that could otherwise run a sandbox without a quota
-    # refuses **by name** (route-B attach, and the in-process fallback).
+    # refuses **by name** (own-identity attach, and the in-process fallback).
     sandbox_cgroup: str = field(
         default_factory=lambda: (
             os.getenv("E2B_SANDBOX_CGROUP") or "off"

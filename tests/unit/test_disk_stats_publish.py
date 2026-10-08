@@ -22,7 +22,7 @@ from envd_service.agent import _write_disk_stats
 from envd_service.config import Settings
 from gateway_common.paths import sandbox_disk_stats_path, sandbox_runtime_dir
 
-#: The uid the route-B slot runs as -- never the writer's. The lane's pool hands
+#: The uid the own-identity slot runs as -- never the writer's. The lane's pool hands
 #: uids out from here (``tests/security/conftest.SANDBOX_UID``).
 SLOT_UID = 1000
 
@@ -79,7 +79,7 @@ def test_publishing_never_raises_on_an_unwritable_target(tmp_path, monkeypatch):
 
 
 def test_only_the_ledger_is_world_readable_in_the_runtime_dir(tmp_path):
-    """The reader is the route-B slot at *another* uid, not the writer.
+    """The reader is the own-identity slot at *another* uid, not the writer.
 
     In the deployed shape the worker writes as 65534 and the slot that reads
     the accounting file runs at the sandbox's own host uid, so the directory

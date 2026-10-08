@@ -619,17 +619,17 @@ PYEOF" 2>&1 | tr -d '\r')"
             || fail "C2.1 regression: the three endpoints did not all answer 200"
     fi
 
-    say "ACCEPT-7 log checks (route-B, per-uid warning, caps, the old degradation warning)"
+    say "ACCEPT-7 log checks (own-identity, per-uid warning, caps, the old degradation warning)"
     if [ "$DRY_RUN" = "1" ]; then
-        note "[dry-run] WOULD RUN: route-B ready count / PER_UID_NONROOT_WARNING / CapEff / getcap / 'XFS project quota unavailable'"
+        note "[dry-run] WOULD RUN: own-identity ready count / PER_UID_NONROOT_WARNING / CapEff / getcap / 'XFS project quota unavailable'"
     else
         for c in sandlock-worker-1-1 sandlock-worker-2-1; do
             echo "    $c:"
-            RB="$(ro1 "docker logs $c 2>&1 | grep -c 'route-B instance ready' || true")"
+            RB="$(ro1 "docker logs $c 2>&1 | grep -c 'own-identity instance ready' || true")"
             PU="$(ro1 "docker logs $c 2>&1 | grep -c 'PER_UID_NONROOT_WARNING' || true")"
             XQ="$(ro1 "docker logs --since 20m $c 2>&1 | grep -c 'XFS project quota unavailable' || true")"
             CAP="$(ro "docker exec $c sh -c 'grep ^CapEff /proc/1/status'")"
-            echo "      route-B ready lines: $RB"
+            echo "      own-identity ready lines: $RB"
             echo "      PER_UID_NONROOT_WARNING: $PU"
             echo "      XFS quota degradation warnings (must be 0): $XQ"
             echo "      $CAP"
@@ -640,7 +640,7 @@ PYEOF" 2>&1 | tr -d '\r')"
             # container. Ask both, without letting either line fail the window.
             ro "docker exec -u 0 $c getcap /var/lib/e2b-priv/e2b-maint" 2>&1 | sed 's/^/      worker(expect: no such file): /'
             ro "docker exec -u 0 sandlock-c3-agent-maint-1 getcap /var/lib/e2b-priv/e2b-maint /var/lib/e2b-priv/as_uid" 2>&1 | sed 's/^/      agent face B: /'
-            [ "${RB:-0}" -ge 1 ] 2>/dev/null || fail "$c: no route-B ready line since the restart"
+            [ "${RB:-0}" -ge 1 ] 2>/dev/null || fail "$c: no own-identity ready line since the restart"
             [ "${PU:-1}" = "0" ] || fail "$c: PER_UID_NONROOT_WARNING present"
             [ "${XQ:-1}" = "0" ] || fail "$c: still logging the XFS quota degradation warning"
             printf '%s' "$CAP" | grep -qi '0000000000000000' \
