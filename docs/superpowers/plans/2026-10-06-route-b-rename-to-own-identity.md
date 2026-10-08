@@ -55,7 +55,7 @@
 - **冻结**：`own_identity_instance_name()` 的返回值与今天 `route_b_instance_name()` 逐字节相同（见下）。
 - Consumes（本轮不动）：`slot_pool_for`、`SlotHandle`、`W1SlotPool`，以及 `OwnIdentityConfig` 的**字段名**（`mode` / `slots` / `tmp_root` / `transport` / `verb_timeout_s` / `slot_identity`）—— 它们归 Task 2/3/4。
 
-- [ ] **Step 1: 写守卫用例（新名字 + 三种输入形态的冻结输出）**
+- [x] **Step 1: 写守卫用例（新名字 + 三种输入形态的冻结输出）**
 
 ```python
 def test_the_own_identity_instance_name_is_frozen() -> None:
@@ -88,21 +88,21 @@ def test_the_backend_types_are_reachable_under_their_new_names() -> None:
 
 （三个字面量取自今天的实现，逐字节抄：短 id 原样、84 字节 id → `sbx_b926db5e21e80dd2`、64 字节 id 原样。）
 
-- [ ] **Step 2: 跑它确认红**
+- [x] **Step 2: 跑它确认红**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_own_identity_naming.py -q`
 Expected: FAIL —— `ImportError: cannot import name 'own_identity_instance_name'`。
 
-- [ ] **Step 3: 机械改名**
+- [x] **Step 3: 机械改名**
 
 `git mv envd_service/route_b.py envd_service/own_identity.py`；符号替换 `route_b_instance_name` → `own_identity_instance_name`、`ROUTE_B_INSTANCE_NAME_MAX_BYTES` → `OWN_IDENTITY_INSTANCE_NAME_MAX_BYTES`、`RouteBConfig` → `OwnIdentityConfig`、`RouteBInstance` → `OwnIdentityInstance`、`RouteBExecProcess` → `OwnIdentityExecProcess`、`_route_b_active` → `_own_identity_active`、`_route_b_decline_reason` → `_own_identity_decline_reason`、`_open_route_b_instance` → `_open_own_identity_instance`、`_route_b_no_starter_warned` / `_route_b_no_fd_client_warned` → `_own_identity_…`；`Settings.route_b` → `Settings.own_identity`。**函数体一字不动**（冻结串在里面）；同批改 45 个测试文件的 import 与符号。
 
-- [ ] **Step 4: 跑测试确认绿**
+- [x] **Step 4: 跑测试确认绿**
 
 Run: `.venv/bin/python -m pytest tests/unit -q`
 Expected: 与基线同绿，**仍然只有那 3 条 macOS 固有红**；新守卫用例通过。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A envd_service control_plane gateway_common tests
@@ -122,7 +122,7 @@ git commit -m "refactor(own-identity): route_b becomes own_identity in the code"
 - Produces: `env_alias.read(name: str, *, legacy: str, default: str = "") -> str` —— 新名非空则用它；否则读旧名并 `logger.warning` **一次**（每个旧名一次，进程级 `set`）；都没有则返回 `default`。
 - Consumes: 无。
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 ```python
 def test_the_new_name_wins_when_both_are_set(monkeypatch, caplog) -> None:
@@ -140,21 +140,21 @@ def test_the_legacy_name_still_works_and_warns_once(monkeypatch, caplog) -> None
     assert _settings().own_identity == "on"      # 第二次不再告警
 ```
 
-- [ ] **Step 2: 跑它确认红**
+- [x] **Step 2: 跑它确认红**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_env_alias.py -q`
 Expected: FAIL —— `E2B_OWN_IDENTITY=off` 被忽略，`own_identity` 仍是 `"on"`。
 
-- [ ] **Step 3: 实现 `env_alias.read()`，把 `Settings.own_identity` 接上**
+- [x] **Step 3: 实现 `env_alias.read()`，把 `Settings.own_identity` 接上**
 
 模块级 `_warned: set[str]`；`logger = logging.getLogger(__name__)`；告警文案同时点名旧名与新名。
 
-- [ ] **Step 4: 跑测试确认绿**
+- [x] **Step 4: 跑测试确认绿**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_env_alias.py tests/unit/test_own_identity_wiring.py -q`
 Expected: PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add envd_service/env_alias.py envd_service/config.py tests/unit/test_env_alias.py
@@ -172,7 +172,7 @@ git commit -m "feat(own-identity): E2B_OWN_IDENTITY, with E2B_ROUTE_B as a warne
 - Produces: `Settings.max_slots: int`、`Settings.slot_transport: str`、`Settings.slot_verb_timeout_s: float`、`Settings.slot_tmp_root: Path` 及对应四个新键。
 - Consumes: `env_alias.read()`（Task 2）。
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 ```python
 def test_the_slot_tmp_root_carries_the_new_name(monkeypatch) -> None:
@@ -188,21 +188,21 @@ def test_per_sandbox_uid_is_not_part_of_this_rename() -> None:
     assert "E2B_PER_SANDBOX_UID" in Path("deploy/k8s/worker.yaml").read_text()
 ```
 
-- [ ] **Step 2: 跑它确认红**
+- [x] **Step 2: 跑它确认红**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_worker_env_key_sets.py -q`
 Expected: FAIL —— 新键被忽略（`slot_tmp_root` 退回默认 `/tmp/sandlock-route-b`）、表项仍是旧键、`KEY_CLASSES["slot_tmp_root"]` 不存在。
 
-- [ ] **Step 3: 改四个字段的读取 + 五个清单/compose + 表项**
+- [x] **Step 3: 改四个字段的读取 + 五个清单/compose + 表项**
 
 清单**只换键名**，`value` 逐字节不动（`/var/lib/e2b/state/.route-b`，目录名 `.route-b` 是冻结串）。`KEY_CLASSES` 的键改名时，把同文件里引用它的两处集合联合（`KEY_CLASSES["route_b_root"] | …`）一起改 —— 漏一处会让"允许缺失/允许额外"的判定悄悄变宽。
 
-- [ ] **Step 4: 跑测试确认绿**
+- [x] **Step 4: 跑测试确认绿**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_worker_env_key_sets.py tests/unit/test_c3_agent_manifest.py tests/unit/test_worker_manifest_permissions.py -q`
 Expected: PASS（含「三个 multinode worker 声明同一组 env key」那条）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add envd_service deploy tests
@@ -220,7 +220,7 @@ git commit -m "refactor(slot): the pool knobs take the slot namespace, and the m
 - Produces: `Settings.identity_grant: str`、`Settings.identity_grant_report_timeout_s: float`、`envd_service.identity_grant` 模块、`IdentityGrantConfig` 的对应字段；环境变量 `E2B_IDENTITY_GRANT` / `E2B_IDENTITY_GRANT_REPORT_TIMEOUT_S` / `E2B_IDENTITY_GRANT_WAIT_TIMEOUT_S`。
 - **保留**：对已退役取值 `spawn` 的具名拒绝（C3 / N52）；旧名三个键仍被读，并各告警一次。
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 ```python
 def test_the_legacy_grant_key_warns_and_names_the_new_one(monkeypatch, caplog) -> None:
@@ -236,21 +236,21 @@ def test_the_retired_grant_value_is_still_refused_by_name(monkeypatch) -> None:
         _settings()
 ```
 
-- [ ] **Step 2: 跑它确认红**
+- [x] **Step 2: 跑它确认红**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_identity_grant.py -q`
 Expected: FAIL —— 第一条没有任何关于新名的告警；第二条 `E2B_IDENTITY_GRANT` 被忽略、默认值让构造成功（应当具名拒绝）。
 
-- [ ] **Step 3: 改名 + 接上别名**
+- [x] **Step 3: 改名 + 接上别名**
 
 `git mv envd_service/slot_identity.py envd_service/identity_grant.py`；`slot_identity_timeout_s()` → `identity_grant_timeout_s()`、`SlotProcess` → `SlotProcess`（不动，它本来就是 slot 概念）、`_await_identity` / `spawn_child` / `_keep_inheritable` 函数体一字不动。
 
-- [ ] **Step 4: 跑测试确认绿**
+- [x] **Step 4: 跑测试确认绿**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_identity_grant.py tests/unit/test_sandlock_executor_own_identity.py -q`
 Expected: PASS（含 Task 1 之后这两族的全部用例）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A envd_service tests
@@ -269,7 +269,7 @@ git commit -m "refactor(identity-grant): the grant mechanism stops being called 
 **Interfaces:**
 - Produces: 现状文档里 `route B` → `own identity`（句子自然改写，不逐字替换）、`E2B_ROUTE_B*` → 新键、`slot identity` → `identity grant`；`docs/isolation-boundaries.md` §1 加一行「旧称 route B（2026-10 按本质改名）」；`deploy/scripts/acceptance/` 里的探针**文件名不动**（历史证据的引用），只改它们 import 的模块名。
 
-- [ ] **Step 1: 写断言（把「历史冻结」变成可运行的检查）**
+- [x] **Step 1: 写断言（把「历史冻结」变成可运行的检查）**
 
 ```bash
 # 现状文档里不应再出现旧环境变量名（历史目录与发版记录除外）
@@ -279,19 +279,19 @@ rg -n 'E2B_ROUTE_B' docs --glob '!docs/reports/**' --glob '!docs/superpowers/**'
 rg -c 'route B' docs/deploy-clusters.md docs/superpowers/plans/2026-10-06-n80-clone3-and-unshare-retirement.md
 ```
 
-- [ ] **Step 2: 跑它确认当前是红的**
+- [x] **Step 2: 跑它确认当前是红的**
 
 Run: 上面第一条
 Expected: 有命中（旧键仍留在现状文档里）。
 
-- [ ] **Step 3: 逐文件改写，并在述评处留一处「旧称」**
+- [x] **Step 3: 逐文件改写，并在述评处留一处「旧称」**
 
-- [ ] **Step 4: 跑断言确认绿**
+- [x] **Step 4: 跑断言确认绿**
 
 Run: 同样两条
 Expected: 第一条 **0 命中**；第二条两边都 > 0。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs
@@ -313,3 +313,49 @@ git commit -m "docs(own-identity): the current docs use the name, the history ke
 5. 两条冒烟（`E2B_API_URL=http://172.18.78.49:3000`，凭据从 `secret/e2b-secrets` 取、`env -u http_proxy -u https_proxy -u all_proxy`）：`MULTI-NODE SMOKE OK` + `DEPLOYMENT SMOKE OK`。
 
 **为什么必须同批**：新清单里的 `E2B_SLOT_TMP_ROOT` 旧镜像读不懂，会退回代码默认的 `/tmp/sandlock-route-b` —— 槽位文档落到非共享目录，建箱直接失败（Review Focus 3）。新镜像读得懂两边（Task 3 的别名），所以"镜像先、清单后"不行，"同批"才是安全形状。
+
+---
+
+## 收尾（2026-10-08：Task 1–5、7 已完，Task 6 仍留到下一版）
+
+写这段的原因：Task 1–5 的复选框当时一个都没勾，读计划的人以为没开工，而事实是
+**0.1.0-1151-g274b3a5 已经纯改名上线**（发版记录见 `docs/deploy-clusters.md` §7.57，线上 9/9 +
+两条冒烟）。所以：上面对 25 个 Step 的勾是照证据补的，逐条出处如下。
+
+| Task | 状态 | 证据 |
+|---|---|---|
+| 1 标识符与模块 | ✅ | `envd_service/route_b.py` → `own_identity.py`、三个 `test_*route_b*` 用例改名、`gateway_common.paths.route_b_instance_name` → `own_identity_instance_name`；冻结输出由 `tests/unit/test_own_identity_naming.py::test_the_own_identity_instance_name_is_frozen` 钉住 |
+| 2 环境变量别名 | ✅ | `envd_service/env_alias.py`（新名优先、旧名接受并告警一次、两者都设且不同值时新名胜出）；`tests/unit/test_env_alias.py` 全绿 |
+| 3 槽位旋钮（唯一动部署面的一项） | ✅ | `E2B_MAX_SLOTS` / `E2B_SLOT_TMP_ROOT` / `E2B_SLOT_TRANSPORT` / `E2B_SLOT_VERB_TIMEOUT_S`；五份清单/compose 与表项已改，`tests/unit/test_c3_agent_manifest.py`、`test_worker_manifest_permissions.py`、`test_worker_env_key_sets.py` 钉住取值 |
+| 4 身份授予 | ✅ | `slot_identity.py` → `identity_grant.py`、`E2B_IDENTITY_GRANT` / `E2B_IDENTITY_GRANT_{WAIT,REPORT}_TIMEOUT_S`；`tests/unit/test_identity_grant.py` 全绿 |
+| 5 现状文档 | ✅ | `docs/isolation-boundaries.md` 留了那处「旧称」；计划自己的验收命令今天复跑：`rg 'E2B_ROUTE_B' docs`（排除三份归档 + 两份日期账）**0 命中**，而 `docs/deploy-clusters.md`（6）与本计划（12）**仍有**旧名 |
+| 7 发布 | ✅ | §7.57：同批镜像 + 清单、9/9、`DEPLOYMENT SMOKE OK` + `MULTI-NODE SMOKE OK` |
+| 6 删别名 | ⏳ **下一版** | 不变：提前删会让「清单尚未更新」的形态静默退回默认值 |
+
+### 本轮补的那半：活字（2026-10-08，Task 1 的第 3 条断言）
+
+Task 1–5 换的是**标识符、模块名、环境键、现状文档**；**活代码里的字**当时没换完
+（`own_identity.py` 52 处、`executors/sandlock.py` 45 处，测试/清单/验收探针里同样成片），
+而计划要换掉的正是这套设计评审遗留的字母名。两笔补齐：
+
+* `11d6b21` —— 83 个文件的活字换完（含 worker 的就绪行与拒绝文本：`deploy/scripts/`
+  里有**按字符串读它们**的验收脚本，必须同批改，否则车道会绿着却什么都没验证到）。
+* `6aea5bb` —— 把它变成钉子（`tests/unit/test_own_identity_naming.py` 新增两条），
+  免得再长回来；RED→GREEN 见该文件与提交信息。
+
+**这轮执行的冻结清单**（计划「命名冻结」一节的落地版，钉子按它放行）：
+
+| 冻结的东西 | 为什么 |
+|---|---|
+| `.route-b`、`/var/lib/e2b*/state/.route-b`、`/tmp/sandlock-route-b` | 磁盘目录名与它的派生默认值（CP 与 worker 都从它推导槽位文档路径） |
+| `rb-<id>` | 无名字调用方的槽位叶子名（嵌入方/测试用；真实路径由 `own_identity_instance_name` 给） |
+| `E2B_ROUTE_B*`、`E2B_SLOT_IDENTITY*` | Task 6 才删的别名，删早了会静默退回默认值 |
+| `scope-slot-document`、`/internal/nodes/{id}/slot-identity` | 线协议/文件操作作用域名 |
+| 四支验收探针的**文件名**（`routeb_cap_probe.py`、`routeb_statfs_probe.py`、`red-routeb-stderr-drain.py`、`rb_token_probe.py`） | 被现存文档与历史记录**按名**引用；改名等于让历史指向不存在的文件（正文里的字已换） |
+| `docs/reports/**`、`docs/superpowers/**`、`docs/security-audit/**`、`docs/deploy-clusters.md`、`docs/HANDOFF.md` | 归档与两份日期账记的是那一天的事实，改它等于篡改记录（钉子反向断言它们**仍有**旧名） |
+
+**唯一留在活文档里的旧名**：`docs/isolation-boundaries.md` 的
+「旧称 route B（2026-10 按本质改名）」—— 让按旧名找过来的人能落地；钉子断言它还在。
+
+**`third_party/sandlock` 不在范围内**：那是 fork 自己的仓库，它的
+`docs/e2b-integration.md` / `supervise-identity-handoff.md` 是那个项目的记录。
