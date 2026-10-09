@@ -145,7 +145,7 @@ expect deploy/scripts/lib/run-target.exp "$cmd" root
 **不会**落到节点 —— 复用跳板机连接的结果是回到跳板机自己（hostname 打印
 `aliyun-bastionhost`）。要碰节点就用 `run-target.exp`，别用裸 `ssh`。
 
-## 7. 当前部署状态（**最近一次发版：§7.59（2026-10-09，N89 —— 退役 readiness 合成，`poll` 族从此不在任何形状的通知表里，非注入映射收成 fail-closed；版本 `0.1.0-1164-g5fee77f-20261009-101349`；线上 9/9 + `cgroup_acceptance` 9/9 + 两条冒烟全绿，pod 内实测注入档 MCP 往返 0.2–0.3 ms；同版附带 N92 与一条 bind-denylist 谓词缺陷）；上一版：§7.58（2026-10-08，N90/N91 —— 映射不能与 `net_deny_bind` 打架、注入的 bind 把端口翻译回来；版本 `0.1.0-1154-gad83c21-20261008-145713`；线上 9/9 复跑，pod 内实测 N90 拒绝 + N91 `getsockname=8080`）；上一版：§7.57（2026-10-08，route B → own_identity 改名 —— 纯改名 + 一层 env 别名，无运行时行为变更；版本 `0.1.0-1151-g274b3a5-20261008-130000`；线上 9/9、两条冒烟 `DEPLOYMENT SMOKE OK` + `MULTI-NODE SMOKE OK`）；上一版：§7.56（2026-10-08，A —— 入站 trap 收窄到"真的用宿主 listener"的形状；版本 `0.1.0-1144-g31e39d8-20261008-110003`；线上 9/9，映射+注入形状的 `epoll_wait` 16.33 → 0.49 µs/次）；更上一版：§7.55（2026-10-07，N88 ② —— `close` 与 `epoll_ctl` 彻底离开通知表；版本 `0.1.0-1138-g50cf84f-20261007-232510`；本地 + 线上 9/9，带映射形状的阶梯 2541 → 5038 op/s）；更上一版：§7.53（2026-10-07，N82 候选① + N85 —— `close` 移出通知表、`status`/`stat` 的 pid 归沙箱；版本 `0.1.0-1129-gd99e885-20261007-201744`；本地 + 线上 9/9，线上第 ③ 条 17100 → 29574 op/s）；再上一版：§7.52（2026-10-07，N82 收口 —— 通知限流只在没有每沙箱 cgroup 的车道上生效，`required`（线上）不再下发；版本 `0.1.0-1123-g8cde486-20261007-182952`；线上验收 9/9、第 3 条 17100 op/s / 1.025 核 / `nr_throttled +264`）；上一版：§7.50（2026-10-07，N83 Phase 2 —— 内存与任务数交内核，线上两次重滚各 9/9）；更早：§7.46（2026-10-06，N83 Phase 0 —— 每沙箱 CPU 计量上线：worker 按 uid 实测每箱 CPU（含 supervisor），随心跳上报、落记录、超额度具名告警；版本 `0.1.0-1046-gd2d669b-20261006-110307`；同节如实记录了本版上线中发现的两处缺陷与一次"混版本"事故及其恢复）；上一版：§7.45（2026-10-06，N81 —— stat 族彻底放行：真根下 `stat` 由内核自己答，p50 25.7 → **1.4 µs**、5000/s 洪泛天花板消失（41.6 万 stat/s、0 停顿）；版本 `0.1.0-1038-ge4ab14f-20261006-081417`；第一轮 `0.1.0-1037` 因"两视图谓词"缺陷作废，两轮都记在该节）；更早：§7.44（2026-10-05，N79 —— stat 族单列 seccomp 通知预算：普通元数据负载不再吃那一秒级停顿，持续洪泛仍被压在 20000/s；版本 `0.1.0-1027-g0481042-20261005-221012`；四条收尾读数 + 三条冒烟 + 三条专项读数全过）；更早：§7.43（2026-10-05，fork 门禁收口 —— 偶发死等 / supervise restore / 注入竞态三条一起收口，版本 `0.1.0-1023-ge1b8444-20261005-204858`；四条收尾读数 + 两条冒烟 + checkpoint 验收 `{"step":"OK"}` 全过）；上一版：§7.41（2026-10-05，checkpoint 三次修复 —— 第二次 pause 终于能抓自己的图；`checkpoint_acceptance.py` 从"永远卡在最后一条断言"到全过 `OK`，两条冒烟同版本全绿，当前版本 `0.1.0-1018-gcf144a5-20261005-172044`）；上一版：§7.40（2026-10-05，N14 S5：真根成唯一形态、模拟根退役，版本 `0.1.0-1000-g9666a86-20261005-094925`）；上一版：§7.39（2026-10-04，SEC-K0S-003 四跳封顶 + N78 + N49 残余接线 —— 版本 `0.1.0-982-gcc0f64c-20261004-180755`；四条收尾读数 + 两条 403 反向对照都在该节；本版**包含**当天更早的 §7.37／§7.38 两条工作）；上一版：§7.38（2026-10-04，fork 钉子与 socket-family 测试上线 —— 版本 `0.1.0-979-g9e17e8f-20261004-174449`；**这一版只加具名清单与测试、无运行时行为变更**，目的是让 wheel 的 HEAD 钉与 fork 对齐；顺带结掉 Landlock ABI 6 vs 本地 8 那个盲点，并纠正一处错误结论）；上一版：§7.37（2026-10-04，SEC-R3-01 空 token 逃逸上线 —— 三层封死 + STATIC-5 + fork `a0c1593` 的 ioctl/LSM 收口，当前版本 `0.1.0-977-gcd792ca-20261004-143100`；9 个 pod 全绿、验证矩阵与生产沙箱内的行为读数都在该节）；上一版：§7.36（2026-10-03，闲置即暂挂 + N77，版本 `0.1.0-965-gb5f194a-20261003-193743`；两条现场验收 + 一条新 bug 的现场证据都在该节）；再上一版：§7.35（2026-10-03，批 B 收口：N64/N65/N66/N67/N68/N69/N70/N72，版本 `0.1.0-945-g01b9b51-20261003-124244`）；四条收尾读数 + 两条冒烟全绿，`0.1.0-943` 那次卷段回归的往返见该节）；上一版：§7.34（2026-10-03，N57/N60/N61/N62/N63 收口，版本 `0.1.0-931-g4181bb4-20261003-013625`）；再上一版：§7.33（2026-10-02，建箱存储本地优先 **Task 0–5 的发版记录**，版本 `0.1.0-915-gfb8a74b-20261002-211709`；跨切面冒烟**先红后绿**（红灯那次：验收窗口留下的孤儿沙箱**真的占着名额**，再加上拒绝路径漏掉的那几份预约）—— 迁移"源节点不可达"拒绝路径泄漏目标节点配额，见该节与 N59；控制者清掉台账与 8 个孤儿沙箱之后**两条冒烟都通过**，N59 的修复已随本版 `32f3667` 上线）；上一版的细节：见 §7.31（2026-10-02，N57/Task 4：本节点 state 分家，`prepare` 72–76 → **7.4 ms**，Task 5 的目录链修复同船）；§7.30（2026-10-02，Task 2：快照载荷从爆炸式 `fs/` 目录改成 `fs.tar`，捕获每条目 39.7 → 9.0 ms、占块减半，从快照建箱 28.2 → 34.4 ms/条目（读侧每条目包含检查，Task 3 搬本地后消失；`942c5bd` 的守卫修复在 `0.1.0-895` 上线后重测 **30.4 ms/条目**），**该节版本 `0.1.0-900-g0079c84-20261002-161409`**；老 `fs/` 快照 4/4 仍可恢复，详见该节）；§7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**该节版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**该节版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，该节版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
+## 7. 当前部署状态（**最近一次发版：§7.60（2026-10-09，控制面移出 uid 65534 —— 控制面跑 65533 且 `CapEff` 仍 0，`_images` 对 worker 只读，`_snapshots` 是 `65534:65533 2775` 的两身份共写目录，`_migrate` 归 65533；版本 `0.1.0-1183-gab98313-20261009-175937`（镜像代码 = `ab98313`，Job 的修复随 ConfigMap 走）；线上 9/9 + 八条判据 7/7 + 两条冒烟全绿 + 回退杆演练过一次并再前滚复验）；上一版：§7.59（2026-10-09，N89 —— 退役 readiness 合成，`poll` 族从此不在任何形状的通知表里，非注入映射收成 fail-closed；版本 `0.1.0-1164-g5fee77f-20261009-101349`；线上 9/9 + `cgroup_acceptance` 9/9 + 两条冒烟全绿，pod 内实测注入档 MCP 往返 0.2–0.3 ms；同版附带 N92 与一条 bind-denylist 谓词缺陷）；上一版：§7.58（2026-10-08，N90/N91 —— 映射不能与 `net_deny_bind` 打架、注入的 bind 把端口翻译回来；版本 `0.1.0-1154-gad83c21-20261008-145713`；线上 9/9 复跑，pod 内实测 N90 拒绝 + N91 `getsockname=8080`）；上一版：§7.57（2026-10-08，route B → own_identity 改名 —— 纯改名 + 一层 env 别名，无运行时行为变更；版本 `0.1.0-1151-g274b3a5-20261008-130000`；线上 9/9、两条冒烟 `DEPLOYMENT SMOKE OK` + `MULTI-NODE SMOKE OK`）；上一版：§7.56（2026-10-08，A —— 入站 trap 收窄到"真的用宿主 listener"的形状；版本 `0.1.0-1144-g31e39d8-20261008-110003`；线上 9/9，映射+注入形状的 `epoll_wait` 16.33 → 0.49 µs/次）；更上一版：§7.55（2026-10-07，N88 ② —— `close` 与 `epoll_ctl` 彻底离开通知表；版本 `0.1.0-1138-g50cf84f-20261007-232510`；本地 + 线上 9/9，带映射形状的阶梯 2541 → 5038 op/s）；更上一版：§7.53（2026-10-07，N82 候选① + N85 —— `close` 移出通知表、`status`/`stat` 的 pid 归沙箱；版本 `0.1.0-1129-gd99e885-20261007-201744`；本地 + 线上 9/9，线上第 ③ 条 17100 → 29574 op/s）；再上一版：§7.52（2026-10-07，N82 收口 —— 通知限流只在没有每沙箱 cgroup 的车道上生效，`required`（线上）不再下发；版本 `0.1.0-1123-g8cde486-20261007-182952`；线上验收 9/9、第 3 条 17100 op/s / 1.025 核 / `nr_throttled +264`）；上一版：§7.50（2026-10-07，N83 Phase 2 —— 内存与任务数交内核，线上两次重滚各 9/9）；更早：§7.46（2026-10-06，N83 Phase 0 —— 每沙箱 CPU 计量上线：worker 按 uid 实测每箱 CPU（含 supervisor），随心跳上报、落记录、超额度具名告警；版本 `0.1.0-1046-gd2d669b-20261006-110307`；同节如实记录了本版上线中发现的两处缺陷与一次"混版本"事故及其恢复）；上一版：§7.45（2026-10-06，N81 —— stat 族彻底放行：真根下 `stat` 由内核自己答，p50 25.7 → **1.4 µs**、5000/s 洪泛天花板消失（41.6 万 stat/s、0 停顿）；版本 `0.1.0-1038-ge4ab14f-20261006-081417`；第一轮 `0.1.0-1037` 因"两视图谓词"缺陷作废，两轮都记在该节）；更早：§7.44（2026-10-05，N79 —— stat 族单列 seccomp 通知预算：普通元数据负载不再吃那一秒级停顿，持续洪泛仍被压在 20000/s；版本 `0.1.0-1027-g0481042-20261005-221012`；四条收尾读数 + 三条冒烟 + 三条专项读数全过）；更早：§7.43（2026-10-05，fork 门禁收口 —— 偶发死等 / supervise restore / 注入竞态三条一起收口，版本 `0.1.0-1023-ge1b8444-20261005-204858`；四条收尾读数 + 两条冒烟 + checkpoint 验收 `{"step":"OK"}` 全过）；上一版：§7.41（2026-10-05，checkpoint 三次修复 —— 第二次 pause 终于能抓自己的图；`checkpoint_acceptance.py` 从"永远卡在最后一条断言"到全过 `OK`，两条冒烟同版本全绿，当前版本 `0.1.0-1018-gcf144a5-20261005-172044`）；上一版：§7.40（2026-10-05，N14 S5：真根成唯一形态、模拟根退役，版本 `0.1.0-1000-g9666a86-20261005-094925`）；上一版：§7.39（2026-10-04，SEC-K0S-003 四跳封顶 + N78 + N49 残余接线 —— 版本 `0.1.0-982-gcc0f64c-20261004-180755`；四条收尾读数 + 两条 403 反向对照都在该节；本版**包含**当天更早的 §7.37／§7.38 两条工作）；上一版：§7.38（2026-10-04，fork 钉子与 socket-family 测试上线 —— 版本 `0.1.0-979-g9e17e8f-20261004-174449`；**这一版只加具名清单与测试、无运行时行为变更**，目的是让 wheel 的 HEAD 钉与 fork 对齐；顺带结掉 Landlock ABI 6 vs 本地 8 那个盲点，并纠正一处错误结论）；上一版：§7.37（2026-10-04，SEC-R3-01 空 token 逃逸上线 —— 三层封死 + STATIC-5 + fork `a0c1593` 的 ioctl/LSM 收口，当前版本 `0.1.0-977-gcd792ca-20261004-143100`；9 个 pod 全绿、验证矩阵与生产沙箱内的行为读数都在该节）；上一版：§7.36（2026-10-03，闲置即暂挂 + N77，版本 `0.1.0-965-gb5f194a-20261003-193743`；两条现场验收 + 一条新 bug 的现场证据都在该节）；再上一版：§7.35（2026-10-03，批 B 收口：N64/N65/N66/N67/N68/N69/N70/N72，版本 `0.1.0-945-g01b9b51-20261003-124244`）；四条收尾读数 + 两条冒烟全绿，`0.1.0-943` 那次卷段回归的往返见该节）；上一版：§7.34（2026-10-03，N57/N60/N61/N62/N63 收口，版本 `0.1.0-931-g4181bb4-20261003-013625`）；再上一版：§7.33（2026-10-02，建箱存储本地优先 **Task 0–5 的发版记录**，版本 `0.1.0-915-gfb8a74b-20261002-211709`；跨切面冒烟**先红后绿**（红灯那次：验收窗口留下的孤儿沙箱**真的占着名额**，再加上拒绝路径漏掉的那几份预约）—— 迁移"源节点不可达"拒绝路径泄漏目标节点配额，见该节与 N59；控制者清掉台账与 8 个孤儿沙箱之后**两条冒烟都通过**，N59 的修复已随本版 `32f3667` 上线）；上一版的细节：见 §7.31（2026-10-02，N57/Task 4：本节点 state 分家，`prepare` 72–76 → **7.4 ms**，Task 5 的目录链修复同船）；§7.30（2026-10-02，Task 2：快照载荷从爆炸式 `fs/` 目录改成 `fs.tar`，捕获每条目 39.7 → 9.0 ms、占块减半，从快照建箱 28.2 → 34.4 ms/条目（读侧每条目包含检查，Task 3 搬本地后消失；`942c5bd` 的守卫修复在 `0.1.0-895` 上线后重测 **30.4 ms/条目**），**该节版本 `0.1.0-900-g0079c84-20261002-161409`**；老 `fs/` 快照 4/4 仍可恢复，详见该节）；§7.29（2026-10-02，N58：根重切上线 —— `_snapshots` 合一、`_migrate` 上浮，建箱 p50 124 → 135/136 ms、逐段不变，**该节版本 `0.1.0-887-g7ef319b-20261002-100406`**；该次上线当场抓到"从快照建箱"的 502，已前滚修复 + 复验，详见该节）；§7.28（2026-10-01，N56 收尾：两跳并发 (b)，建箱 p50 193 → 127–130 ms，**该节版本 `0.1.0-877-ge15b77f-20261001-231822`**；该次上线中间出过一次"每次建箱都 409"的全站故障，已回滚 + 修复，详见该节）**；§7.27 是载体 C（建箱材料化改走控制面直送，p50 191 → 193 ms，版本 `0.1.0-864-g3377ffc-20261001-204142`）；§7.26（2026-10-01，N55：建箱里三处白付往返 —— 记录读、file-op 连接、控制面派发 —— 加一个逐段计时开关，建箱 p50 228 ms → 191 ms，该节版本 `0.1.0-841-g0d7dc76-20261001-131547`）**；§7.25 是 N54：镜像 digest 解析结果落盘缓存（建箱 p50 0.66 s → 0.23 s，版本 `0.1.0-839-g4271c45-20261001-112409`）；§7.24 是 N53：worker 丢掉"控制面不认的"运行时记录 + TTL 拆除顺序 + 历史残留清理，版本 `0.1.0-836-g6d7532b-20261001-102113`；§7.23 是沙箱第一档 syscall 加固 + clone3 命名空间位，版本 `0.1.0-824-gf2aec0b-20261001-073534`；§7.22 是 ① 第二步：删掉 worker 侧 file-capability 形态的残留，版本 `0.1.0-818-g7205fba-20260930-221244`；§7.21 是 ① 第一步：exec/socket 传输具名拒绝，版本 `0.1.0-816-g1c85e7c-20260930-213813`；§7.20 是回退杆清理：删 `E2B_AS_K8S_KIND` 与 `spawn`，版本 `0.1.0-814-gf8d1685-20260930-210628`；§7.19 是 C3 出厂形态收尾：删 C1 死代码 + slot 身份默认按形态解析，版本 `0.1.0-811-g071beb4-20260930-202337`；§7.18 是 N51 缩容目标修正、§7.17 是 autoscaler 并入控制面 + 本地池退役、§7.16 是 quota-agent 搬到顶层 `quota_agent/`（`deploy/` 从此不含任何 Python 包）、§7.15 是 `priv` 的 C 源码跟进搬去 `c3_agent/priv/`、§7.14 是 C3 agent 代码搬去顶层 `c3_agent/`、§7.13 是同一轮的 `Template.build` mirror 链路修复、§7.12 是 compose 车道评审的两条回归、§7.11 是同一轮的三条缺口收口、§7.10 是 C3 收口评审、§7.9 是 C3 Task 7 上线，下面 §7.1–§7.8 是历史记录）
 
 > **本节从 §7.1 到 §7.8 是 2026-09-27 → 09-29 的分批记录，其中多处标着"仓库已落，集群未上线"
 > 的段落到 2026-09-29 已经全部上线**（C3 的 Task 2–7 在 09-29 随 Task 7 的镜像一起滚上去了）。
@@ -177,6 +177,10 @@ C1 的三条尾项与「记账项批次」都在这一版）。2026-09-27 **三�
    2005/7、`_templates` 53/53、`_builds` 54/108，另有 `_images`（已是 65534）、`_secrets`、
    `workspaces/_migrate`。Job 与 ConfigMap 跑完自清理；
 4. `apply.sh`：等 `ds/e2b-priv-broker` 先滚完再滚 worker（脚本内建顺序），随后预热 base image。
+
+> **2026-10-09 注**：上面第 3 步那条命令是当天的原话（那时控制面和 worker 同 uid）。§7.60 之后
+> 控制面是 65533，同一件事要写成 `deploy/scripts/migrate-state-owner.sh --uid 65533 --apply`；
+> 不写 `--uid` 会把它迁回 65534 —— 那正好是 §7.60 的回退杆，不是上线。
 
 **验收证据（全部现场实测）**：
 
@@ -291,7 +295,7 @@ peer 身份 `ping` 回 `ok:true` 且四根一致；
   `SETUID`/`SETGID`，唯一的 initContainer 是**非 root** 的 `wait-for-broker`（broker 先监听、
   worker 才放行；等的是 `hello` 往返，不只是 socket 文件存在）。
 * **第一次滚这个形态必须先把平台态属主迁过来**（一次迁移，不是滚动）：worker 缩到 0 →
-  `deploy/scripts/migrate-state-owner.sh --apply` → 再把 worker 起回来。它只 `chown` **八个**平台目录
+  `deploy/scripts/migrate-state-owner.sh --uid 65533 --apply`（**2026-10-09 起控制面是 65533**：迁移按身份分流，`_images`/`_secrets`/`_templates`/`_builds` 等归 `--uid`、共享的 `state` 仍留 65534、`_snapshots` 只挪组位；不给 `--uid` 就是"一把 chown 到 65534"，等于撤销 §7.60）→ 再把 worker 起回来。它只 `chown` **八个**平台目录
   （`state`/`workspaces/_migrate`/`workspaces/_snapshots`/`_images`/`_secrets`/`_snapshots`/
   `_templates`/`_builds`），**树根下恰放行两条**：`workspaces/_migrate`（N27 之后控制面的迁移暂存
   就在树根之下，不是 export 根）与 `workspaces/_snapshots`（**worker 的快照 payload 根**，
@@ -3372,6 +3376,151 @@ tmp/venv/bin/python deploy/scripts/acceptance/cgroup_acceptance.py \
 
 **没做的（另立）**：`close` 仍在通知表里（N82 候选 ①，每个 fd 一次往返）；clone 族的读数与其缺口
 （`clone3` 那一半没有读数，而量它要用 `wait4(__WCLONE)`；追查见 N85/N86）。
+
+### 7.60 发版：控制面移出 uid 65534（`--uid 65533`）—— **本地 + 线上都已验**，版本 `0.1.0-1183-gab98313-20261009-175937`
+
+计划 `docs/superpowers/plans/2026-10-09-control-plane-uid-relocation.md`，规格
+`docs/security-audit/control-plane-uid-2026-10-09.md`（§5 形状、§6 实测、§7 关闭判据）。
+`main` = `5401017`；**镜像 tag 记的是 `ab98313`，这是有意的**：
+`git diff --stat ab98313..5401017` 只有七条（`.superpowers/**`、`deploy/k8s-k0s/README.md`、
+`deploy/scripts/migrate-state-{owner,base}.sh`、`docs/k8s-deployment.md`、两条 `tests/unit/**`），
+**没有一行进镜像** —— `5401017` 修的是集群内 Job 的加载路径，它随 **ConfigMap** 下发（脚本是运维手打
+的那一份，不从镜像取），所以镜像按 `ab98313` 的代码复用、不重建。`deploy/stack/.version` =
+`0.1.0-1183-gab98313-20261009-175937`（三处工作负载 + `seccomp-installer` 实测都等于它）。
+
+**这一版改了什么**
+
+* 控制面（`deploy/control-plane` 的 `control-plane` 容器）从 **65534 → 65533**
+  （`runAsUser`/`runAsGroup`），**`CapEff` 仍是 0**（移出共享 uid 不许顺手带回 capability）；
+* 属主按身份分层：CP 自己的命名空间 `_builds`/`_images`/`_secrets`/`_templates`/`_volumes`/`_migrate`
+  → 65533；**两个身份共写**的 `_snapshots` 与 `_migrate` 用组位（`_snapshots` 属主留 worker：
+  `65534:65533`、模式 `2775`），worker 靠 `securityContext.supplementalGroups: [65533]` 入组；
+* 共享 `_oci/` 的回收从 worker 收归控制面 ⇒ `_images` 对 worker **只读**（它只解包到自己节点本地的
+  `/var/lib/e2b-images`）；
+* root init 顺带把**老快照目录**扫成 `65534:65533 2775` —— 不改的话 `SnapshotRegistry.delete()` 的
+  `rmtree(ignore_errors=True)` 会吞掉 EACCES、`snapshot.json` 留在原地、DELETE 答 204 什么也没删。
+
+**时间线**（第一次尝试 10:02→10:09 止步于 Job；本次 10:28→11:07）
+
+| 时刻 | 动作 |
+|---|---|
+| 10:28:41 | 清掉上次留下的现场（`job/state-owner-migrate` + 它的 ConfigMap + pod） |
+| 10:28:36 | 隧道 + `require_target_cluster`：`context=Default server=v1.36.4+k0s nodes=2`，`sandlock` 10 pod |
+| 10:29 | 基线（只读）：CP `uid=65534 gid=65534`、`CapEff 0`；八条平台路径**全 65534:65534**（`state`/`_migrate` `0o1777`，其余 `0o755`）；`GET /sandboxes` = `[]` |
+| 10:28:50 | Step 3：`E2B_AS_ENABLED=false` → `rollout status` → worker 缩到 0（`wait --for=delete` 返回 0；8 s 后复核 `sts replicas=0`、无 worker pod） |
+| 10:29:46 | Step 4a：只读计划 `--uid 65533`（`targets=8 chowned=0 missing=2`，与 R12/R13 的形状逐字一致） |
+| 10:32:35 | Step 4b：`migrate-state-owner.sh --uid 65533 --apply` → **`chowned=6 missing=2`**、EXIT=0（首次这条路真的 chown 了；Job 与 ConfigMap 跑完自清理） |
+| 10:37:54 | Step 5：`DRY_RUN=1 apply.sh` + `kubectl diff`：只 5 个对象变（CP/worker/agent/seccomp-installer 的 tag + NetworkPolicy `generation` 噪声） |
+| 10:37:5x | `apply.sh`（整套清单，含 agent DaemonSet）→ agent 先滚完、worker `rolling update complete 2 pods`、两台 base image `cached=true`、EXIT=0 |
+| 10:38–11:05 | Step 7 全部读数（见下）+ 回退杆演练（见下） |
+| 11:07 | 收尾：9/9 pod Running / **0 重启**、`GET /sandboxes` = `[]`、0 卷、两条 worker 预约都是 0 |
+
+**属主迁移原文（`--uid 65533 --apply`，`tmp/cpuid-prod-2/migrate-apply.log`）**
+
+```
+TARGET rel=state            owner=65534:65534      # worker 的记录/命令日志/池台账，永远 65534
+TARGET rel=_images          owner=65533:65533
+TARGET rel=_secrets         owner=65533:65533
+TARGET rel=_snapshots       owner=65534:65533      # 属主留 worker、组位给 CP
+TARGET rel=_templates       owner=65533:65533
+TARGET rel=_builds          owner=65533:65533
+MISSING rel=workspaces/_migrate    # N58 之前的拼写，不在盘上 ⇒ 幂等跳过
+MISSING rel=workspaces/_snapshots
+STAT/AFTER _images    uid=65534→65533 gid=65534→65533 mode=0755 files=23597 dirs=3360
+STAT/AFTER _secrets   0 文件 0 目录          → 65533:65533
+STAT/AFTER _snapshots uid=65534 gid=65534→65533 mode=02755 files=4055 dirs=22
+STAT/AFTER _templates 131/131 → 65533:65533
+STAT/AFTER _builds    99/198  → 65533:65533
+STAT/AFTER state      3032/1534，**不动**
+SUMMARY mode=apply targets=8 chowned=6 missing=2
+```
+
+**探针原文**（`deploy/scripts/acceptance/probe_platform_paths_shape.py --root /var/lib/e2b-sandboxes --json`，
+在 `sandlock/control-plane` 主容器里跑）：
+
+```
+_builds     0o755  65533:65533      _templates  0o755  65533:65533
+_images     0o755  65533:65533      _volumes    0o755  65533:65533
+_secrets    0o755  65533:65533      state       0o1777 65534:65534
+_snapshots  0o2775 65534:65533      _migrate    0o2775 65533:65533
+```
+
+* 控制面两个 pod：`uid=65533 gid=65533 groups=65533,1000`；
+  `Uid/Gid` 全 65533，**`CapEff: 0000000000000000`**（`CapPrm` 同为 0）。
+* 老快照目录：8 个 `<id>` 全部 `drwxrwsr-x 65534 65533`（`2775`，setgid 由 root init 扫出来）。
+* `_volumes`/`_volumes/_meta` = `65533:65533`（**非递归**交接：下面的沙箱卷数据仍是池 uid 的）。
+
+**两条只有集群能证的事实**
+
+(a) **NAS 认真补组 65533** —— 快照捕获（`snap_9ef9f6f26ffd13c6`），CP 容器里读盘：
+
+```
+_snapshots/snap_9ef9f6f26ffd13c6/          drwxrwsr-x 65534:65533
+_snapshots/snap_9ef9f6f26ffd13c6/fs.tar    -rw------- 65534:65533 10240    # worker(65534) 写的载荷
+_snapshots/snap_9ef9f6f26ffd13c6/.complete -rw-r--r-- 65534:65533
+_snapshots/snap_9ef9f6f26ffd13c6/snapshot.json -rw-r--r-- 65533:65533       # CP(65533) 写的记录
+```
+
+同一个 `<id>/` 里两个身份都写进去了 ⇒ 组位这条机制在阿里云 NAS 上成立。
+
+(b) **worker 写 `_migrate/<id>.tar.gz`** —— 用 `pod/e2b-worker-0` 里一个慢读者拉住流，中途 `ls -lan`：
+
+```
+_migrate/                              drwxrwsr-x 65533:65533   (2775)
+_migrate/sbx_fe75dae99da60fea.tar.gz   -rw------- 65534:65533 25173935 bytes   # worker(65534) 写进 2775 的 CP 目录
+…读完：同一个 ls 只剩目录本身（服务端自己 unlink 了这份暂存）
+```
+
+**八条判据（fleet，`/tmp` 下的临时 runner，逐条原文在报告里）= 7/7 PASS**
+：create + 首条命令 / `GET /logs`（三条日志行逐字） / pause+resume（`paused`→`running`） /
+snapshot+restore（文件回来了） / 模板构建 / 卷挂载读写 / delete（记录 404 + 两台 worker 预约回 0）。
+
+* **模板构建**：`tpl_2f106485948f6559` 的 tar 落成 **`644 65533:65533`**
+  （`_images/_oci/e2b-local_tpl_2f106485948f6559.oci.tar`）—— 与本地车道量到的 buildctl `0666`
+  不同，说明这条路上控制面把 tar 收成了 `0644`；老 tar 仍是 666（历史遗留，worker 只读它，不受影响）。
+  worker 的解包落在**节点本地** `_images`：`/var/lib/e2b-images/e2b-local_tpl_2f106485948f6559-<sha>`
+  `755 65534:65534` + `.lock 644 65534:65534` ⇒ "tar 共享、rootfs 本地" 的形状没变。
+* **两条冒烟**：`MULTI-NODE SMOKE OK`（4 箱分两节点、命令/文件/health/stdin、杀完预约回 0）与
+  `DEPLOYMENT SMOKE OK`（六步全绿，含"**migrated e2b-worker-0 → e2b-worker-1, files kept**"——
+  这一步就是 worker 的 export 路由往 `_migrate` 写 tar 的端到端）。
+
+**回退杆（演练过一次，且是可信的）**
+
+顺序按脚本 `--help`：先关自动扩缩器 → worker 缩到 0 → `migrate-state-owner.sh --rollback --uid 65533 --apply`
+（`chowned=6`，`_snapshots` 回到 `65534:65534`）→ **apply 回上一版的清单 + 镜像**
+（从 `git archive 5fee77f` 取出的树，`VERSION=0.1.0-1164-g5fee77f-20261009-101349`）→ 起 worker。
+
+读数：CP 回到 `uid=65534 gid=65534`、`CapEff 0`；八条路径**全 65534:65534**；三处镜像 tag 回到 `0.1.0-1164`；
+`_volumes`/`_meta` 由旧 `storage-init` 的 `hand_over` 交回 65534；旧 `workspace-root-init` 把 `_migrate`
+置成世界可写（`3777`，setgid 是前一轮的残留）。旧形状上 `MULTI-NODE SMOKE OK` +
+`DEPLOYMENT SMOKE OK`（六步全绿）。随后按 3–7 重跑一遍本节的**全部**读数，车队停在**新形状**上。
+
+> **回退杆的两条残留**（诚实记下来，不影响功能）：① `_snapshots` 的模式停在 `0o2755`、`_migrate`
+> 停在 `0o3777` —— chown 不动模式位，setgid 是前一轮留下的；旧形状里两个目录的**属主都是 65534**，
+> 写权限照旧。② 回退只走"chown + 换清单"，**`_volumes` 不在迁移表里**（它的内容是池 uid 的账，不能
+> 递归 chown），本轮回退靠旧 `storage-init` 的**非递归** `hand_over` 交回 65534 —— 所以 §24.2 里
+> "回退不需要反向 chown" 那句**在 65533 这一版之后不再成立**（见那节的新注）。
+
+**踩过的两个坑（都写进文档/脚本了）**
+
+1. **Job 的 ConfigMap 只装一个文件**。`migrate-state-owner.sh` 曾在**顶层**无条件
+   `. "$SCRIPT_DIR/lib/cluster-guard.sh"`（`1d0852b`，2026-10-03 的 N71 闸门），而集群内
+   `SCRIPT_DIR=/scripts` 且 ConfigMap 的 key 不含 `/`（塞不进 `lib/`）⇒ Job 一启动
+   `/scripts/migrate-state-owner.sh: line 563: /scripts/lib/cluster-guard.sh: No such file or directory`
+   就退 1。**Task 4 的本机彩排走的是离线 `--root`，从不加载那个 lib，所以照不到**；
+   `migrate-state-base.sh` 同一形状。`5401017` 把 source 收进非 `--in-cluster` 分支，并加了
+   `tests/unit/test_migrate_scripts_in_cluster_loadable.py`（渲染成 ConfigMap 再真的加载）。
+2. **先关自动扩缩器**。N58 之后 autoscaler 就在控制面里，`E2B_AS_MIN_REPLICAS=2` 无条件把副本数拉回
+   floor（5 s 一次 tick）——只 `scale --replicas=0` 会在迁移中途被拉回来（第一次尝试就是这么被拉回的，
+   `REFUSE(2): … 有 2 个副本`）。做法：`kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=false`
+   → 等 rollout → 缩 worker；`apply.sh` 会把清单里的 `true` 写回去。§7.29 早写了这条，`5401017` 才把它
+   补进 `docs/k8s-deployment.md` §24.1、`deploy/k8s-k0s/README.md` 与两个脚本的 `--help`。
+
+**一个顺带观察到的既有小毛病**（与本改动无关，记为残留）：快照/迁移的**导出流被客户端中途掐断**时，
+worker 的 `_migrate/<id>.tar.gz` 会被 NFS 改名成 `.nfs…` 并**被 worker 的 pid 1 一直持着 fd**
+（本次用一条中止的 `export` 探针撞到过；`kubectl delete pod e2b-worker-0` 之后它消失）。有界影响：
+一个隐身文件占着那一份字节数，直到该 worker 重启。文档化的排查线索：
+`ls -lan <export>/_migrate` 里出现 `.nfs…` 就是它。
 
 ### 7.59 发版：N89（退役 readiness 合成）—— **本地 + 线上都已验**，版本 `0.1.0-1164-g5fee77f-20261009-101349`
 

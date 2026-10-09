@@ -2810,12 +2810,14 @@ kubectl -n sandlock scale statefulset/e2b-worker --replicas=0
 kubectl -n sandlock wait --for=delete pod -l app=e2b-worker --timeout=300s
 
 # 2) 先只看不写（默认 dry-run）：经控制面 pod 读实物、打印路径计划与每个目录的 stat
-deploy/scripts/migrate-state-owner.sh
+#    **控制面从 2026-10-09（§7.60）起是 65533**，所以迁移按身份分流，必须带 `--uid 65533`
+#    （不给 `--uid` 会把它迁回 65534 —— 那是回退杆，见 §24.2）
+deploy/scripts/migrate-state-owner.sh --uid 65533
 
 # 3) 真迁移：脚本建 configmap + Job（runAsUser 0、PVC 以 RW 挂到 /var/lib/e2b-sandboxes），
 #    跑完收日志、每个目录 stat 留证，然后清理 Job 与 configmap
-deploy/scripts/migrate-state-owner.sh --apply
-deploy/scripts/migrate-state-owner.sh --apply --keep-job    # 想留现场排查时
+deploy/scripts/migrate-state-owner.sh --uid 65533 --apply
+deploy/scripts/migrate-state-owner.sh --uid 65533 --apply --keep-job    # 想留现场排查时
 
 # 4) 起回来：先把自动扩缩器写回去（第 1 步 set env 关掉的那把），再 apply agent DaemonSet、
 #    把 worker 起回来（升级顺序见 §2 的"镜像与升级"）
@@ -2826,9 +2828,9 @@ kubectl apply -f deploy/k8s/c3-agent.yaml
 kubectl apply -f deploy/k8s/worker.yaml
 kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
 
-# 5) 判据（只读）：平台态的属主是 65534，池里的树仍是池 uid
+# 5) 判据（只读）：CP 自己的命名空间是 65533，`state` 与池里的树仍是 65534
 kubectl -n sandlock exec e2b-worker-0 -c worker -- sh -c '
-  stat -c "%a %u %g %n" /var/lib/e2b-sandboxes/state /var/lib/e2b-sandboxes/_secrets'
+  stat -c "%a %u %g %n" /var/lib/e2b-sandboxes/state /var/lib/e2b-sandboxes/_images'
 kubectl -n sandlock exec e2b-worker-0 -c worker -- sh -c '
   stat -c "%a %u %g %n" /var/lib/e2b-sandboxes/workspaces/*/ | head -5'
 ```
@@ -2838,8 +2840,30 @@ kubectl -n sandlock exec e2b-worker-0 -c worker -- sh -c '
 
 ### 24.2 回退
 
-迁移只改属主、不删数据，所以回退**不需要反向 chown**：把清单**和镜像**一起 revert 回上一版就行 ——
-root 读 uid 65534 的文件本来就有权限。这与 §23 的 N27 迁移不同（那是 `rename` 数据，必须按 journal 反向改名）。
+**⚠ 2026-10-09（§7.60）之后，这一节的老口径要加一步。** 当时控制面和 worker 同 uid（65534），
+迁移改的是**别人的**属主，root 读 65534 的文件本来有权限，所以"清单 + 镜像一起 revert"就够。
+现在控制面是 **65533**：`_images`/`_secrets`/`_templates`/`_builds`/`_volumes`/`_migrate` 都归它，
+把清单 revert 回 65534 会让旧控制面**写不了自己的一半平台态**（建箱、模板、卷全 EACCES）。
+回退要按脚本 `--help` 的顺序走（已演练过一次，§7.60）：
+
+```bash
+kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=false   # 先关自动扩缩器
+kubectl -n sandlock rollout status deploy/control-plane --timeout=180s
+kubectl -n sandlock scale statefulset/e2b-worker --replicas=0
+kubectl -n sandlock wait --for=delete pod -l app=e2b-worker --timeout=300s
+deploy/scripts/migrate-state-owner.sh --rollback --uid 65533 --apply    # 反向 chown（只改属主）
+VERSION=<上一版> deploy/k8s-k0s/apply.sh                                # 清单 + 镜像一起 revert
+kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=true    # 或让 apply 写回 true
+kubectl -n sandlock rollout status deploy/control-plane --timeout=180s
+kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
+```
+
+正向若用过 `--target _migrate`，`--rollback` 要写同一条。`_volumes` 不在迁移表里（它的内容是池 uid
+的账，不能递归 chown），旧 `storage-init` 的非递归 `hand_over` 会把它交回 65534。剩下的差异只是
+模式位上的 setgid 残留（`_snapshots 0o2755`、`_migrate 0o3777`），不影响功能。
+
+其余仍然是"回退不需要反向 chown 删数据"：**迁移只改属主、不删数据**，卷上不会留下"看不懂的半成品"：
+七个目标目录的属主就是那次迁移的全部状态（N27 那种 `rename` 数据才需要按 journal 反向改名，见 §23）。
 卷上不会留下"看不懂的半成品"：七个目标目录的属主就是那次迁移的全部状态。
 
 > **⚠ N52（2026-09-30）之后，三种旧形态都只剩"整批 revert（清单 + 镜像）"这一条路：**

@@ -122,10 +122,12 @@ kubectl -n sandlock scale statefulset/e2b-worker --replicas=0
 kubectl -n sandlock wait --for=delete pod -l app=e2b-worker --timeout=300s
 
 # 2) 先只看不写（默认 dry-run）：经控制面 pod 读实物、打印路径计划与 stat
-deploy/scripts/migrate-state-owner.sh
+#    **2026-10-09（docs/deploy-clusters.md §7.60）起控制面是 65533**，迁移按身份分流：
+#    必须带 `--uid 65533`；不给 `--uid` 就是搬回 65534，那是回退杆
+deploy/scripts/migrate-state-owner.sh --uid 65533
 
 # 3) 真迁移：脚本建 configmap + Job，跑完收日志并清理
-deploy/scripts/migrate-state-owner.sh --apply
+deploy/scripts/migrate-state-owner.sh --uid 65533 --apply
 
 # 4) 把自动扩缩器写回去，再起 worker 并复核
 kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=true
@@ -133,7 +135,10 @@ kubectl -n sandlock rollout status deploy/control-plane --timeout=180s
 kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
 ```
 
-它做的是**递归 `chown 65534:65534`，只改属主**：不改权限位、不删东西、不拷内容。范围是一张显式
+它做的是**递归 `chown`，只改属主**：不改权限位、不删东西、不拷内容。目标对由身份决定
+（`--uid 65533` 之后：`_images`/`_secrets`/`_templates`/`_builds` → 控制面；共享的 `state` 与树根下的
+两条仍留 65534；`_snapshots` 只挪组位到 `65534:65533`；不给 `--uid` 时逐字等于 C1 wave 2 的
+`65534:65534`）。范围是一张显式
 的路径计划（`<export>` 下的 `state`、`workspaces/_migrate`、`workspaces/_snapshots`、
 `_images`、`_secrets`、`_snapshots`、`_templates`、`_builds` 八条）—— **树根下恰放行
 `workspaces/_migrate` 与 `workspaces/_snapshots` 这两条**（前者是 N27 之后控制面的迁移暂存
