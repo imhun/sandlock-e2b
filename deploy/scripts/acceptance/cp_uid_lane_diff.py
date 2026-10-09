@@ -727,7 +727,9 @@ def sweep_leftovers() -> None:
     A leftover *running* sandbox holds its node reservation, and the smokes
     assert that reservations go back to zero after they kill their own -- so the
     reading would be about the leftover, not about the shape under test. This
-    lane has its own compose project, so the sweep can only see its own.
+    lane has its own compose project, so the sweep can only see its own. A lane
+    that is not up yet is named here rather than surfacing as a connection
+    traceback from deep inside the sweep.
     """
     section("0a. sweep this lane's leftovers (so the readings are about this run)")
     import httpx
@@ -735,6 +737,21 @@ def sweep_leftovers() -> None:
     from e2b import Sandbox, Volume
 
     headers = {"X-API-Key": os.environ["E2B_API_KEY"]}
+    try:
+        resp = httpx.get(f"{API_URL}/health", timeout=5)
+    except httpx.HTTPError as exc:
+        raise SystemExit(
+            f"the control plane on {API_URL} is not answering ({exc}); bring the "
+            f"lane up first (`--up`) or check `docker compose -p {PROJECT} ps`"
+        )
+    if resp.status_code >= 500:
+        # ``/health`` sits behind the API key (401 without one), so anything below
+        # 500 is "something is serving"; a 5xx (or docker's own 502 for a port
+        # with no container behind it) is the not-up case.
+        raise SystemExit(
+            f"the control plane on {API_URL} answered HTTP {resp.status_code}; "
+            f"bring the lane up first (`--up`) or check `docker compose -p {PROJECT} ps`"
+        )
     paginator = Sandbox.list()
     ids: list[str] = []
     while paginator.has_next:

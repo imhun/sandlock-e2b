@@ -1,9 +1,10 @@
 """C3 Task 5 (ruling **D24**): the control plane converges to no root.
 
-Task 5's deliverable is "CP 主容器 65534、CP pod 无 root 容器、A 类动作在 CP 侧清零"
-(`plan §3`). The plan's §3.2 letter says the CP's remaining A-class action — the
-`_volumes` volume-root `mkdir` + `chmod 1777` — is *handed to the agent*. It is
-not, and this file pins the decision that replaced it.
+Task 5's deliverable was "CP 主容器 65534、CP pod 无 root 容器、A 类动作在 CP 侧清零"
+(`plan §3`) — the uid in that sentence is **65533** since Task 3, and `CP_UID`
+below is the number the assertions read. The plan's §3.2 letter says the CP's
+remaining A-class action — the `_volumes` volume-root `mkdir` + `chmod 1777` — is
+*handed to the agent*. It is not, and this file pins the decision that replaced it.
 
 **Why the letter changed (D24, 2026-09-29).** Recon for this task established
 that `_volumes` is not the CP's only write there: `VolumeRegistry` also writes
@@ -25,9 +26,9 @@ What that turns the brief's third criterion into: "`_volumes` 的 `mkdir` 不在
 代码路径里" becomes "**the CP owns `_volumes`, so its `mkdir`/`chmod` need no
 privilege**". Pinned here, so the property cannot be dropped quietly:
 
-* the manifest half — the CP pod's main container is uid 65534, nothing in that
-  pod runs as uid 0, and the once-root `image-cache-init` has moved to the
-  agent's own pod (§3.2 step 3);
+* the manifest half — the CP pod's main container is uid 65533 (the workers' 65534
+  until Task 3), nothing in that pod runs as uid 0, and the once-root
+  `image-cache-init` has moved to the agent's own pod (§3.2 step 3);
 * the hand-over half — the agent runs it once per node, **non-recursively** on
   the store (the per-sandbox volume data directories below it belong to pooled
   sandbox uids and must survive a platform rollout), idempotently, and it *names*
@@ -831,8 +832,10 @@ def test_a_volume_store_the_control_plane_owns_is_created_without_the_agent(
 
 # ------------------------------------------------- the compose lane (gap 1)
 
-#: The three stacks whose control plane now runs as 65534 and whose
-#: `image-cache-init` is the root one-shot that prepares what it must own.
+#: The three stacks whose control plane runs as a non-root uid -- 65533 in the
+#: multinode lane, still the workers' 65534 in the two single-volume prod shapes
+#: (`docs/open-issues.md` N94) -- and whose `image-cache-init` is the root
+#: one-shot that prepares what it must own.
 COMPOSE_STACKS = (
     REPO / "deploy" / "compose" / "docker-compose.prod.yml",
     REPO / "deploy" / "compose" / "docker-compose.multinode.yml",
@@ -979,8 +982,9 @@ def test_each_compose_init_hands_the_volume_store_over_like_storage_init() -> No
     The compose stacks have no pod, so the same job belongs to the root one-shot
     that already prepares the volumes (`image-cache-init`) -- and it has to carry
     the *same* properties, because the failure mode is identical: the control
-    plane now runs as 65534 and would otherwise hit `EACCES` on the first
-    volume create.
+    plane runs as a non-root uid (per lane -- 65533 where it has its own volume,
+    65534 on the single-volume prod shapes) and would otherwise hit `EACCES` on
+    the first volume create.
 
     Pinned by text here and behaviourally below:
 
@@ -990,7 +994,8 @@ def test_each_compose_init_hands_the_volume_store_over_like_storage_init() -> No
     * idempotent and audible (an already-owned target says so, and the run says
       which of the three things happened);
     * gated: each target is re-`stat`ed after the attempt, and a target that is
-      still not 65534 is a FATAL that names the path and the one-time command.
+      still not the uid its volume resolves to is a FATAL that names the path and
+      the one-time command.
 
     Also pinned here, exactly and separately: the **cache** half of the same
     discipline (review item 4). Its non-recursion is what keeps live
@@ -1020,8 +1025,8 @@ def test_each_compose_init_hands_the_volume_store_over_like_storage_init() -> No
         assert 'chown -R 65534:65534 "$store' not in body, path.name
         assert 'chown -R 65534:65534 "$target' not in body, path.name
         assert 'chown -R 65534:65534 "$dir"' not in body, path.name
-        # ...and the same service is where the rest of the ownership the 65534
-        # control plane needs is made true (the k8s `workspace-root-init`
+        # ...and the same service is where the rest of the ownership the control
+        # plane's volume uid needs is made true (the k8s `workspace-root-init`
         # products), each verified by the same `stat` gate.
         assert env["OWNED_DIRS"].split(), path.name
         assert env["WRITABLE_ROOTS"].split(), path.name
