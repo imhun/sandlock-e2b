@@ -44,6 +44,7 @@ DEPLOY = REPO / "deploy"
 K8S = DEPLOY / "k8s"
 CONTROL_PLANE_MANIFEST = K8S / "control-plane.yaml"
 WORKER_MANIFEST = K8S / "worker.yaml"
+AGENT_MANIFEST = K8S / "c3-agent.yaml"
 COMPOSE_MULTINODE = DEPLOY / "compose" / "docker-compose.multinode.yml"
 
 #: The new uid, in both shipped shapes. 65533 is deliberately adjacent to the
@@ -104,8 +105,29 @@ def _containers(workload: dict) -> dict[str, dict]:
     return {c["name"]: c for c in workload["spec"]["template"]["spec"]["containers"]}
 
 
+def _init_containers(workload: dict) -> dict[str, dict]:
+    return {
+        c["name"]: c
+        for c in (workload["spec"]["template"]["spec"].get("initContainers") or [])
+    }
+
+
 def _env(container: dict) -> dict[str, dict]:
     return {entry["name"]: entry for entry in (container.get("env") or [])}
+
+
+def _commands(container: dict) -> list[str]:
+    """The container's shell body, one stripped non-comment line each."""
+    body = container["command"][2]
+    return [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def _agent_daemonset() -> dict:
+    return _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
 
 
 def _compose(path: Path) -> dict:
@@ -270,6 +292,118 @@ def test_the_control_plane_uid_comment_points_at_the_migration() -> None:
         in lines
     )
     assert f"{UID_MIGRATION_DOC} (Task 4)." in lines
+
+
+# ------------------------------------------------- the k8s hand-over (R13)
+
+
+def test_the_k8s_hand_over_gives_the_shared_root_to_the_control_plane() -> None:
+    """R13: the shared export root is the control plane's, the node-local half the worker's.
+
+    `c3-agent.yaml`'s `storage-init` is the root one-shot that prepares both
+    roots, so the split is read off the **values the script is handed** and the
+    uid each target's chown uses: the node-local rootfs cache keeps the worker's
+    65534, while `_images` (Task 2: the worker only reads it now) and the
+    control plane's own namespaces take 65533.
+    """
+    inits = _init_containers(_agent_daemonset())
+    storage = _env(inits["storage-init"])
+    assert storage["WORKER_UID"]["value"] == "65534"
+    assert storage["CP_UID"]["value"] == "65533"
+    assert storage["WORKER_CACHE_DIRS"]["value"].split() == [NODE_LOCAL_CACHE]
+    assert storage["CP_CACHE_DIRS"]["value"].split() == [f"{SHARED_ROOT}/_images"]
+    assert storage["CP_DIRS"]["value"].split() == [
+        f"{SHARED_ROOT}/_builds",
+        f"{SHARED_ROOT}/_secrets",
+        f"{SHARED_ROOT}/_templates",
+    ]
+    assert storage["SHARED_ROOT"]["value"] == SHARED_ROOT
+    lines = _commands(inits["storage-init"])
+    for expected in (
+        "for dir in $WORKER_CACHE_DIRS; do",
+        'chown $WORKER_UID:$WORKER_UID "$dir" 2>/dev/null ||',
+        'if [ "$owner" != "$WORKER_UID" ]; then',
+        "for dir in $CP_CACHE_DIRS; do",
+        'chown -R $CP_UID:$CP_UID "$dir/_oci" 2>/dev/null ||',
+        'if [ "$owner" != "$CP_UID" ]; then',
+        # The volume store is the control plane's, and its uid comes from
+        # `$CP_UID` at the call site rather than from a literal.
+        'hand_over "$volume_store" "$CP_UID" || exit 1',
+        'hand_over "$volume_store/_meta" "$CP_UID" || exit 1',
+        # ...and the node-local `secrets/` handling stays on the worker.
+        'find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown $WORKER_UID:$WORKER_UID {} + 2>/dev/null || echo "storage-init: chown refused ($dir/secrets -mindepth 1 -maxdepth 2, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid $WORKER_UID"',
+    ):
+        assert expected in lines, expected
+
+
+def test_the_k8s_state_base_stays_the_workers_and_migrate_does_not() -> None:
+    """`state` is the worker's; `_migrate` is the control plane's (R13).
+
+    Both are `1777` on the shared export root, so the only thing that changes is
+    which uid each is handed to: one loop, two expected uids, and the
+    world-writable fallback untouched (that fallback is what lets the *other*
+    identity create its own top-level names when a chown is refused).
+    """
+    inits = _init_containers(_agent_daemonset())
+    workspace = _env(inits["workspace-root-init"])
+    assert workspace["WORKER_UID"]["value"] == "65534"
+    assert workspace["CP_UID"]["value"] == "65533"
+    lines = _commands(inits["workspace-root-init"])
+    assert 'for target in "$state" "$shared/_migrate"; do' in lines
+    assert 'if [ "$target" = "$state" ]; then uid="$WORKER_UID"; else uid="$CP_UID"; fi' in lines
+    # `_snapshots`' ownership is *not* re-imposed here any more: storage-init is
+    # the one container that hands it over (a 65534 chown here would take the
+    # control plane's group back off).
+    assert not [line for line in lines if line.startswith('chown 65534:65534 "$shared/_snapshots"')]
+
+
+def test_the_k8s_snapshot_store_is_the_one_cross_uid_directory() -> None:
+    """`_snapshots` = `65534:65533` mode `2775` (R13).
+
+    The worker writes `<id>/fs.tar` and the control plane writes
+    `<id>/snapshot.json` **inside the same directory**, so this one target keeps
+    the worker as its owner, takes the control plane's group, and carries the
+    group-write + setgid bits that the two creators then reproduce on each
+    `<id>/`. The mode is set here because `migrate-state-owner.sh` is pinned to
+    chown-only.
+    """
+    inits = _init_containers(_agent_daemonset())
+    storage = _env(inits["storage-init"])
+    assert storage["SNAPSHOT_DIR"]["value"] == f"{SHARED_ROOT}/_snapshots"
+    assert storage["SNAPSHOT_OWNER"]["value"] == "65534:65533"
+    assert storage["SNAPSHOT_MODE"]["value"] == "2775"
+    lines = _commands(inits["storage-init"])
+    for expected in (
+        'mkdir -p "$SNAPSHOT_DIR"',
+        'chown "$SNAPSHOT_OWNER" "$SNAPSHOT_DIR" 2>/dev/null ||',
+        'chmod "$SNAPSHOT_MODE" "$SNAPSHOT_DIR" 2>/dev/null ||',
+        'if [ "$snap_owner:$snap_group" != "$SNAPSHOT_OWNER" ] || [ "$snap_mode" != "$SNAPSHOT_MODE" ]; then',
+    ):
+        assert expected in lines, expected
+
+
+def test_the_k8s_worker_pod_joins_the_control_planes_group() -> None:
+    """The worker must be a *member* of 65533 to write where the CP made a dir.
+
+    `supplementalGroups` is the pod-level k8s spelling (the spec's §5.4 names
+    it). The worker's own uid/gid stay 65534/65534 -- the control plane's
+    trusted identity source reads exactly those, and a pod-level `runAsUser`
+    would override the container's -- and the control plane needs no entry of
+    its own, because 65533 is already its `runAsGroup`.
+    """
+    worker = _only(_load_all(WORKER_MANIFEST), "StatefulSet", "e2b-worker")
+    pod = worker["spec"]["template"]["spec"]
+    assert pod["securityContext"]["supplementalGroups"] == [65533]
+    security = _containers(worker)["worker"]["securityContext"]
+    assert security["runAsUser"] == 65534
+    assert security["runAsGroup"] == 65534
+    assert "runAsUser" not in pod["securityContext"]
+    assert "runAsGroup" not in pod["securityContext"]
+    control_plane = _only(
+        _load_all(CONTROL_PLANE_MANIFEST), "Deployment", "control-plane"
+    )
+    cp_security = _containers(control_plane)["control-plane"]["securityContext"]
+    assert cp_security["runAsGroup"] == 65533
 
 
 # --------------------------------------------------------- the compose half

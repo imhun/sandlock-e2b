@@ -120,7 +120,11 @@ def _shim(directory: Path, name: str, body: str) -> None:
 
 
 def _run_storage_init(
-    tmp_path: Path, *, refuse_uid: str | None
+    tmp_path: Path,
+    *,
+    refuse_uid: str | None,
+    refuse_mode: str = "",
+    refuse: str = "/_meta",
 ) -> subprocess.CompletedProcess:
     """Run the manifest's own `storage-init` script under `sh`, for real.
 
@@ -129,20 +133,26 @@ def _run_storage_init(
     the body is executed against a probe tree. It is made deterministic on any
     host with two shims, because the script's own tools are Linux-shaped:
 
-    * ``stat -c %u|%a <path>`` is answered through Python's ``os.stat`` (macOS
-      ``stat`` has no ``-c``), reporting ``65534`` everywhere except a path
-      ending in ``/_meta`` -- which is the "record directory is root-owned"
-      shape;
-    * ``chown`` succeeds, except in the refusal case where it fails for exactly
-      that path (which is what an NFS ``root_squash`` refusal looks like).
+    * ``stat -c %u|%g|%a <path>`` (macOS ``stat`` has no ``-c``) answers from a
+      static model of the two identities Task 3 introduced: the node-local cache
+      is ``65534:65534 0755``, everything on the shared export root is
+      ``65533:65533 0755``, and ``_snapshots`` is ``65534:65533 2775``;
+    * ``chown``/``chmod`` succeed (the model already answers the post-hand-over
+      values), except in the refusal arms below.
 
-    ``refuse_uid`` is the uid the shims report for a path that must *not* be
-    handed over; ``None`` means every path hands over, which is the control arm.
+    ``refuse`` is the path suffix that ``refuse_uid`` applies to: a uid there
+    means "the chown is refused and the path keeps that uid" (the NFS
+    ``root_squash`` shape). ``refuse_uid=None`` is the control arm.
+    ``refuse_mode`` is a path suffix whose ``chmod`` is refused instead, so its
+    mode stays ``0755``.
     """
     store = tmp_path / "probe" / "shared"
-    (store / "_images" / "_oci").mkdir(parents=True)
+    node_cache = tmp_path / "probe" / "node-local" / "e2b-images"
+    for name in ("_images/_oci", "_builds", "_secrets", "_templates", "_snapshots"):
+        (store / name).mkdir(parents=True)
     (store / "_volumes" / "_meta").mkdir(parents=True)
     (store / "_volumes" / "vol_abc").mkdir()
+    node_cache.mkdir(parents=True)
     shims = tmp_path / "shims"
     shims.mkdir()
     refused_uid = "-1" if refuse_uid is None else refuse_uid
@@ -153,17 +163,34 @@ def _run_storage_init(
         "import os, sys\n"
         "fmt, path = sys.argv[1], sys.argv[2]\n"
         "refused = os.environ.get('PROBE_REFUSED_UID', '-1')\n"
-        "uid = int(refused) if refused != '-1' and path.endswith('/_meta') "
-        "else 65534\n"
-        "mode = os.stat(path).st_mode & 0o7777\n"
-        "print(uid if '%u' in fmt else format(mode, 'o'))\n"
+        "suffix = os.environ.get('PROBE_REFUSED', '')\n"
+        "shared = os.environ['PROBE_SHARED']\n"
+        "refuse_mode = os.environ.get('PROBE_REFUSED_MODE', '')\n"
+        "if refused != '-1' and suffix and path.endswith(suffix):\n"
+        "    uid, gid, mode = int(refused), int(refused), '755'\n"
+        "elif path == os.environ['PROBE_SNAPSHOT']:\n"
+        "    uid, gid = 65534, 65533\n"
+        "    mode = '755' if refuse_mode and path.endswith(refuse_mode) else '2775'\n"
+        "elif path.startswith(shared):\n"
+        "    uid, gid, mode = 65533, 65533, '755'\n"
+        "else:\n"
+        "    uid, gid, mode = 65534, 65534, '755'\n"
+        "print(uid if '%u' in fmt else gid if '%g' in fmt else mode)\n"
         "PY\n",
     )
     _shim(
         shims,
         "chown",
-        'if [ "$PROBE_REFUSED_UID" != "-1" ]; then\n'
-        '  case "${2:-}" in */_meta) exit 1;; esac\n'
+        'if [ "$PROBE_REFUSED_UID" != "-1" ] && [ -n "$PROBE_REFUSED" ]; then\n'
+        '  case "${2:-}" in *"$PROBE_REFUSED") exit 1;; esac\n'
+        "fi\n"
+        "exit 0\n",
+    )
+    _shim(
+        shims,
+        "chmod",
+        'if [ -n "$PROBE_REFUSED_MODE" ]; then\n'
+        '  case "${2:-}" in *"$PROBE_REFUSED_MODE") exit 1;; esac\n'
         "fi\n"
         "exit 0\n",
     )
@@ -176,9 +203,24 @@ def _run_storage_init(
     )
     environment = dict(os.environ)
     environment["PATH"] = f"{shims}{os.pathsep}{environment['PATH']}"
+    # Task 3: the script is handed one list per identity, and the probe answers
+    # each target's uid/gid/mode accordingly.
+    environment["WORKER_UID"] = "65534"
+    environment["CP_UID"] = "65533"
+    environment["WORKER_CACHE_DIRS"] = str(node_cache)
+    environment["CP_CACHE_DIRS"] = str(store / "_images")
+    environment["CP_DIRS"] = " ".join(
+        str(store / name) for name in ("_builds", "_secrets", "_templates")
+    )
+    environment["SNAPSHOT_DIR"] = str(store / "_snapshots")
+    environment["SNAPSHOT_OWNER"] = "65534:65533"
+    environment["SNAPSHOT_MODE"] = "2775"
     environment["SHARED_ROOT"] = str(store)
-    environment["CACHE_DIRS"] = str(store / "_images")
     environment["PROBE_REFUSED_UID"] = refused_uid
+    environment["PROBE_REFUSED"] = refuse
+    environment["PROBE_REFUSED_MODE"] = refuse_mode
+    environment["PROBE_SHARED"] = str(store)
+    environment["PROBE_SNAPSHOT"] = str(store / "_snapshots")
     return subprocess.run(
         ["sh", str(script)],
         capture_output=True,
@@ -292,7 +334,11 @@ def test_the_agent_hands_the_volume_store_over_non_recursively_and_says_so() -> 
     for expected in (
         # ...one directory at a time, never `-R` (the recursive form would take
         # the sandbox volume data directories back on every agent rollout).
-        'chown 65534:65534 "$target" 2>/dev/null ||',
+        # Task 3: the uid is the caller's now -- the store is the control
+        # plane's, the node-local cache list is the worker's.
+        'target="$1"',
+        'uid="$2"',
+        'chown $uid:$uid "$target" 2>/dev/null ||',
         # The store is *created* here when it is missing: the control plane pod
         # mounts it as a subPath (a missing source keeps that pod in
         # ContainerCreating) and the creator used to be the broker's own init,
@@ -304,16 +350,17 @@ def test_the_agent_hands_the_volume_store_over_non_recursively_and_says_so() -> 
         # The gate: the store's own ownership is *verified*, and a
         # root_squashed NFS stops the pod here instead of failing the first
         # volume create later, inside the control plane.
-        'if [ "$owner" != "65534" ]; then',
+        'if [ "$owner" != "$uid" ]; then',
         'return 1',
-        'hand_over "$volume_store" || exit 1',
-        'hand_over "$volume_store/_meta" || exit 1',
+        'hand_over "$volume_store" "$CP_UID" || exit 1',
+        'hand_over "$volume_store/_meta" "$CP_UID" || exit 1',
     ):
         assert expected in lines, expected
-    assert "chown -R 65534:65534 \"$SHARED_ROOT/_volumes" not in script
-    assert "chown -R 65534:65534 \"$target" not in script
+    for uid in ("$CP_UID", "$WORKER_UID"):
+        assert f'chown -R {uid}:{uid} "$SHARED_ROOT/_volumes' not in script
+        assert f'chown -R {uid}:{uid} "$target' not in script
     # Visible, in both directions: the already-owned branch and the refusal.
-    assert "already belongs to uid 65534" in script
+    assert "already belongs to uid $uid" in script
     assert "chown refused" in script
 
 
@@ -328,11 +375,15 @@ def test_the_volume_store_hand_over_targets_the_path_the_control_plane_writes() 
     init = _init_containers(agent)["storage-init"]
     env = {entry["name"]: entry["value"] for entry in init["env"]}
     assert env["SHARED_ROOT"] == SHARED_ROOT
-    # The shared cache is one of the two caches this init prepares. (C3 Task 7
-    # moved C1's broker `image-cache-init` in here too, which is why the list
-    # also carries the node-local `/var/lib/e2b-images`; the volume-store
+    # The shared cache is one of the two caches this init prepares -- its own
+    # list since Task 3, because the two now belong to two identities. (C3 Task 7
+    # moved C1's broker `image-cache-init` in here too, which is why the other
+    # list carries the node-local `/var/lib/e2b-images`; the volume-store
     # hand-over this test is about is unaffected.)
-    assert f"{SHARED_ROOT}/_images" in env["CACHE_DIRS"].split()
+    assert env["CP_CACHE_DIRS"].split() == [f"{SHARED_ROOT}/_images"]
+    assert env["WORKER_CACHE_DIRS"].split() == ["/var/lib/e2b-images"]
+    assert env["CP_UID"] == "65533"
+    assert env["WORKER_UID"] == "65534"
     # ...and the control plane's own store, from the app's wiring: the registry
     # is built on `<shared root>/_volumes` when no explicit root is configured
     # (`control_plane/app.py`). Pinned as the same literal.
@@ -350,14 +401,26 @@ def test_a_record_directory_that_hands_over_reports_success(tmp_path: Path) -> N
     """
     result = _run_storage_init(tmp_path, refuse_uid=None)
 
+    store = tmp_path / "probe" / "shared"
+    node_cache = tmp_path / "probe" / "node-local" / "e2b-images"
     assert result.returncode == 0
     assert result.stdout.splitlines() == [
-        f"storage-init: {tmp_path}/probe/shared/_images is owned by uid 65534",
-        f"storage-init: {tmp_path}/probe/shared/_volumes already belongs to uid "
-        "65534 (mode 755) -- nothing to do",
-        f"storage-init: {tmp_path}/probe/shared/_volumes/_meta already belongs to "
-        "uid 65534 (mode 755) -- nothing to do",
-        f"storage-init: {tmp_path}/probe/shared/_volumes is owned by uid 65534 "
+        # 1a: the node-local cache, the worker's.
+        f"storage-init: {node_cache} is owned by uid 65534",
+        # 1b/1c: the shared export root, the control plane's.
+        f"storage-init: {store}/_images is owned by uid 65533",
+        f"storage-init: {store}/_builds is owned by uid 65533",
+        f"storage-init: {store}/_secrets is owned by uid 65533",
+        f"storage-init: {store}/_templates is owned by uid 65533",
+        # 1d: the one cross-uid directory, group + mode included.
+        f"storage-init: {store}/_snapshots is 65534:65533 mode 2775 "
+        "(two writers: uid 65534 for the payload, uid 65533 for the record)",
+        # 2: the volume store, gated one target at a time.
+        f"storage-init: {store}/_volumes already belongs to uid "
+        "65533 (mode 755) -- nothing to do",
+        f"storage-init: {store}/_volumes/_meta already belongs to "
+        "uid 65533 (mode 755) -- nothing to do",
+        f"storage-init: {store}/_volumes is owned by uid 65533 "
         "(the volume data directories below it are left alone)",
     ]
     assert result.stderr == ""
@@ -380,32 +443,69 @@ def test_a_refused_record_directory_cannot_read_as_a_hand_over(tmp_path: Path) -
     """
     result = _run_storage_init(tmp_path, refuse_uid="0")
 
+    store = tmp_path / "probe" / "shared"
     assert result.returncode == 1
     # ...the store root's own state is read and reported (here it already is the
-    # worker uid, which is the shape a re-run on a healthy node has)...
+    # control plane's uid, which is the shape a re-run on a healthy node has)...
     assert (
-        f"storage-init: {tmp_path}/probe/shared/_volumes already belongs to uid "
-        "65534 (mode 755) -- nothing to do" in result.stdout.splitlines()
+        f"storage-init: {store}/_volumes already belongs to uid "
+        "65533 (mode 755) -- nothing to do" in result.stdout.splitlines()
     )
     # ...and the refused record directory printed **no** success line.
     for line in result.stdout.splitlines():
         assert not line.startswith(
-            f"storage-init: {tmp_path}/probe/shared/_volumes/_meta -> uid"
+            f"storage-init: {store}/_volumes/_meta -> uid"
         ), line
     # ...it is a FATAL on stderr that names the path and the exact one-time fix.
     assert result.stderr.splitlines() == [
-        f"storage-init: chown refused ({tmp_path}/probe/shared/_volumes/_meta, "
-        "NFS root_squash?) -- the control plane (uid 65534) cannot create or "
-        "record a volume until this is done once: chown 65534:65534 "
-        f"{tmp_path}/probe/shared/_volumes/_meta",
-        f"storage-init: FATAL: {tmp_path}/probe/shared/_volumes/_meta is owned by "
-        "uid 0, not the control-plane uid 65534: the control plane creates every "
+        f"storage-init: chown refused ({store}/_volumes/_meta, "
+        "NFS root_squash?) -- the control plane (uid 65533) cannot create or "
+        "record a volume until this is done once: chown 65533:65533 "
+        f"{store}/_volumes/_meta",
+        f"storage-init: FATAL: {store}/_volumes/_meta is owned by "
+        "uid 0, not the control-plane uid 65533: the control plane creates every "
         "volume as <store>/<volume_id> and writes <store>/_meta/<volume_id>.json, "
         "so the first volume create would fail with EACCES",
         "storage-init: fix it once (as root on the node, or on the NFS server): "
-        f"chown 65534:65534 {tmp_path}/probe/shared/_volumes/_meta  "
+        f"chown 65533:65533 {store}/_volumes/_meta  "
         "(non-recursive: the volume data directories below it belong to pooled "
         "sandbox uids)",
+    ]
+
+
+def test_a_snapshot_store_at_the_wrong_mode_is_a_fatal(tmp_path: Path) -> None:
+    """The one *mode* this init owns is verified too (Task 3 / R13).
+
+    `_snapshots` is the single cross-uid directory: the worker writes the payload
+    and the control plane writes the record inside the same `<id>/`, so a hand-over
+    that chowns the pair but leaves the mode at 0755 (an NFS `root_squash` that
+    eats the `chmod`, or an edit that drops it) is exactly the shape that fails
+    later, un-named, at the first capture. It stops here instead.
+    """
+    result = _run_storage_init(tmp_path, refuse_uid=None, refuse_mode="_snapshots")
+
+    store = tmp_path / "probe" / "shared"
+    node_cache = tmp_path / "probe" / "node-local" / "e2b-images"
+    assert result.returncode == 1
+    # Everything before the snapshot block still reports, and the snapshot store
+    # prints **no** success line.
+    assert result.stdout.splitlines() == [
+        f"storage-init: {node_cache} is owned by uid 65534",
+        f"storage-init: {store}/_images is owned by uid 65533",
+        f"storage-init: {store}/_builds is owned by uid 65533",
+        f"storage-init: {store}/_secrets is owned by uid 65533",
+        f"storage-init: {store}/_templates is owned by uid 65533",
+        # The refused `chmod` says so where the script's own echo goes (stdout,
+        # like the compose lane's twin), and the store prints no success line.
+        f"storage-init: chmod refused ({store}/_snapshots, NFS root_squash?)",
+    ]
+    assert result.stderr.splitlines() == [
+        f"storage-init: FATAL: {store}/_snapshots is 65534:65533 mode 755, not "
+        "65534:65533 mode 2775: the worker (uid 65534) writes <id>/fs.tar and the "
+        "control plane (uid 65533) writes <id>/snapshot.json inside the same "
+        "directory, so the group-write + setgid hand-over cannot be skipped",
+        "storage-init: fix it once (as root on the node, or on the NFS server): "
+        f"chown 65534:65533 {store}/_snapshots && chmod 2775 {store}/_snapshots",
     ]
 
 
@@ -420,13 +520,13 @@ def test_both_hand_overs_are_gated_in_the_script_text() -> None:
     agent = _only(_load_all(AGENT_MANIFEST), "DaemonSet", "e2b-c3-agent")
     lines = _commands(_init_containers(agent)["storage-init"])
     for expected in (
-        'hand_over "$volume_store" || exit 1',
-        'hand_over "$volume_store/_meta" || exit 1',
+        'hand_over "$volume_store" "$CP_UID" || exit 1',
+        'hand_over "$volume_store/_meta" "$CP_UID" || exit 1',
     ):
         assert expected in lines, expected
     # Inside the helper: verify, then either FATAL+return 1 or the success echo.
     helper = lines[lines.index("hand_over() {") : lines.index("}") + 1]
-    verify = helper.index('if [ "$owner" != "65534" ]; then')
+    verify = helper.index('if [ "$owner" != "$uid" ]; then')
     fatal = next(
         index for index, line in enumerate(helper) if line.startswith('echo "storage-init: FATAL:')
     )

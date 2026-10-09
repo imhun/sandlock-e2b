@@ -26,6 +26,7 @@ import importlib.util
 import io
 import json
 import os
+import stat
 import sys
 import tarfile
 from pathlib import Path
@@ -35,6 +36,7 @@ import pytest
 
 import envd_service.agent as agent_module
 from control_plane.api import sandboxes as cp_sandboxes
+from control_plane.registry.snapshots import SnapshotRegistry
 from envd_service import agent as envd_agent
 from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
@@ -148,6 +150,48 @@ async def test_a_snapshot_is_one_tar(workspace: Path) -> None:
     with tarfile.open(store / "fs.tar") as tar:
         members = sorted((member.name, member.issym()) for member in tar)
     assert members == [("link", True), ("workspace", False), ("workspace/kept.txt", False)]
+
+
+@pytest.mark.asyncio
+async def test_the_store_directory_is_group_writable_for_the_other_identity(
+    workspace: Path,
+) -> None:
+    """Task 3: one ``<id>/``, two identities -- the creator leaves it writable.
+
+    The worker writes ``fs.tar`` here and the 65533 control plane writes
+    ``snapshot.json`` **inside the same directory** (``SnapshotRegistry``'s
+    ``_snapshot_dir`` says the record directory *is* the payload directory, by
+    design). So whichever of the two creates ``<export>/_snapshots/<id>/`` has to
+    leave the group-write + setgid bits its peer needs -- the store itself is
+    handed over as ``65534:65533`` mode ``2775`` by
+    ``deploy/k8s/c3-agent.yaml``'s ``storage-init``. ``mkdir(mode=...)`` alone
+    would not do it: the process umask masks the mode down to 0755.
+    """
+    worker = _worker(workspace)
+    _app, settings = worker
+    _tree(settings)
+
+    resp = await _capture(worker)
+
+    assert resp.status_code == 201
+    store = settings.workspace_base / "_snapshots" / SNAPSHOT
+    assert stat.S_IMODE(store.stat().st_mode) == 0o2775
+    # ...and the control plane's own creator applies the same mode to a
+    # directory *it* creates first (the async reserve path writes the record
+    # before the worker's payload lands).
+    registry = SnapshotRegistry(workspace / "cp-platform-root")
+    record = registry.reserve_from_sandbox(
+        template_id="tpl_1",
+        env_vars={},
+        metadata={},
+        volume_mounts=[],
+        base_image=None,
+        allow_internet_access=False,
+        source_sandbox_id="sbx_1",
+        snapshot_id="snap_reserved",
+    )
+    control_store = Path(registry._base) / "_snapshots" / record.snapshot_id
+    assert stat.S_IMODE(control_store.stat().st_mode) == 0o2775
 
 
 @pytest.mark.asyncio

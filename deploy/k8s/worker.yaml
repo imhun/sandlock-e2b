@@ -80,6 +80,19 @@ spec:
       # also removes a pod-level hole that had nothing to do with sandboxes:
       # every process in this pod could bind low ports.
       terminationGracePeriodSeconds: 120
+      # Task 3: the **one** group this pod needs. `<export>/_snapshots` is the
+      # single directory two identities write inside each `<id>/`: this worker
+      # writes the payload (`fs.tar` + `.complete`, through
+      # `envd_service/agent.py`'s `/agent/snapshots`) and the 65533 control
+      # plane writes `snapshot.json` beside it. The store is handed over as
+      # `65534:65533` mode `2775` (setgid, group-writable) by the agent's
+      # `storage-init`, and the worker has to be a *member* of 65533 to write
+      # into a `<id>/` the control plane created first -- which is exactly what
+      # this adds. The uid/gid above stay the worker's; a pod-level
+      # `runAsUser`/`runAsGroup` would be read by the control plane's identity
+      # source instead of the container's, so neither is set here.
+      securityContext:
+        supplementalGroups: [65533]
       # C1 (wave 2): the one init this pod still needs -- and it is *not* root.
       #
       # The two owner inits that used to live here (image-cache-init,

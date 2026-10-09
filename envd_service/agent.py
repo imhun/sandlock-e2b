@@ -5342,6 +5342,18 @@ async def agent_health(request: Request) -> dict[str, Any]:
     return payload
 
 
+#: The per-snapshot directory's mode (Task 3): group-writable + setgid. One
+#: ``<export>/_snapshots/<id>/`` holds both halves of a snapshot -- this
+#: worker's payload (``fs.tar`` + ``.complete``) and the control plane's
+#: ``snapshot.json`` record -- so whichever identity creates the directory has
+#: to leave it writable by the other, and the setgid bit is what keeps the
+#: shared group on everything created below it. The store itself is handed over
+#: as ``65534:65533`` mode ``2775`` (`deploy/k8s/c3-agent.yaml`'s
+#: `storage-init`); the control plane applies the same mode in
+#: ``control_plane/registry/snapshots.py::_prepare_snapshot_dir``.
+_SNAPSHOT_DIR_MODE = 0o2775
+
+
 def _write_snapshot_tar(
     src: Path,
     dst: Path,
@@ -5464,7 +5476,26 @@ async def agent_create_snapshot(request: Request) -> Response:
             # writes the record *after* this returns, so nothing created it for
             # us (the old ``copytree`` did it as a side effect of the
             # destination being the payload path).
-            await asyncio.to_thread(snapshot_dir.mkdir, parents=True, exist_ok=True)
+            #
+            # Task 3: the control plane writes ``snapshot.json`` into this very
+            # directory (one snapshot, both halves -- see
+            # ``SnapshotRegistry._snapshot_dir``), and the k8s store is handed
+            # over as ``65534:65533`` mode ``2775``. So the directory this route
+            # creates carries the same group-write + setgid bits: ``mode=`` at
+            # ``mkdir`` is masked by the umask (022 leaves 0755), hence the
+            # explicit ``chmod``; a directory this process does not own was made
+            # by the control plane with the same mode, so a refusal there is the
+            # one case that is not a failure.
+            await asyncio.to_thread(
+                snapshot_dir.mkdir,
+                parents=True,
+                exist_ok=True,
+                mode=_SNAPSHOT_DIR_MODE,
+            )
+            try:
+                await asyncio.to_thread(os.chmod, snapshot_dir, _SNAPSHOT_DIR_MODE)
+            except OSError:
+                pass
             await asyncio.to_thread(
                 _write_snapshot_tar,
                 src,

@@ -223,29 +223,33 @@ def test_the_control_plane_mounts_the_migration_staging_at_the_shared_root():
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
 def test_workspace_root_init_creates_both_namespaces_on_the_shared_export_root():
-    """`workspace-root-init` 是唯一在新卷上建这些根的容器。
+    """两个 export 根上的命名空间：`_migrate` 在这里，`_snapshots` 在 storage-init。
 
-    两个失败它挡着：① `_migrate` 是控制面唯一可写 subPath 的**源**，缺了那个 pod
-    就停在 ContainerCreating；② `_snapshots` 的**属主**必须是 worker 的 65534 ——
-    载荷端点写它下面的每一个 id，root:0755 是"第一次建快照才 EACCES"的那种静默故障。
-    N58 之后两条都在 export 根上，所以判据也必须在 export 根上。
+    `_migrate` 是控制面可写 subPath 的**源**，缺了那个 pod 就停在
+    ContainerCreating —— 仍然由这个容器建。`_snapshots` 的缴付在 Task 3 移到了
+    `storage-init`（它是那条唯一带**组**的手续：worker 写 `<id>/fs.tar`、控制面写
+    `<id>/snapshot.json`，同一个目录两个身份；本容器里再来一次 `chown 65534:65534`
+    会把它重新变回单一属主、并把控制面的记录写打回 EACCES）。N58 之后两条都在
+    export 根上，所以判据也必须在 export 根上。
     """
     agent = _rendered_workload(_rendered(K8S_BASE), "DaemonSet", "e2b-c3-agent")
     inits = {c["name"]: c for c in agent["spec"]["template"]["spec"]["initContainers"]}
     lines = [line.strip() for line in inits["workspace-root-init"]["command"][2].splitlines()]
     for expected in (
         'mkdir -p "$shared/_migrate"',
-        'mkdir -p "$shared/_snapshots"',
-        'chown 65534:65534 "$shared/_snapshots" 2>/dev/null ||',
-        'chmod 0755 "$shared/_snapshots" 2>/dev/null ||',
-        'snap_owner="$(stat -c %u "$shared/_snapshots")"',
         # Task 3: `$base`（树根）不再是共享挂载上的目标 —— 它是节点本地盘，
         # 由它自己的严格块创建/校验（`chown 65534:65534 "$base"`），这里的
-        # 宽松回落（1777）只留给共享卷上的两个目标。
+        # 宽松回落（1777）只留给共享卷上的两个目标，每个目标按自己的 uid。
         'for target in "$state" "$shared/_migrate"; do',
+        'if [ "$target" = "$state" ]; then uid="$WORKER_UID"; else uid="$CP_UID"; fi',
+        'chown $uid:$uid "$target" 2>/dev/null ||',
         'chown 65534:65534 "$base" 2>/dev/null ||',
     ):
         assert expected in lines, expected
+    # `_snapshots` 不再由本容器处理（Task 3：缴付在 `storage-init`，带组与 mode）：
+    # 命令里一个 `_snapshots` 都不许有（注释里点名它是允许的）。
+    commands = [line for line in lines if not line.startswith("#")]
+    assert [line for line in commands if "_snapshots" in line] == []
     # ...and the tree-root spellings are gone: an init that recreates
     # `<workspaces>/_snapshots` on every pod start would resurrect the second
     # namespace the reslice just merged away.

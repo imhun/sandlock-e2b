@@ -538,16 +538,25 @@ def test_worker_keeps_the_extracted_rootfs_off_the_shared_volume() -> None:
     )
     # ...while the workspaces keep arriving through the RWX claim.
     assert "          persistentVolumeClaim:\n            claimName: sandbox-shared\n" in K8S_WORKER
-    # Both caches are prepared (created + handed to the worker uid) by the init
-    # container, in the order the resolver uses them -- and since C1 that
-    # container lives outside the worker pod (the worker has no root left to
-    # chown a cache with): C1's broker DaemonSet, then C3 Task 7's agent
-    # DaemonSet. Byte-exact on the ordered list, because the resolver and the
-    # init must agree on which directory comes first.
+    # Both caches are prepared (created + handed to the uid that writes them) by
+    # the init container, and since C1 that container lives outside the worker
+    # pod (the worker has no root left to chown a cache with): C1's broker
+    # DaemonSet, then C3 Task 7's agent DaemonSet. Task 3 split the one list into
+    # two, one per identity -- the node-local unpack cache stays the worker's,
+    # the shared tar store is the control plane's now that Task 2 took the `_oci`
+    # reclaim -- and both are pinned byte-exact, because the resolver and the
+    # init have to agree on *which directory* each one is.
     agent_text = (REPO / "deploy" / "k8s" / "c3-agent.yaml").read_text(
         encoding="utf-8"
     )
-    assert "value: /var/lib/e2b-images /var/lib/e2b-sandboxes/_images\n" in agent_text
+    agent_docs = [doc for doc in yaml.safe_load_all(agent_text) if doc]
+    daemonset = [doc for doc in agent_docs if doc["kind"] == "DaemonSet"][0]
+    caches = {
+        entry["name"]: entry["value"]
+        for entry in daemonset["spec"]["template"]["spec"]["initContainers"][0]["env"]
+    }
+    assert caches["WORKER_CACHE_DIRS"] == "/var/lib/e2b-images"
+    assert caches["CP_CACHE_DIRS"] == "/var/lib/e2b-sandboxes/_images"
 
 
 # ----------------------------------------------------------------------------
@@ -1048,6 +1057,10 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
         }
     )
     assert {e["name"]: e.get("value") for e in init["env"]} == {
+        "WORKER_UID": "65534",
+        # Task 3: the uid this init hands the *shared* roots to (the control
+        # plane's), while `$state` and the node-local roots stay the worker's.
+        "CP_UID": "65533",
         "SHARED_ROOT": "/var/lib/e2b-sandboxes",
         # Task 3: the tree root this init creates and hands over is the
         # **node-local** one (hostPath), not a directory under the shared mount.
@@ -1068,10 +1081,11 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
         'base="$WORKSPACE_BASE"',
         'state="$STATE_BASE"',
         'node_state="$NODE_STATE_BASE"',
-        # The platform's own namespaces stay under the shared export root.
-        "for dir in _builds _images _secrets _templates _snapshots _volumes; do",
-        'mkdir -p "$shared/$dir"',
-        # ...and the shared state base is created (it is the subPath source the
+        # The platform's own namespaces stay under the shared export root, but
+        # Task 3 moved their creation *and* their ownership into `storage-init`
+        # (a bare `mkdir` here left them root-owned 0755 on a fresh volume, and
+        # the control plane could not write them). The shared state base is
+        # still created here -- it is the subPath source the
         # control plane mounts, and where the uid pool's records live). Task 3:
         # the tree root is **not** here any more -- it is the node-local
         # hostPath, created and handed over by its own block below.
@@ -1086,22 +1100,10 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
         'chmod 0755 "$node_state" 2>/dev/null ||',
         'if [ "$node_state_owner" != "65534" ]; then',
         # ...plus the migration staging, on the *export* root since N58 (the
-        # tree root is no longer the thing its reader can see).
+        # tree root is no longer the thing its reader can see). It is the
+        # control plane's directory (it stages the tar there), so it is the
+        # `else` arm of the uid case in the shared-roots loop below.
         'mkdir -p "$shared/_migrate"',
-        # Task 8 preflight: the *live* snapshot store is the other platform
-        # directory, and since N58 the agent's payloads and the control plane's
-        # records share one directory per id on the *shared export root*. It is
-        # created and handed to the worker here; a root:0755
-        # `<export>/_snapshots` is the silent "first create_snapshot is EACCES"
-        # failure. Dropping
-        # either of these two lines must turn this test red.
-        'mkdir -p "$shared/_snapshots"',
-        'chown 65534:65534 "$shared/_snapshots" 2>/dev/null ||',
-        # ...and the mode stays the platform convention (0755), never the
-        # sandbox-tree root's 1777 -- the snapshot store needs no cross-uid
-        # sharing.
-        'chmod 0755 "$shared/_snapshots" 2>/dev/null ||',
-        'if [ "$snap_owner" != "65534" ]; then',
         'mkdir -p "$state/_runtime/.checkpoints"',
         'chmod 0711 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||',
         # Task 3: the tree root left this loop. It is the **node-local** base
@@ -1109,17 +1111,24 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
         # world-writable fallback -- a local disk that cannot be chowned is a
         # broken node, and 1777 would hide it). `state` and the migration
         # staging (where the control plane stages a tar) keep the shared
-        # judgement.
+        # judgement, each against its own uid.
         'mkdir -p "$base"',
         'chown 65534:65534 "$base" 2>/dev/null ||',
         'if [ "$base_owner" != "65534" ]; then',
         'for target in "$state" "$shared/_migrate"; do',
+        'if [ "$target" = "$state" ]; then uid="$WORKER_UID"; else uid="$CP_UID"; fi',
         'owner="$(stat -c %u "$target")"',
+        'chown $uid:$uid "$target" 2>/dev/null ||',
     ):
         assert expected in lines, expected
     # The 1777 fallback loop is for the two roots and the migration staging; the
-    # snapshot store must not be swept into it.
-    assert [line for line in lines if "1777" in line and "_snapshots" in line] == []
+    # snapshot store must not be swept into it -- and since Task 3 this container
+    # does not name `_snapshots` at all: its hand-over (the one shape with a
+    # group) is `storage-init`'s, and a 65534 chown here would take the control
+    # plane's group back off.
+    commands = [line for line in lines if not line.startswith("#")]
+    assert [line for line in commands if "_snapshots" in line] == []
+    assert [line for line in commands if "1777" in line and "_snapshots" in line] == []
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
@@ -1171,6 +1180,8 @@ def test_the_retired_brokers_owner_inits_moved_into_the_agent() -> None:
         assert inits[name]["securityContext"]["runAsUser"] == 0, name
     roots = inits["workspace-root-init"]
     assert {e["name"]: e.get("value") for e in roots["env"]} == {
+        "WORKER_UID": "65534",
+        "CP_UID": "65533",
         "SHARED_ROOT": "/var/lib/e2b-sandboxes",
         # Task 3: the init creates and hands over the *node-local* tree root
         # too (the worker makes `<root>/<id>` as uid 65534); the shared mount
@@ -1187,11 +1198,27 @@ def test_the_retired_brokers_owner_inits_moved_into_the_agent() -> None:
     # The cache init owns the node-local cache too -- that half used to be the
     # broker's, and dropping it would leave `/var/lib/e2b-images` root-owned on
     # a fresh node (its `DirectoryOrCreate` hostPath is created by the kubelet).
+    # Task 3 split the one `CACHE_DIRS` list into one list per identity, and this
+    # is the *whole* declaration of the split -- so it is compared whole: the two
+    # uids, the worker's node-local cache, the control plane's shared tar store
+    # and namespaces, and the one cross-uid directory (`_snapshots`) with its
+    # group and mode.
     assert inits["storage-init"]["env"] == [
+        {"name": "WORKER_UID", "value": "65534"},
+        {"name": "CP_UID", "value": "65533"},
+        {"name": "WORKER_CACHE_DIRS", "value": "/var/lib/e2b-images"},
+        {"name": "CP_CACHE_DIRS", "value": "/var/lib/e2b-sandboxes/_images"},
         {
-            "name": "CACHE_DIRS",
-            "value": "/var/lib/e2b-images /var/lib/e2b-sandboxes/_images",
+            "name": "CP_DIRS",
+            "value": (
+                "/var/lib/e2b-sandboxes/_builds "
+                "/var/lib/e2b-sandboxes/_secrets "
+                "/var/lib/e2b-sandboxes/_templates"
+            ),
         },
+        {"name": "SNAPSHOT_DIR", "value": "/var/lib/e2b-sandboxes/_snapshots"},
+        {"name": "SNAPSHOT_OWNER", "value": "65534:65533"},
+        {"name": "SNAPSHOT_MODE", "value": "2775"},
         {"name": "SHARED_ROOT", "value": "/var/lib/e2b-sandboxes"},
     ]
     assert {m["mountPath"] for m in inits["storage-init"]["volumeMounts"]} == {
@@ -1286,9 +1313,11 @@ def test_the_image_cache_init_hands_the_secret_directories_over_without_touching
     # Every line that actually runs. The script's comments name `*.secret` on
     # purpose; only the commands are the contract.
     commands = [line for line in lines if not line.startswith("#")]
-    # The two chowns it *is* responsible for, each pinned exactly.
-    assert 'chown 65534:65534 "$dir" 2>/dev/null ||' in lines
-    assert 'chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||' in lines
+    # The two chowns it *is* responsible for, each pinned exactly. (Task 3: the
+    # node-local cache is what this loop is now -- the shared `_images` moved to
+    # its own list under the control plane's uid -- so the uid is `$WORKER_UID`.)
+    assert 'chown $WORKER_UID:$WORKER_UID "$dir" 2>/dev/null ||' in lines
+    assert 'chown -R $WORKER_UID:$WORKER_UID "$dir/_oci" 2>/dev/null ||' in lines
     # The secret *directories* are handed over: `secrets/` itself (the worker
     # mkdirs `<sandbox_id>` below it) and the directories under it (the worker
     # unlinks and writes `<name>.secret` inside them).
@@ -1300,14 +1329,14 @@ def test_the_image_cache_init_hands_the_secret_directories_over_without_touching
     secrets_commands = [
         line
         for line in lines
-        if line.startswith('chown 65534:65534 "$dir/secrets"')
+        if line.startswith('chown $WORKER_UID:$WORKER_UID "$dir/secrets"')
         or line.startswith('find "$dir/secrets"')
     ]
     assert len(secrets_commands) == 2
     for command in secrets_commands:
         assert '|| echo "storage-init: chown refused' in command, command
         assert command.endswith(
-            'the per-sandbox secret dirs must belong to uid 65534"'
+            'the per-sandbox secret dirs must belong to uid $WORKER_UID"'
         ), command
     # ...the directory sweep keeps `-type d` (the payload contract:
     # `<secrets>/<sandbox_id>/<name>.secret`, directories only to depth 1) and
@@ -1322,10 +1351,20 @@ def test_the_image_cache_init_hands_the_secret_directories_over_without_touching
     # ...and the directory sweep is `-type d` only (no `-type f` anywhere).
     assert [line for line in commands if "secrets" in line and "-type f" in line] == []
     # ...and the one line that must never come back: the whole-tree recursion.
-    assert 'chown -R 65534:65534 "$dir" 2>/dev/null ||' not in lines
+    for whole_tree in (
+        'chown -R $WORKER_UID:$WORKER_UID "$dir" 2>/dev/null ||',
+        'chown -R $CP_UID:$CP_UID "$dir" 2>/dev/null ||',
+    ):
+        assert whole_tree not in lines
     assert [
-        line for line in lines if line.startswith('chown -R 65534:65534 "$dir')
-    ] == ['chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||']
+        line
+        for line in lines
+        if line.startswith('chown -R $WORKER_UID:$WORKER_UID "$dir')
+        or line.startswith('chown -R $CP_UID:$CP_UID "$dir')
+    ] == [
+        'chown -R $WORKER_UID:$WORKER_UID "$dir/_oci" 2>/dev/null ||',
+        'chown -R $CP_UID:$CP_UID "$dir/_oci" 2>/dev/null ||',
+    ]
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")

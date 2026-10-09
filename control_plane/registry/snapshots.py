@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import threading
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +40,30 @@ COPY_CLAIM_TTL_S = 600
 #: control-plane loop rather than losing it to one missed tick.
 COPY_LEASE_TTL_S = 30
 COPY_LEASE_REFRESH_S = 10
+
+#: The per-snapshot directory's mode (Task 3): group-writable + setgid. One
+#: ``<export>/_snapshots/<id>/`` holds both halves of a snapshot -- the worker's
+#: payload (``fs.tar`` + ``.complete``, written by ``/agent/snapshots``) and this
+#: registry's ``snapshot.json`` -- so whichever identity creates the directory
+#: has to leave it writable by the other. The store itself is handed over as
+#: ``65534:65533`` mode ``2775`` (`deploy/k8s/c3-agent.yaml`'s `storage-init`);
+#: the setgid bit is what makes a directory created by *either* identity carry
+#: the shared group.
+_SNAPSHOT_DIR_MODE = 0o2775
+
+
+def _prepare_snapshot_dir(directory: Path) -> None:
+    """Create a snapshot directory the *other* identity can also write.
+
+    ``mkdir(mode=...)`` is masked by the process umask (022 leaves 0755), and
+    the worker's payload write needs the group bit, so the mode is applied
+    explicitly as well. A directory this replica does not own is left alone --
+    only the owner (or root) may ``chmod``, and such a directory was created by
+    the worker's ``/agent/snapshots`` route, which applies the same mode.
+    """
+    directory.mkdir(parents=True, exist_ok=True, mode=_SNAPSHOT_DIR_MODE)
+    with suppress(OSError):
+        os.chmod(directory, _SNAPSHOT_DIR_MODE)
 
 
 def _text(value) -> str | None:
@@ -563,10 +589,11 @@ class SnapshotRegistry:
         # Atomic because the reader is another *process* by design: ``get()``
         # re-reads a ``creating`` record from this file precisely because the
         # replica that owns the copy is the one flipping it (F11 step 3).
-        write_json_atomically(
-            self._snapshot_dir(record.snapshot_id) / "snapshot.json",
-            record.to_dict(),
-        )
+        directory = self._snapshot_dir(record.snapshot_id)
+        # Task 3: the worker's payload lands in this same directory, so the one
+        # that creates it leaves it group-writable (see `_prepare_snapshot_dir`).
+        _prepare_snapshot_dir(directory)
+        write_json_atomically(directory / "snapshot.json", record.to_dict())
 
     def get(self, snapshot_id: str) -> SnapshotRecord:
         if not validate_sandbox_id(snapshot_id):
