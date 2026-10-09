@@ -292,6 +292,49 @@ def test_the_compose_control_plane_runs_as_its_own_uid() -> None:
     assert "cap_add" not in services["control-plane"]
 
 
+#: The two compose stacks that put the control plane and the workers on **one**
+#: volume (`sandbox-shared`), and therefore keep the control plane on the
+#: workers' 65534 (`docs/open-issues.md` N94). The reason is one directory, and
+#: it is pinned below rather than only described in the comment: the control
+#: plane's cache/OCI store and the worker's rootfs cache are the same path on
+#: the same volume, and *both* write it.
+SINGLE_VOLUME_STACKS = (
+    REPO / "deploy" / "compose" / "docker-compose.prod.yml",
+    REPO / "deploy" / "stack" / "docker-compose.prod.yml",
+)
+
+SHARED_MOUNT = "sandbox-shared:/var/lib/e2b-sandboxes"
+
+
+@pytest.mark.parametrize("path", SINGLE_VOLUME_STACKS, ids=lambda p: p.parent.name)
+def test_a_single_volume_compose_stack_keeps_the_control_plane_on_65534(
+    path: Path,
+) -> None:
+    """The ruled disposition for the other two compose shapes (N94).
+
+    Characterization pin, not a RED->GREEN one: it asserts facts that already
+    hold, and it exists so the *reason* written next to `user:` and in N94
+    cannot go silently stale. If a later change moves the worker's rootfs cache
+    off this volume (the k8s split) or gives the two identities a shared group,
+    this goes red -- which is exactly the moment the control plane here can be
+    moved off 65534.
+    """
+    services = _compose(path)["services"]
+    control_env = _compose_env(services["control-plane"])
+    worker_env = _compose_env(services["worker-1"])
+    assert services["control-plane"]["user"] == "65534:65534"
+    # One directory, written by both identities:
+    assert control_env["E2B_IMAGE_CACHE_DIR"] == "/var/lib/e2b-sandboxes/_images"
+    assert worker_env["E2B_IMAGE_CACHE_DIR"] == control_env["E2B_IMAGE_CACHE_DIR"]
+    # ...and the same directory is the control plane's OCI store here, because
+    # neither service names a separate one.
+    assert "E2B_IMAGE_OCI_DIR" not in control_env
+    assert "E2B_IMAGE_OCI_DIR" not in worker_env
+    # ...on one volume, mounted into both.
+    assert SHARED_MOUNT in services["control-plane"]["volumes"]
+    assert SHARED_MOUNT in services["worker-1"]["volumes"]
+
+
 def test_the_compose_hand_over_declares_one_uid_per_volume() -> None:
     """R4's shape: the two volumes, and the uid each one's writer runs as.
 

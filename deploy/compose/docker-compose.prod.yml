@@ -251,6 +251,13 @@ services:
     # owner is 65534 (another uid would lock itself out of what it creates).
     # Everything it needs to *own* is prepared by `image-cache-init` above, which
     # is also where the D24 volume-store hand-over lives.
+    #
+    # Task 3 (2026-10-09): this shape keeps 65534, unlike the k8s control plane
+    # (65533) -- `/var/lib/e2b-sandboxes/_images` is still written by **both**
+    # identities here (it is this service's `E2B_IMAGE_CACHE_DIR` *and* the
+    # worker's rootfs cache, on the one `sandbox-shared` volume; neither service
+    # sets `E2B_IMAGE_OCI_DIR`), so the hand-over cannot give it to one uid.
+    # Tracked in `docs/open-issues.md` N94.
     user: "65534:65534"
     depends_on:
       image-cache-init:

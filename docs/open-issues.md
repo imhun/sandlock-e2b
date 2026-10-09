@@ -19,7 +19,7 @@
 | **不做（带触发）** | 已决定不做，触发条件满足时必须回到这条 |
 | **有意保留** | 明确决定维持现状，不是漏项（退役要另立条目） |
 
-**一句话读法**：下面共 21 行，其中 20 行不是"现在就该动手"的 —— 待拍的 3 条、带触发条件的 7 条、
+**一句话读法**：下面共 22 行，其中 21 行不是"现在就该动手"的 —— 待拍的 4 条、带触发条件的 7 条、
 换环境时复核的 2 条、有意保留的 6 条、可选卫生 2 条；唯一建议立刻做的是 2026-10-09 新登记的
 **N93**（第 19 行）。
 
@@ -38,6 +38,7 @@
 | E2B_PAUSED_TTL_S | paused 沙箱的过期策略 | 已实现（`4396915`），默认 **0 = 不启用**；打开后周期任务只删"超期且 paused"的沙箱 | 拍板是否启用、阈值多少。出处 `docs/checkpoint-restore-e2b-half.md` §6(l) |
 | 空闲判定 ② | 沙箱互访 / 纯 egress 型长任务判不出空闲（① CPU 采样已上线并集群验收全绿） | ② **未做** | 等真有人用这类负载再做（每沙箱网络计数）。出处 `docs/resource-contention.md` §6 |
 | 控制面移出 uid 65534 | **已评估（2026-10-09）⇒ 可行**：控制面与 worker / agent 面 A 同 uid ⇒ 被攻破的 agent 可 ptrace 读控制面内存（实测）。评估订正了三条过期结论（`.uid_pool.lock` / `0700 记录目录` 今天都不约束控制面；舰队里"解包缓存"在节点本地，控制面不碰） | 现状：控制面 `runAsUser: 65534`；`hostPID` 拿不掉（承重）。**全库只剩一个共写点：`_images/_oci/`（控制面创建 vs worker 修剪）** | 要不要做：选专用 uid +（共享组 + setgid，或把 `_oci` 的修剪收回控制面）+ `migrate-state-owner.sh` 迁属主 + 两份清单 + 车道差分（create/logs/pause/snapshot/模板构建/卷/delete + 两条 smoke）。方案与代价见 `docs/security-audit/control-plane-uid-2026-10-09.md`；为什么值得做见 `docs/security-audit/c3-agent-hostpid-2026-10-09.md` §5 |
+| N94 | **两份 compose-prod 形状的控制面仍是 65534**（舰队已移出） | Task 3（2026-10-09，`c3392d4`）把**舰队**控制面移到 uid 65533；`deploy/compose/docker-compose.prod.yml` 与 `deploy/stack/docker-compose.prod.yml` 是**单卷**形状：控制面与 worker 的 `E2B_IMAGE_CACHE_DIR` 都是 `/var/lib/e2b-sandboxes/_images`（两份都没设 `E2B_IMAGE_OCI_DIR`，于是 OCI 目录就是它），在同一个 `sandbox-shared` 卷上**两边都写它** ⇒ 属主拆不开，两份清单的 CP 保持 65534（就地注释写明原因） | 要不要一起收口：与舰队同一个问题（选共享组 `group_add` + 目录 0770/2770，或把 worker 的 rootfs 缓存挪到节点本地）——不做的代价是这两份形状里"被攻破的 agent/worker 可 ptrace 控制面"继续成立。出处 `deploy/compose/docker-compose.prod.yml:331,590`、`deploy/stack/docker-compose.prod.yml:363,636`；背景 `docs/security-audit/control-plane-uid-2026-10-09.md` |
 
 ## 三、带触发条件（不触发就不做）
 
@@ -84,7 +85,9 @@
   "已关（防翻旧账）"两节，以及 §五 的"N41 残余 / N27 identity 残差"两条 —— 后者在 S5 T1 把
   `E2B_PURE_ROOTFS=off` 变成启动期具名拒绝之后已不可达）。
 - **保留并压缩**：清理时保留 19 行（原文是超长单元格，这里改成"现状 + 触发/下一步 + 出处"的短行）；
-  当天稍后又追加 2 行（`hostPID` 评估的结论、以及随之新登记的控制面 uid 待决策）⇒ 现在 21 行。
+  当天稍后又追加 2 行（`hostPID` 评估的结论、以及随之新登记的控制面 uid 待决策）⇒ 当时 21 行。
+- **追加**：**N94**（N93 之后的下一个空号）—— compose-prod 两份单卷形状的同一个控制面 uid 问题，
+  见 §二 ⇒ 现在 22 行。
 - **新增**：**N93**（编号在 markdown 里此前未占用）。
 - **全文快照**：`docs/reports/open-issues-archive-2026-10-09.md`；`docs/**`、`tests/**` 里按编号
   引用被移除行的注释仍可在快照里检索到。
