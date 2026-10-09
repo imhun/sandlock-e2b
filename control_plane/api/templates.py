@@ -207,9 +207,11 @@ def reclaim_oci_artifacts(
     still referenced" is a question only the record knows (Task 2).
 
     The judge is the live record set the caller hands in -- never an mtime.
-    Unlinking an artifact some other name still resolves to is the exact bug
-    this guard exists for, so an image outside ``known_images`` is refused by
-    name before either file is touched.
+    The guard is an allowlist: only an image *present* in ``known_images`` may
+    be unlinked, and an image the caller does not vouch for is refused by name
+    before either file is touched. The caller owns the records and so decides
+    what is live; this function only refuses to act on a name no record stands
+    behind.
     """
     if image not in set(known_images):
         raise ValueError(

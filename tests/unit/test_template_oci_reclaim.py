@@ -33,7 +33,9 @@ def test_reclaim_refuses_an_image_no_template_names(tmp_path):
     tar, link = _make_tar(tmp_path)
     with pytest.raises(ValueError) as err:
         reclaim_oci_artifacts(tmp_path, IMAGE, known_images=set())
-    assert IMAGE in str(err.value)
+    assert str(err.value) == (
+        f"refusing to reclaim the OCI artifacts of unnamed image {IMAGE}"
+    )
     assert tar.exists() is True
     assert link.exists() is True
 
