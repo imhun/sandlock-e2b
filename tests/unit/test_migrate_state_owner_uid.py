@@ -5,7 +5,8 @@ Task 3 把控制面从 worker 的 65534 挪到 65533（`deploy/k8s/control-plane
 `chown 65534:65534`（R12）：
 
 * 控制面写的那些（`_builds`、`_images`（连同 `_oci`）、`_secrets`、`_templates`、
-  `_snapshots`、`_migrate`）迁到 `--uid` 给的那一对；
+  `_snapshots`；**N58 之后**它自己的迁移暂存是 `<export>/_migrate`，不在计划表里，要
+  `--target _migrate` 才进计划）迁到 `--uid` 给的那一对；
 * worker 自己的（共享 `state`：记录、命令日志、`.uid_pool.lock`；树根下那份 `workspaces/`
   拼写 —— 没有 `E2B_SHARED_VOLUME_ROOT` 时的快照 payload 根，以及 **N58 之前**的迁移暂存
   `workspaces/_migrate`）留在 65534 —— 把共享 `state` 交给控制面 uid 会让第一个建箱就写不动；

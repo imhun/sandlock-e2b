@@ -12,8 +12,8 @@
 # 沙箱树 `<export>/workspaces/<id>` 属于池 uid（不是 worker 的），**绝不在迁移范围内**：
 # 要迁的目录是一份显式的路径计划（引擎里的 `PLATFORM_TARGETS` + 调用方用 `--target` 追加的
 # 条目），每一条都过 `normalize_target()`：树根下**恰放行 `workspaces/_migrate` 与
-# `workspaces/_snapshots` 这两条确切条目**（前者是控制面的迁移暂存，`workspace-root-init`
-# 建的就是它；后者是 **worker 的快照 payload 根** —— `envd_service/agent.py` 把它硬编码在
+# `workspaces/_snapshots` 这两条确切条目**（前者是**N58 之前**的迁移暂存拼写，`workspace-root-init`
+# 建的是今天那条 `<export>/_migrate`；后者是 **worker 的快照 payload 根** —— `envd_service/agent.py` 把它硬编码在
 # `<workspace_base>/_snapshots`），其余任何落在 `workspaces/` 之下 —— 包括用 `..` 或符号
 # 链接绕过去的拼写 —— 一律拒绝并点名。注意控制面的快照*记录*在另一个根上
 # （`<export>/_snapshots`，见下），两个根都在计划里，所以两边都覆盖到。
@@ -257,8 +257,9 @@ SANDBOX_TREES = "workspaces"
 #: 树根下**恰好**放行的两条。两条都在 `<export>/workspaces/` 之下（N27 之后平台命名空间沉
 #: 到树根下，不在 export 根上 —— 它们与 `workspace-root-init`、控制面 subPath、worker 端点
 #: 四处同名）：
-#:   * `workspaces/_migrate`：控制面的迁移暂存（`workspace-root-init` 建的就是它，控制面唯一
-#:     可写的 subPath；worker 的迁移端点也写它）；
+#:   * `workspaces/_migrate`：**N58 之前**的迁移暂存拼写（N27 把它放在树根之下，因为那时
+#:     worker 的迁移端点命名的就是树根）。控制面**今天**的迁移暂存 subPath 是 `<export>/_migrate`
+#:     （`workspace-root-init` 建的就是它；worker 的迁移端点 N57 之后也写它），不在这份白名单里；
 #:   * `workspaces/_snapshots`：**worker 的快照 payload 根** —— `envd_service/agent.py` 把它的
 #:     copy/export/delete 路由硬编码在 `<workspace_base>/_snapshots/<id>`（`fs/` 载荷 +
 #:     `.complete` 标记），也就是树根下的这一条。C1 之后 worker 以 uid 65534 跑，它要往这里
@@ -435,8 +436,10 @@ def main(argv):
                 "拒绝：--uid %d 不在 uid 范围里（1..4294967295）—— 迁移不会把平台态交给 root"
                 "（回退是 worker 自己那一对）" % requested_uid,
             )
-        # `--target` 追加的条目一律按控制面角色解析：调用方点名要迁的那条路径就是要迁到本次
-        # 目标 uid 的那条（没给 `--uid` 时它还是 65534:65534，与今天逐字相同）。
+        # `--target` 追加的**新**条目按控制面身份解析：调用方点名要迁的那条路径就是要迁到本次
+        # 目标 uid 的那条（没给 `--uid` 时它还是 65534:65534，与今天逐字相同）。已经在计划表
+        # 里的路径不受影响 —— 去重按归一化后的 rel、以表里那条的角色为准（这个行为是有意钉住
+        # 的），所以 `--target workspaces/_migrate` 不会把表里 worker 的那条变成控制面的。
         declared = list(PLATFORM_TARGETS) + [
             (raw, ROLE_CONTROL, ROLE_CONTROL) for raw in args.target
         ]

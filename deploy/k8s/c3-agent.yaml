@@ -80,12 +80,18 @@ spec:
       #
       # Both are "hand a directory on the shared mount to the uid that writes
       # it", and both need uid 0 for the same reason face B does (`chown` on
-      # this NAS goes through AUTH_SYS, which honours only uid 0):
+      # this NAS goes through AUTH_SYS, which honours only uid 0). Task 3
+      # (2026-10-09) split the *uids*: the control plane is 65533
+      # (`deploy/k8s/control-plane.yaml`), the workers and the agent face A
+      # stay 65534, so "the platform's uid" is no longer one number -- every
+      # target below names the identity that actually writes it.
       #
-      #   * `_images` -- the rootfs/OCI cache. The control plane (now 65534)
-      #     exports the template layout tars into `_images/_oci/` and the
-      #     workers extract from the same root, so it has to belong to 65534
-      #     before either writes. Moved verbatim from the control-plane pod:
+      #   * `_images` -- the rootfs/OCI cache. The control plane (65533 since
+      #     Task 3) exports the template layout tars into `_images/_oci/`, and
+      #     the workers only *read* that root (Task 2: the `_oci` reclaim is
+      #     the CP's now, so the workers get read + traverse and no group), so
+      #     it belongs to 65533 rather than the workers' 65534. Moved verbatim
+      #     from the control-plane pod:
       #     the recursive form is safe *there* because the shared `_images`
       #     holds only `_oci/` (per-sandbox secrets live in the node-local
       #     `E2B_IMAGE_CACHE_DIR`, `/var/lib/e2b-images`, whose directories the
@@ -93,21 +99,32 @@ spec:
       #     init and C3 Task 7 retired it, so face B is the only copy left).
       #   * `_volumes` -- the volume store. The control plane creates
       #     `<store>/<volume_id>` and writes `<store>/_meta/<volume_id>.json`,
-      #     and with the CP at 65534 both are *owner* operations only if the
+      #     and with the CP at 65533 both are *owner* operations only if the
       #     store belongs to it. D24: the hand-over is one `chown` of the store
       #     itself, **non-recursive on purpose** -- the entries below it are the
       #     sandbox volume data (`<id>/` and the per-sandbox quota slices),
       #     which belong to pooled sandbox uids and must never be taken back by
       #     a platform rollout. The recursive form is the regression this file
       #     must not acquire.
+      #   * `_snapshots` and `_migrate` are the two **two-identity** targets,
+      #     so they are *not* handed to one uid: `_snapshots` holds the worker's
+      #     `<id>/fs.tar` (+ `.complete`) beside the control plane's
+      #     `<id>/snapshot.json` -- one directory by design -- and `_migrate`
+      #     holds the worker's `<id>.tar.gz` beside the control plane's
+      #     `control-plane/<id>.tar.gz`. Each keeps the identity that owns its
+      #     namespace as the owner, gives the other the **group** (65533), and
+      #     carries group-write + setgid (`65534:65533 2775`), with the worker
+      #     joining group 65533 through its pod's
+      #     `securityContext.supplementalGroups` (`deploy/k8s/worker.yaml`).
+      #     The exact hand-over is 1d below.
       #
-      # Idempotent and audible: every target is either "already belongs to uid
-      # 65534" (nothing to do -- the second node of a shared mount lands here)
-      # or "handed over", and the store's own ownership is *verified*, so an
-      # NFS `root_squash` that refuses the chown stops this pod with the exact
-      # one-time fix instead of failing later, at the first volume create,
-      # inside the control plane (which now names the same command --
-      # `control_plane.registry.volumes.VolumeRootNotOwnedError`).
+      # Idempotent and audible: every target is either "already belongs to the
+      # uid it is being handed to" (nothing to do -- the second node of a
+      # shared mount lands here) or "handed over", and the store's own
+      # ownership is *verified*, so an NFS `root_squash` that refuses the chown
+      # stops this pod with the exact one-time fix instead of failing later, at
+      # the first volume create, inside the control plane (which now names the
+      # same command -- `control_plane.registry.volumes.VolumeRootNotOwnedError`).
       initContainers:
         - name: storage-init
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-agent:0.1.0

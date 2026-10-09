@@ -9,8 +9,9 @@ wave 1/2 之后 worker 是 uid 65534，而今天这台 NAS 上的平台态文件
   PVC 上且不自动重试、三处占位符让"直接 apply 原文件"什么也做不了；
 * **行为**：在没有集群的情况下跑 `--print-plan` 与 `--root` 彩排 —— 计划恰是 8 个平台
   目标；树根下**恰允许 `workspaces/_migrate` 与 `workspaces/_snapshots` 这两条确切条目**
-  （前者是控制面唯一可写的 subPath、也是 `workspace-root-init` 建的那个；后者是 **worker
-  的快照 payload 根** —— `envd_service/agent.py` 硬编码为 `<workspace_base>/_snapshots`，
+  （前者是**N58 之前**的迁移暂存拼写 —— 控制面今天的 subPath 是 `<export>/_migrate`，
+  由 `workspace-root-init` 建；后者是 **worker 的快照 payload 根** ——
+  `envd_service/agent.py` 硬编码为 `<workspace_base>/_snapshots`，
   C1 之后 worker 以 uid 65534 往它里面写，属主必须是 worker；控制面的记录根是另一条
   `<export>/_snapshots`），其余任何落在 `workspaces/` 之下的拼写（含
   `workspaces` 本身、它的兄弟、那两条下面的东西、`..` 与符号链接的变体）都被点名拒绝。
@@ -385,8 +386,9 @@ def test_the_two_tree_root_platform_dirs_are_the_entries_the_tree_root_allows(
 ) -> None:
     """树根下恰放行那两条 —— 而且它们都是那两条**真的路径**（fixture 里确实存在）。
 
-    `workspaces/_migrate` 是 N27 之后控制面唯一可写的 subPath（`workspace-root-init` 建的就是
-    它）；`workspaces/_snapshots` 是 worker 的快照 payload 根（C1 之后 worker 把 payload 写进
+    `workspaces/_migrate` 是**N58 之前**的迁移暂存拼写（控制面今天的 subPath 是
+    `<export>/_migrate`，`workspace-root-init` 建的是那一条）；`workspaces/_snapshots` 是
+    worker 的快照 payload 根（C1 之后 worker 把 payload 写进
     它）。两者都坐在
     树根下，所以迁移工具必须去 chown 它们。`--target` 再声明一遍是幂等的：计划去重，打印出来
     仍是那 8 条；相对与绝对拼写都 rc=0。

@@ -28,11 +28,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 GEN = REPO / "deploy" / "scripts" / "gen-tls-cert.sh"
 
-#: The control plane's uid (C3 Task 5, D24): k8s `runAsUser` (65533 since Task
-#: 3) and the compose `user:` on all three `control-plane` services.
-CP_UID = 65534
-
-#: ...which for the compose stacks is per lane since Task 3. Only the two
+#: The control plane's uid, per compose stack since Task 3. Only the two
 #: production stacks ship the TLS mount, and both are still the workers' 65534
 #: (they share one volume with the workers); the multinode acceptance lane has
 #: its own 65533 and no TLS at all. Pinned here because "the reader this recipe

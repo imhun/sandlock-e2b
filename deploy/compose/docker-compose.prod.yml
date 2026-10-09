@@ -243,14 +243,17 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.control-plane-gateway
     image: ${CONTROL_PLANE_IMAGE:-e2b-sandlock-control-plane-gateway:0.1.0}
-    # C3 Task 5 (D24) / gap 1: the same posture the k8s control plane converged
-    # to (`deploy/k8s/control-plane.yaml`: `runAsUser`/`runAsGroup` 65534, no
-    # root container in the pod). 65534 is not arbitrary -- §13.6 collapses to
-    # it: the platform's own directories are 65534, `.uid_pool.lock` is
-    # `65534:65534 0600` (another uid cannot even open it), and the image cache
-    # owner is 65534 (another uid would lock itself out of what it creates).
-    # Everything it needs to *own* is prepared by `image-cache-init` above, which
-    # is also where the D24 volume-store hand-over lives.
+    # C3 Task 5 (D24) / gap 1: the same *posture* the k8s control plane
+    # converged to (`deploy/k8s/control-plane.yaml`: a non-root
+    # `runAsUser`/`runAsGroup`, no root container in the pod) -- but not the
+    # same uid any more: the k8s control plane moved to 65533 (Task 3), and the
+    # paragraph below says why this single-volume shape stays 65534. 65534 is
+    # not arbitrary -- §13.6 collapses to it: in this shape the platform's own
+    # directories are 65534, `.uid_pool.lock` is `65534:65534 0600` (another uid
+    # cannot even open it), and the image cache owner is 65534 (another uid
+    # would lock itself out of what it creates). Everything it needs to *own* is
+    # prepared by `image-cache-init` above, which is also where the D24
+    # volume-store hand-over lives.
     #
     # Task 3 (2026-10-09): this shape keeps 65534, unlike the k8s control plane
     # (65533) -- `/var/lib/e2b-sandboxes/_images` is still written by **both**

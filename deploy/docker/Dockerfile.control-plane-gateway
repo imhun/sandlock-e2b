@@ -42,11 +42,13 @@ COPY autoscaler/ autoscaler/
 # root:root and every worker provision then fails with EACCES on
 # ``<workspace>/<sandbox-id>`` (measured; ``upgrade.sh`` can only repair it on
 # an existing host). Pre-creating the directory owned by 65534 makes a fresh
-# ``docker compose up`` work. C3 Task 5: the control plane **is** that uid now
-# (every compose stack sets `user: "65534:65534"` on it, the k8s Deployment
-# `runAsUser/runAsGroup: 65534`), so this line is no longer just "make the
-# volume safe for the workers" -- it is the directory the CP itself creates its
-# own top-level names in.
+# ``docker compose up`` work. C3 Task 5 made the control plane a non-root uid,
+# and Task 3 (2026-10-09) split the numbers: the k8s Deployment and the
+# multinode lane run it as 65533, and only the two single-volume compose-prod
+# shapes still set `user: "65534:65534"` on it (each says why -- N94). So the
+# 65534 below is the **workers'** uid, not the CP's: it is what makes a fresh
+# volume safe for them, and every lane's root init then hands the root (and the
+# CP's own top-level names) to the identity that writes there.
 ENV E2B_WORKSPACE_BASE=/var/lib/e2b-sandboxes
 RUN mkdir -p /var/lib/e2b-sandboxes && chown 65534:65534 /var/lib/e2b-sandboxes
 EXPOSE 3000

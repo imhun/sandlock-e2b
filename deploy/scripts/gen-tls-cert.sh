@@ -40,12 +40,13 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
     -addext "subjectAltName=$(IFS=,; echo "${sans[*]}")" \
     -addext "extendedKeyUsage=serverAuth"
 
-# C3 Task 5: the control plane serves this pair, and it now runs as **uid
-# 65534** in every lane (the k8s Deployment's `runAsUser`, and `user:
-# "65534:65534"` on the compose stacks' `control-plane`). The pair is mounted
-# read-only (`./tls:/tls:ro`) and owned by whoever ran *this* script -- not by
-# 65534 -- so a `0600` key (and a `0600` cert, which is what `umask 077` gives
-# you) is unreadable to it and uvicorn dies at startup with
+# C3 Task 5: the control plane serves this pair as a non-root uid. Which one is
+# per lane -- **65533** in the k8s Deployment and the multinode lane (Task 3),
+# 65534 on the two single-volume compose-prod shapes (N94) -- and this recipe's
+# reader is whichever lane mounts the pair. The pair is mounted read-only
+# (`./tls:/tls:ro`) and owned by whoever ran *this* script -- not by the control
+# plane's uid -- so a `0600` key (and a `0600` cert, which is what `umask 077`
+# gives you) is unreadable to it and uvicorn dies at startup with
 # `PermissionError: [Errno 13] ... /tls/tls.key`. Measured 2026-09-30 on the
 # `deploy/stack` shape; both arms are in `docs/deploy-clusters.md` §7.12.
 #
