@@ -1746,14 +1746,7 @@ def _resolve_local_oci(image: str, cache: Path, tar_path: Path, link: Path) -> P
     rootfs, digest = _extract_local_oci(image, cache, tar_path)
     _write_shared_file(link, f"{digest}\n{rootfs}")
     logger.info("resolved locally built image %s to rootfs %s", image, rootfs)
-    # The tar may have come from the producer directory (the shared volume the
-    # control plane writes to). That directory is not the caller's cache, so the
-    # prune that `_materialize_entry` schedules for the caller does not bound it;
-    # schedule one for the tars explicitly, or a long-lived deployment grows the
-    # shared `_oci/` directory without limit.
-    producer = _producer_oci_dir()
-    if producer is not None and producer.resolve() != Path(cache).resolve():
-        _schedule_cache_prune(producer)
+    # The producer directory's reclaim belongs to the control plane (Task 2); the worker only reads it.
     return rootfs
 
 

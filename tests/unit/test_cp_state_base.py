@@ -196,10 +196,15 @@ def test_platform_directories_follow_the_shared_root_not_the_tree_root(
 def test_the_template_build_directory_is_not_derived_from_the_tree_base():
     """``_builds`` is a platform namespace like the registries' bases: it stays
     on the shared export root (this pod's writable subPath), so the module that
-    writes build contexts must not name the tree base."""
+    writes build contexts must not name the tree base.
+
+    The three ``platform_root`` reads are the build-context directory, the
+    build trigger's hand-off, and -- since Task 2 -- the reclaim of the shared
+    ``_oci/`` artifacts when a failed build's record is dropped.
+    """
     source = inspect.getsource(api.templates)
     assert source.count("app.state.workspace_base") == 0
-    assert source.count("app.state.platform_root") == 2
+    assert source.count("app.state.platform_root") == 3
 
 
 def test_the_local_delete_removes_the_runtime_dir_from_the_state_base(tmp_path):

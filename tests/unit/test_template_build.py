@@ -41,9 +41,14 @@ class _FakeProc:
 class _FakeTemplateRegistry:
     """Records save() calls: a mutated record must be persisted."""
 
-    def __init__(self) -> None:
+    def __init__(self, records: list | None = None) -> None:
         self.saved: list = []
         self.discarded: list = []
+        self._records: list = list(records or [])
+
+    def list(self) -> list:
+        # The discard path reads the live set to decide what is still named.
+        return [r for r in self._records if not getattr(r, "discarded", False)]
 
     def save(self, record) -> None:  # noqa: ANN001
         self.saved.append(record)
@@ -58,9 +63,15 @@ class _FakeTemplateRegistry:
         self.discarded.append(record)
 
 
-def _app(settings: Settings) -> SimpleNamespace:
+def _app(settings: Settings, *records) -> SimpleNamespace:
     return SimpleNamespace(
-        state=SimpleNamespace(settings=settings, templates=_FakeTemplateRegistry())
+        state=SimpleNamespace(
+            settings=settings,
+            templates=_FakeTemplateRegistry(list(records)),
+            # The deploy shapes keep the OCI tar directory at ``<export>/_images``;
+            # the discard path derives the reclaim paths from this root.
+            platform_root=(settings.image_oci_dir or settings.image_cache_dir).parent,
+        )
     )
 
 
@@ -261,7 +272,10 @@ async def test_a_failed_build_removes_its_half_written_oci_tar(
         return _FakeProc(code=1)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    build, template, app = _build(), _template(), _app(settings)
+    build, template = _build(), _template()
+    # The registry has to name the record: the discard path hands its live set
+    # to the reclaim, and the template's image has to be in it.
+    app = _app(settings, template)
     await tmpl._run_build(app, template, build, "FROM python:3.11-slim\n", tmp_path)
 
     assert build.status == "error"

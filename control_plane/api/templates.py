@@ -11,7 +11,7 @@ import tempfile
 import uuid
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 
@@ -195,26 +195,70 @@ def _write_docker_config(settings: Any) -> None:
     path.write_text(json.dumps(config), encoding="utf-8")
 
 
+def reclaim_oci_artifacts(
+    platform_root: Path, image: str, *, known_images: Iterable[str]
+) -> list[Path]:
+    """Delete a locally built image's shared OCI layout tar and its sidecar.
+
+    The control plane *produces* ``<export>/_images/_oci/<slug>.oci.tar`` (and
+    the link that points at the rootfs unpacked from it), so reclaiming them is
+    the control plane's job too: the worker used to schedule a prune of the
+    producer directory, but that directory is shared, and "when is an artifact
+    still referenced" is a question only the record knows (Task 2).
+
+    The judge is the live record set the caller hands in -- never an mtime.
+    Unlinking an artifact some other name still resolves to is the exact bug
+    this guard exists for, so an image outside ``known_images`` is refused by
+    name before either file is touched.
+    """
+    if image not in set(known_images):
+        raise ValueError(
+            f"refusing to reclaim the OCI artifacts of unnamed image {image}"
+        )
+    # Imported lazily for the same reason ``_run_build`` does: the separated
+    # control-plane image ships envd_service for exactly this code path, and
+    # resolution has to name the artifacts the same way the build did.
+    from envd_service.runtime.image_resolver import local_oci_paths
+
+    tar, link = local_oci_paths(platform_root / "_images", image)
+    for artifact in (tar, link):
+        with suppress(OSError):
+            artifact.unlink(missing_ok=True)
+    return [tar, link]
+
+
 def _discard_failed_build(
     app: Any, template: TemplateRecord, *artifacts: Path | None
 ) -> None:
     """Forget a template whose build produced no image (N19).
 
-    Two things have to go, and they are different in kind:
+    Three things have to go, and they are different in kind:
 
     * the **artifacts** buildctl left behind. With no registry the layout tar is
       opened before the build is known to succeed, so a failure leaves a 0-byte
       file -- exactly what a worker later reports as `file could not be opened
       successfully: … empty file`, which names the symptom and hides the cause;
     * the **record**, via :meth:`TemplateRegistry.discard`: the name must stop
-      resolving, so the next build of it cannot inherit a broken image.
+      resolving, so the next build of it cannot inherit a broken image;
+    * the **shared ``_oci/`` pair**, via :func:`reclaim_oci_artifacts`: the
+      record leaving is what makes the image unreferenced, so the reclaim is
+      wired here -- the one path in this process that forgets a record (there
+      is no template delete/rename endpoint, and the rebuild path already
+      unlinks the stale pair it is about to rewrite).
     """
     for artifact in artifacts:
         if artifact is None:
             continue
         with suppress(OSError):
             artifact.unlink(missing_ok=True)
+    # Taken before the discard, while ``template.image`` is still a live
+    # record's image: the judge is "a template record named this image" (a
+    # bogus string is refused by name), and the record is what we drop below.
+    known_images = {record.image for record in app.state.templates.list()}
     app.state.templates.discard(template)
+    reclaim_oci_artifacts(
+        app.state.platform_root, template.image, known_images=known_images
+    )
 
 
 async def _run_build(
