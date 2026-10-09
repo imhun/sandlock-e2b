@@ -129,7 +129,8 @@ def test_shape_reports_the_eight_platform_paths(tmp_path):
 ### Task 5: 本地车道差分 → 上线 → 现场复核
 
 **Files:**
-- Create: `cp_uid_lane_diff`（放 `deploy/scripts/acceptance/`）（一条命令跑完全部判据）
+- Create: `deploy/scripts/acceptance/cp_uid_lane_diff.py`（一条命令跑完全部判据；
+  Task 1 的 `probe_platform_paths_shape` 同样按 `.py` 落盘）
 - Test: 无单测；产出是读数，落 `docs/reports/`
 
 **Interfaces:**
@@ -144,3 +145,68 @@ def test_shape_reports_the_eight_platform_paths(tmp_path):
   复核控制面 `CapEff` 为 0、`_images` 属主为 65533、worker 仍能解包
 - [ ] **Step 5: 回退杆演练**（一次）：`migrate-state-owner.sh --rollback --apply` + 滚回旧 uid
 - [ ] **Step 6: Commit**（含发版记录；`docs/deploy-clusters.md` 新增一节）
+
+---
+
+## 执行记录（2026-10-09，Task 5 的 Step 1–3）
+
+**状态**：Step 1–3 完成；Step 4–6（生产）**未开始**，按裁定 R6 停在人工放行之前，
+本轮**没有**碰 k0s（无隧道、无 kubectl、无 apply）。
+
+**入口**：`deploy/scripts/acceptance/cp_uid_lane_diff.py`（一条命令跑全部判据并打印读数；
+两个相位 `--phase lane` / `--phase shared`，`--up` 起车道、`--down` 拆车道、`--only` 单跑）。
+它自己把 gitignored 的 `tmp/task5-cpuid/override-lane.yml` /
+`override-shared-namespaces.yml` 生成出来（生成后 `docker compose config` 校验），
+所以换台机器/清过 `tmp/` 之后仍是一条命令。
+
+**读数全文**：`docs/reports/2026-10-09-cp-uid-lane-diff.md`（本计划 §Task 5 的判据逐条
+原文 + 收尾记录）。
+
+**结果（LOCAL LANE，`-p cpuid`，宿主 3110；16/19 与 17/19）**：
+
+1. **形态**（两个相位都 ✅）：控制面 `uid=65533`、`CapEff: 0000000000000000`；三个 worker 与
+   agent 面 A 仍是 `65534`；`image-cache-init` 的交接按卷分流：
+   `control-data` 上 6 个命名空间 + `_volumes` + 卷根 → **65533**，`worker-data` 上 3 个 →
+   **65534**（原文见报告 §2）。这条就是本轮的"两个 uid 不再相等、控制面照旧拥有它自己的
+   一切"的实测。
+2. **六项判据 + `multinode_smoke.py`**：两个相位全绿 —— create / 首条命令 /
+   `GET /logs`（三条日志行逐字断言）/ pause+resume / snapshot+restore / delete（含节点预约
+   归零）。
+3. **模板构建（`buildkit → _oci → worker 解包`）**：**基表这条车道量不到** ——
+   `deploy/compose/docker-compose.multinode.yml:339` 给控制面写死
+   `E2B_IMAGE_REGISTRY: registry.example.com/e2b`（占位符）⇒ `Template.build` 走 push 分支、
+   从不导出 tar；而且整条栈**没有 buildkitd**（`stack/` 才有那一层）⇒ 原文是
+   `dial unix /run/buildkit/buildkitd.sock: connect: no such file or directory`。
+   按简报的授权做了一个**最小本地形状**（`--phase shared`：起 rootless buildkit +
+   `E2B_IMAGE_REGISTRY=""` + 控制面写 tar 的车队路径 `<platform_root>/_images/_oci` 挂成共享卷 +
+   worker 侧 `E2B_IMAGE_OCI_DIR` 指到同一卷的另一个路径）：**tar 45.6 MB、65533:65533** 落在
+   共享 `_oci`，worker（65534）**读**它、解包进自己的 `_images`，`.link` 边车 644、**65534:65534**
+   写在自己的缓存里（写共享目录会 EACCES —— Task 2/3 的只读契约在起作用，原文含这条反例）。
+   ⚠️ 车队的 `_oci`/worker 缓存挂载形状是 **k8s 形状事实**，要在 gated 的 Step 4 现场复核。
+4. **卷挂载读写**：**两个相位都红**，且已把原因限定到车道形状：沙箱里的 `mnt/data` 是指向
+   平台根绝对路径的符号链接，而沙箱自己的文件系统视图里**没有** `/var/lib/e2b-sandboxes`
+   （沙箱内 `os.stat` 三条 ENOENT 原文）；把卷存储挂进 worker 与面 B 之后**仍然**红。
+   对照车道（`deploy/compose/docker-compose.prod.yml`，控制面与 worker 共用一个卷）同一探针
+   **绿**（`cat mnt/data/host.txt` 读到 `from-the-host`）。⇒ 是本车道"两个卷"的形状事实，
+   与本轮的 uid 迁移无关（对照车道跑的还是旧姿态的控制面）。**未改任何车道文件**，问题
+   Q3/Q2 写进了报告 §8，留给控制面裁定。
+5. **`deployment_smoke.py`**：本车道不可能全绿（它的用法头写的是
+   `docker-compose.prod.yml`）。lane 相位第 2 段（迁移保留文件）失败的原因是**本车道自己的
+   形状不一致**：三个 worker 共用一个 `worker-data`，而控制面没有
+   `E2B_TREES_SHARED`/`E2B_SHARED_WORKSPACE_ROOT` ⇒ `trees_shared=False` ⇒ 迁移按"树在
+   节点本地"走 export→import→**释放源树**，而源与目标是同一个目录，于是刚 import 的树被删。
+   最小形状里补 `E2B_TREES_SHARED: "1"`（= 这条车道实际的存储形态）后这一段转绿
+   （`OK: migrated worker-1 -> worker-2, files kept`）；它剩下的失败只剩第 4 段（卷挂载，
+   见上）。这条也只是 override，没动车道的文件。
+
+**收尾**：两个工程都已 `down -v`（`cpuid` 与对照 `cpuidprod`），`docker ps -a` /
+`docker volume ls` 里没有 `cpuid*` 残留；用户自己的 `compose` 栈（3100）没被动。
+只留下本轮构建的镜像 tag（`local/e2b/e2b-sandlock-{worker,agent,quota-agent}:cpuid`、
+`local/e2b/e2b-sandlock-control-plane-gateway:cpuid`、`cpuid-control-plane:latest`），
+与这台机器上原有的那批 lane 镜像同类。
+
+**留给 Step 4（gated）的问题**：Q1 车队上模板 tar + buildkit 侧车 + `CapEff 0`；
+Q2 车队的单 PVC 下同一支卷挂载探针；Q3 本车道 `E2B_TREES_SHARED` 的具名判据；
+Q4 `_snapshots`/`_migrate` 的跨 uid 关系（本车道两卷量不到）；
+Q5 buildctl 落的 tar 实测是 **0666**，而 `deploy/k8s/worker.yaml:294-296` 的注释写的是
+"0644 tars" —— 要不要落成 0644、还是改注释，是一处独立的小决定。详见报告 §8。
