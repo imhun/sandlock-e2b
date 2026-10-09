@@ -235,19 +235,15 @@ ALLOWED_TMP_REFERENCES = {
     "tmp/signal-probe/cross_sandbox_signal.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
     "tmp/signal-probe/inside_sandbox_blast.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
     "tmp/syscall-probe/probe.py": "一次性线上审计探针（需集群 + API key），结论见 docs/security-audit/findings.md",
-    # N79 的卡顿取证组（2026-10-05）：stat 族进 seccomp 通知后，撞限流会"一秒睡满 0.86 s"。
-    # 三支都需要当时那套部署 —— stat_stall_hunt 走控制面 API 建箱，另外两支要 kubectl exec
-    # 进 hostPID 的 c3-agent pod 读全宿主 /proc，脱离当时的集群形状不可复现。
-    # 结论与口径见 docs/benchmarks.md §③、docs/open-issues.md 的 N79 行。
+    # N79 的卡顿取证（2026-10-05）：stat 族进 seccomp 通知后，撞限流会"一秒睡满 0.86 s"。
+    # 需要当时那套部署（走控制面 API 建箱），脱离当时的集群形状不可复现；
+    # 结论与口径见 docs/benchmarks.md §③。
+    # 同组的 host_sampler / stall_snapshot（要 kubectl exec 进 hostPID 的 c3-agent pod 读全宿主
+    # /proc）与 N80 的 userns_thread_probe / clone3_probe（要在 worker 容器里跑）在 2026-10-09
+    # 索引清理时随 docs/open-issues.md 的 N79/N80 行一起挪进了冻结归档：它们当年只被那一行
+    # 引用，而归档不在本钉子的"活文档"扫描范围内 ⇒ 那几条允差已经没有要豁免的引用，
+    # 按本文件的口径（悬空允差本身就是错）一并删除。
     "tmp/stat_stall_hunt.py": "一次性线上卡顿取证（需集群 + API key）：前台 stat 循环标出 >20 ms 的调用；结论见 docs/benchmarks.md §③",
-    "tmp/host_sampler.py": "一次性线上卡顿取证（需 kubectl exec 进 hostPID 的 c3-agent pod）：宿主侧 200 ms 采样，与 stat_stall_hunt 同源时间戳对齐",
-    "tmp/stall_snapshot.py": "一次性线上卡顿取证（需 kubectl exec 进 hostPID 的 c3-agent pod）：卡顿瞬间的 /proc 现场快照（谁烧 CPU、supervisor wchan）",
-    # N80 的进程合并取证（2026-10-05）：unshare(CLONE_NEWUSER) 对多线程调用方 EINVAL，
-    # 而 clone3 一次带 CLONE_NEWUSER+CLONE_NEWPID 两臂都成功 —— 三条都得在 worker 容器里跑
-    # （agent pod 的 unshare 直接 EPERM，到不了线程检查），脱离当时那套部署不可复现。
-    # 结论与代码出处见 docs/open-issues.md 的 N80 行、docs/isolation-boundaries.md §4。
-    "tmp/userns_thread_probe.py": "一次性内核实测（需 kubectl exec 进 e2b-worker-0）：unshare(CLONE_NEWUSER) 单/多线程对照，EINVAL 那一臂是 N80 的硬约束",
-    "tmp/clone3_probe.py": "一次性内核实测（需 kubectl exec 进 e2b-worker-0）：clone3 一次带 CLONE_NEWUSER+CLONE_NEWPID 的单/多线程对照",
 }
 
 

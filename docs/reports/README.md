@@ -71,6 +71,22 @@ round 1 附节）：五条检查的 RED→GREEN 全文、脚本 `deploy/scripts/
 所以正文引用是 `docs/open-issues.md` 的 N83 行与 `docs/deploy-clusters.md` §7.48（后者写明两次
 apply 的剧本与回退杆），而不是 §7 的当前部署状态索引。
 
+## 例外：两份"就地归档"（2026-10-09）
+
+`open-issues-archive-2026-10-09.md` 与 `task-backlog-archive-2026-10-09.md` **不是**从
+`.superpowers/sdd/` 提升来的，而是仓库自己两份清单文档的**全文快照**（正文逐字节未改，各加了一段
+顶部归档说明）：
+
+- `docs/open-issues.md`：当天按用户要求清理成"只留未作项"，被移除的**已收口**条目（N1–N92 …）
+  只存在于这份快照里；
+- `docs/task-backlog.md`：2026-08-31 ~ 09-12 的路线图，口径停在 09-12，此后一直被
+  open-issues 取代，整份归档（原位只留一个指针存根，因为 `README.md` 的文档索引与
+  `deploy/k8s/worker.yaml` 的注释按路径/编号引用它）。
+
+把快照放本目录的理由与这里其它文件是同一条 —— `docs/**` 与 `tests/**` 成片按编号引用那些行
+（N18/N35/N49/N52/N79/N80/N83…），清理不能让它们变成断链；而"按编号回溯一条历史结论"不是
+"怎么再跑一遍"的指令，正好适用本目录对钉子的豁免。
+
 ## 与钉子测试的关系
 
 `tests/unit/test_docs_only_point_at_repo_artifacts.py` 只把**活文档**（`docs/` 下除本目录

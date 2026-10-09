@@ -195,7 +195,8 @@ deploy/k8s-k0s/apply.sh                       # 渲染 + apply + 等滚动 + 预
 - **入口与现状**：[docs/deploy-clusters.md](docs/deploy-clusters.md)（集群怎么连、历次上线，改部署前必读）·
   [docs/k8s-deployment.md](docs/k8s-deployment.md)（清单逐项、升级/回退、故障）·
   [deploy/k8s-k0s/README.md](deploy/k8s-k0s/README.md) · [docs/env-vars.md](docs/env-vars.md) ·
-  [docs/open-issues.md](docs/open-issues.md) / [docs/task-backlog.md](docs/task-backlog.md)
+  [docs/open-issues.md](docs/open-issues.md)（剩余工作，唯一活清单）·
+  [docs/task-backlog.md](docs/task-backlog.md)（旧路线图，已归档 → 页内指针）
 - **设计与形态**：[docs/security-architecture.md](docs/security-architecture.md) ·
   [docs/isolation-boundaries.md](docs/isolation-boundaries.md)（三种命名空间全口径）·
   [docs/c3-privilege-relocation.md](docs/c3-privilege-relocation.md)（特权收口，已实施）·
