@@ -22,8 +22,10 @@
 # 计划表里的数据，"→ `--uid`" 是不给 `--uid` 时也落到 65534:65534（逐字等于 C1 wave 2）：
 #   state/**     记录、命令日志、.checkpoints、.route-b、.uid_reservations、.uid_pool.lock
 #                → worker（永远 65534:65534）
-#   workspaces/_migrate   控制面迁移暂存（N27 之后它在树根之下；worker 只写它下面自己那份）
-#                         → `--uid`
+#   workspaces/_migrate   **N58 之前的**迁移暂存拼写（N27 把它放在树根之下，因为那时 worker 的
+#                        迁移端点命名的就是树根）。这份卷上如果还留着它，它是 worker 的；
+#                        今天活着的那条是 `<export>/_migrate`（控制面 pod 的 subPath，见下）
+#                        → worker（永远 65534:65534）
 #   workspaces/_snapshots worker 的快照 payload 根（agent.py 硬编码 <workspace_base>/_snapshots，
 #                        坐在树根旁边；控制面的记录根是另一条 <export>/_snapshots）
 #                        → worker（永远 65534:65534）
@@ -37,6 +39,11 @@
 #   _templates   模板                                            → `--uid`
 #   _builds      构建产物                                        → `--uid`
 #   （`_volumes` 不在其中：它的数据要被 bind 进沙箱，属主是池 uid 的账，另做。）
+#   （**控制面的迁移暂存 `<export>/_migrate` 也不在其中**：它是 `workspace-root-init`
+#     `mkdir -p "$shared/_migrate"` 建出来、按 `$CP_UID`（=65533，1777 兜底）交出去的
+#     —— 见 `deploy/k8s/c3-agent.yaml`。所以上线顺序是「迁移脚本 → 再 apply 清单」，脚本单独
+#     跑完不算迁完；要让脚本在同一次跑里也迁它，加 `--target _migrate` —— 回退时同一条要再写
+#     一遍，否则它会留在 65533。）
 #
 # 用法：
 #   deploy/scripts/migrate-state-owner.sh                       # dry-run（默认，只看不写）
@@ -62,8 +69,11 @@
 #   * 先跑一遍只读的计划（经控制面 pod），再让 Job 去写；跑完每个目录 stat 留证
 #   * 任何一步失败都非零退出并**保留现场**（没有 trap、没有 try/finally 式清理）
 #
-# 上线顺序：worker 缩到 0 → 本脚本 --uid 65533 --apply → 起 worker → 验证
-# 回退顺序：worker 缩到 0 → 本脚本 --rollback --apply → 起 worker → 验证
+# 上线顺序：worker 缩到 0 → 本脚本 --uid 65533 --apply → **apply 清单**（`workspace-root-init`
+#   把 <export>/_migrate 交给 65533，1777 兜底）→ 起 worker → 用 Task 1 的探针验证（它读的就是那条）
+#   （想让脚本在同一次跑里也迁它：`--uid 65533 --target _migrate --apply`；回退写同一条）
+# 回退顺序：worker 缩到 0 → 本脚本 --rollback --apply（正向写过 --target 的这里要写同一条）
+#   → 回退清单（否则下一次 agent rollout 时 init 容器会按新身份再交一遍）→ 起 worker → 验证
 set -euo pipefail
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -109,7 +119,7 @@ warn() {
 
 usage() {
     # 头部注释块（到第一个非注释行为止）就是用法。
-    sed -n '2,66p' "$SCRIPT_PATH"
+    sed -n '2,76p' "$SCRIPT_PATH"
 }
 
 # `--uid` 的形状闸门：运维手打的数字，一个 `--uid 0` 或一个笔误不该走到集群上才炸（更不该把
@@ -220,8 +230,15 @@ PLATFORM_TARGETS = (
     # 共享 `state`（记录、命令日志、`.uid_pool.lock`）是 worker 的账：控制面迁到自己的 uid
     # 之后它也必须留在 worker 那里，否则第一个建箱就写不动。
     ("state", ROLE_WORKER, ROLE_WORKER),
-    # 控制面的迁移暂存（N27 之后在树根之下；控制面 pod 的 subPath 就是它）。
-    ("workspaces/_migrate", ROLE_CONTROL, ROLE_CONTROL),
+    # `workspaces/_migrate` 是**N58 之前的拼写**：N27 把迁移暂存放在树根之下，因为那时
+    # "worker 的迁移端点命名的就是树根"（`deploy/k8s/c3-agent.yaml` 的 workspace-root-init 原话）。
+    # 所以这份卷上如果还留着它，它是 **worker 的**（端点 + 控制面当时挂的 subPath 两用），
+    # 这一条因此拿 worker 那一对 —— 迁移窗口里还挂在那儿的旧控制面 pod 同样还是 65534
+    # （这张表就是给"还没 apply 新清单"的现场用的）。活着的那条迁移暂存已经搬到
+    # `<export>/_migrate`（控制面 pod 今天的 subPath），它不在这张表里 —— 由 `workspace-root-init`
+    # `mkdir -p` 后按 `$CP_UID` 交出去。想让本脚本在同一次跑里也把它迁掉，用 `--target _migrate`
+    # （回退时同一条要再写一遍）。
+    ("workspaces/_migrate", ROLE_WORKER, ROLE_WORKER),
     # 树根下的快照 payload 根：没有 `E2B_SHARED_VOLUME_ROOT` 的部署里，写它的是 worker。
     ("workspaces/_snapshots", ROLE_WORKER, ROLE_WORKER),
     ("_images", ROLE_CONTROL, ROLE_CONTROL),
@@ -423,8 +440,10 @@ def main(argv):
         declared = list(PLATFORM_TARGETS) + [
             (raw, ROLE_CONTROL, ROLE_CONTROL) for raw in args.target
         ]
-        # 计划按归一化后的 rel 去重（追加一条已经在计划里的路径不会 chown 两遍），顺序保持
-        # 声明顺序；每一条都过 normalize_target()，白名单照旧。
+        # 计划按**归一化后的 rel** 去重，这是有意为之：同一条路径换个写法（`--target
+        # <export>/state`、`--target workspaces/./_migrate`）不会 chown 两遍 —— C1 wave 2 那份
+        # 是按原字符串去重的，于是同一个目录能被计划两次。顺序保持声明顺序；每一条都先过
+        # normalize_target()（白名单照旧），拒绝仍发生在打印与动手之前。
         plan = []
         seen = set()
         for raw, uid_role, gid_role in declared:

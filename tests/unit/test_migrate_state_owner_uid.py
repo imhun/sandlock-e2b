@@ -6,9 +6,12 @@ Task 3 把控制面从 worker 的 65534 挪到 65533（`deploy/k8s/control-plane
 
 * 控制面写的那些（`_builds`、`_images`（连同 `_oci`）、`_secrets`、`_templates`、
   `_snapshots`、`_migrate`）迁到 `--uid` 给的那一对；
-* worker 自己的（共享 `state`：记录、命令日志、`.uid_pool.lock`；以及没有
-  `E2B_SHARED_VOLUME_ROOT` 时树根下那份快照 payload 根）留在 65534 —— 把共享 `state`
-  交给控制面 uid 会让第一个建箱就写不动；
+* worker 自己的（共享 `state`：记录、命令日志、`.uid_pool.lock`；树根下那份 `workspaces/`
+  拼写 —— 没有 `E2B_SHARED_VOLUME_ROOT` 时的快照 payload 根，以及 **N58 之前**的迁移暂存
+  `workspaces/_migrate`）留在 65534 —— 把共享 `state` 交给控制面 uid 会让第一个建箱就写不动；
+  控制面**今天**的迁移暂存是 `<export>/_migrate`（它 pod 的 subPath），那一条不在计划表里：
+  `workspace-root-init` 会把它交给 65533，要让脚本在同一次跑里做就用 `--target _migrate`
+  （回退时要再写一遍）；
 * `_snapshots` 是唯一一条**两个身份共写**的：worker 写 `<id>/fs.tar` 与 `.complete`
   （`envd_service/agent.py` 的 `/agent/snapshots`），控制面写 `<id>/snapshot.json`，所以属主
   留在 worker、只把**组位**交给控制面 —— `65534:65533`（R13）。权限位（`2775` + setgid）由
@@ -55,7 +58,7 @@ C1_WAVE_2_OWNER = "owner=65534:65534"
 #: `--uid 65533` 时每一条的目标对（R12 的拆分 + R13 的组位）。顺序与 `PLATFORM_TARGETS` 相同。
 CONTROL_PLANE_PLAN = (
     "TARGET rel=state owner=65534:65534",
-    "TARGET rel=workspaces/_migrate owner=65533:65533",
+    "TARGET rel=workspaces/_migrate owner=65534:65534",
     "TARGET rel=workspaces/_snapshots owner=65534:65534",
     "TARGET rel=_images owner=65533:65533",
     "TARGET rel=_secrets owner=65533:65533",
@@ -201,13 +204,13 @@ def test_uid_65533_moves_only_the_control_plane_paths(tmp_path: Path) -> None:
     proc = _print_plan(tmp_path, "--uid", "65533")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert _targets(proc.stdout) == list(CONTROL_PLANE_PLAN)
-    # 留在 worker 的恰是 `state` 与树根下的快照 payload 根 —— 共享 `state` 交给 65533 会让
-    # worker 的建箱（记录、命令日志、`.uid_pool.lock`）当场写不动。
+    # 留在 worker 的恰是共享 `state` 与树根下的那两条（快照 payload 根、N58 之前的迁移暂存）
+    # —— 共享 `state` 交给 65533 会让 worker 的建箱（记录、命令日志、`.uid_pool.lock`）当场写不动。
     assert [
         line.split("rel=")[1].split(" ")[0]
         for line in _targets(proc.stdout)
         if line.endswith("owner=65534:65534")
-    ] == ["state", "workspaces/_snapshots"]
+    ] == ["state", "workspaces/_migrate", "workspaces/_snapshots"]
     lines = proc.stdout.splitlines()
     root = tmp_path / "not-on-disk"
     assert f"mode=plan root={root} dry_run=1 uid=65533 gid=65533" in lines
@@ -249,8 +252,9 @@ def test_the_snapshot_store_moves_its_group_not_its_owner(tmp_path: Path) -> Non
 def test_an_extra_target_resolves_to_the_control_plane_pair(tmp_path: Path) -> None:
     """`--target` 追加的条目按控制面角色解析 —— 它是调用方点名要迁的那条路径。
 
-    这也是计划里那处拼写不一致的逃生口：探针读的是 `<export>/_migrate`（N58 之后控制面 pod
-    挂的就是它），而计划表里拼的是 `workspaces/_migrate`。
+    这也是那处拼写不一致的逃生口：控制面**今天**的迁移暂存是 `<export>/_migrate`（N58 之后它
+    pod 挂的就是这条 subPath），而计划表里那条 `workspaces/_migrate` 是 N58 之前的拼写、属
+    worker。想让本脚本在同一次跑里也把 `<export>/_migrate` 迁掉，就 `--target _migrate`。
     """
     proc = _print_plan(tmp_path, "--uid", "65533", "--target", "_migrate")
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -409,10 +413,20 @@ def test_the_control_plane_pair_defaults_to_the_worker_pair_in_the_engine() -> N
     """没有 `--uid` 时那一对必须是 worker 自己 —— 引擎里的默认值就是它。"""
     text = SCRIPT.read_text(encoding="utf-8")
     engine = text.split("<<'PY_ENGINE'", 1)[1].split("\nPY_ENGINE", 1)[0]
-    assert 'parser.add_argument("--uid", type=int, default=None)' in engine
-    assert '"--rollback", action="store_true"' in engine
+    engine_lines = [line.strip() for line in engine.splitlines()]
+    assert [
+        line for line in engine_lines if line.startswith('parser.add_argument("--uid"')
+    ] == ['parser.add_argument("--uid", type=int, default=None)']
+    assert [
+        line for line in engine_lines if line.startswith('parser.add_argument("--rollback"')
+    ] == ['parser.add_argument("--rollback", action="store_true")']
     # 唯一的写操作还是那一条 argv（默认那一对逐字保留 C1 wave 2 的拼法）。
-    assert '"chown", "-R", "%d:%d" % (WORKER_UID, WORKER_GID)' in engine
+    assert [
+        line for line in engine_lines if line.startswith('return ["chown", "-R"')
+    ] == [
+        'return ["chown", "-R", "%d:%d" % (WORKER_UID, WORKER_GID), path]',
+        'return ["chown", "-R", "%d:%d" % (uid, gid), path]',
+    ]
     assert [token for token in ("chmod", "os.unlink", "os.rmdir", "os.remove", "shutil") if token in text] == []
 
 
@@ -447,19 +461,50 @@ def test_the_two_new_knobs_are_in_the_scripts_own_help() -> None:
         if not line.startswith("#"):
             break
         last_comment = number
-    assert f"sed -n '2,{last_comment}p' \"$SCRIPT_PATH\"" in text, (
-        f"usage() should read lines 2..{last_comment}"
-    )
+    # `usage()` 里那一条 `sed` 必须**恰好**是它，且头部注释块的真实范围就是 2..last_comment。
+    assert [line.strip() for line in lines if line.strip().startswith("sed -n '2,")] == [
+        f"sed -n '2,{last_comment}p' \"$SCRIPT_PATH\""
+    ], f"usage() should read lines 2..{last_comment}"
     proc = subprocess.run(
         ["bash", str(SCRIPT), "--help"], capture_output=True, text=True, cwd=str(REPO)
     )
     assert proc.returncode == 0
     assert proc.stdout == "\n".join(lines[1:last_comment]) + "\n"
     usage = proc.stdout.splitlines()
-    assert (
+    assert [
+        line for line in usage if line.startswith("#   deploy/scripts/migrate-state-owner.sh --uid")
+    ] == [
         "#   deploy/scripts/migrate-state-owner.sh --uid 65533 [--apply] # 控制面迁到它自己的 uid"
-        in usage
-    )
-    assert (
-        "#   deploy/scripts/migrate-state-owner.sh --rollback [--uid 65533] [--apply]" in usage
-    )
+    ]
+    assert [
+        line
+        for line in usage
+        if line.startswith("#   deploy/scripts/migrate-state-owner.sh --rollback")
+    ] == ["#   deploy/scripts/migrate-state-owner.sh --rollback [--uid 65533] [--apply]"]
+
+
+def test_the_documented_rollout_names_the_step_that_hands_over_the_live_migrate() -> None:
+    """上线顺序必须点名"再 apply 清单"这一步 —— 否则读者会以为脚本跑完就算迁完。
+
+    控制面**今天**的迁移暂存是 `<export>/_migrate`（`deploy/k8s/control-plane.yaml` 的
+    `subPath: _migrate`），而计划表里那条 `workspaces/_migrate` 是 N58 之前的拼写、属 worker：
+    真那条由 `deploy/k8s/c3-agent.yaml` 的 `workspace-root-init`
+    （`mkdir -p "$shared/_migrate"` + `chown $CP_UID`，1777 兜底）交出去，所以脚本单独跑完
+    Task 1 的探针读到的还是 65534。
+    """
+    lines = [line.strip() for line in SCRIPT.read_text(encoding="utf-8").splitlines()]
+    start = next(index for index, line in enumerate(lines) if line.startswith("# 上线顺序："))
+    rollout = []
+    for line in lines[start:]:
+        if not line.startswith("#"):
+            break
+        rollout.append(line)
+    assert rollout == [
+        "# 上线顺序：worker 缩到 0 → 本脚本 --uid 65533 --apply → **apply 清单**"
+        "（`workspace-root-init`",
+        "#   把 <export>/_migrate 交给 65533，1777 兜底）→ 起 worker → 用 Task 1 的探针验证"
+        "（它读的就是那条）",
+        "#   （想让脚本在同一次跑里也迁它：`--uid 65533 --target _migrate --apply`；回退写同一条）",
+        "# 回退顺序：worker 缩到 0 → 本脚本 --rollback --apply（正向写过 --target 的这里要写同一条）",
+        "#   → 回退清单（否则下一次 agent rollout 时 init 容器会按新身份再交一遍）→ 起 worker → 验证",
+    ]
