@@ -276,6 +276,16 @@ spec:
             # takes 61.4s onto the shared Aliyun NAS and 0.26s onto a node's own
             # disk (measured 2026-09-17), and the unpack runs while the sandbox's
             # first command waits. See docs/task-backlog.md N18.
+            #
+            # Task 3 precondition: this is the OCI tar store, and it is
+            # read-only for the worker (0755 directories, 0644 tars, read +
+            # traverse, no shared group). Task 2's reclaim derives
+            # `<platform_root>/_images` from the export root, so a shape that
+            # points E2B_IMAGE_OCI_DIR anywhere else turns that reclaim into
+            # a silent no-op -- the worker-side fallback prune is gone.
+            # E2B_IMAGE_CACHE_OCI_MAX_BYTES / E2B_IMAGE_CACHE_OCI_STALE_S stay
+            # unset in both manifests: either one needs the worker to write
+            # `_oci/` again, which is exactly the shape Task 2 removed.
             - name: E2B_IMAGE_OCI_DIR
               value: /var/lib/e2b-sandboxes/_images
             - name: E2B_IMAGE_CACHE_MAX_BYTES

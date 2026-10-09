@@ -980,7 +980,10 @@ DECLARED_USERS = {
     },
     "deploy/compose/docker-compose.multinode.yml": {
         "image-cache-init": "0:0",
-        "control-plane": "65534:65534",
+        # Task 3: the multinode lane's control plane has its own uid -- it is
+        # the only compose stack whose two volumes let it (see
+        # `CONTROL_PLANE_UIDS` below).
+        "control-plane": "65533:65533",
         "c3-agent": "65534:65534",
         "c3-agent-maint": "0:0",
         "worker-1": "65534:65534",
@@ -997,16 +1000,36 @@ DECLARED_USERS = {
     },
 }
 
+#: The control plane's uid per compose stack. C3 Task 5 put all three on the
+#: workers' 65534 (the k8s posture of the day); **Task 3** moved the multinode
+#: lane off it, onto its own 65533. That lane is the one with two volumes
+#: (`control-data` is the only volume its `control-plane` service mounts, and
+#: its `image-cache-init` hands that volume's directories over to 65533). The
+#: other two stacks share a single volume between the control plane and the
+#: workers, so they stay on 65534 -- a move there needs a shared group first,
+#: which is a separate shape decision. `deploy/k8s/control-plane.yaml` is 65533
+#: (`tests/unit/test_control_plane_uid.py`).
+CONTROL_PLANE_UIDS = {
+    "deploy/compose/docker-compose.prod.yml": "65534:65534",
+    "deploy/compose/docker-compose.multinode.yml": "65533:65533",
+    "deploy/stack/docker-compose.prod.yml": "65534:65534",
+}
 
-def test_every_compose_control_plane_runs_as_the_worker_uid() -> None:
-    """Gap 1: the compose control planes reach the k8s posture (Task 5).
 
-    `deploy/k8s/control-plane.yaml` runs its main container as `runAsUser` 65534
-    and carries no root container in the pod. The separated compose stacks ran
-    theirs as the image default (root) until this pin; 65534 is the same value
-    the k8s arm chose, for the reasons §13.6 collates (the platform's own
-    directories and the image-cache owner are 65534; `<state>/.uid_pool.lock` is
-    `0600` and another uid cannot even open it).
+def test_every_compose_control_plane_runs_as_its_declared_uid() -> None:
+    """Gap 1: the compose control planes carry the k8s posture (Task 5 + 3).
+
+    `deploy/k8s/control-plane.yaml` runs its main container as a non-root
+    `runAsUser` (65534 when this pin was written, 65533 since Task 3) and carries
+    no root container in the pod. The separated compose stacks ran theirs as the
+    image default (root) until this pin; 65534 is the same value the k8s arm
+    chose, for the reasons §13.6 collates (the platform's own directories and
+    the image-cache owner are 65534; `<state>/.uid_pool.lock` is `0600` and
+    another uid cannot even open it).
+
+    The uid is per stack now, and the exact value is read off
+    `CONTROL_PLANE_UIDS` -- a *different* value on the multinode lane is the
+    point of Task 3, not a drift, so the assertion cannot be a single constant.
 
     "No root container that does not need to be" is pinned as a *set*: exactly
     two services in each stack may be uid 0, and both are load-bearing --
@@ -1017,10 +1040,10 @@ def test_every_compose_control_plane_runs_as_the_worker_uid() -> None:
     """
     for path in COMPOSE_STACKS:
         services = _compose(path)["services"]
-        assert services["control-plane"]["user"] == "65534:65534", path.name
+        key = path.relative_to(REPO).as_posix()
+        assert services["control-plane"]["user"] == CONTROL_PLANE_UIDS[key], path.name
         root = {n for n, s in services.items() if s.get("user") == "0:0"}
         assert root == {"image-cache-init", "c3-agent-maint"}, (path.name, root)
-        key = path.relative_to(REPO).as_posix()
         declared = {n: s["user"] for n, s in services.items() if "user" in s}
         assert declared == DECLARED_USERS[key], (path.name, declared)
         default_user = {n for n, s in services.items() if "user" not in s}

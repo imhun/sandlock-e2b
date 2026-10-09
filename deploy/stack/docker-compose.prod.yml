@@ -72,58 +72,86 @@ services:
     command:
       - |-
         set -e
+        # Task 3: the uid a target is handed to comes from the **volume** it
+        # lives on. `control-data` is the control plane's (`/cache/control`
+        # here, and the only volume the `control-plane` service mounts) and
+        # belongs to 65533; `worker-data` is the workers' (`/cache/worker`,
+        # mounted by worker-1/2/3 and by the root `c3-agent-maint`) and stays
+        # 65534. Reading it here, once, is what keeps a directory from being
+        # handed to the wrong uid by a copy-paste -- and a target under neither
+        # root is refused by name instead of guessed at. The single-volume
+        # stacks set both roots to their one, same-uid pair, which is what
+        # keeps this script one text across the three lanes.
+        uid_of() {
+          case "$$1" in
+            "$$CONTROL_ROOT"|"$$CONTROL_ROOT"/*) uid="$$CONTROL_UID" ;;
+            "$$WORKER_ROOT"|"$$WORKER_ROOT"/*) uid="$$WORKER_UID" ;;
+            *) uid="" ;;
+          esac
+        }
+        refuse_foreign() {
+          echo "image-cache-init: FATAL: $$1 is under neither $$CONTROL_ROOT (the control plane's volume, uid $$CONTROL_UID) nor $$WORKER_ROOT (the workers', uid $$WORKER_UID) -- refusing to guess the uid it must belong to" >&2
+          exit 1
+        }
         # 1. the image caches (Z-F7 C1), in the careful form `storage-init` uses.
         for dir in $$CACHE_DIRS; do
+          uid_of "$$dir"
+          [ -n "$$uid" ] || refuse_foreign "$$dir"
           mkdir -p "$$dir/_oci"
           chmod 0755 "$$dir" "$$dir/_oci" 2>/dev/null || true
-          chown 65534:65534 "$$dir" 2>/dev/null ||
+          chown "$$uid:$$uid" "$$dir" 2>/dev/null ||
           echo "image-cache-init: chown refused ($$dir, NFS root_squash?) -- verifying the owner instead"
-          chown -R 65534:65534 "$$dir/_oci" 2>/dev/null ||
+          chown -R "$$uid:$$uid" "$$dir/_oci" 2>/dev/null ||
           echo "image-cache-init: chown refused ($$dir/_oci, NFS root_squash?) -- verifying the owner instead"
           if [ -d "$$dir/secrets" ]; then
-            chown 65534:65534 "$$dir/secrets" 2>/dev/null ||
-            echo "image-cache-init: chown refused ($$dir/secrets, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"
-            find "$$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown 65534:65534 {} + 2>/dev/null ||
-            echo "image-cache-init: chown refused ($$dir/secrets -mindepth 1 -maxdepth 2, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"
-            echo "image-cache-init: handed $$dir/secrets (directories only; *.secret files stay with their sandbox uid) to uid 65534"
+            chown "$$uid:$$uid" "$$dir/secrets" 2>/dev/null ||
+            echo "image-cache-init: chown refused ($$dir/secrets, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid $$uid"
+            find "$$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown "$$uid:$$uid" {} + 2>/dev/null ||
+            echo "image-cache-init: chown refused ($$dir/secrets -mindepth 1 -maxdepth 2, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid $$uid"
+            echo "image-cache-init: handed $$dir/secrets (directories only; *.secret files stay with their sandbox uid) to uid $$uid"
           fi
           owner="$$(stat -c %u "$$dir")"
-          if [ "$$owner" != "65534" ]; then
-            echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2
-            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $$dir && chown -R 65534:65534 $$dir/_oci" >&2
+          if [ "$$owner" != "$$uid" ]; then
+            echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not uid $$uid (the uid of the volume it lives on): a $$uid writer cannot create its lock files or staging trees there, so every image resolve would fail" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown $$uid:$$uid $$dir && chown -R $$uid:$$uid $$dir/_oci" >&2
             exit 1
           fi
-          echo "image-cache-init: $$dir is owned by uid 65534"
+          echo "image-cache-init: $$dir is owned by uid $$uid"
         done
         # 2. the platform's own top-level namespaces (the k8s `workspace-root-init`
-        #    list, plus the two the workers' tree root carries).
+        #    list: `_builds`/`_secrets`/`_templates`/`_snapshots`/`_migrate` are
+        #    written by whatever runs on this shape's one volume).
         for dir in $$OWNED_DIRS; do
+          uid_of "$$dir"
+          [ -n "$$uid" ] || refuse_foreign "$$dir"
           mkdir -p "$$dir"
           chmod 0755 "$$dir" 2>/dev/null || true
-          chown 65534:65534 "$$dir" 2>/dev/null ||
+          chown "$$uid:$$uid" "$$dir" 2>/dev/null ||
           echo "image-cache-init: chown refused ($$dir, NFS root_squash?) -- verifying the owner instead"
           owner="$$(stat -c %u "$$dir")"
-          if [ "$$owner" != "65534" ]; then
-            echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not uid 65534: the control plane and the workers create <namespace>/<id> entries directly under it, so their first write would fail with EACCES" >&2
-            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $$dir" >&2
+          if [ "$$owner" != "$$uid" ]; then
+            echo "image-cache-init: FATAL: $$dir is owned by uid $$owner, not uid $$uid (the uid of the volume it lives on): the component that creates <namespace>/<id> entries directly under it runs as $$uid, so its first write would fail with EACCES" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown $$uid:$$uid $$dir" >&2
             exit 1
           fi
-          echo "image-cache-init: $$dir is owned by uid 65534"
+          echo "image-cache-init: $$dir is owned by uid $$uid"
         done
-        # 3. the roots a 65534 process creates top-level names in. Same judgement
-        #    as `workspace-root-init`: owner 65534, or world-writable.
+        # 3. the roots a writer creates top-level names in. Same judgement
+        #    as `workspace-root-init`: owner == the volume's uid, or world-writable.
         for dir in $$WRITABLE_ROOTS; do
+          uid_of "$$dir"
+          [ -n "$$uid" ] || refuse_foreign "$$dir"
           owner="$$(stat -c %u "$$dir")"
           mode="$$(stat -c %a "$$dir")"
-          if [ "$$owner" != "65534" ]; then
-            chown 65534:65534 "$$dir" 2>/dev/null ||
+          if [ "$$owner" != "$$uid" ]; then
+            chown "$$uid:$$uid" "$$dir" 2>/dev/null ||
             echo "image-cache-init: chown refused ($$dir, NFS root_squash?)"
             owner="$$(stat -c %u "$$dir")"
             mode="$$(stat -c %a "$$dir")"
           fi
           world_writable=0
           case "$$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
-          if [ "$$owner" != "65534" ] && [ "$$world_writable" != "1" ]; then
+          if [ "$$owner" != "$$uid" ] && [ "$$world_writable" != "1" ]; then
             chmod 1777 "$$dir" 2>/dev/null ||
             echo "image-cache-init: chmod refused ($$dir, NFS root_squash?)"
             owner="$$(stat -c %u "$$dir")"
@@ -131,37 +159,39 @@ services:
             world_writable=0
             case "$$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
           fi
-          if [ "$$owner" != "65534" ] && [ "$$world_writable" != "1" ]; then
-            echo "image-cache-init: FATAL: $$dir is mode $$mode, owned by uid $$owner -- uid 65534 cannot create the top-level names it owns there, so every Sandbox.create() would fail with EACCES" >&2
-            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chmod 1777 $$dir  (or chown 65534:65534 $$dir)" >&2
+          if [ "$$owner" != "$$uid" ] && [ "$$world_writable" != "1" ]; then
+            echo "image-cache-init: FATAL: $$dir is mode $$mode, owned by uid $$owner -- uid $$uid cannot create the top-level names it owns there, so every Sandbox.create() would fail with EACCES" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chmod 1777 $$dir  (or chown $$uid:$$uid $$dir)" >&2
             exit 1
           fi
-          echo "image-cache-init: $$dir is writable by uid 65534 (owner=$$owner mode=$$mode)"
+          echo "image-cache-init: $$dir is writable by uid $$uid (owner=$$owner mode=$$mode)"
         done
         # 4. the volume store (D24). `hand_over` moves one directory's owner and
         #    nothing else, and **verifies what it moved**: a target that is not
-        #    65534 after the attempt is a FATAL for *that* target (the caller
-        #    exits 1). `_meta` is created lazily by the control plane, so a
-        #    missing one is the one no-op.
+        #    its volume's uid after the attempt is a FATAL for *that* target
+        #    (the caller exits 1). `_meta` is created lazily by the control
+        #    plane, so a missing one is the one no-op.
         hand_over() {
           target="$$1"
+          uid_of "$$target"
+          [ -n "$$uid" ] || refuse_foreign "$$target"
           if [ ! -e "$$target" ]; then
             echo "image-cache-init: $$target does not exist -- nothing to hand over (the control plane creates it under its own uid when it first needs it)"
             return 0
           fi
           owner="$$(stat -c %u "$$target")"
           mode="$$(stat -c %a "$$target")"
-          if [ "$$owner" = "65534" ]; then
-            echo "image-cache-init: $$target already belongs to uid 65534 (mode $$mode) -- nothing to do"
+          if [ "$$owner" = "$$uid" ]; then
+            echo "image-cache-init: $$target already belongs to uid $$uid (mode $$mode) -- nothing to do"
             return 0
           fi
-          chown 65534:65534 "$$target" 2>/dev/null ||
-            echo "image-cache-init: chown refused ($$target, NFS root_squash?) -- the control plane (uid 65534) cannot create or record a volume until this is done once: chown 65534:65534 $$target" >&2
+          chown "$$uid:$$uid" "$$target" 2>/dev/null ||
+            echo "image-cache-init: chown refused ($$target, NFS root_squash?) -- the control plane (uid $$uid) cannot create or record a volume until this is done once: chown $$uid:$$uid $$target" >&2
           owner="$$(stat -c %u "$$target")"
           mode="$$(stat -c %a "$$target")"
-          if [ "$$owner" != "65534" ]; then
-            echo "image-cache-init: FATAL: $$target is owned by uid $$owner, not the control-plane uid 65534: the control plane creates every volume as <store>/<volume_id> and writes <store>/_meta/<volume_id>.json, so the first volume create would fail with EACCES" >&2
-            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $$target  (non-recursive: the volume data directories below it belong to pooled sandbox uids)" >&2
+          if [ "$$owner" != "$$uid" ]; then
+            echo "image-cache-init: FATAL: $$target is owned by uid $$owner, not the control-plane uid $$uid: the control plane creates every volume as <store>/<volume_id> and writes <store>/_meta/<volume_id>.json, so the first volume create would fail with EACCES" >&2
+            echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown $$uid:$$uid $$target  (non-recursive: the volume data directories below it belong to pooled sandbox uids)" >&2
             return 1
           fi
           echo "image-cache-init: $$target -> uid $$owner mode $$mode (a non-recursive hand-over; the sandbox volume data directories below it keep their pooled uids)"
@@ -178,6 +208,17 @@ services:
           echo "image-cache-init: $$store is owned by uid $$store_owner (the volume data directories below it are left alone)"
         done
     environment:
+      # Task 3: this stack keeps **one** volume and one uid -- the control plane
+      # is still the workers' 65534 here, because both write the same
+      # `sandbox-shared` volume. The two-volume lane where the control plane has
+      # its own uid is `deploy/compose/docker-compose.multinode.yml`; declaring
+      # the roots (which are the same directory here) is what keeps one script
+      # serving both shapes, so every target below resolves to the uid it had
+      # before.
+      CONTROL_ROOT: /var/lib/e2b-sandboxes
+      CONTROL_UID: "65534"
+      WORKER_ROOT: /var/lib/e2b-sandboxes
+      WORKER_UID: "65534"
       CACHE_DIRS: /var/lib/e2b-sandboxes/_images
       OWNED_DIRS: /var/lib/e2b-sandboxes/_builds /var/lib/e2b-sandboxes/_secrets /var/lib/e2b-sandboxes/_snapshots /var/lib/e2b-sandboxes/_templates /var/lib/e2b-sandboxes/_migrate
       WRITABLE_ROOTS: /var/lib/e2b-sandboxes

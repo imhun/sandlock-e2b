@@ -59,11 +59,21 @@ AGENT_MANIFEST = K8S / "c3-agent.yaml"
 VOLUMES_SOURCE = REPO / "control_plane" / "registry" / "volumes.py"
 MAINT_C = REPO / "c3_agent" / "priv" / "maint.c"
 
-#: The control plane's uid. §13.6's三条 findings collapse to this one value:
-#: the platform's own directories are already 65534, `.uid_pool.lock` is
-#: `65534:65534 0600` (a different uid cannot even open it) and the image cache
-#: owner is 65534 (a different uid would lock itself out of what it creates).
-CP_UID = 65534
+#: The control plane's uid. C3 Task 5 picked 65534 (the workers' uid) because
+#: §13.6's三条 findings collapsed to it: the platform's own directories were
+#: already 65534, `.uid_pool.lock` is `65534:65534 0600`, and the image cache
+#: owner was 65534. **Task 3 of the uid-relocation plan moved it to 65533** --
+#: sharing the workers' uid meant a compromised worker or agent face A (also
+#: 65534) could ptrace the control plane
+#: (`docs/security-audit/c3-agent-hostpid-2026-10-09.md` §5). Task 2's move of
+#: the `_oci` reclaim to the control plane is what made the split affordable:
+#: `_images` is read-only for the worker, so no shared group is needed. The
+#: migration that makes the platform directories belong to 65533 is Task 4
+#: (`docs/security-audit/control-plane-uid-2026-10-09.md`).
+CP_UID = 65533
+#: The workers' uid, which the control plane used to share. Pinned separately
+#: here because the whole point of Task 3 is that the two are *different*.
+WORKER_UID = 65534
 #: The volume store, as every manifest in this repo spells it.
 SHARED_ROOT = "/var/lib/e2b-sandboxes"
 VOLUME_STORE = f"{SHARED_ROOT}/_volumes"
@@ -181,19 +191,21 @@ def _run_storage_init(
 # ------------------------------------------------ the control-plane pod itself
 
 
-def test_the_control_plane_container_runs_as_the_worker_uid() -> None:
-    """判据 8, first half: main container `runAsUser == 65534`.
+def test_the_control_plane_container_runs_as_its_own_uid() -> None:
+    """判据 8, first half: main container `runAsUser == CP_UID`.
 
-    `runAsGroup` is pinned with it: the platform's own state is `65534:65534`
+    `runAsGroup` is pinned with it: the platform's own state was `65534:65534`
     and `.uid_pool.lock` is `0600`, so the uid is the load-bearing half — but a
-    container that runs `65534:0` would create every record with the root
-    group, and the two are one decision.
+    container that ran `CP_UID:0` would create every record with the root
+    group, and the two are one decision. (Task 3 moved CP_UID off the workers'
+    65534 onto its own 65533; see that constant.)
     """
     deployment = _only(_load_all(CONTROL_PLANE_MANIFEST), "Deployment", "control-plane")
     cp = _containers(deployment)["control-plane"]
     security = cp["securityContext"]
     assert security["runAsUser"] == CP_UID
     assert security["runAsGroup"] == CP_UID
+    assert security["runAsUser"] != WORKER_UID
 
 
 def test_no_container_in_the_control_plane_pod_is_root() -> None:
@@ -601,30 +613,35 @@ VOLUME_STORE_ENV = {
 #: pin for it, and it is an exact list rather than a containment check.
 CACHE_HANDOVER_LINES = [
     'for dir in $CACHE_DIRS; do',
+    # Task 3: the uid is read off the volume the target lives on (`uid_of`),
+    # never a literal at the call site, and a target under neither declared
+    # root is refused by name.
+    'uid_of "$dir"',
+    '[ -n "$uid" ] || refuse_foreign "$dir"',
     'mkdir -p "$dir/_oci"',
     'chmod 0755 "$dir" "$dir/_oci" 2>/dev/null || true',
     # Non-recursive on the cache's own directory...
-    'chown 65534:65534 "$dir" 2>/dev/null ||',
+    'chown "$uid:$uid" "$dir" 2>/dev/null ||',
     'echo "image-cache-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"',
     # ...recursive only inside the control plane's `_oci/` sidecar...
-    'chown -R 65534:65534 "$dir/_oci" 2>/dev/null ||',
+    'chown -R "$uid:$uid" "$dir/_oci" 2>/dev/null ||',
     'echo "image-cache-init: chown refused ($dir/_oci, NFS root_squash?) -- verifying the owner instead"',
     # ...and `secrets/` **directories only**: the `*.secret` files stay with the
     # sandbox uid that wrote them.
     'if [ -d "$dir/secrets" ]; then',
-    'chown 65534:65534 "$dir/secrets" 2>/dev/null ||',
-    'echo "image-cache-init: chown refused ($dir/secrets, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"',
-    'find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown 65534:65534 {} + 2>/dev/null ||',
-    'echo "image-cache-init: chown refused ($dir/secrets -mindepth 1 -maxdepth 2, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid 65534"',
-    'echo "image-cache-init: handed $dir/secrets (directories only; *.secret files stay with their sandbox uid) to uid 65534"',
+    'chown "$uid:$uid" "$dir/secrets" 2>/dev/null ||',
+    'echo "image-cache-init: chown refused ($dir/secrets, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid $uid"',
+    'find "$dir/secrets" -mindepth 1 -maxdepth 2 -type d -exec chown "$uid:$uid" {} + 2>/dev/null ||',
+    'echo "image-cache-init: chown refused ($dir/secrets -mindepth 1 -maxdepth 2, NFS root_squash?) -- the per-sandbox secret dirs must belong to uid $uid"',
+    'echo "image-cache-init: handed $dir/secrets (directories only; *.secret files stay with their sandbox uid) to uid $uid"',
     'fi',
     'owner="$(stat -c %u "$dir")"',
-    'if [ "$owner" != "65534" ]; then',
-    'echo "image-cache-init: FATAL: $dir is owned by uid $owner, not the worker uid 65534: a 65534 worker cannot create its lock files or staging trees there, so every image resolve would fail" >&2',
-    'echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $dir && chown -R 65534:65534 $dir/_oci" >&2',
+    'if [ "$owner" != "$uid" ]; then',
+    'echo "image-cache-init: FATAL: $dir is owned by uid $owner, not uid $uid (the uid of the volume it lives on): a $uid writer cannot create its lock files or staging trees there, so every image resolve would fail" >&2',
+    'echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown $uid:$uid $dir && chown -R $uid:$uid $dir/_oci" >&2',
     "exit 1",
     "fi",
-    'echo "image-cache-init: $dir is owned by uid 65534"',
+    'echo "image-cache-init: $dir is owned by uid $uid"',
     "done",
 ]
 
@@ -634,23 +651,27 @@ CACHE_HANDOVER_LINES = [
 STORE_HANDOVER_LINES = [
     "hand_over() {",
     'target="$1"',
+    # Task 3: same rule for the store -- its uid comes from the volume it lives
+    # on, which in the multinode lane is the control plane's own 65533.
+    'uid_of "$target"',
+    '[ -n "$uid" ] || refuse_foreign "$target"',
     'if [ ! -e "$target" ]; then',
     'echo "image-cache-init: $target does not exist -- nothing to hand over (the control plane creates it under its own uid when it first needs it)"',
     "return 0",
     "fi",
     'owner="$(stat -c %u "$target")"',
     'mode="$(stat -c %a "$target")"',
-    'if [ "$owner" = "65534" ]; then',
-    'echo "image-cache-init: $target already belongs to uid 65534 (mode $mode) -- nothing to do"',
+    'if [ "$owner" = "$uid" ]; then',
+    'echo "image-cache-init: $target already belongs to uid $uid (mode $mode) -- nothing to do"',
     "return 0",
     "fi",
-    'chown 65534:65534 "$target" 2>/dev/null ||',
-    'echo "image-cache-init: chown refused ($target, NFS root_squash?) -- the control plane (uid 65534) cannot create or record a volume until this is done once: chown 65534:65534 $target" >&2',
+    'chown "$uid:$uid" "$target" 2>/dev/null ||',
+    'echo "image-cache-init: chown refused ($target, NFS root_squash?) -- the control plane (uid $uid) cannot create or record a volume until this is done once: chown $uid:$uid $target" >&2',
     'owner="$(stat -c %u "$target")"',
     'mode="$(stat -c %a "$target")"',
-    'if [ "$owner" != "65534" ]; then',
-    'echo "image-cache-init: FATAL: $target is owned by uid $owner, not the control-plane uid 65534: the control plane creates every volume as <store>/<volume_id> and writes <store>/_meta/<volume_id>.json, so the first volume create would fail with EACCES" >&2',
-    'echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown 65534:65534 $target  (non-recursive: the volume data directories below it belong to pooled sandbox uids)" >&2',
+    'if [ "$owner" != "$uid" ]; then',
+    'echo "image-cache-init: FATAL: $target is owned by uid $owner, not the control-plane uid $uid: the control plane creates every volume as <store>/<volume_id> and writes <store>/_meta/<volume_id>.json, so the first volume create would fail with EACCES" >&2',
+    'echo "image-cache-init: fix it once (as root on the node, or on the NFS server): chown $uid:$uid $target  (non-recursive: the volume data directories below it belong to pooled sandbox uids)" >&2',
     "return 1",
     "fi",
     'echo "image-cache-init: $target -> uid $owner mode $mode (a non-recursive hand-over; the sandbox volume data directories below it keep their pooled uids)"',
@@ -990,6 +1011,15 @@ def _run_compose_init(
     script.write_text(_compose_init_body(path).replace("$$", "$"), encoding="utf-8")
     environment = dict(os.environ)
     environment["PATH"] = f"{shims}{os.pathsep}{environment['PATH']}"
+    # Task 3: the script reads each target's uid off the volume it lives on, so
+    # the probe declares its one tree as both roots with the one uid the three
+    # single-volume lanes use. (The multinode lane's two-volume split is pinned
+    # in `test_control_plane_uid.py`, which runs the same script against a
+    # control tree and a worker tree.)
+    environment["CONTROL_ROOT"] = str(shared)
+    environment["CONTROL_UID"] = "65534"
+    environment["WORKER_ROOT"] = str(shared)
+    environment["WORKER_UID"] = "65534"
     environment["CACHE_DIRS"] = str(shared / "_images")
     environment["OWNED_DIRS"] = str(shared / "_secrets")
     environment["WRITABLE_ROOTS"] = str(shared)

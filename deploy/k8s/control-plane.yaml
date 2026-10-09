@@ -92,24 +92,42 @@ spec:
       #     The deviation is recorded in `docs/c3-privilege-relocation.md` §13.6).
       #
       # The control plane therefore has no `initContainers` left: it starts as
-      # uid 65534 (below) and every path it writes belongs to it.
+      # its own uid 65533 (below, Task 3) and every path it writes belongs to it.
       containers:
         - name: control-plane
           image: registry.cn-shanghai.aliyuncs.com/byteplan/e2b-sandlock-control-plane-gateway:0.1.0
-          # C3 Task 5 (ruling D24 / §3.2 step 1): the control plane is the
-          # worker's uid, and that is a *measured* choice, not a symmetry:
-          # all of the platform's own directories on the shared volume are
-          # already `65534:65534`, `state/.uid_pool.lock` is `65534:65534 0600`
-          # (a different uid cannot even open it, and it is touched at startup
-          # -- the first uid allocation), and the image cache's owner is 65534,
-          # so a different uid would create cache entries it could no longer
-          # write. `runAsGroup` goes with it: a `65534:0` container would write
-          # every record with the root group.
+          # C3 Task 5 (ruling D24 / §3.2 step 1) put this container on the
+          # worker's uid, and said why in the same breath: every platform
+          # directory on the shared volume is `65534:65534`, the image cache
+          # had to stay writable by whoever created its entries, and
+          # `state/.uid_pool.lock` is `65534:65534 0600`. It also named the
+          # price -- "CP and worker are no longer distinguishable at the
+          # filesystem layer" -- and what buying that back would cost.
           #
-          # The price is real and named: CP and worker are no longer
-          # distinguishable at the filesystem layer. Buying that back is a
-          # dedicated uid plus a second migration package (§13.2 / §13.6's
-          # "三条合起来指向同一个结论"), not a side change.
+          # Task 3 (2026-10-09): the price is paid -- the control plane runs as 65533.
+          # The exposure it closes is concrete: with the control plane on 65534
+          # a compromised agent (face A is 65534 too, and the agent pod is
+          # `hostPID`) could ptrace the control plane process
+          # (`docs/security-audit/c3-agent-hostpid-2026-10-09.md` §5).
+          #
+          # Task 2 is the precondition that made the move affordable: the
+          # shared `_images/_oci/` reclaim belongs to the control plane now, so
+          # `_images` is read-only for the 65534 worker (0755/0644, read +
+          # traverse) and needs no shared group; the per-sandbox uid pool is
+          # untouched. The two `1777` roots (`state`, `_migrate`) accept writes
+          # from either uid by design, so they need nothing either.
+          #
+          # What made the old trade look necessary was the ownership, and that
+          # is a migration, not a symmetry: `deploy/scripts/migrate-state-owner.sh
+          # --uid 65533` (Task 4) moves the platform's own directories off
+          # 65534, with a rehearsed `--rollback`; this manifest must roll
+          # **after** it. The runbook and the readings are
+          # docs/security-audit/control-plane-uid-2026-10-09.md (Task 4).
+          #
+          # `runAsGroup` goes with the uid, as it did with 65534: a
+          # `65533:65534` container would write every record with the workers'
+          # group and a `65533:0` one with the root group -- a different
+          # filesystem identity either way.
           #
           # ⚠ The `buildkit` sidecar below is the one container in this pod that
           # is *not* held to this: it stays uid 1000 (the image's) with
@@ -117,8 +135,12 @@ spec:
           # the口径, but it is the only wide-profile container left here and the
           # plan requires it to be named rather than left implicit (§3.2).
           securityContext:
-            runAsUser: 65534
-            runAsGroup: 65534
+            # Task 3: its own uid. No `capabilities` block is added with it --
+            # `CapEff` stays 0 (§7's closing criterion), because the whole
+            # point of the move is a *smaller* filesystem identity, not a
+            # privileged one.
+            runAsUser: 65533
+            runAsGroup: 65533
           ports:
             - containerPort: 3000
           # `/healthz` is the static 200 in `control_plane/app.py` -- it says
@@ -468,6 +490,16 @@ spec:
             # envd_service/runtime/image_resolver.py is what makes the shared
             # directory safe for two replicas, and E2B_IMAGE_CACHE_MAX_BYTES
             # bounds it -- docs/production-deployment-requirements.md §2.7).
+            #
+            # Task 3 precondition: this is the OCI tar store, and it is
+            # read-only for the worker (0755 directories, 0644 tars, read +
+            # traverse, no shared group). Task 2's reclaim derives
+            # `<platform_root>/_images` from the export root, so a shape that
+            # points E2B_IMAGE_OCI_DIR anywhere else turns that reclaim into
+            # a silent no-op -- the worker-side fallback prune is gone.
+            # E2B_IMAGE_CACHE_OCI_MAX_BYTES / E2B_IMAGE_CACHE_OCI_STALE_S stay
+            # unset in both manifests: either one needs the worker to write
+            # `_oci/` again, which is exactly the shape Task 2 removed.
             - name: E2B_IMAGE_OCI_DIR
               value: /var/lib/e2b-sandboxes/_images
             - name: E2B_IMAGE_CACHE_MAX_BYTES
@@ -475,15 +507,24 @@ spec:
             - name: E2B_IMAGE_CACHE_EVICT_MIN_AGE_S
               value: "300"
             # The resolver hands every directory and file it creates to **this**
-            # uid, which is the worker's 65534: the worker writes as the owner,
-            # and a sandbox uid (10000+) gets read/traverse bits only -- never
-            # 0777, since a writable rootfs cache is a cross-tenant poisoning
-            # vector. docs/production-deployment-requirements.md §2.7.1.
+            # uid: the worker writes as the owner, and a sandbox uid (10000+)
+            # gets read/traverse bits only -- never 0777, since a writable
+            # rootfs cache is a cross-tenant poisoning vector.
             #
-            # (Until C3 Task 5 this container ran as root and the rationale read
-            # "root writes through CAP_DAC_OVERRIDE"; the CP is 65534 now, so it
-            # writes as the owner of what it created. The value is unchanged --
-            # 65534 was and is the uid the cache must belong to.)
+            # Task 3 decision: the value **stays the worker's 65534**, and the
+            # comment now says which cache it is naming. `E2B_IMAGE_CACHE_DIR`
+            # on this side is the *worker's* node-local cache
+            # (`/var/lib/e2b-images`, where the worker unpacks rootfs and keeps
+            # `secrets/<id>/`), not the control plane's own OCI directory one
+            # path above -- so it is not this container's identity under a
+            # different name, and moving it would misname the cache. The
+            # hand-over half of the resolver's use is inert here regardless:
+            # `image_resolver._ensure_shared_dir` chowns only when the process
+            # runs as root and `_adopt_tree` returns early otherwise, and this
+            # container is 65533 since Task 3. What the value still does is
+            # name the owner in the resolver's rejection messages -- and the
+            # owner of that cache is the worker.
+            # docs/production-deployment-requirements.md §2.7.1.
             - name: E2B_IMAGE_CACHE_OWNER_UID
               value: "65534"
             # ⚠ 共享工作区（RWX PVC）必须显式设 `E2B_MAX_TOTAL_DISK_MB`：

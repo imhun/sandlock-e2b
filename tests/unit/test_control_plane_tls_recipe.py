@@ -1,10 +1,12 @@
-"""The TLS recipe has to produce a pair the **65534** control plane can read.
+"""The TLS recipe has to produce a pair the control plane's own uid can read.
 
 Review item 2 turned a live regression into a pin. `control_plane` serves the
 pair uvicorn is handed (`control_plane.config.uvicorn_ssl_kwargs`), and since C3
-Task 5 it is uid 65534 in every lane; `deploy/scripts/gen-tls-cert.sh` used to
-write the key `0600` (and a `umask 077` operator got a `0600` cert too), which a
-65534 reader cannot open -- measured on the `deploy/stack` shape 2026-09-30:
+Task 5 it has been a non-root uid in every lane (65534 then; the multinode lane
+ships no TLS and moved to 65533 in Task 3, the two TLS stacks stay 65534);
+`deploy/scripts/gen-tls-cert.sh` used to write the key `0600` (and a `umask 077`
+operator got a `0600` cert too), which that reader cannot open -- measured on
+the `deploy/stack` shape 2026-09-30:
 `PermissionError: [Errno 13] Permission denied` out of `load_cert_chain`, and
 the container restart-looped. The generator is the *local-verification* recipe,
 so it now writes both files with mode `0644` (same effective mode the k8s lane
@@ -26,9 +28,20 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 GEN = REPO / "deploy" / "scripts" / "gen-tls-cert.sh"
 
-#: The control plane's uid (C3 Task 5, D24): k8s `runAsUser` and the compose
-#: `user:` on all three `control-plane` services.
+#: The control plane's uid (C3 Task 5, D24): k8s `runAsUser` (65533 since Task
+#: 3) and the compose `user:` on all three `control-plane` services.
 CP_UID = 65534
+
+#: ...which for the compose stacks is per lane since Task 3. Only the two
+#: production stacks ship the TLS mount, and both are still the workers' 65534
+#: (they share one volume with the workers); the multinode acceptance lane has
+#: its own 65533 and no TLS at all. Pinned here because "the reader this recipe
+#: has to satisfy" is exactly this number.
+CP_UID_BY_STACK = {
+    "deploy/compose/docker-compose.prod.yml": "65534:65534",
+    "deploy/compose/docker-compose.multinode.yml": "65533:65533",
+    "deploy/stack/docker-compose.prod.yml": "65534:65534",
+}
 
 COMPOSE_STACKS = (
     REPO / "deploy" / "compose" / "docker-compose.prod.yml",
@@ -94,8 +107,9 @@ def test_every_stack_hands_the_pair_to_a_container_that_runs_as_the_cp_uid() -> 
     """The manifest half: the mount is read-only and the env names the files.
 
     The recipe and the stacks have to agree on one thing -- the CP reads
-    `/tls/tls.crt` + `/tls/tls.key` as uid 65534 -- so the paths the comment
-    tells the operator to export are the paths the services actually carry.
+    `/tls/tls.crt` + `/tls/tls.key` as its own uid (65534 in the two stacks that
+    ship TLS) -- so the paths the comment tells the operator to export are the
+    paths the services actually carry.
 
     Only the two *production* stacks ship the mount: the multinode acceptance
     shape publishes plain HTTP on 3100 and carries neither the mount nor the
@@ -111,10 +125,11 @@ def test_every_stack_hands_the_pair_to_a_container_that_runs_as_the_cp_uid() -> 
     for path in COMPOSE_STACKS:
         compose = yaml.safe_load(path.read_text(encoding="utf-8"))
         control_plane = compose["services"]["control-plane"]
-        assert control_plane["user"] == "65534:65534", path.name
+        key = path.relative_to(REPO).as_posix()
+        assert control_plane["user"] == CP_UID_BY_STACK[key], path.name
         mounts = [str(mount) for mount in control_plane["volumes"]]
         env = control_plane["environment"]
-        if path.relative_to(REPO).as_posix() in with_tls:
+        if key in with_tls:
             assert any(mount.startswith("./tls:/tls:ro") for mount in mounts), mounts
             assert env["E2B_TLS_CERT"] == "${E2B_TLS_CERT:-}", path.name
             assert env["E2B_TLS_KEY"] == "${E2B_TLS_KEY:-}", path.name
