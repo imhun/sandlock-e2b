@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# C1 wave 2 Task 6 —— 平台态属主的一次性迁移：递归 `chown 65534:65534`：不改权限位、不删东西、不动内容。
+# C1 wave 2 Task 6（Task 4 扩展）—— 平台态属主的一次性迁移：递归 `chown -R <uid>:<gid>`：
+# 不改权限位、不删东西、不动内容。
 #
 # 背景：wave 1/2 之后 worker 以 uid 65534 跑，而**今天**这台 NAS 上的平台态是 root worker
 # 写下的（0600/0700）。非 root worker 读不了 root 的文件 ⇒ 这一步是硬前置。
+# Task 3 之后控制面不再和 worker 共用 uid（`deploy/k8s/control-plane.yaml` 的
+# `runAsUser`/`runAsGroup` 是 65533），于是共享卷上的平台态有**两个**身份：`--uid 65533`
+# 只把控制面的那些迁过去，worker 自己的（共享 `state` 等）留在 65534 —— 属主迁移不能再是
+# 一把 `chown 65534:65534`。
+#
 # 沙箱树 `<export>/workspaces/<id>` 属于池 uid（不是 worker 的），**绝不在迁移范围内**：
 # 要迁的目录是一份显式的路径计划（引擎里的 `PLATFORM_TARGETS` + 调用方用 `--target` 追加的
 # 条目），每一条都过 `normalize_target()`：树根下**恰放行 `workspaces/_migrate` 与
@@ -12,16 +18,24 @@
 # 链接绕过去的拼写 —— 一律拒绝并点名。注意控制面的快照*记录*在另一个根上
 # （`<export>/_snapshots`，见下），两个根都在计划里，所以两边都覆盖到。
 #
-# 迁移目标（相对 `<export>` = `/var/lib/e2b-sandboxes`，**只改属主**）：
+# 迁移目标（相对 `<export>` = `/var/lib/e2b-sandboxes`，**只改属主**）。每一条的目标对是
+# 计划表里的数据，"→ `--uid`" 是不给 `--uid` 时也落到 65534:65534（逐字等于 C1 wave 2）：
 #   state/**     记录、命令日志、.checkpoints、.route-b、.uid_reservations、.uid_pool.lock
+#                → worker（永远 65534:65534）
 #   workspaces/_migrate   控制面迁移暂存（N27 之后它在树根之下；worker 只写它下面自己那份）
+#                         → `--uid`
 #   workspaces/_snapshots worker 的快照 payload 根（agent.py 硬编码 <workspace_base>/_snapshots，
 #                        坐在树根旁边；控制面的记录根是另一条 <export>/_snapshots）
-#   _images      OCI layout / rootfs 缓存
-#   _secrets     沙箱 secret 文件
+#                        → worker（永远 65534:65534）
+#   _images      OCI layout / rootfs 缓存                        → `--uid`
+#   _secrets     沙箱 secret 文件                                → `--uid`
 #   _snapshots   控制面的快照记录/载荷根（SnapshotRegistry 建在共享 export 根上）
-#   _templates   模板
-#   _builds      构建产物
+#                        → 属主留 worker、**组位**给控制面（`65534:65533`）：它是唯一一条
+#                          两个身份共写的（worker 写 <id>/fs.tar 与 .complete，控制面写
+#                          <id>/snapshot.json），权限位（2775 + setgid）由清单里 root 的
+#                          init 容器摆，这个脚本只 chown
+#   _templates   模板                                            → `--uid`
+#   _builds      构建产物                                        → `--uid`
 #   （`_volumes` 不在其中：它的数据要被 bind 进沙箱，属主是池 uid 的账，另做。）
 #
 # 用法：
@@ -29,20 +43,27 @@
 #   deploy/scripts/migrate-state-owner.sh --print-plan          # 只打印计划（不连集群，退出 0）
 #   deploy/scripts/migrate-state-owner.sh --render-job          # 只渲染 Job YAML（不连集群）
 #   deploy/scripts/migrate-state-owner.sh --apply               # 建 configmap + Job，收日志后清理
+#   deploy/scripts/migrate-state-owner.sh --uid 65533 [--apply] # 控制面迁到它自己的 uid
+#   deploy/scripts/migrate-state-owner.sh --rollback [--uid 65533] [--apply]
+#                                                               # 同一张表反向（还给 worker）
+#     （回退的目标对是迁移前的 worker 那一对 65534:65534，所以它不依赖 --uid；给 --uid 只是
+#       把"要撤掉的是哪一次"写进这一行的日志里。）
 #   deploy/scripts/migrate-state-owner.sh --root DIR [--apply]  # 本机彩排（不连集群）
 #   deploy/scripts/migrate-state-owner.sh --apply --keep-job    # 跑完留着 Job（排查用）
 #   MIGRATE_JOB_TIMEOUT=1800 … --apply                          # 等 Job 的上限（秒）
 #
-# 硬性质（tests/unit/test_state_owner_migrate.py 逐条钉住）：
+# 硬性质（tests/unit/test_state_owner_migrate.py 与 test_migrate_state_owner_uid.py 逐条钉住）：
 #   * DRY_RUN=1 是默认；只有显式 --apply（以及 Job 里的 --in-cluster --apply）才写
-#   * 唯一的写操作是 `chown -R 65534:65534`：不改权限位、不删任何东西、不拷内容
+#     （`--rollback` 也一样：不给 --apply 就只打印反向的计划）
+#   * 唯一的写操作是 `chown -R <uid>:<gid>`：不改权限位、不删任何东西、不拷内容
 #   * worker 不在 0 副本、或还有 worker pod 在跑，就拒绝（观测，不是猜）
 #   * 路径计划只放行 <export>/workspaces/_migrate 与 <export>/workspaces/_snapshots 这两条；
 #     其余任何落在 <export>/workspaces/ 之下的路径都拒绝（含 `..` / 符号链接的拼写）
 #   * 先跑一遍只读的计划（经控制面 pod），再让 Job 去写；跑完每个目录 stat 留证
 #   * 任何一步失败都非零退出并**保留现场**（没有 trap、没有 try/finally 式清理）
 #
-# 上线顺序：worker 缩到 0 → 本脚本 --apply → 起 worker → 验证
+# 上线顺序：worker 缩到 0 → 本脚本 --uid 65533 --apply → 起 worker → 验证
+# 回退顺序：worker 缩到 0 → 本脚本 --rollback --apply → 起 worker → 验证
 set -euo pipefail
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -64,7 +85,13 @@ IN_CLUSTER=0
 KEEP_JOB=0
 PRINT_PLAN=0
 RENDER_JOB=0
+ROLLBACK=0
 OFFLINE_ROOT=""
+#: 控制面那些路径的目标 uid（`--uid`）。空 = 没给 —— 这时每一条都还是 worker 那一对
+#: （不带 `--uid` 的渲染逐字等于 C1 wave 2）。`UID_SET` 记的是"这个旗标出现过没有"，
+#: 这样 `--uid`（后面没跟值）不会静默退化成默认。
+TARGET_UID=""
+UID_SET=0
 #: 本地观测到的 worker 副本数（`check_worker_stopped` 填；渲染 Job 时用它）。
 observed_replicas=""
 #: 计划之外的追加条目（`--target`，成对存 `--target` + 值）。追加一条已经在默认计划里的
@@ -82,7 +109,28 @@ warn() {
 
 usage() {
     # 头部注释块（到第一个非注释行为止）就是用法。
-    sed -n '2,40p' "$SCRIPT_PATH"
+    sed -n '2,66p' "$SCRIPT_PATH"
+}
+
+# `--uid` 的形状闸门：运维手打的数字，一个 `--uid 0` 或一个笔误不该走到集群上才炸（更不该把
+# 共享卷上的平台态交给 root）。在参数解析里就调用 —— 这样 `--uid`（后面没跟值、`shift` 已经
+# 把旗标吃掉）也是点名拒绝，而不是被 `set -e` 以一个没有消息的非零码带走。
+require_uid_shape() {
+    case "$TARGET_UID" in
+        ''|*[!0-9]*)
+            refuse 2 "--uid 需要一个十进制 uid：${TARGET_UID}（1..4294967295，例如 65533）" ;;
+    esac
+    if [ "${#TARGET_UID}" -gt 10 ]; then
+        refuse 2 "--uid 超出 uid 范围（1..4294967295）：${TARGET_UID}"
+    fi
+    # 去前导零（`10#` 强制十进制）—— 于是后面两句比的是干净的十进制，Job 的 args 也是。
+    TARGET_UID="$(( 10#$TARGET_UID ))"
+    if [ "$TARGET_UID" -eq 0 ]; then
+        refuse 2 "--uid 0 是 root：平台态不交给 root（控制面那一对是 65533，回退是 worker 的 65534）"
+    fi
+    if [ "$TARGET_UID" -gt 4294967295 ]; then
+        refuse 2 "--uid 超出 uid 范围（1..4294967295）：${TARGET_UID}"
+    fi
 }
 
 while [ $# -gt 0 ]; do
@@ -95,6 +143,9 @@ while [ $# -gt 0 ]; do
         --keep-job) KEEP_JOB=1 ;;
         --target) shift; TARGETS[${#TARGETS[@]}]="--target"; TARGETS[${#TARGETS[@]}]="${1:-}" ;;
         --target=*) TARGETS[${#TARGETS[@]}]="--target"; TARGETS[${#TARGETS[@]}]="${1#--target=}" ;;
+        --uid) shift; TARGET_UID="${1:-}"; UID_SET=1; require_uid_shape ;;
+        --uid=*) TARGET_UID="${1#--uid=}"; UID_SET=1; require_uid_shape ;;
+        --rollback) ROLLBACK=1 ;;
         --root) shift; OFFLINE_ROOT="${1:-}" ;;
         --root=*) OFFLINE_ROOT="${1#--root=}" ;;
         -h|--help) usage; exit 0 ;;
@@ -102,6 +153,16 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+#: 传给引擎的方向/目标参数（`--uid` / `--rollback`）。没给时展开成空 —— 默认那条路逐字不变。
+ENGINE_ARGS=()
+if [ "$UID_SET" = "1" ]; then
+    ENGINE_ARGS[${#ENGINE_ARGS[@]}]="--uid"
+    ENGINE_ARGS[${#ENGINE_ARGS[@]}]="$TARGET_UID"
+fi
+if [ "$ROLLBACK" = "1" ]; then
+    ENGINE_ARGS[${#ENGINE_ARGS[@]}]="--rollback"
+fi
 
 # 引擎正文。刻意写成**函数里的 heredoc** 而不是 `X="$(cat <<'PY')"`：后者在 macOS 自带的
 # bash 3.2 上会被解析坏（它扫 `$( )` 时会跟着 heredoc 正文里的单引号走，而 python 到处都是
@@ -114,9 +175,13 @@ py_engine() {
 由 `deploy/scripts/migrate-state-owner.sh` 内嵌并 `python3 -` 执行（本机 `--print-plan`
 与 `--root` 彩排直接跑，真迁移时由 Job 在容器里跑）。
 
-唯一的写操作是 `chown -R 65534:65534 <target>`；这里不改权限位、没有 unlink/rmdir、
-没有任何形式的删除 —— 迁移改的只是属主。路径计划是显式数据，每一条都过
-`normalize_target()`：归一化（`posixpath.normpath` 把 `..` 消掉）之后只要落在
+唯一的写操作是 `chown -R <uid>:<gid> <target>`；这里不改权限位、没有 unlink/rmdir、
+没有任何形式的删除 —— 迁移改的只是属主。目标对是**计划表里的数据**：控制面写的那些路径
+迁到 `--uid` 给的那一对（没给时默认还是 worker 的 65534:65534，于是不带 `--uid` 时逐字
+等于 C1 wave 2 的行为），worker 自己的（共享 `state`、树根下的快照 payload 根）留在
+65534，`_snapshots` 这条两个身份共写的只把组位交给控制面（`65534:65533`）；`--rollback`
+把同一张表反向走一遍（正向动过的槽位还给迁移前的 worker 那一对）。路径计划是显式数据，
+每一条都过 `normalize_target()`：归一化（`posixpath.normpath` 把 `..` 消掉）之后只要落在
 `<export>/workspaces/` 之下就拒绝（**例外恰是那两条确切条目**：`workspaces/_migrate`
 控制面的迁移暂存；`workspaces/_snapshots` worker 的快照 payload 根，`envd_service/agent.py`
 硬编码为 `<workspace_base>/_snapshots`）—— 其余的都是池 uid 的沙箱树，不是 worker 的。
@@ -140,17 +205,33 @@ EXIT_CHOWN = 4
 WORKER_UID = 65534
 WORKER_GID = 65534
 
-#: 平台态：worker（uid 65534）要读写它们，所以属主得是 worker。顺序即 TARGET 顺序。
-#: `_volumes` 不在其中 —— 它的数据要被 bind 进沙箱，属主是池 uid 的账，另做。
+#: 平台态的两个身份（Task 3 之后控制面不再和 worker 共用 uid）。一条路径归谁，是下面那张
+#: 计划表里的**数据**，不是循环里的特例：
+#:   * ROLE_CONTROL —— 控制面写的那些，目标对是 `--uid` 给的那一对；没给 `--uid` 时默认还是
+#:     worker 那一对，于是不带 `--uid` 时逐字等于 C1 wave 2 的行为；
+#:   * ROLE_WORKER —— worker 自己的那些，永远是 65534:65534（共享卷上另一份身份的账）。
+ROLE_CONTROL = "control-plane"
+ROLE_WORKER = "worker"
+
+#: 平台态：(路径, 属主角色, 组位角色)。顺序即 TARGET 顺序。`_volumes` 不在其中 —— 它的数据
+#: 要被 bind 进沙箱，属主是池 uid 的账，另做（`_volumes` 与 `_volumes/_meta` 由节点上 root 的
+#: init 容器**非递归**地 hand over，这里要是递归 chown 会把沙箱的卷数据一起改掉）。
 PLATFORM_TARGETS = (
-    "state",
-    "workspaces/_migrate",
-    "workspaces/_snapshots",
-    "_images",
-    "_secrets",
-    "_snapshots",
-    "_templates",
-    "_builds",
+    # 共享 `state`（记录、命令日志、`.uid_pool.lock`）是 worker 的账：控制面迁到自己的 uid
+    # 之后它也必须留在 worker 那里，否则第一个建箱就写不动。
+    ("state", ROLE_WORKER, ROLE_WORKER),
+    # 控制面的迁移暂存（N27 之后在树根之下；控制面 pod 的 subPath 就是它）。
+    ("workspaces/_migrate", ROLE_CONTROL, ROLE_CONTROL),
+    # 树根下的快照 payload 根：没有 `E2B_SHARED_VOLUME_ROOT` 的部署里，写它的是 worker。
+    ("workspaces/_snapshots", ROLE_WORKER, ROLE_WORKER),
+    ("_images", ROLE_CONTROL, ROLE_CONTROL),
+    ("_secrets", ROLE_CONTROL, ROLE_CONTROL),
+    # `_snapshots` 是唯一一条**两个身份共写**的（worker 写 `<id>/fs.tar` 与 `.complete`，
+    # 控制面写 `<id>/snapshot.json`），所以属主留在 worker、只把组位交给控制面：
+    # `65534:65533`。权限位（2775 + setgid）由清单里 root 的 init 容器摆，不由这个脚本摆。
+    ("_snapshots", ROLE_WORKER, ROLE_CONTROL),
+    ("_templates", ROLE_CONTROL, ROLE_CONTROL),
+    ("_builds", ROLE_CONTROL, ROLE_CONTROL),
 )
 
 #: 沙箱树：池 uid 的树，不是 worker 的。这个前缀下除 `TREE_ROOT_ALLOWED` 外一律拒绝。
@@ -183,6 +264,34 @@ class Refuse(Exception):
 def emit(line):
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
+
+
+def resolve_owner(uid_role, gid_role, control_pair, rollback):
+    """(属主角色, 组位角色) -> 这一条这次跑的目标 `(uid, gid)`。
+
+    正向：控制面角色拿 `control_pair`（`--uid` 给的那一对；没给时就是 worker 那一对，于是
+    不带 `--uid` 时每一条都还是 65534:65534）；worker 角色永远拿 worker 那一对。
+    反向（`--rollback`）：把正向动过的槽位还回**迁移前**的属主 —— 也就是 worker 那一对；
+    worker 自己的槽位反向是恒等。同一张表，只是方向反过来。
+    """
+    if rollback:
+        control_pair = (WORKER_UID, WORKER_GID)
+    return (
+        control_pair[0] if uid_role == ROLE_CONTROL else WORKER_UID,
+        control_pair[1] if gid_role == ROLE_CONTROL else WORKER_GID,
+    )
+
+
+def chown_argv(uid, gid, path):
+    """`chown -R <uid>:<gid> <path>` —— 迁移唯一的写操作。
+
+    默认那一对（worker 自己）逐字保留 C1 wave 2 的拼法；别的目标对按同一形状拼出来，写操作
+    永远只有 `chown -R` 这一种（`tests/unit/test_state_owner_migrate.py` 就是按那一串钉住
+    "唯一的写操作是 chown -R"的，所以默认那条单独写出来）。
+    """
+    if (uid, gid) == (WORKER_UID, WORKER_GID):
+        return ["chown", "-R", "%d:%d" % (WORKER_UID, WORKER_GID), path]
+    return ["chown", "-R", "%d:%d" % (uid, gid), path]
 
 
 def normalize_target(raw, root):
@@ -286,15 +395,48 @@ def main(argv):
     parser.add_argument("--mode", choices=("plan", "apply"), default="plan")
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--target", action="append", default=[])
+    # 控制面那些路径的目标 uid（Task 3 之后是 65533）。没给时默认是 worker 那一对，也就是
+    # 不带这个参数时逐字等于 C1 wave 2 的行为。
+    parser.add_argument("--uid", type=int, default=None)
+    # 同一张映射表反向：把正向动过的槽位还给迁移前的 worker 那一对。
+    parser.add_argument("--rollback", action="store_true")
     args = parser.parse_args(argv)
 
     root = args.root
-    # 计划去重（追加一条已经在默认计划里的路径不会 chown 两遍），顺序保持声明顺序。
-    declared = list(dict.fromkeys(PLATFORM_TARGETS + tuple(args.target)))
+    rollback = args.rollback
+    # 控制面角色这一次的目标对：`--uid` 给的那一对；回退时它是 worker 那一对（`resolve_owner`
+    # 负责反向），而 `--uid` 只是"要撤掉的那次用的是哪个 uid"。范围在这里就闸住 ——
+    # 一个 `--uid 0` 不该把共享卷上的平台态交给 root。
+    requested_uid = args.uid
+    control_pair = (WORKER_UID, WORKER_GID)
+    if requested_uid is not None and not rollback:
+        control_pair = (requested_uid, requested_uid)
     try:
-        plan = [(raw, normalize_target(raw, root)) for raw in declared]
+        if requested_uid is not None and not (0 < requested_uid < 2**32):
+            raise Refuse(
+                EXIT_PLAN,
+                "拒绝：--uid %d 不在 uid 范围里（1..4294967295）—— 迁移不会把平台态交给 root"
+                "（回退是 worker 自己那一对）" % requested_uid,
+            )
+        # `--target` 追加的条目一律按控制面角色解析：调用方点名要迁的那条路径就是要迁到本次
+        # 目标 uid 的那条（没给 `--uid` 时它还是 65534:65534，与今天逐字相同）。
+        declared = list(PLATFORM_TARGETS) + [
+            (raw, ROLE_CONTROL, ROLE_CONTROL) for raw in args.target
+        ]
+        # 计划按归一化后的 rel 去重（追加一条已经在计划里的路径不会 chown 两遍），顺序保持
+        # 声明顺序；每一条都过 normalize_target()，白名单照旧。
+        plan = []
+        seen = set()
+        for raw, uid_role, gid_role in declared:
+            rel = normalize_target(raw, root)
+            if rel in seen:
+                continue
+            seen.add(rel)
+            plan.append(
+                (raw, rel) + resolve_owner(uid_role, gid_role, control_pair, rollback)
+            )
         if os.path.isdir(root):
-            for raw, rel in plan:
+            for raw, rel, _uid, _gid in plan:
                 assert_no_symlink_escape(root, rel, raw)
             # 形状闸门要在**打印与动手之前**：挂上来的不是这份卷时，一条计划都别当真。
             if not args.plan_only:
@@ -302,19 +444,30 @@ def main(argv):
 
         mode = "apply" if (args.mode == "apply" and not args.plan_only) else "plan"
         emit("== state-owner-migration(C1 wave 2) ==")
+        # `uid=`/`gid=` 是**控制面角色**这一次的目标对；每条路径自己的目标对见下面的 TARGET 行。
         emit(
             "mode=%s root=%s dry_run=%d uid=%d gid=%d"
-            % (mode, root, 1 if mode == "plan" else 0, WORKER_UID, WORKER_GID)
+            % (mode, root, 1 if mode == "plan" else 0, control_pair[0], control_pair[1])
         )
+        # 两个旋钮只在不默认时才多打一行：不带 `--uid`/`--rollback` 的那条路逐字不变。
+        if rollback or requested_uid is not None:
+            emit(
+                "direction=%s control=%d:%d"
+                % (
+                    "rollback" if rollback else "forward",
+                    control_pair[0],
+                    control_pair[1],
+                )
+            )
         if not os.path.isdir(root):
             if not args.plan_only:
                 raise Refuse(EXIT_SHAPE, "--root 不是目录：%s" % root)
             emit("NOTE %s 不在本机盘上：只打印路径计划（不 stat、不 chown）" % root)
-        for _raw, rel in plan:
-            emit("TARGET rel=%s owner=%d:%d" % (rel, WORKER_UID, WORKER_GID))
+        for _raw, rel, uid, gid in plan:
+            emit("TARGET rel=%s owner=%d:%d" % (rel, uid, gid))
 
         chowned = missing = 0
-        for _raw, rel in plan:
+        for _raw, rel, uid, gid in plan:
             path = os.path.join(root, rel)
             if not os.path.lexists(path):
                 emit("MISSING rel=%s（不在盘上：跳过 —— 这条对第二次跑就是幂等的）" % rel)
@@ -327,19 +480,15 @@ def main(argv):
             before = describe(rel, path, "STAT")
             if mode == "plan":
                 continue
-            proc = subprocess.run(
-                ["chown", "-R", "%d:%d" % (WORKER_UID, WORKER_GID), path],
-                capture_output=True,
-                text=True,
-            )
+            proc = subprocess.run(chown_argv(uid, gid, path), capture_output=True, text=True)
             if proc.returncode != 0:
                 raise Refuse(
                     EXIT_CHOWN,
                     "chown -R %d:%d %s 失败（rc=%d）：%s"
-                    % (WORKER_UID, WORKER_GID, rel, proc.returncode, proc.stderr.strip()),
+                    % (uid, gid, rel, proc.returncode, proc.stderr.strip()),
                 )
             after = describe(rel, path, "AFTER")
-            if (after[0], after[1]) != (WORKER_UID, WORKER_GID):
+            if (after[0], after[1]) != (uid, gid):
                 raise Refuse(
                     EXIT_CHOWN,
                     "%s chown 之后属主还是 %d:%d（存储把 chown 当成 no-op？）—— 停下来查"
@@ -351,7 +500,7 @@ def main(argv):
                     "%s chown 前后条目数变了（files %d->%d, dirs %d->%d）—— 停下来查"
                     % (rel, before[2], after[2], before[3], after[3]),
                 )
-            emit("CHOWN rel=%s uid=%d gid=%d" % (rel, WORKER_UID, WORKER_GID))
+            emit("CHOWN rel=%s uid=%d gid=%d" % (rel, uid, gid))
             chowned += 1
 
         # apply 模式什么也没 chown 就不算成功（"跑完了"必须是"真的迁了"，否则运维会以为
@@ -486,8 +635,17 @@ cluster_engine() {
 }
 
 #: 渲染 Job 时填进 `args:` 的那串 YAML（`__ENGINE_FLAGS__` 在清单里是唯一一项）。
+#: 不带 `--uid`/`--rollback` 时逐字还是今天那一条 `"--in-cluster", "--apply"`。
 render_flags() {
-    printf '%s' '"--in-cluster", "--apply"'
+    local flags
+    flags='"--in-cluster", "--apply"'
+    if [ "$UID_SET" = "1" ]; then
+        flags="$flags, \"--uid\", \"${TARGET_UID}\""
+    fi
+    if [ "$ROLLBACK" = "1" ]; then
+        flags="$flags, \"--rollback\""
+    fi
+    printf '%s' "$flags"
 }
 
 render_job() {
@@ -572,15 +730,17 @@ job_run() {
 
 # --- 主流程 ---------------------------------------------------------------
 #
-# 给引擎传 `--target` 时一律写 `${TARGETS[@]+"${TARGETS[@]}"}`：bash 3.2 + `set -u` 下，
-# 空数组的 `"${arr[@]}"` 会被当成"未绑定变量"直接报错，而这个写法让空数组展开成空。
+# 给引擎传 `--target` 与 `--uid`/`--rollback` 时一律写 `${ARR[@]+"${ARR[@]}"}`：bash 3.2 +
+# `set -u` 下，空数组的 `"${arr[@]}"` 会被当成"未绑定变量"直接报错，而这个写法让空数组展开成空
+# —— 默认那条路（两个数组都空）于是逐字不变。
 
 # `--print-plan`：只打印路径计划，**不连集群**（单测与上线前都靠它）。根目录在本机盘上
 # 时顺带把 stat/条目数也打出来（只读）；不在盘上就只打计划。
 if [ "$PRINT_PLAN" = "1" ]; then
     require_python
     run_engine "${OFFLINE_ROOT:-${MIGRATE_ROOT:-$EXPORT_IN_POD}}" \
-        --mode plan --plan-only ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
+        --mode plan --plan-only ${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"} \
+        ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
     exit 0
 fi
 
@@ -594,9 +754,11 @@ fi
 if [ -n "$OFFLINE_ROOT" ]; then
     printf 'OFFLINE 彩排：root=%s（不连集群、不查 worker=0、不做集群身份自检）\n' "$OFFLINE_ROOT"
     if [ "$DRY_RUN" = "0" ]; then
-        run_engine "$OFFLINE_ROOT" --mode apply ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
+        run_engine "$OFFLINE_ROOT" --mode apply ${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"} \
+            ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
     else
-        run_engine "$OFFLINE_ROOT" --mode plan ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
+        run_engine "$OFFLINE_ROOT" --mode plan ${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"} \
+            ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
     fi
     exit 0
 fi
@@ -611,9 +773,11 @@ if [ "$IN_CLUSTER" = "1" ]; then
     gate_replicas_zero "${MIGRATE_WORKER_REPLICAS:-}"
     # 与外面同一条纪律：DRY_RUN=1 是默认，只有显式 --apply（Job 的 args）才写。
     if [ "$DRY_RUN" = "0" ]; then
-        run_engine "$ROOT" --mode apply ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
+        run_engine "$ROOT" --mode apply ${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"} \
+            ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
     else
-        run_engine "$ROOT" --mode plan ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
+        run_engine "$ROOT" --mode plan ${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"} \
+            ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
     fi
     exit 0
 fi
@@ -628,8 +792,10 @@ observed_replicas="$(check_worker_stopped)"
 # 写操作之前先把只读的计划跑一遍：经控制面 pod（它那份 export 是只读挂载，正好只够读计划），
 # 任何口径不一致都会在这里先响。
 if [ "$DRY_RUN" = "1" ]; then
-    cluster_engine --mode plan ${TARGETS[@]+"${TARGETS[@]}"}
+    cluster_engine --mode plan ${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"} \
+        ${TARGETS[@]+"${TARGETS[@]}"}
     exit $?
 fi
-cluster_engine --mode plan ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
+cluster_engine --mode plan ${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"} \
+    ${TARGETS[@]+"${TARGETS[@]}"} || exit $?
 job_run
