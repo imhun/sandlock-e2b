@@ -109,16 +109,132 @@ prune 实际上**只剩一次只读走查**（要回收的 staging 也都在它�
    卷挂载读写 / delete，外加 `multinode_smoke.py` 与 `deployment_smoke.py` 两条 smoke。
    **这一批就是"CP 与 worker 不再同 uid"之后唯一值得看的证据**。
 
-## 6. 还没量、必须在集群上量的（我不从代码推）
+## 6. 实测读数（2026-10-09 取；本节第一版那三条"待测"已收口）
 
-一条只读探针就能取全（下面三条一起）：
+三条各有读数：第 1、3 条来自集群只读探针（只 `os.lstat` / `stat`，不写盘），第 2 条由本仓库
+代码逐处对齐 —— 它本来就不需要集群。三条都已量，没有剩下"必须在集群上量"的。
 
-1. 8 条平台路径**今天的真实 mode/owner**（本文的读数来自 §13.7 的 2026-09-28 快照 + 代码里的
-   默认 umask；两者都不是今天的集群读数）；
-2. **每一处显式 `0o600` 写的读者**（把 `os.open(..., 0o600)` 与 `open(..., "w")` 的模式列表
-   与它的读者对齐）；
-3. `_volumes` 的当前属主与"切片由谁创建"（§13.8 的 `_volumes` `0:0 755` 是 09-28 的读数，
-   之后 C3 把 `chown-volume-*` 交给了 agent）。
+### 6.1 八条平台路径的真实 mode/owner
+
+`deploy/scripts/acceptance/probe_platform_paths_shape.py` 在 `sandlock/control-plane` 主容器内、
+`--root /var/lib/e2b-sandboxes --json` 的原样输出：
+
+```json
+[
+  {
+    "path": "_builds",
+    "mode": "0o755",
+    "uid": 65534,
+    "gid": 65534
+  },
+  {
+    "path": "_images",
+    "mode": "0o755",
+    "uid": 65534,
+    "gid": 65534
+  },
+  {
+    "path": "_secrets",
+    "mode": "0o755",
+    "uid": 65534,
+    "gid": 65534
+  },
+  {
+    "path": "_snapshots",
+    "mode": "0o755",
+    "uid": 65534,
+    "gid": 65534
+  },
+  {
+    "path": "_templates",
+    "mode": "0o755",
+    "uid": 65534,
+    "gid": 65534
+  },
+  {
+    "path": "_volumes",
+    "mode": "0o755",
+    "uid": 65534,
+    "gid": 65534
+  },
+  {
+    "path": "state",
+    "mode": "0o1777",
+    "uid": 65534,
+    "gid": 65534
+  },
+  {
+    "path": "workspaces/_migrate",
+    "mode": "missing",
+    "uid": -1,
+    "gid": -1
+  }
+]
+```
+
+| 路径 | 真实 mode | uid:gid |
+|---|---|---|
+| `_builds` / `_images` / `_secrets` / `_snapshots` / `_templates` / `_volumes` | `0755` | `65534:65534` |
+| `state` | `1777` | `65534:65534` |
+| `workspaces/_migrate` | **missing** | — |
+
+* 六条 `0755 65534:65534` ⇒ 迁到新 uid 之后 worker / agent 对它们仍"世界可读 + 可遍历"
+  （`0644`/`0755`），§4.1 的"只读就够了"成立。
+* `state` 是 **`1777`**（sticky + world-rwx）而不是 `0755`。C3 的 storage-init
+  （`deploy/k8s/c3-agent.yaml` 的 `workspace-root-init`）对 `$state` 的放行判据就是"属主 65534 **或**
+  world-writable"；属主换成 65533 之后，这条 world-writable 位（或 init 自己再 `chmod 1777`）
+  是 worker / 槽位 uid 继续在 `state/**` 下建名字所依赖的 —— 迁移只改属主，**不要顺手收模式**。
+* `workspaces/_migrate` 报 `missing`：这条钉的是 §13.8（2026-09-28）的清单，**N58（§7.29）已把
+  `_migrate` 上浮到导出根**，舰队清单挂的是 `<root>/_migrate` —— 逐条实测 `0o1777 65534:65534`
+  （`workspaces/` 下没有 `_migrate`；`workspaces/` 自己 `0o1777 0:65534`）。所以"8 条"里这一条
+  按老路径读是空的，真实挂载点的读数就是这句括注。
+
+### 6.2 显式模式的写点与它们的读者（从代码对齐）
+
+`control_plane/` 里的显式模式写入只有一处 `0o600` 和一处 `chmod 0o1777`，另有一条经共享助手
+落地的 `0o666 & ~umask`（= `0644`）：
+
+| 写点 | 显式模式 | 落地 | 读者 |
+|---|---|---|---|
+| `api/sandboxes.py:2937`、`:2960`（`_export_sandbox_archive`，local 与 remote 两条） | `0o600` | `_migrate/control-plane/<sandbox_id>.tar.gz`（迁移暂存 tar） | **控制面自己** —— `_import_sandbox_archive` 以 `open(tar_path, "rb")` 读出再经 HTTP 流给目标节点 agent（`POST /agent/sandboxes/<id>/import`）；目标 agent 收到的是字节流，**不读这个文件**。同 uid 读写 ⇒ 迁移后仍成立。 |
+| `registry/volumes.py:306`（`os.chmod`） | `0o1777` | `_volumes/<volume_id>/`（卷根） | 沙箱（池 uid）经挂载写/读、控制面卷内容 API 写；world-rwx + sticky 是有意的（单层 userns 无附加组，sticky 防跨 uid 删） |
+| `gateway_common/paths.py:798`（`write_text_atomically` 的暂存兄弟文件；`control_plane/registry/{templates,volumes,secrets,snapshots}.py` 经 `write_json_atomically`/`write_text_atomically` 调用） | `0o666 & ~umask` = `0644` | `_meta/*.json`（模板/构建/卷记录）、`_volumes/_meta/<id>.deleted`、`_secrets/**`、`_snapshots/**` | 另一副本的控制面（SDK 轮询可能落在任一副本；`secrets` 的 `_scan_disk` 也在未命中时扫） + 控制面自己；`_snapshots/**` 的读者还有 agent（root，从快照建箱读 `fs.tar`）。注意：**沙箱的 secret 文件不在共享 `_secrets/` 上** —— 它由 worker 写在**节点本地** `<E2B_IMAGE_CACHE_DIR>/secrets/<id>/`（`envd_service/executors/sandlock.py`），`chown-secret` 交的就是这份 |
+
+`open(..., "w")` 形状的（默认 umask ⇒ `0644`，世界可读）：
+
+| 写点 | 落地 | 读者 |
+|---|---|---|
+| `_write_docker_config`（`api/templates.py`） | `$DOCKER_CONFIG/config.json`（pod 本地） | `buildctl` 子进程（同 pod、同 uid） |
+| `_run_build`（写 build context 的 `Dockerfile`） | `_builds/<id>/ctx/Dockerfile` | buildkit 的 dockerfile frontend（`--local dockerfile=…`） |
+| `template_file_upload`（`api/templates.py`）→ `gateway_common/upload.py:142`（`open(path, "wb")`） | `_builds/<id>/archives/<hash>.tar.gz` | 控制面自己（`_extract_build_context`） |
+| `volume_write_file`（`api/volumes.py`）→ 同上 | `_volumes/<id>/<path>` | 沙箱（池 uid）经卷挂载 |
+| `api/snapshots.py:247`、`registry/snapshots.py:427/672`（`shutil.copytree`，继承源模式） | `_snapshots/**` | agent / 控制面 |
+
+不是控制面的文件系统写、列出来只为免含糊：`_steps_to_dockerfile`（`api/templates.py`）里的
+`--chmod={mode}` 是**用户** COPY 步骤生成的 Dockerfile 指令；`api/volumes.py::_entry` 的
+`0o4000`/`0o7777` 是**读掩码**（上报 mode 用）。`control_plane/` 里没有任何 `os.chown`
+（§2 的结论，这轮复核仍成立）。
+
+⇒ 显式 `0600` 那处唯一的读者是控制面自己；`1777` 那处是给沙箱 uid 的卷根；其余都世界可读。
+**没有一处显式模式把文件关到"写者之外的读者读不到"**（`0600` 的读者就是写者）。
+
+### 6.3 `_volumes` 的当前属主与切片由谁创建
+
+* `_volumes` 属主：**`0755 65534:65534`**（§6.1）—— §13.8 的 `0:0 755` 是 09-28 的旧读数，
+  C1 wave 2 的 `migrate-state-owner.sh` 已把它连同其余 7 条改到 65534。
+* 切片目录 = `_volumes/<volume_id>/<sandbox_id>/`（`envd_service/volumes.py` 的 E2.5 形状）。
+  **创建**它的是**目标节点的 agent**（root）：控制面在 create 时把 `materialize` 计划
+  （含 `slices`，由 `control_plane/file_ops.py::_volume_slices` 派生）发给 agent，
+  `c3_agent/materialize.py::_plan_slices` 落 `mkdir`；计划不可表达时回落到
+  `envd_service/volumes.py::provision_sandbox_volume_mount` 自己 `mkdir`（worker 或 local 车道的
+  控制面）。**交接**（`chmod 0770` 后 `chown` 到槽位 uid）由 agent 的 `chown-volume-slice` 做；
+  卷根（`_volumes/<id>` 的 `1777`）由控制面卷仓建。
+* 集群现状里 `_volumes` 只有一个 `_meta/`（`0755 65534:65534`），**没有活着的卷目录**，所以没有
+  切片可 stat；`_meta` 下有几个旧 `.deleted` 墓碑是 `0:0 0644`（控制面还是 root 时留下的），
+  迁移的递归 chown 会一并带上它们。
+
+⇒ `_volumes` 今天已是 65534 的目录，迁到新 uid 是**纯属主变更**；切片归**槽位 uid**（不是控制面、
+也不是 worker），所以换控制面的 uid 不碰切片的属主。
 
 ## 7. 关闭判据
 

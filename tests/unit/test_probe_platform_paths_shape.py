@@ -44,3 +44,17 @@ def test_shape_reports_the_eight_platform_paths(tmp_path):
 def test_a_missing_path_is_reported_not_raised(tmp_path):
     entries = _probe().platform_path_shape(tmp_path)
     assert entries[0] == {"path": "_builds", "mode": "missing", "uid": -1, "gid": -1}
+
+
+def test_world_readable_follows_the_st_iroth_bit():
+    probe = _probe()
+    assert probe.mode_is_world_readable({"path": "state", "mode": "0o755", "uid": 0, "gid": 0}) is True
+    assert probe.mode_is_world_readable({"path": "state", "mode": "0o750", "uid": 0, "gid": 0}) is False
+    assert probe.mode_is_world_readable({"path": "state", "mode": "0o640", "uid": 0, "gid": 0}) is False
+    assert probe.mode_is_world_readable({"path": "state", "mode": "0o644", "uid": 0, "gid": 0}) is True
+
+
+def test_a_missing_path_is_not_world_readable():
+    probe = _probe()
+    entry = {"path": "_builds", "mode": "missing", "uid": -1, "gid": -1}
+    assert probe.mode_is_world_readable(entry) is False

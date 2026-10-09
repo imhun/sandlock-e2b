@@ -63,6 +63,20 @@ def platform_path_shape(root: str | os.PathLike[str]) -> list[dict[str, object]]
     return entries
 
 
+def mode_is_world_readable(entry: dict[str, object]) -> bool:
+    """Whether ``entry`` (a row from :func:`platform_path_shape`) is other-readable.
+
+    ``True`` iff ``stat.S_IROTH`` is set on the reported mode. A path whose ``mode`` is
+    ``"missing"`` is ``False``: an absent path cannot be read by anybody, and the migration's
+    criterion (Task 4) must not treat "not there yet" as "readable". The comparison goes through
+    ``stat`` so the answer matches the kernel's bits rather than the string.
+    """
+    mode = entry.get("mode")
+    if not isinstance(mode, str) or mode == "missing":
+        return False
+    return bool(int(mode, 8) & stat.S_IROTH)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default="/var/lib/e2b-sandboxes")
