@@ -2800,7 +2800,12 @@ worker 的 payload 根与 `SnapshotRegistry` 合成一个，都在 export 根的
 ```bash
 export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 
-# 1) 停写：worker 缩到 0，并确认没有 worker pod 还在跑（脚本自己也会验一遍）
+# 1) 停写：**先关自动扩缩器**（N58 之后 autoscaler 就在控制面里，`E2B_AS_MIN_REPLICAS=2`
+#    会无条件把副本数拉回 floor，5 秒一次 tick；只 scale 到 0 会在迁移中途被拉回来 ——
+#    见 docs/deploy-clusters.md §7.29 与 2026-10-09 的那次生产尝试），等它滚完再缩 worker，
+#    并确认没有 worker pod 还在跑（脚本自己也会验一遍）
+kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=false
+kubectl -n sandlock rollout status deploy/control-plane --timeout=180s
 kubectl -n sandlock scale statefulset/e2b-worker --replicas=0
 kubectl -n sandlock wait --for=delete pod -l app=e2b-worker --timeout=300s
 
@@ -2812,8 +2817,11 @@ deploy/scripts/migrate-state-owner.sh
 deploy/scripts/migrate-state-owner.sh --apply
 deploy/scripts/migrate-state-owner.sh --apply --keep-job    # 想留现场排查时
 
-# 4) 起回来：先 apply agent DaemonSet，再把 worker 起回来（升级顺序见 §2 的"镜像与升级"）
+# 4) 起回来：先把自动扩缩器写回去（第 1 步 set env 关掉的那把），再 apply agent DaemonSet、
+#    把 worker 起回来（升级顺序见 §2 的"镜像与升级"）
 #    （C3 Task 7 之后是 agent → worker；C1 的 broker DaemonSet 已退役，这一行不再是它）
+kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=true
+kubectl -n sandlock rollout status deploy/control-plane --timeout=180s
 kubectl apply -f deploy/k8s/c3-agent.yaml
 kubectl apply -f deploy/k8s/worker.yaml
 kubectl -n sandlock scale statefulset/e2b-worker --replicas=2

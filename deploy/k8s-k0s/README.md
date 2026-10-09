@@ -113,7 +113,11 @@ worker 换成 uid 65534 之后，**今天卷上那些 root worker 写下的平�
 ```bash
 export KUBECONFIG="$PWD/tmp/k0s/kubeconfig"
 
-# 1) 停写：worker 缩到 0，并确认没有 worker pod 还在跑（脚本自己也会验一遍）
+# 1) 停写：先关自动扩缩器（N58 之后它在控制面里，`E2B_AS_MIN_REPLICAS=2` 会把刚缩到 0 的
+#    worker 在 ~1 秒内拉回来 —— 见 docs/deploy-clusters.md §7.29），等它滚完，再把 worker
+#    缩到 0、确认没有 worker pod 还在跑（脚本自己也会验一遍）
+kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=false
+kubectl -n sandlock rollout status deploy/control-plane --timeout=180s
 kubectl -n sandlock scale statefulset/e2b-worker --replicas=0
 kubectl -n sandlock wait --for=delete pod -l app=e2b-worker --timeout=300s
 
@@ -123,7 +127,9 @@ deploy/scripts/migrate-state-owner.sh
 # 3) 真迁移：脚本建 configmap + Job，跑完收日志并清理
 deploy/scripts/migrate-state-owner.sh --apply
 
-# 4) 起 worker 并复核
+# 4) 把自动扩缩器写回去，再起 worker 并复核
+kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=true
+kubectl -n sandlock rollout status deploy/control-plane --timeout=180s
 kubectl -n sandlock scale statefulset/e2b-worker --replicas=2
 ```
 

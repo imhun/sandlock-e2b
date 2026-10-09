@@ -52,6 +52,9 @@
 #   * 先跑一遍只读的计划（经控制面 pod），再让 Job 去写
 #
 # 上线顺序（与 deploy/k8s/worker.yaml、deploy/k8s/control-plane.yaml 的注释一致）：
+#   （先关自动扩缩器：`kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=false` 并等它滚完 ——
+#   N58 起 autoscaler 就在控制面里，`E2B_AS_MIN_REPLICAS=2` 会在 ~1 秒内把刚缩到 0 的 worker 拉回来，
+#   2026-10-09 的一次生产尝试正是这么被拉回来的，见 docs/deploy-clusters.md §7.29；apply.sh 会把 true 写回去）
 #   worker 缩到 0 → 本脚本 --apply → apply.sh（新清单）→ 起 worker → 验证
 set -euo pipefail
 
@@ -91,7 +94,7 @@ warn() {
 }
 
 usage() {
-    sed -n '2,55p' "$SCRIPT_PATH"
+    sed -n '2,58p' "$SCRIPT_PATH"
 }
 
 while [ $# -gt 0 ]; do
@@ -1012,7 +1015,18 @@ PY_ENGINE
 #: 可用 `E2B_TARGET_*` 覆盖）。这里**不调** `require_target_cluster` —— 本脚本保有自己的
 #: 姿态：`--root`（OFFLINE_ROOT）完全不连集群、逐条累加 `bad` 再 `refuse 2`，而且它比
 #: 闸门多一条"KUBECONFIG 必须是本项目那一份"（`check_kubeconfig`）。
-. "$SCRIPT_DIR/lib/cluster-guard.sh"
+#:
+#: 闸门只在**本地（运维）路径**上加载：`--in-cluster` 是 Job 的那条路，Job 的 ConfigMap 只装
+#: `migrate-state-base.sh` 一个文件（ConfigMap 的 key 不含 `/`，塞不进 `lib/` 子目录），而
+#: Job 里没有 KUBECONFIG（service account + in-cluster API）—— 闸门自己的判据（显式
+#: KUBECONFIG + `kubectl version` 的形状）在那条路上本来就不适用，它由 Job 的
+#: `MIGRATE_WORKER_REPLICAS=0` 闸门与脚本自己的 `--in-cluster` 检查承担。所以顶层无条件
+#: source 等于把只属于本地的东西塞给 Job：容器里 `/scripts/lib/cluster-guard.sh` 不存在，
+#: `set -e` 让 Job 一启动就退 1（2026-10-03 的 N71 闸门 `1d0852b` 引入的潜伏回归，
+#: 2026-10-09 的生产尝试才在这条路上撞到）。运维路径的加载与今天逐字相同。
+if [ "$IN_CLUSTER" != "1" ]; then
+    . "$SCRIPT_DIR/lib/cluster-guard.sh"
+fi
 
 IDENTITY_CHECK='
 import json, sys

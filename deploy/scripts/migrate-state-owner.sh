@@ -69,13 +69,16 @@
 #   * 先跑一遍只读的计划（经控制面 pod），再让 Job 去写；跑完每个目录 stat 留证
 #   * 任何一步失败都非零退出并**保留现场**（没有 trap、没有 try/finally 式清理）
 #
-# 上线顺序：worker 缩到 0 → 本脚本 --uid 65533 --apply → **apply 整套清单**（agent DaemonSet 也在内）
+# 上线顺序：先关自动扩缩器 → worker 缩到 0 → 本脚本 --uid 65533 --apply → **apply 整套清单**（agent DaemonSet 也在内）
+#   （关自动扩缩器：`kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=false` 并等它滚完 ——
+#   N58 起 autoscaler 就在控制面里，`E2B_AS_MIN_REPLICAS=2` 会在 ~1 秒内把刚缩到 0 的 worker 拉回来，
+#   2026-10-09 的一次生产尝试正是这么被拉回来的，见 docs/deploy-clusters.md §7.29；apply.sh 会把 true 写回去）
 #   → agent 的 `storage-init` 把 <export>/_migrate 交给 65533:65533、<export>/_snapshots 交给
 #   65534:65533、`_volumes` 交给 65533（前两条 mode 2775 一起摆；属主或权限位被拒就 FATAL，
 #   没有兜底；顺带扫掉旧的 `_snapshots/<id>` 子目录）→ 起 worker → 用 Task 1 的探针验证
 #   （控制面 pod 滚上去到 storage-init 跑完之间是窗口期：这段要挑安静的时候做）
 #   （想让脚本在同一次跑里也迁 <export>/_migrate：`--uid 65533 --target _migrate --apply`；回退写同一条）
-# 回退顺序：worker 缩到 0 → 本脚本 --rollback --apply（正向写过 --target 的这里要写同一条）
+# 回退顺序：先关自动扩缩器（同 §7.29）→ worker 缩到 0 → 本脚本 --rollback --apply（正向写过 --target 的这里要写同一条）
 #   → 回退清单（否则下一次 agent rollout 时 init 容器会按新身份再交一遍）→ 起 worker → 验证
 set -euo pipefail
 
@@ -122,7 +125,7 @@ warn() {
 
 usage() {
     # 头部注释块（到第一个非注释行为止）就是用法。
-    sed -n '2,79p' "$SCRIPT_PATH"
+    sed -n '2,82p' "$SCRIPT_PATH"
 }
 
 # `--uid` 的形状闸门：运维手打的数字，一个 `--uid 0` 或一个笔误不该走到集群上才炸（更不该把
@@ -560,7 +563,18 @@ PY_ENGINE
 #: 可用 `E2B_TARGET_*` 覆盖）。这里**不调** `require_target_cluster` —— 本脚本保有自己的
 #: 姿态：`--root`/`--print-plan` 完全不连集群、逐条累加 `bad` 再 `refuse 2`，而且它比
 #: 闸门多一条"KUBECONFIG 必须是本项目那一份"（`check_kubeconfig`）。
-. "$SCRIPT_DIR/lib/cluster-guard.sh"
+#:
+#: 闸门只在**本地（运维）路径**上加载：`--in-cluster` 是 Job 的那条路，Job 的 ConfigMap 只装
+#: `migrate-state-owner.sh` 一个文件（ConfigMap 的 key 不含 `/`，塞不进 `lib/` 子目录），而
+#: Job 里没有 KUBECONFIG（service account + in-cluster API）—— 闸门自己的判据（显式
+#: KUBECONFIG + `kubectl version` 的形状）在那条路上本来就不适用，它由 Job 的
+#: `MIGRATE_WORKER_REPLICAS=0` 闸门与脚本自己的 `--in-cluster` 检查承担。所以顶层无条件
+#: source 等于把只属于本地的东西塞给 Job：容器里 `/scripts/lib/cluster-guard.sh` 不存在，
+#: `set -e` 让 Job 一启动就退 1（2026-10-03 的 N71 闸门 `1d0852b` 引入的潜伏回归，
+#: 2026-10-09 的生产尝试才在这条路上撞到）。运维路径的加载与今天逐字相同。
+if [ "$IN_CLUSTER" != "1" ]; then
+    . "$SCRIPT_DIR/lib/cluster-guard.sh"
+fi
 
 IDENTITY_CHECK='
 import json, sys

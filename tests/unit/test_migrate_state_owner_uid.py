@@ -495,6 +495,10 @@ def test_the_documented_rollout_names_the_step_that_hands_over_the_live_migrate(
     65533）；所以脚本单独跑完 Task 1 的探针读到的还是 65534。这一段还必须点名"整套清单"
     （agent DaemonSet 也在内）与那段窗口期 —— 只 apply `control-plane.yaml` 会让 `_volumes`
     留在 65534，第一个建卷就撞具名 EACCES。
+
+    它还必须**在缩 worker 之前先关自动扩缩器**：N58 起 autoscaler 就在控制面里，
+    `E2B_AS_MIN_REPLICAS=2` 会在 ~1 秒内把刚缩到 0 的 worker 拉回来（`docs/deploy-clusters.md`
+    §7.29；2026-10-09 的生产尝试正是这么被拉回来的）。
     """
     lines = [line.strip() for line in SCRIPT.read_text(encoding="utf-8").splitlines()]
     start = next(index for index, line in enumerate(lines) if line.startswith("# 上线顺序："))
@@ -504,14 +508,18 @@ def test_the_documented_rollout_names_the_step_that_hands_over_the_live_migrate(
             break
         rollout.append(line)
     assert rollout == [
-        "# 上线顺序：worker 缩到 0 → 本脚本 --uid 65533 --apply → **apply 整套清单**"
+        "# 上线顺序：先关自动扩缩器 → worker 缩到 0 → 本脚本 --uid 65533 --apply → **apply 整套清单**"
         "（agent DaemonSet 也在内）",
+        "#   （关自动扩缩器：`kubectl -n sandlock set env deploy/control-plane E2B_AS_ENABLED=false` 并等它滚完 ——",
+        "#   N58 起 autoscaler 就在控制面里，`E2B_AS_MIN_REPLICAS=2` 会在 ~1 秒内把刚缩到 0 的 worker 拉回来，",
+        "#   2026-10-09 的一次生产尝试正是这么被拉回来的，见 docs/deploy-clusters.md §7.29；apply.sh 会把 true 写回去）",
         "#   → agent 的 `storage-init` 把 <export>/_migrate 交给 65533:65533、<export>/_snapshots 交给",
         "#   65534:65533、`_volumes` 交给 65533（前两条 mode 2775 一起摆；属主或权限位被拒就 FATAL，",
         "#   没有兜底；顺带扫掉旧的 `_snapshots/<id>` 子目录）→ 起 worker → 用 Task 1 的探针验证",
         "#   （控制面 pod 滚上去到 storage-init 跑完之间是窗口期：这段要挑安静的时候做）",
         "#   （想让脚本在同一次跑里也迁 <export>/_migrate：`--uid 65533 --target _migrate --apply`；"
         "回退写同一条）",
-        "# 回退顺序：worker 缩到 0 → 本脚本 --rollback --apply（正向写过 --target 的这里要写同一条）",
+        "# 回退顺序：先关自动扩缩器（同 §7.29）→ worker 缩到 0 → 本脚本 --rollback --apply"
+        "（正向写过 --target 的这里要写同一条）",
         "#   → 回退清单（否则下一次 agent rollout 时 init 容器会按新身份再交一遍）→ 起 worker → 验证",
     ]
