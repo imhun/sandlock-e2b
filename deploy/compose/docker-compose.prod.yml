@@ -333,7 +333,7 @@ services:
       # `_images` holds the extracted rootfs and is project 0 / no quota).
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       # Bounded by the resolver itself (`_images` is project 0, no quota) and
-      # owned by the worker uid, so this root-run control plane and the 65534
+      # owned by the worker uid, so this 65534 control plane and the 65534
       # workers can both write it without a world-writable cache. See
       # docs/production-deployment-requirements.md §2.7.
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}

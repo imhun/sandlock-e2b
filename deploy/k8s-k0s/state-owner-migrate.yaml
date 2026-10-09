@@ -1,5 +1,10 @@
-# C1 wave 2 Task 6 —— 平台态属主一次性迁移的 Job（递归 `chown 65534:65534`，不 chmod、
-# 不动内容）。
+# C1 wave 2 Task 6 —— 平台态属主一次性迁移的 Job。
+#
+# 它跑的是 `deploy/scripts/migrate-state-owner.sh` 的参数化版本：Job 自己**不**写死
+# `chown 65534:65534`，迁移目标对（worker 那一对，以及控制面的 `--uid` 那一对）与工作目录
+# 都由脚本按它自己的计划表传进来（`__ENGINE_FLAGS__` 占位符）。脚本唯一的写操作仍是递归
+# `chown -R <uid>:<gid>`：不改权限位、不删东西、不动内容 —— 属主迁移不是这一步的事，
+# 控制面路径的权限位（`2775`）由 agent 的 `storage-init` 摆。
 #
 # 由 `deploy/scripts/migrate-state-owner.sh` 渲染（把下面三处占位符填掉）后 apply：
 #

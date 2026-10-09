@@ -327,13 +327,14 @@ services:
       E2B_SLOT_TMP_ROOT: /var/lib/e2b-sandboxes/.route-b
       E2B_IMAGE_CACHE_DIR: /var/lib/e2b-sandboxes/_images
       # Bounded by the resolver itself (`_images` sits in the volume's
-      # unlimited project) and owned by the worker uid, so both the root-run
-      # control plane and the 65534 workers can write it without a
-      # world-writable cache. See
-      # docs/production-deployment-requirements.md §2.7.
+      # unlimited project) and handed to the **control plane's own 65533** by
+      # `image-cache-init` above -- which is what this uid names. The value is
+      # inert in this shape (the resolver only chowns when the process runs as
+      # root, and this service is 65533); the 65534 workers only read the
+      # store. See docs/production-deployment-requirements.md §2.7.
       E2B_IMAGE_CACHE_MAX_BYTES: ${E2B_IMAGE_CACHE_MAX_BYTES:-4294967296}
       E2B_IMAGE_CACHE_EVICT_MIN_AGE_S: ${E2B_IMAGE_CACHE_EVICT_MIN_AGE_S:-300}
-      E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65534}
+      E2B_IMAGE_CACHE_OWNER_UID: ${E2B_IMAGE_CACHE_OWNER_UID:-65533}
       # 模板构建完成后推送到镜像仓库，worker 按需从 OCI registry 直拉 rootfs。
       # 自建 HTTP 仓库需在 docker daemon 配置 insecure-registries。
       E2B_IMAGE_REGISTRY: registry.example.com/e2b

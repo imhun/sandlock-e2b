@@ -12,8 +12,8 @@
 # 沙箱树 `<export>/workspaces/<id>` 属于池 uid（不是 worker 的），**绝不在迁移范围内**：
 # 要迁的目录是一份显式的路径计划（引擎里的 `PLATFORM_TARGETS` + 调用方用 `--target` 追加的
 # 条目），每一条都过 `normalize_target()`：树根下**恰放行 `workspaces/_migrate` 与
-# `workspaces/_snapshots` 这两条确切条目**（前者是**N58 之前**的迁移暂存拼写，`workspace-root-init`
-# 建的是今天那条 `<export>/_migrate`；后者是 **worker 的快照 payload 根** —— `envd_service/agent.py` 把它硬编码在
+# `workspaces/_snapshots` 这两条确切条目**（前者是**N58 之前**的迁移暂存拼写 —— 今天那条
+# `<export>/_migrate` 由 agent 的 `storage-init` 交出；后者是 **worker 的快照 payload 根** —— `envd_service/agent.py` 把它硬编码在
 # `<workspace_base>/_snapshots`），其余任何落在 `workspaces/` 之下 —— 包括用 `..` 或符号
 # 链接绕过去的拼写 —— 一律拒绝并点名。注意控制面的快照*记录*在另一个根上
 # （`<export>/_snapshots`，见下），两个根都在计划里，所以两边都覆盖到。
@@ -32,18 +32,18 @@
 #   _images      OCI layout / rootfs 缓存                        → `--uid`
 #   _secrets     沙箱 secret 文件                                → `--uid`
 #   _snapshots   控制面的快照记录/载荷根（SnapshotRegistry 建在共享 export 根上）
-#                        → 属主留 worker、**组位**给控制面（`65534:65533`）：它是唯一一条
+#                        → 属主留 worker、**组位**给控制面（`65534:65533`）：它是这张表里唯一一条
 #                          两个身份共写的（worker 写 <id>/fs.tar 与 .complete，控制面写
 #                          <id>/snapshot.json），权限位（2775 + setgid）由清单里 root 的
 #                          init 容器摆，这个脚本只 chown
 #   _templates   模板                                            → `--uid`
 #   _builds      构建产物                                        → `--uid`
 #   （`_volumes` 不在其中：它的数据要被 bind 进沙箱，属主是池 uid 的账，另做。）
-#   （**控制面的迁移暂存 `<export>/_migrate` 也不在其中**：它是 `workspace-root-init`
-#     `mkdir -p "$shared/_migrate"` 建出来、按 `$CP_UID`（=65533，1777 兜底）交出去的
-#     —— 见 `deploy/k8s/c3-agent.yaml`。所以上线顺序是「迁移脚本 → 再 apply 清单」，脚本单独
-#     跑完不算迁完；要让脚本在同一次跑里也迁它，加 `--target _migrate` —— 回退时同一条要再写
-#     一遍，否则它会留在 65533。）
+#   （**控制面的迁移暂存 `<export>/_migrate` 也不在其中**：它是 `deploy/k8s/c3-agent.yaml` 的
+#     `storage-init` 建出来、按 `$MIGRATE_OWNER` = `65533:65533`、模式 `2775` 交出去的
+#     （`hand_over_shared`；属主或权限位被拒就 FATAL 退出，没有兜底）。所以上线顺序是
+#     「迁移脚本 → 再 apply **整套**清单 → 起 worker → 探针」，脚本单独跑完不算迁完；要让脚本
+#     在同一次跑里也迁它，加 `--target _migrate` —— 回退时同一条要再写一遍，否则它会留在 65533。）
 #
 # 用法：
 #   deploy/scripts/migrate-state-owner.sh                       # dry-run（默认，只看不写）
@@ -69,9 +69,12 @@
 #   * 先跑一遍只读的计划（经控制面 pod），再让 Job 去写；跑完每个目录 stat 留证
 #   * 任何一步失败都非零退出并**保留现场**（没有 trap、没有 try/finally 式清理）
 #
-# 上线顺序：worker 缩到 0 → 本脚本 --uid 65533 --apply → **apply 清单**（`workspace-root-init`
-#   把 <export>/_migrate 交给 65533，1777 兜底）→ 起 worker → 用 Task 1 的探针验证（它读的就是那条）
-#   （想让脚本在同一次跑里也迁它：`--uid 65533 --target _migrate --apply`；回退写同一条）
+# 上线顺序：worker 缩到 0 → 本脚本 --uid 65533 --apply → **apply 整套清单**（agent DaemonSet 也在内）
+#   → agent 的 `storage-init` 把 <export>/_migrate 交给 65533:65533、<export>/_snapshots 交给
+#   65534:65533、`_volumes` 交给 65533（前两条 mode 2775 一起摆；属主或权限位被拒就 FATAL，
+#   没有兜底；顺带扫掉旧的 `_snapshots/<id>` 子目录）→ 起 worker → 用 Task 1 的探针验证
+#   （控制面 pod 滚上去到 storage-init 跑完之间是窗口期：这段要挑安静的时候做）
+#   （想让脚本在同一次跑里也迁 <export>/_migrate：`--uid 65533 --target _migrate --apply`；回退写同一条）
 # 回退顺序：worker 缩到 0 → 本脚本 --rollback --apply（正向写过 --target 的这里要写同一条）
 #   → 回退清单（否则下一次 agent rollout 时 init 容器会按新身份再交一遍）→ 起 worker → 验证
 set -euo pipefail
@@ -119,7 +122,7 @@ warn() {
 
 usage() {
     # 头部注释块（到第一个非注释行为止）就是用法。
-    sed -n '2,76p' "$SCRIPT_PATH"
+    sed -n '2,79p' "$SCRIPT_PATH"
 }
 
 # `--uid` 的形状闸门：运维手打的数字，一个 `--uid 0` 或一个笔误不该走到集群上才炸（更不该把
@@ -235,15 +238,15 @@ PLATFORM_TARGETS = (
     # 所以这份卷上如果还留着它，它是 **worker 的**（端点 + 控制面当时挂的 subPath 两用），
     # 这一条因此拿 worker 那一对 —— 迁移窗口里还挂在那儿的旧控制面 pod 同样还是 65534
     # （这张表就是给"还没 apply 新清单"的现场用的）。活着的那条迁移暂存已经搬到
-    # `<export>/_migrate`（控制面 pod 今天的 subPath），它不在这张表里 —— 由 `workspace-root-init`
-    # `mkdir -p` 后按 `$CP_UID` 交出去。想让本脚本在同一次跑里也把它迁掉，用 `--target _migrate`
-    # （回退时同一条要再写一遍）。
+    # `<export>/_migrate`（控制面 pod 今天的 subPath），它不在这张表里 —— 由 agent 的
+    # `storage-init`（`hand_over_shared`，`65533:65533` / 模式 `2775`，拒绝就 FATAL）交出去。
+    # 想让本脚本在同一次跑里也把它迁掉，用 `--target _migrate`（回退时同一条要再写一遍）。
     ("workspaces/_migrate", ROLE_WORKER, ROLE_WORKER),
     # 树根下的快照 payload 根：没有 `E2B_SHARED_VOLUME_ROOT` 的部署里，写它的是 worker。
     ("workspaces/_snapshots", ROLE_WORKER, ROLE_WORKER),
     ("_images", ROLE_CONTROL, ROLE_CONTROL),
     ("_secrets", ROLE_CONTROL, ROLE_CONTROL),
-    # `_snapshots` 是唯一一条**两个身份共写**的（worker 写 `<id>/fs.tar` 与 `.complete`，
+    # `_snapshots` 是这张表里唯一一条**两个身份共写**的（worker 写 `<id>/fs.tar` 与 `.complete`，
     # 控制面写 `<id>/snapshot.json`），所以属主留在 worker、只把组位交给控制面：
     # `65534:65533`。权限位（2775 + setgid）由清单里 root 的 init 容器摆，不由这个脚本摆。
     ("_snapshots", ROLE_WORKER, ROLE_CONTROL),
@@ -259,7 +262,7 @@ SANDBOX_TREES = "workspaces"
 #: 四处同名）：
 #:   * `workspaces/_migrate`：**N58 之前**的迁移暂存拼写（N27 把它放在树根之下，因为那时
 #:     worker 的迁移端点命名的就是树根）。控制面**今天**的迁移暂存 subPath 是 `<export>/_migrate`
-#:     （`workspace-root-init` 建的就是它；worker 的迁移端点 N57 之后也写它），不在这份白名单里；
+#:     （agent 的 `storage-init` 建的、`hand_over_shared` 交的；worker 的迁移端点 N57 之后也写它），不在这份白名单里；
 #:   * `workspaces/_snapshots`：**worker 的快照 payload 根** —— `envd_service/agent.py` 把它的
 #:     copy/export/delete 路由硬编码在 `<workspace_base>/_snapshots/<id>`（`fs/` 载荷 +
 #:     `.complete` 标记），也就是树根下的这一条。C1 之后 worker 以 uid 65534 跑，它要往这里

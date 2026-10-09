@@ -80,15 +80,18 @@ spec:
       # also removes a pod-level hole that had nothing to do with sandboxes:
       # every process in this pod could bind low ports.
       terminationGracePeriodSeconds: 120
-      # Task 3: the **one** group this pod needs. `<export>/_snapshots` is the
-      # single directory two identities write inside each `<id>/`: this worker
-      # writes the payload (`fs.tar` + `.complete`, through
-      # `envd_service/agent.py`'s `/agent/snapshots`) and the 65533 control
-      # plane writes `snapshot.json` beside it. The store is handed over as
-      # `65534:65533` mode `2775` (setgid, group-writable) by the agent's
-      # `storage-init`, and the worker has to be a *member* of 65533 to write
-      # into a `<id>/` the control plane created first -- which is exactly what
-      # this adds. The uid/gid above stay the worker's; a pod-level
+      # Task 3: the **one** group this pod needs. Two shared directories have
+      # the same two writers: `<export>/_snapshots` (this worker writes the
+      # payload `fs.tar` + `.complete` through `envd_service/agent.py`'s
+      # `/agent/snapshots`, and the 65533 control plane writes `snapshot.json`
+      # beside it) and `<export>/_migrate` (the control plane stages
+      # `control-plane/<id>.tar.gz` and this worker writes/unlinks
+      # `<id>.tar.gz` in-process). Both are handed over by the agent's
+      # `storage-init` with the other identity in the **group** --
+      # `65534:65533` and `65533:65533`, mode `2775` (setgid, group-writable)
+      # -- and the worker has to be a *member* of 65533 to write into an
+      # `<id>/` or `<id>.tar.gz` the control plane created first, which is
+      # exactly what this adds. The uid/gid above stay the worker's; a pod-level
       # `runAsUser`/`runAsGroup` would be read by the control plane's identity
       # source instead of the container's, so neither is set here.
       securityContext:
@@ -292,7 +295,13 @@ spec:
             #
             # Task 3 precondition: this is the OCI tar store, and it is
             # read-only for the worker (0755 directories, 0644 tars, read +
-            # traverse, no shared group). Task 2's reclaim derives
+            # traverse, no shared group) -- and the tar mode is enforced, not
+            # assumed: `control_plane/api/templates.py` pins the layout tar it
+            # wrote to `0644` after a successful build (the lane measured
+            # `0666 65533:65533` on 2026-10-09, at which a 65534 worker could
+            # overwrite an existing tar's bytes in place). The sandboxes cannot
+            # reach `_images` at all; the readers are the control plane and the
+            # worker. Task 2's reclaim derives
             # `<platform_root>/_images` from the export root, so a shape that
             # points E2B_IMAGE_OCI_DIR anywhere else turns that reclaim into
             # a silent no-op -- the worker-side fallback prune is gone.
@@ -318,10 +327,12 @@ spec:
               value: "1342177280"
             - name: E2B_TREE_COPY_WINDOW_BYTES
               value: "67108864"
-            # The cache is written by two uids (the control-plane pod runs as
-            # root, this pod as 65534), so the resolver hands every directory
-            # and file it creates to the worker uid: the worker writes as the
-            # owner, root writes through CAP_DAC_OVERRIDE, and a sandbox uid
+            # This cache is the worker's: this pod runs as 65534 and writes it,
+            # and the control plane only *names* it (since Task 3 it runs as
+            # 65533 and never touches a node-local cache in the fleet -- see
+            # `deploy/k8s/control-plane.yaml`'s `E2B_IMAGE_CACHE_OWNER_UID`).
+            # The resolver hands every directory and file it creates to the
+            # worker uid: the worker writes as the owner, and a sandbox uid
             # (10000+) gets read/traverse bits only -- never 0777, since a
             # writable rootfs cache is a cross-tenant poisoning vector.
             # docs/production-deployment-requirements.md §2.7.1.

@@ -11,7 +11,7 @@ Task 3 把控制面从 worker 的 65534 挪到 65533（`deploy/k8s/control-plane
   拼写 —— 没有 `E2B_SHARED_VOLUME_ROOT` 时的快照 payload 根，以及 **N58 之前**的迁移暂存
   `workspaces/_migrate`）留在 65534 —— 把共享 `state` 交给控制面 uid 会让第一个建箱就写不动；
   控制面**今天**的迁移暂存是 `<export>/_migrate`（它 pod 的 subPath），那一条不在计划表里：
-  `workspace-root-init` 会把它交给 65533，要让脚本在同一次跑里做就用 `--target _migrate`
+  agent 的 `storage-init` 会把它交给 65533，要让脚本在同一次跑里做就用 `--target _migrate`
   （回退时要再写一遍）；
 * `_snapshots` 是唯一一条**两个身份共写**的：worker 写 `<id>/fs.tar` 与 `.complete`
   （`envd_service/agent.py` 的 `/agent/snapshots`），控制面写 `<id>/snapshot.json`，所以属主
@@ -489,9 +489,12 @@ def test_the_documented_rollout_names_the_step_that_hands_over_the_live_migrate(
 
     控制面**今天**的迁移暂存是 `<export>/_migrate`（`deploy/k8s/control-plane.yaml` 的
     `subPath: _migrate`），而计划表里那条 `workspaces/_migrate` 是 N58 之前的拼写、属 worker：
-    真那条由 `deploy/k8s/c3-agent.yaml` 的 `workspace-root-init`
-    （`mkdir -p "$shared/_migrate"` + `chown $CP_UID`，1777 兜底）交出去，所以脚本单独跑完
-    Task 1 的探针读到的还是 65534。
+    真那条由 `deploy/k8s/c3-agent.yaml` 的 **`storage-init`** 交出去（`hand_over_shared`：
+    `65533:65533` + 模式 `2775`，chown/chmod 被拒就 FATAL 退出，**没有** 1777 兜底），
+    和它一起交的还有 `<export>/_snapshots`（`65534:65533 2775`）与 `_volumes`（非递归 chown 到
+    65533）；所以脚本单独跑完 Task 1 的探针读到的还是 65534。这一段还必须点名"整套清单"
+    （agent DaemonSet 也在内）与那段窗口期 —— 只 apply `control-plane.yaml` 会让 `_volumes`
+    留在 65534，第一个建卷就撞具名 EACCES。
     """
     lines = [line.strip() for line in SCRIPT.read_text(encoding="utf-8").splitlines()]
     start = next(index for index, line in enumerate(lines) if line.startswith("# 上线顺序："))
@@ -501,11 +504,14 @@ def test_the_documented_rollout_names_the_step_that_hands_over_the_live_migrate(
             break
         rollout.append(line)
     assert rollout == [
-        "# 上线顺序：worker 缩到 0 → 本脚本 --uid 65533 --apply → **apply 清单**"
-        "（`workspace-root-init`",
-        "#   把 <export>/_migrate 交给 65533，1777 兜底）→ 起 worker → 用 Task 1 的探针验证"
-        "（它读的就是那条）",
-        "#   （想让脚本在同一次跑里也迁它：`--uid 65533 --target _migrate --apply`；回退写同一条）",
+        "# 上线顺序：worker 缩到 0 → 本脚本 --uid 65533 --apply → **apply 整套清单**"
+        "（agent DaemonSet 也在内）",
+        "#   → agent 的 `storage-init` 把 <export>/_migrate 交给 65533:65533、<export>/_snapshots 交给",
+        "#   65534:65533、`_volumes` 交给 65533（前两条 mode 2775 一起摆；属主或权限位被拒就 FATAL，",
+        "#   没有兜底；顺带扫掉旧的 `_snapshots/<id>` 子目录）→ 起 worker → 用 Task 1 的探针验证",
+        "#   （控制面 pod 滚上去到 storage-init 跑完之间是窗口期：这段要挑安静的时候做）",
+        "#   （想让脚本在同一次跑里也迁 <export>/_migrate：`--uid 65533 --target _migrate --apply`；"
+        "回退写同一条）",
         "# 回退顺序：worker 缩到 0 → 本脚本 --rollback --apply（正向写过 --target 的这里要写同一条）",
         "#   → 回退清单（否则下一次 agent rollout 时 init 容器会按新身份再交一遍）→ 起 worker → 验证",
     ]

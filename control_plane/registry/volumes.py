@@ -61,11 +61,12 @@ class UnknownVolumeError(KeyError):
 class VolumeRootNotOwnedError(RuntimeError):
     """The volume store is not writable by this control plane's own uid.
 
-    C3 Task 5 (ruling **D24**): the control plane runs as **65534** and creates
+    C3 Task 5 (ruling **D24**): the control plane runs as its own uid (**65533**
+    since Task 3; it shared the workers' 65534 before that) and creates
     every volume as ``<store>/<volume_id>`` — an ordinary owner operation, not
     a privileged one — plus the record at ``<store>/_meta/<volume_id>.json``.
     The store's ownership is therefore a *deployment pre-condition*: it is
-    handed over to 65534 once, **non-recursively** (the directories below it
+    handed over to 65533 once, **non-recursively** (the directories below it
     are sandbox volume data owned by pooled sandbox uids), by the agent's
     ``storage-init`` (``deploy/k8s/c3-agent.yaml``).
 

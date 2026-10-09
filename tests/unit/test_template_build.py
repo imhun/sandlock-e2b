@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import stat
@@ -19,6 +20,12 @@ from control_plane.registry.templates import (
     TemplateRegistry,
     UnknownTemplateBuildError,
 )
+
+#: Captured at import, before any test patches ``os.chmod`` with a spy: the fake
+#: buildctl below has to leave the raw mode it models (buildctl applies the
+#: process umask, measured on the lane as ``0666``), not whatever the spy
+#: happens to do with it.
+_REAL_CHMOD = os.chmod
 
 
 class _FakeStream:
@@ -97,6 +104,15 @@ async def _run_build(
     async def fake_exec(*args, **kwargs):  # noqa: ANN002, ANN003
         captured["args"] = args
         captured["kwargs"] = kwargs
+        # What buildctl leaves when it exports a layout tar: the file exists
+        # and wears the process umask (the lane measured 0666 on a non-root
+        # build). The registry path has no local `dest` and writes nothing.
+        output = args[args.index("--output") + 1]
+        if output.startswith("type=oci,dest="):
+            dest = Path(output.removeprefix("type=oci,dest="))
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"oci")
+            _REAL_CHMOD(dest, 0o666)
         return _FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -146,7 +162,14 @@ async def test_buildctl_builds_and_pushes_to_registry(
 async def test_buildctl_builds_without_registry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    settings = Settings(api_keys=("k",), image_registry="")
+    # The cache directory is a tmp_path one: the fake buildctl now writes the
+    # `dest` file it models, and a test must not leave it in the repo's own
+    # `tmp/sandboxes/_images` (the default). `image_oci_dir` stays unset, so
+    # this still pins the fallback the shipped shapes without
+    # `E2B_IMAGE_OCI_DIR` rely on.
+    settings = Settings(
+        api_keys=("k",), image_registry="", image_cache_dir=tmp_path / "_images"
+    )
     captured, build, template, app = await _run_build(monkeypatch, settings, tmp_path)
     args = captured["args"]
 
@@ -161,6 +184,86 @@ async def test_buildctl_builds_without_registry(
     assert build.status == "ready"
     assert template.image == "e2b-sandlock-template:tpl_abc"
     assert app.state.templates.saved == []
+
+
+@pytest.mark.asyncio
+async def test_a_finished_build_pins_its_layout_tar_to_0644(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The tar the worker reads must not be writable by the 65534 worker.
+
+    `buildctl` opens `dest` with this process's umask, and the lane measured
+    `666 65533:65533` (2026-10-09) -- at 0666 the worker can overwrite the
+    bytes of a tar the manifests call read-only (it still cannot create or
+    replace one). The control plane owns the file, so it pins `0644` itself,
+    on the build path, before the build is published.
+    """
+    settings = Settings(
+        api_keys=("k",),
+        image_registry="",
+        image_oci_dir=tmp_path / "oci",
+    )
+    tar = tmp_path / "oci" / "_oci" / "e2b-sandlock-template_tpl_abc.oci.tar"
+    chmods: list[tuple[Path, int]] = []
+    real_chmod = os.chmod
+
+    def spy_chmod(path, mode, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        chmods.append((Path(path), mode))
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(tmpl.os, "chmod", spy_chmod)
+    captured, build, template, app = await _run_build(monkeypatch, settings, tmp_path)
+
+    assert captured["args"][captured["args"].index("--output") + 1] == (
+        f"type=oci,dest={tar}"
+    )
+    assert build.status == "ready"
+    # Exactly one chmod, on exactly the tar buildctl wrote, to exactly 0644 --
+    # and it really moved (the fake left the umask mode of 0666).
+    assert chmods == [(tar, 0o644)]
+    assert stat.S_IMODE(tar.stat().st_mode) == 0o644
+    assert app.state.templates.discarded == []
+
+
+@pytest.mark.asyncio
+async def test_a_layout_tar_whose_mode_cannot_be_pinned_is_discarded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A 0666 tar is the shape the read-only claim forbids: fail by name.
+
+    `chmod` by the file's owner is not something NFS `root_squash` can refuse,
+    so a refusal here means the store (or the file) is not what the build just
+    wrote -- and publishing a tar a 65534 worker can overwrite would make the
+    manifests lie. The build is discarded with the tar, exactly like the other
+    no-image paths (N19).
+    """
+    settings = Settings(
+        api_keys=("k",),
+        image_registry="",
+        image_oci_dir=tmp_path / "oci",
+    )
+    tar = tmp_path / "oci" / "_oci" / "e2b-sandlock-template_tpl_abc.oci.tar"
+    refusal = PermissionError(errno.EPERM, "Operation not permitted")
+
+    def refuse_chmod(path, mode, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise refusal
+
+    async def fake_exec(*args, **kwargs):  # noqa: ANN002, ANN003
+        dest = Path(args[args.index("--output") + 1].removeprefix("type=oci,dest="))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"oci")
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(tmpl.os, "chmod", refuse_chmod)
+    build, template = _build(), _template()
+    app = _app(settings, template)
+    await tmpl._run_build(app, template, build, "FROM python:3.11-slim\n", tmp_path)
+
+    assert build.status == "error"
+    assert build.error == f"cannot set the OCI layout tar mode to 0644: {refusal}"
+    assert not tar.exists(), "the un-pinnable tar must not be left resolvable"
+    assert app.state.templates.discarded == [template]
 
 
 def test_write_docker_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -378,6 +378,25 @@ async def _run_build(
             template.image = remote
             app.state.templates.save(template)
             build.append_log(f"pushed image to {remote}")
+        elif oci_tar is not None:
+            # The layout tar is the worker's image source and the manifests
+            # call the store read-only for the worker (read + traverse), but
+            # ``buildctl`` opens ``dest`` with *this* process's umask: the lane
+            # measured `0666 65533:65533` (2026-10-09), and at 0666 a 65534
+            # worker can overwrite the bytes of an existing tar. The control
+            # plane owns the file buildctl just wrote for it, so it pins the
+            # mode the manifests advertise -- and a failure is not "carry on":
+            # a 0666 tar *is* the shape the comment promises cannot exist, so
+            # the build is discarded by name instead of published.
+            try:
+                os.chmod(oci_tar, 0o644)
+            except OSError as e:
+                build.status = "error"
+                build.error = f"cannot set the OCI layout tar mode to 0644: {e}"
+                build.append_log(build.error)
+                _discard_failed_build(app, template, oci_tar, oci_link)
+                publish()
+                return
         if build.status != "error":
             build.status = "ready"
             build.append_log("Build finished successfully")

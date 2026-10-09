@@ -10,7 +10,7 @@ wave 1/2 之后 worker 是 uid 65534，而今天这台 NAS 上的平台态文件
 * **行为**：在没有集群的情况下跑 `--print-plan` 与 `--root` 彩排 —— 计划恰是 8 个平台
   目标；树根下**恰允许 `workspaces/_migrate` 与 `workspaces/_snapshots` 这两条确切条目**
   （前者是**N58 之前**的迁移暂存拼写 —— 控制面今天的 subPath 是 `<export>/_migrate`，
-  由 `workspace-root-init` 建；后者是 **worker 的快照 payload 根** ——
+  由 agent 的 `storage-init` 建并交出去；后者是 **worker 的快照 payload 根** ——
   `envd_service/agent.py` 硬编码为 `<workspace_base>/_snapshots`，
   C1 之后 worker 以 uid 65534 往它里面写，属主必须是 worker；控制面的记录根是另一条
   `<export>/_snapshots`），其余任何落在 `workspaces/` 之下的拼写（含
