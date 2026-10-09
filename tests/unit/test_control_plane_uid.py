@@ -336,36 +336,89 @@ def test_the_k8s_hand_over_gives_the_shared_root_to_the_control_plane() -> None:
         assert expected in lines, expected
 
 
-def test_the_k8s_state_base_stays_the_workers_and_migrate_does_not() -> None:
-    """`state` is the worker's; `_migrate` is the control plane's (R13).
+def test_the_k8s_state_base_stays_the_workers() -> None:
+    """`state` is the worker's, and only `state` (R13/R15).
 
-    Both are `1777` on the shared export root, so the only thing that changes is
-    which uid each is handed to: one loop, two expected uids, and the
-    world-writable fallback untouched (that fallback is what lets the *other*
-    identity create its own top-level names when a chown is refused).
+    `state` keeps its old judgement -- owner 65534, or `1777` as the fallback
+    for a storage that refuses a chown -- and it is now the *only* target of that
+    block: `_migrate` left this container entirely (it is a two-identity
+    directory, handed over with a group and an explicit mode by `storage-init`).
     """
     inits = _init_containers(_agent_daemonset())
     workspace = _env(inits["workspace-root-init"])
     assert workspace["WORKER_UID"]["value"] == "65534"
     assert workspace["CP_UID"]["value"] == "65533"
     lines = _commands(inits["workspace-root-init"])
-    assert 'for target in "$state" "$shared/_migrate"; do' in lines
-    assert 'if [ "$target" = "$state" ]; then uid="$WORKER_UID"; else uid="$CP_UID"; fi' in lines
+    assert 'target="$state"' in lines
+    assert 'uid="$WORKER_UID"' in lines
+    assert 'chmod 1777 "$target" 2>/dev/null ||' in lines
+    # Nothing here names `_migrate` any more: its hand-over (group + mode) is
+    # `storage-init`'s, and a 1777-only-on-refusal chmod here is exactly the bug
+    # R15 records (a fresh volume stayed 0755 and the worker's write got EACCES).
+    assert [line for line in lines if "_migrate" in line] == []
     # `_snapshots`' ownership is *not* re-imposed here any more: storage-init is
     # the one container that hands it over (a 65534 chown here would take the
     # control plane's group back off).
     assert not [line for line in lines if line.startswith('chown 65534:65534 "$shared/_snapshots"')]
 
 
-def test_the_k8s_snapshot_store_is_the_one_cross_uid_directory() -> None:
-    """`_snapshots` = `65534:65533` mode `2775` (R13).
+def test_the_k8s_migrate_staging_is_shared_the_same_way() -> None:
+    """R15: `_migrate` is dual-written too, so it gets the group and an explicit mode.
+
+    The control plane writes `_migrate/control-plane/<id>.tar.gz`
+    (`gateway_common/paths.py::migrate_transfer_path`) and the **worker** writes
+    `_migrate/<id>.tar.gz` in-process -- `envd_service/agent.py`'s export route
+    (`mkdir` + `os.open(..., O_WRONLY|O_CREAT|O_TRUNC, 0o600)`, and the
+    `unlink` in its streaming `finally`) and its import route do the same. That
+    needs *write on the directory*, so the owner is the control plane and the
+    worker's group gets the write bit -- which it has, because the worker is a
+    member of 65533 (`supplementalGroups`).
+
+    The mode is set **unconditionally**: the old shape chmodded `1777` only
+    inside the "the chown was refused" branch, so a *fresh* volume (where the
+    root `mkdir` had just made it 0755 and the chown succeeded) left the worker
+    with EACCES on its first export. `2775` is preferred to `1777` because the
+    latter would let any pooled sandbox uid plant or remove migration payloads.
+    """
+    inits = _init_containers(_agent_daemonset())
+    storage = _env(inits["storage-init"])
+    assert storage["MIGRATE_DIR"]["value"] == f"{SHARED_ROOT}/_migrate"
+    assert storage["MIGRATE_OWNER"]["value"] == "65533:65533"
+    assert storage["MIGRATE_MODE"]["value"] == "2775"
+    lines = _commands(inits["storage-init"])
+    for expected in (
+        'hand_over_shared "$MIGRATE_DIR" "$MIGRATE_OWNER" "$MIGRATE_MODE" "the control plane writes control-plane/<id>.tar.gz and the worker writes <id>.tar.gz"',
+        'mkdir -p "$dir"',
+        'chown "$owner" "$dir" 2>/dev/null ||',
+        'chmod "$mode" "$dir" 2>/dev/null ||',
+        'if [ "$shared_owner:$shared_group" != "$owner" ] || [ "$shared_mode" != "$mode" ]; then',
+    ):
+        assert expected in lines, expected
+    # The mode is not inside "the chown was refused" branch: it is applied on
+    # every run, whatever the directory looked like before.
+    chmod_index = lines.index('chmod "$mode" "$dir" 2>/dev/null ||')
+    chown_index = lines.index('chown "$owner" "$dir" 2>/dev/null ||')
+    assert chown_index < chmod_index
+    assert 'chmod 1777 "$MIGRATE_DIR"' not in "\n".join(lines)
+
+
+def test_the_k8s_snapshot_store_is_shared_and_its_old_children_are_swept() -> None:
+    """`_snapshots` = `65534:65533` mode `2775`, and the pre-existing ids too.
 
     The worker writes `<id>/fs.tar` and the control plane writes
-    `<id>/snapshot.json` **inside the same directory**, so this one target keeps
-    the worker as its owner, takes the control plane's group, and carries the
+    `<id>/snapshot.json` **inside the same directory**, so this target keeps the
+    worker as its owner, takes the control plane's group, and carries the
     group-write + setgid bits that the two creators then reproduce on each
     `<id>/`. The mode is set here because `migrate-state-owner.sh` is pinned to
     chown-only.
+
+    Fix round 3 (finding 2): the `<id>/` directories that predate this are
+    `65534:65534 0755`, and a 0755 directory the control plane does not own makes
+    its `SnapshotRegistry.delete()` a silent no-op (`rmtree(..., ignore_errors=True)`
+    cannot unlink inside it, so the `snapshot.json` survives and the id keeps
+    being listed). The same hand-over therefore sweeps the store's **direct
+    children** -- owner, group *and* mode -- and it must not reach further: the
+    payload files below belong to whoever wrote them.
     """
     inits = _init_containers(_agent_daemonset())
     storage = _env(inits["storage-init"])
@@ -374,12 +427,19 @@ def test_the_k8s_snapshot_store_is_the_one_cross_uid_directory() -> None:
     assert storage["SNAPSHOT_MODE"]["value"] == "2775"
     lines = _commands(inits["storage-init"])
     for expected in (
-        'mkdir -p "$SNAPSHOT_DIR"',
-        'chown "$SNAPSHOT_OWNER" "$SNAPSHOT_DIR" 2>/dev/null ||',
-        'chmod "$SNAPSHOT_MODE" "$SNAPSHOT_DIR" 2>/dev/null ||',
-        'if [ "$snap_owner:$snap_group" != "$SNAPSHOT_OWNER" ] || [ "$snap_mode" != "$SNAPSHOT_MODE" ]; then',
+        'hand_over_shared "$SNAPSHOT_DIR" "$SNAPSHOT_OWNER" "$SNAPSHOT_MODE" "the worker writes <id>/fs.tar and the control plane writes <id>/snapshot.json inside the same directory"',
+        # The sweep: direct children only, one level, owner+group+mode.
+        'for child in "$SNAPSHOT_DIR"/*; do',
+        '[ -d "$child" ] || continue',
+        'chown "$SNAPSHOT_OWNER" "$child" 2>/dev/null ||',
+        'chmod "$SNAPSHOT_MODE" "$child" 2>/dev/null ||',
+        'if [ "$child_owner:$child_group" != "$SNAPSHOT_OWNER" ] || [ "$child_mode" != "$SNAPSHOT_MODE" ]; then',
     ):
         assert expected in lines, expected
+    script = "\n".join(lines)
+    # One level: nothing recursive into the payloads below the `<id>` children.
+    assert 'chown -R "$SNAPSHOT_OWNER"' not in script
+    assert 'chmod -R "$SNAPSHOT_MODE"' not in script
 
 
 def test_the_k8s_worker_pod_joins_the_control_planes_group() -> None:

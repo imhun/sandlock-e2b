@@ -1099,26 +1099,25 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
         'chown 65534:65534 "$node_state" 2>/dev/null ||',
         'chmod 0755 "$node_state" 2>/dev/null ||',
         'if [ "$node_state_owner" != "65534" ]; then',
-        # ...plus the migration staging, on the *export* root since N58 (the
-        # tree root is no longer the thing its reader can see). It is the
-        # control plane's directory (it stages the tar there), so it is the
-        # `else` arm of the uid case in the shared-roots loop below.
-        'mkdir -p "$shared/_migrate"',
+        # (`_migrate` is not this container's any more: Task 3 moved it to
+        # `storage-init`'s `hand_over_shared`, because the worker writes its own
+        # `<id>.tar.gz` there too and the directory needs a group + a mode that
+        # is set unconditionally -- R15.)
         'mkdir -p "$state/_runtime/.checkpoints"',
         'chmod 0711 "$state/_runtime" "$state/_runtime/.checkpoints" 2>/dev/null ||',
-        # Task 3: the tree root left this loop. It is the **node-local** base
-        # now, so it gets its own strict hand-over (`chown` + owner check, no
-        # world-writable fallback -- a local disk that cannot be chowned is a
-        # broken node, and 1777 would hide it). `state` and the migration
-        # staging (where the control plane stages a tar) keep the shared
-        # judgement, each against its own uid.
+        # Task 3: the tree root left this register. It is the **node-local**
+        # base now, so it gets its own strict hand-over (`chown` + owner check,
+        # no world-writable fallback -- a local disk that cannot be chowned is a
+        # broken node, and 1777 would hide it). `state` is what is left of the
+        # shared world-writable register, and it is the worker's.
         'mkdir -p "$base"',
         'chown 65534:65534 "$base" 2>/dev/null ||',
         'if [ "$base_owner" != "65534" ]; then',
-        'for target in "$state" "$shared/_migrate"; do',
-        'if [ "$target" = "$state" ]; then uid="$WORKER_UID"; else uid="$CP_UID"; fi',
+        'target="$state"',
+        'uid="$WORKER_UID"',
         'owner="$(stat -c %u "$target")"',
         'chown $uid:$uid "$target" 2>/dev/null ||',
+        'chmod 1777 "$target" 2>/dev/null ||',
     ):
         assert expected in lines, expected
     # The 1777 fallback loop is for the two roots and the migration staging; the
@@ -1128,7 +1127,6 @@ def test_the_agent_creates_both_roots_and_the_checkpoint_gate() -> None:
     # plane's group back off.
     commands = [line for line in lines if not line.startswith("#")]
     assert [line for line in commands if "_snapshots" in line] == []
-    assert [line for line in commands if "1777" in line and "_snapshots" in line] == []
 
 
 @pytest.mark.skipif(KUBECTL is None, reason="kubectl needed to render the kustomize overlay")
@@ -1219,6 +1217,10 @@ def test_the_retired_brokers_owner_inits_moved_into_the_agent() -> None:
         {"name": "SNAPSHOT_DIR", "value": "/var/lib/e2b-sandboxes/_snapshots"},
         {"name": "SNAPSHOT_OWNER", "value": "65534:65533"},
         {"name": "SNAPSHOT_MODE", "value": "2775"},
+        # R15: the migration landing zone is the second two-identity directory.
+        {"name": "MIGRATE_DIR", "value": "/var/lib/e2b-sandboxes/_migrate"},
+        {"name": "MIGRATE_OWNER", "value": "65533:65533"},
+        {"name": "MIGRATE_MODE", "value": "2775"},
         {"name": "SHARED_ROOT", "value": "/var/lib/e2b-sandboxes"},
     ]
     assert {m["mountPath"] for m in inits["storage-init"]["volumeMounts"]} == {

@@ -145,14 +145,27 @@ def _run_storage_init(
     ``root_squash`` shape). ``refuse_uid=None`` is the control arm.
     ``refuse_mode`` is a path suffix whose ``chmod`` is refused instead, so its
     mode stays ``0755``.
+
+    The snapshot store's direct children are modelled *statefully*, because
+    fix round 3 sweeps them: a child answers the pre-Task-3 shape
+    (``65534:65534 0755``) until both a ``chown`` and a ``chmod`` have run
+    against it, and each of those writes a marker file, so the test can read the
+    sweep's exact scope off the filesystem (`PROBE_MARKERS`).
     """
     store = tmp_path / "probe" / "shared"
     node_cache = tmp_path / "probe" / "node-local" / "e2b-images"
     for name in ("_images/_oci", "_builds", "_secrets", "_templates", "_snapshots"):
         (store / name).mkdir(parents=True)
+    # Two snapshot ids that predate the change: one empty, one with a payload
+    # file inside it (the file must never be touched by the sweep).
+    (store / "_snapshots" / "snap_old").mkdir()
+    (store / "_snapshots" / "snap_new").mkdir()
+    (store / "_snapshots" / "snap_new" / "fs.tar").write_bytes(b"tar")
     (store / "_volumes" / "_meta").mkdir(parents=True)
     (store / "_volumes" / "vol_abc").mkdir()
     node_cache.mkdir(parents=True)
+    markers = tmp_path / "markers"
+    markers.mkdir()
     shims = tmp_path / "shims"
     shims.mkdir()
     refused_uid = "-1" if refuse_uid is None else refuse_uid
@@ -165,12 +178,24 @@ def _run_storage_init(
         "refused = os.environ.get('PROBE_REFUSED_UID', '-1')\n"
         "suffix = os.environ.get('PROBE_REFUSED', '')\n"
         "shared = os.environ['PROBE_SHARED']\n"
+        "snap = os.environ['PROBE_SNAPSHOT']\n"
+        "migrate = os.environ['PROBE_MIGRATE']\n"
         "refuse_mode = os.environ.get('PROBE_REFUSED_MODE', '')\n"
+        "markers = os.environ['PROBE_MARKERS']\n"
+        "def swept(kind):\n"
+        "    return os.path.exists(markers + '/' + kind + '-' + path.replace('/', '_'))\n"
         "if refused != '-1' and suffix and path.endswith(suffix):\n"
         "    uid, gid, mode = int(refused), int(refused), '755'\n"
-        "elif path == os.environ['PROBE_SNAPSHOT']:\n"
+        "elif path == snap:\n"
         "    uid, gid = 65534, 65533\n"
         "    mode = '755' if refuse_mode and path.endswith(refuse_mode) else '2775'\n"
+        "elif path == migrate:\n"
+        "    uid, gid = 65533, 65533\n"
+        "    mode = '755' if refuse_mode and path.endswith(refuse_mode) else '2775'\n"
+        "elif path.startswith(snap + '/'):\n"
+        "    uid = 65534\n"
+        "    gid = 65533 if swept('chown') else 65534\n"
+        "    mode = '2775' if swept('chmod') else '755'\n"
         "elif path.startswith(shared):\n"
         "    uid, gid, mode = 65533, 65533, '755'\n"
         "else:\n"
@@ -184,6 +209,12 @@ def _run_storage_init(
         'if [ "$PROBE_REFUSED_UID" != "-1" ] && [ -n "$PROBE_REFUSED" ]; then\n'
         '  case "${2:-}" in *"$PROBE_REFUSED") exit 1;; esac\n'
         "fi\n"
+        "shift\n"
+        'for target in "$@"; do\n'
+        '  case "$target" in\n'
+        '    "$PROBE_SNAPSHOT"/*) : > "$PROBE_MARKERS/chown-$(printf %s "$target" | tr / _)" ;;\n'
+        "  esac\n"
+        "done\n"
         "exit 0\n",
     )
     _shim(
@@ -192,6 +223,12 @@ def _run_storage_init(
         'if [ -n "$PROBE_REFUSED_MODE" ]; then\n'
         '  case "${2:-}" in *"$PROBE_REFUSED_MODE") exit 1;; esac\n'
         "fi\n"
+        "shift\n"
+        'for target in "$@"; do\n'
+        '  case "$target" in\n'
+        '    "$PROBE_SNAPSHOT"/*) : > "$PROBE_MARKERS/chmod-$(printf %s "$target" | tr / _)" ;;\n'
+        "  esac\n"
+        "done\n"
         "exit 0\n",
     )
     script = tmp_path / "storage-init.sh"
@@ -215,12 +252,17 @@ def _run_storage_init(
     environment["SNAPSHOT_DIR"] = str(store / "_snapshots")
     environment["SNAPSHOT_OWNER"] = "65534:65533"
     environment["SNAPSHOT_MODE"] = "2775"
+    environment["MIGRATE_DIR"] = str(store / "_migrate")
+    environment["MIGRATE_OWNER"] = "65533:65533"
+    environment["MIGRATE_MODE"] = "2775"
     environment["SHARED_ROOT"] = str(store)
     environment["PROBE_REFUSED_UID"] = refused_uid
     environment["PROBE_REFUSED"] = refuse
     environment["PROBE_REFUSED_MODE"] = refuse_mode
     environment["PROBE_SHARED"] = str(store)
     environment["PROBE_SNAPSHOT"] = str(store / "_snapshots")
+    environment["PROBE_MIGRATE"] = str(store / "_migrate")
+    environment["PROBE_MARKERS"] = str(markers)
     return subprocess.run(
         ["sh", str(script)],
         capture_output=True,
@@ -413,8 +455,20 @@ def test_a_record_directory_that_hands_over_reports_success(tmp_path: Path) -> N
         f"storage-init: {store}/_secrets is owned by uid 65533",
         f"storage-init: {store}/_templates is owned by uid 65533",
         # 1d: the one cross-uid directory, group + mode included.
-        f"storage-init: {store}/_snapshots is 65534:65533 mode 2775 "
-        "(two writers: uid 65534 for the payload, uid 65533 for the record)",
+        f"storage-init: {store}/_snapshots is 65534:65533 mode 2775 (two writers: "
+        "the worker writes <id>/fs.tar and the control plane writes "
+        "<id>/snapshot.json inside the same directory)",
+        # ...and the second one (R15): the migration landing zone.
+        f"storage-init: {store}/_migrate is 65533:65533 mode 2775 (two writers: "
+        "the control plane writes control-plane/<id>.tar.gz and the worker writes "
+        "<id>.tar.gz)",
+        # ...then the pre-existing snapshot ids are swept, one level only.
+        f"storage-init: {store}/_snapshots/snap_new is 65534:65533 mode 2775 "
+        "(a pre-existing snapshot directory, swept so the control plane can "
+        "delete it)",
+        f"storage-init: {store}/_snapshots/snap_old is 65534:65533 mode 2775 "
+        "(a pre-existing snapshot directory, swept so the control plane can "
+        "delete it)",
         # 2: the volume store, gated one target at a time.
         f"storage-init: {store}/_volumes already belongs to uid "
         "65533 (mode 755) -- nothing to do",
@@ -424,6 +478,15 @@ def test_a_record_directory_that_hands_over_reports_success(tmp_path: Path) -> N
         "(the volume data directories below it are left alone)",
     ]
     assert result.stderr == ""
+    # The sweep's exact scope, read off the markers its own `chown`/`chmod` wrote:
+    # both direct children, owner *and* mode, and nothing below them (the payload
+    # file inside `snap_new` is not touched).
+    assert sorted(path.name for path in (tmp_path / "markers").iterdir()) == [
+        "chmod-" + str(store / "_snapshots" / "snap_new").replace("/", "_"),
+        "chmod-" + str(store / "_snapshots" / "snap_old").replace("/", "_"),
+        "chown-" + str(store / "_snapshots" / "snap_new").replace("/", "_"),
+        "chown-" + str(store / "_snapshots" / "snap_old").replace("/", "_"),
+    ]
 
 
 def test_a_refused_record_directory_cannot_read_as_a_hand_over(tmp_path: Path) -> None:
@@ -501,11 +564,91 @@ def test_a_snapshot_store_at_the_wrong_mode_is_a_fatal(tmp_path: Path) -> None:
     ]
     assert result.stderr.splitlines() == [
         f"storage-init: FATAL: {store}/_snapshots is 65534:65533 mode 755, not "
-        "65534:65533 mode 2775: the worker (uid 65534) writes <id>/fs.tar and the "
-        "control plane (uid 65533) writes <id>/snapshot.json inside the same "
-        "directory, so the group-write + setgid hand-over cannot be skipped",
+        "65534:65533 mode 2775: the worker writes <id>/fs.tar and the control "
+        "plane writes <id>/snapshot.json inside the same directory, so the "
+        "hand-over cannot be skipped",
         "storage-init: fix it once (as root on the node, or on the NFS server): "
         f"chown 65534:65533 {store}/_snapshots && chmod 2775 {store}/_snapshots",
+    ]
+
+
+def test_a_migrate_staging_at_the_wrong_mode_is_a_fatal(tmp_path: Path) -> None:
+    """R15's gate: `_migrate`'s mode is verified, and it is set unconditionally.
+
+    The worker writes `_migrate/<id>.tar.gz` in-process, so a hand-over that
+    leaves the directory at 0755 (a fresh volume's `mkdir` mode, or an NFS that
+    eats the `chmod`) makes the first cross-node export answer 500. The old shape
+    only chmodded `1777` when the chown had been *refused*, which is exactly the
+    fresh-volume case this arm pins shut.
+    """
+    result = _run_storage_init(tmp_path, refuse_uid=None, refuse_mode="_migrate")
+
+    store = tmp_path / "probe" / "shared"
+    node_cache = tmp_path / "probe" / "node-local" / "e2b-images"
+    assert result.returncode == 1
+    assert result.stdout.splitlines() == [
+        f"storage-init: {node_cache} is owned by uid 65534",
+        f"storage-init: {store}/_images is owned by uid 65533",
+        f"storage-init: {store}/_builds is owned by uid 65533",
+        f"storage-init: {store}/_secrets is owned by uid 65533",
+        f"storage-init: {store}/_templates is owned by uid 65533",
+        # The snapshot store hands over *before* the migration staging, and its
+        # line is the only success line before the refusal.
+        f"storage-init: {store}/_snapshots is 65534:65533 mode 2775 (two writers: "
+        "the worker writes <id>/fs.tar and the control plane writes "
+        "<id>/snapshot.json inside the same directory)",
+        f"storage-init: chmod refused ({store}/_migrate, NFS root_squash?)",
+    ]
+    assert result.stderr.splitlines() == [
+        f"storage-init: FATAL: {store}/_migrate is 65533:65533 mode 755, not "
+        "65533:65533 mode 2775: the control plane writes "
+        "control-plane/<id>.tar.gz and the worker writes <id>.tar.gz, so the "
+        "hand-over cannot be skipped",
+        "storage-init: fix it once (as root on the node, or on the NFS server): "
+        f"chown 65533:65533 {store}/_migrate && chmod 2775 {store}/_migrate",
+    ]
+
+
+def test_a_snapshot_id_the_sweep_cannot_fix_is_a_warning_not_an_outage(
+    tmp_path: Path,
+) -> None:
+    """A refused sweep names the id and lets the pod start (fix round 3).
+
+    The sweep exists because the control plane's `SnapshotRegistry.delete()` is
+    `rmtree(..., ignore_errors=True)`: on a 0755 `<id>/` it cannot unlink the
+    `snapshot.json` inside, so `DELETE` answers 204 and removes nothing. A
+    storage that refuses the `chmod` still has to be able to *start* -- stopping
+    the agent pod would trade one old snapshot's deletion for a start-up outage
+    -- so the failure is a WARN that names the id and the one-time fix.
+    """
+    result = _run_storage_init(
+        tmp_path, refuse_uid=None, refuse_mode="snap_new"
+    )
+
+    store = tmp_path / "probe" / "shared"
+    assert result.returncode == 0
+    lines = result.stdout.splitlines()
+    # The other id is swept and says so; the refused one says which it is.
+    assert (
+        f"storage-init: {store}/_snapshots/snap_old is 65534:65533 mode 2775 "
+        "(a pre-existing snapshot directory, swept so the control plane can "
+        "delete it)" in lines
+    )
+    assert not [
+        line for line in lines if line.startswith(f"storage-init: {store}/_snapshots/snap_new is")
+    ]
+    # The refused `chmod` says so on stdout (the script's own echo shape), and
+    # the WARN is the part an operator has to act on.
+    assert (
+        f"storage-init: chmod refused ({store}/_snapshots/snap_new, NFS "
+        "root_squash?) -- this old snapshot cannot be deleted until it is done "
+        f"once: chmod 2775 {store}/_snapshots/snap_new" in lines
+    )
+    assert result.stderr.splitlines() == [
+        f"storage-init: WARN: {store}/_snapshots/snap_new is 65534:65533 mode 755, "
+        "not 65534:65533 mode 2775 -- deleting that snapshot would answer 204 "
+        "and remove nothing; fix it once: chown 65534:65533 "
+        f"{store}/_snapshots/snap_new && chmod 2775 {store}/_snapshots/snap_new",
     ]
 
 
@@ -525,7 +668,8 @@ def test_both_hand_overs_are_gated_in_the_script_text() -> None:
     ):
         assert expected in lines, expected
     # Inside the helper: verify, then either FATAL+return 1 or the success echo.
-    helper = lines[lines.index("hand_over() {") : lines.index("}") + 1]
+    start = lines.index("hand_over() {")
+    helper = lines[start : lines.index("}", start) + 1]
     verify = helper.index('if [ "$owner" != "$uid" ]; then')
     fatal = next(
         index for index, line in enumerate(helper) if line.startswith('echo "storage-init: FATAL:')

@@ -238,56 +238,104 @@ spec:
                 fi
                 echo "storage-init: $dir is owned by uid $CP_UID"
               done
-              # 1d. `_snapshots`: the one directory **two identities** write. The
-              #     worker writes `<id>/fs.tar` (+ `.complete`) through
-              #     `envd_service/agent.py`'s `/agent/snapshots`, and the control
-              #     plane writes `<id>/snapshot.json` into the *same* `<id>/`
-              #     (`control_plane/registry/snapshots.py::_snapshot_dir` says
-              #     the record directory *is* the payload directory, by design).
-              #     So it keeps the worker as the owner, takes the control
-              #     plane's **group**, and carries group-write + setgid:
+              # 1d. The two directories **two identities write**, which is why
+              #     they are the only ones with a group and a fixed mode:
               #
-              #       * setgid makes every `<id>/` that either identity creates
-              #         inherit gid $SNAPSHOT_GID, and both creators leave that
-              #         directory group-writable (`envd_service/agent.py`'s
-              #         capture route and the control plane's record write), so
-              #         each can write into a directory the other made first;
-              #       * the worker is a member of that group through its pod's
-              #         `securityContext.supplementalGroups: [$SNAPSHOT_GID]`
+              #       * `_snapshots`: the worker writes `<id>/fs.tar`
+              #         (+ `.complete`) through `envd_service/agent.py`'s
+              #         `/agent/snapshots`, and the control plane writes
+              #         `<id>/snapshot.json` into the *same* `<id>/`
+              #         (`control_plane/registry/snapshots.py::_snapshot_dir`
+              #         says the record directory *is* the payload directory, by
+              #         design);
+              #       * `_migrate`: the control plane writes
+              #         `control-plane/<id>.tar.gz`
+              #         (`gateway_common/paths.py::migrate_transfer_path`) and
+              #         the **worker** writes `<id>.tar.gz` in-process -- its
+              #         export route (`mkdir` + `os.open(..., O_WRONLY|O_CREAT|
+              #         O_TRUNC, 0o600)` and the `unlink` in the streaming
+              #         `finally`) and its import route do the same, and that
+              #         needs *write on the directory*.
+              #
+              #     So each keeps the identity that owns its namespace as the
+              #     owner, gives the other the **group**, and carries
+              #     group-write + setgid:
+              #
+              #       * setgid makes children inherit the group, and the two
+              #         creators of a snapshot `<id>/` leave it group-writable
+              #         (`envd_service/agent.py`'s capture route and the control
+              #         plane's record write), so each can write into a
+              #         directory the other made first;
+              #       * the worker is a member of the group through its pod's
+              #         `securityContext.supplementalGroups: [65533]`
               #         (`deploy/k8s/worker.yaml`); the control plane needs
               #         nothing extra, because 65533 is already its `runAsGroup`;
-              #       * the **mode is set here** and deliberately not by
-              #         `migrate-state-owner.sh`: that script is pinned to
-              #         chown-only (it contains no `chmod` at all), and 2775 is
-              #         not a chown.
+              #       * the **mode is set here, unconditionally** -- the old
+              #         shape chmodded `1777` only inside "the chown was
+              #         refused", so a fresh volume (made 0755 by a root
+              #         `mkdir`, chown succeeding) left the worker with EACCES
+              #         on its first migration write. `2775` is preferred to
+              #         `1777`: the latter would let any pooled sandbox uid
+              #         plant or remove migration payloads;
+              #       * and deliberately **not** by `migrate-state-owner.sh`:
+              #         that script is pinned to chown-only (it contains no
+              #         `chmod` at all), and 2775 is not a chown.
+              hand_over_shared() {
+                dir="$1"
+                owner="$2"
+                mode="$3"
+                why="$4"
+                mkdir -p "$dir"
+                chown "$owner" "$dir" 2>/dev/null ||
+                  echo "storage-init: chown refused ($dir, NFS root_squash?) -- verifying the owner instead"
+                chmod "$mode" "$dir" 2>/dev/null ||
+                  echo "storage-init: chmod refused ($dir, NFS root_squash?)"
+                shared_owner="$(stat -c %u "$dir")"
+                shared_group="$(stat -c %g "$dir")"
+                shared_mode="$(stat -c %a "$dir")"
+                if [ "$shared_owner:$shared_group" != "$owner" ] || [ "$shared_mode" != "$mode" ]; then
+                  echo "storage-init: FATAL: $dir is $shared_owner:$shared_group mode $shared_mode, not $owner mode $mode: $why, so the hand-over cannot be skipped" >&2
+                  echo "storage-init: fix it once (as root on the node, or on the NFS server): chown $owner $dir && chmod $mode $dir" >&2
+                  exit 1
+                fi
+                echo "storage-init: $dir is $shared_owner:$shared_group mode $shared_mode (two writers: $why)"
+              }
+              hand_over_shared "$SNAPSHOT_DIR" "$SNAPSHOT_OWNER" "$SNAPSHOT_MODE" "the worker writes <id>/fs.tar and the control plane writes <id>/snapshot.json inside the same directory"
+              hand_over_shared "$MIGRATE_DIR" "$MIGRATE_OWNER" "$MIGRATE_MODE" "the control plane writes control-plane/<id>.tar.gz and the worker writes <id>.tar.gz"
+              # ...and the snapshot `<id>/` directories that predate the group
+              # hand-over: they are `65534:65534 0755`, and the control plane's
+              # `SnapshotRegistry.delete()` is `shutil.rmtree(..., ignore_errors=
+              # True)` -- it cannot unlink inside a 0755 directory it neither
+              # owns nor can write, the error is swallowed, and because
+              # `snapshot.json` lives *inside* that directory the record
+              # survives, so `DELETE` answers 204 and removes nothing. The sweep
+              # below therefore fixes owner, group **and** mode, and it does so
+              # before the control plane starts.
               #
-              #     Known limitation, stated rather than hidden: `<id>/`
-              #     directories that predate this change stay 0755 (the
-              #     ownership migration is chown-only, and this init does not
-              #     sweep them). Reading and restoring an old snapshot is
-              #     unaffected -- a finished record is never rewritten -- but
-              #     *deleting* one is: the control plane's `rmtree` cannot unlink
-              #     inside a 0755 directory it neither owns nor can write, and
-              #     that call ignores errors, so an old payload can be left
-              #     behind as an orphan (never a corrupt snapshot; the record is
-              #     gone). One `find "$SNAPSHOT_DIR" -mindepth 1 -maxdepth 1
-              #     -type d -exec chmod "$SNAPSHOT_MODE" {} +` here would close
-              #     it, inside this same store; it is deliberately not done this
-              #     round (R13 accepts the legacy mode).
-              mkdir -p "$SNAPSHOT_DIR"
-              chown "$SNAPSHOT_OWNER" "$SNAPSHOT_DIR" 2>/dev/null ||
-                echo "storage-init: chown refused ($SNAPSHOT_DIR, NFS root_squash?) -- verifying the owner instead"
-              chmod "$SNAPSHOT_MODE" "$SNAPSHOT_DIR" 2>/dev/null ||
-                echo "storage-init: chmod refused ($SNAPSHOT_DIR, NFS root_squash?)"
-              snap_owner="$(stat -c %u "$SNAPSHOT_DIR")"
-              snap_group="$(stat -c %g "$SNAPSHOT_DIR")"
-              snap_mode="$(stat -c %a "$SNAPSHOT_DIR")"
-              if [ "$snap_owner:$snap_group" != "$SNAPSHOT_OWNER" ] || [ "$snap_mode" != "$SNAPSHOT_MODE" ]; then
-                echo "storage-init: FATAL: $SNAPSHOT_DIR is $snap_owner:$snap_group mode $snap_mode, not $SNAPSHOT_OWNER mode $SNAPSHOT_MODE: the worker (uid $WORKER_UID) writes <id>/fs.tar and the control plane (uid $CP_UID) writes <id>/snapshot.json inside the same directory, so the group-write + setgid hand-over cannot be skipped" >&2
-                echo "storage-init: fix it once (as root on the node, or on the NFS server): chown $SNAPSHOT_OWNER $SNAPSHOT_DIR && chmod $SNAPSHOT_MODE $SNAPSHOT_DIR" >&2
-                exit 1
-              fi
-              echo "storage-init: $SNAPSHOT_DIR is $snap_owner:$snap_group mode $snap_mode (two writers: uid $WORKER_UID for the payload, uid $CP_UID for the record)"
+              #     Its exact scope is **one level**: the store's own direct
+              #     children, and nothing below them -- the payload files inside
+              #     belong to whoever wrote them (`*.secret`-style reasoning, one
+              #     directory up). A child the storage refuses to sweep is a
+              #     WARN, not a FATAL: it costs the *deletion* of that one old
+              #     snapshot, and stopping the agent pod over that would trade a
+              #     cleanup no-op for a start-up outage (the store's own
+              #     hand-over above *is* a FATAL, because nothing works without
+              #     it).
+              for child in "$SNAPSHOT_DIR"/*; do
+                [ -d "$child" ] || continue
+                chown "$SNAPSHOT_OWNER" "$child" 2>/dev/null ||
+                  echo "storage-init: chown refused ($child, NFS root_squash?) -- this old snapshot cannot be deleted until it is done once: chown $SNAPSHOT_OWNER $child"
+                chmod "$SNAPSHOT_MODE" "$child" 2>/dev/null ||
+                  echo "storage-init: chmod refused ($child, NFS root_squash?) -- this old snapshot cannot be deleted until it is done once: chmod $SNAPSHOT_MODE $child"
+                child_owner="$(stat -c %u "$child")"
+                child_group="$(stat -c %g "$child")"
+                child_mode="$(stat -c %a "$child")"
+                if [ "$child_owner:$child_group" != "$SNAPSHOT_OWNER" ] || [ "$child_mode" != "$SNAPSHOT_MODE" ]; then
+                  echo "storage-init: WARN: $child is $child_owner:$child_group mode $child_mode, not $SNAPSHOT_OWNER mode $SNAPSHOT_MODE -- deleting that snapshot would answer 204 and remove nothing; fix it once: chown $SNAPSHOT_OWNER $child && chmod $SNAPSHOT_MODE $child" >&2
+                else
+                  echo "storage-init: $child is $child_owner:$child_group mode $child_mode (a pre-existing snapshot directory, swept so the control plane can delete it)"
+                fi
+              done
               # 2. The volume store (D24). `hand_over` moves one directory's
               #    owner and nothing else, and **verifies what it moved**: a
               #    target that is not the uid it was handed to after the attempt
@@ -386,6 +434,18 @@ spec:
             - name: SNAPSHOT_MODE
               # Group-write + setgid, so a `<id>/` created by either identity
               # inherits gid 65533 and the other can write inside it.
+              value: "2775"
+            - name: MIGRATE_DIR
+              # The cross-node migration landing zone (R15): the control plane
+              # stages `control-plane/<id>.tar.gz` there and the worker writes
+              # (and unlinks) `<id>.tar.gz` in-process, so it is shared exactly
+              # the way `_snapshots` is -- owner control plane, group 65533.
+              value: /var/lib/e2b-sandboxes/_migrate
+            - name: MIGRATE_OWNER
+              value: "65533:65533"
+            - name: MIGRATE_MODE
+              # The mode is applied unconditionally (a fresh volume used to end
+              # up 0755 and EACCES the worker's first write).
               value: "2775"
             - name: SHARED_ROOT
               value: /var/lib/e2b-sandboxes
@@ -552,8 +612,10 @@ spec:
               # all. It is the control plane's one writable subPath
               # (`deploy/k8s/control-plane.yaml` names the same directory):
               # sandbox trees stay EROFS for that pod (OBS-9), and neither node
-              # writes its own staging.
-              mkdir -p "$shared/_migrate"
+              # writes its own staging. Task 3 moved its creation *and* its
+              # hand-over to `storage-init` (it is a two-identity directory now:
+              # the worker writes its own `<id>.tar.gz` there, so it needs the
+              # group and an explicitly set mode -- see `hand_over_shared`).
               # ...and the **live snapshot store** (`<export>/_snapshots/<id>/`:
               # the worker's payload and the control plane's `snapshot.json`
               # record in one directory, which is what
@@ -595,46 +657,46 @@ spec:
                   exit 1
                 fi
               done
-              # The **shared** roots that two identities create top-level names
-              # in, each with its own owner now (Task 3): `$state` is the
-              # worker's (the uid pool's lock and the runtime records -- the
-              # control plane reaches those over the worker's HTTP face), and
-              # `_migrate` is the control plane's (it stages the migration tar
-              # there; a node's agent reads it back). The judgement keeps its old
-              # shape -- owner, or 1777 as the compose convention -- with the
-              # target's own uid: 1777 is still accepted because that is what
-              # lets the *other* identity create its own top-level names when the
-              # storage refuses a chown, and a mode the platform already ships is
-              # not this container's to tighten. The node-local tree root is
-              # deliberately **not** in this loop: it is a local disk, where the
-              # 1777 fallback would only hide a broken node, so it is verified
-              # strictly above (Task 3).
-              for target in "$state" "$shared/_migrate"; do
-                if [ "$target" = "$state" ]; then uid="$WORKER_UID"; else uid="$CP_UID"; fi
+              # The **shared state base** is the one target left in this
+              # container's world-writable register: it is the worker's (the uid
+              # pool's lock and the runtime records -- the control plane reaches
+              # those over the worker's HTTP face), and the judgement keeps its
+              # old shape -- owner 65534, or `1777` as the compose convention --
+              # because that fallback is what lets a storage that refuses a chown
+              # still be usable, and a mode the platform already ships is not
+              # this container's to tighten. (`_migrate` used to share this loop;
+              # Task 3 moved it to `storage-init`'s `hand_over_shared`, because
+              # it is a *two-identity* directory and a 1777 that only appeared on
+              # the refused-chown path left a fresh volume at 0755 -- EACCES for
+              # the worker's first migration write.) The node-local tree root is
+              # deliberately **not** in this register either: it is a local disk,
+              # where the 1777 fallback would only hide a broken node, so it is
+              # verified strictly above (Task 3).
+              target="$state"
+              uid="$WORKER_UID"
+              owner="$(stat -c %u "$target")"
+              mode="$(stat -c %a "$target")"
+              echo "workspace-root-init: $target owner=$owner mode=$mode (wants uid $uid)"
+              if [ "$owner" != "$uid" ]; then
+                chown $uid:$uid "$target" 2>/dev/null ||
+                  echo "workspace-root-init: chown refused ($target, NFS root_squash?) -- the one-time migration does this: chown $uid:$uid $target"
                 owner="$(stat -c %u "$target")"
                 mode="$(stat -c %a "$target")"
-                echo "workspace-root-init: $target owner=$owner mode=$mode (wants uid $uid)"
                 if [ "$owner" != "$uid" ]; then
-                  chown $uid:$uid "$target" 2>/dev/null ||
-                    echo "workspace-root-init: chown refused ($target, NFS root_squash?) -- the one-time migration does this: chown $uid:$uid $target"
+                  chmod 1777 "$target" 2>/dev/null ||
+                    echo "workspace-root-init: chmod refused (NFS root_squash?)"
                   owner="$(stat -c %u "$target")"
                   mode="$(stat -c %a "$target")"
-                  if [ "$owner" != "$uid" ]; then
-                    chmod 1777 "$target" 2>/dev/null ||
-                      echo "workspace-root-init: chmod refused (NFS root_squash?)"
-                    owner="$(stat -c %u "$target")"
-                    mode="$(stat -c %a "$target")"
-                  fi
                 fi
-                world_writable=0
-                case "$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
-                if [ "$owner" != "$uid" ] && [ "$world_writable" != "1" ]; then
-                  echo "workspace-root-init: FATAL: $target is mode $mode, owned by uid $owner -- uid $uid cannot create the top-level names it owns there, so every Sandbox.create() would fail with EACCES" >&2
-                  echo "workspace-root-init: fix it once (on the node, or on the storage server): chmod 1777 $target  (or chown $uid:$uid $target)" >&2
-                  exit 1
-                fi
-                echo "workspace-root-init: $target is writable by uid $uid (owner=$owner mode=$mode)"
-              done
+              fi
+              world_writable=0
+              case "$mode" in *2|*3|*6|*7) world_writable=1 ;; esac
+              if [ "$owner" != "$uid" ] && [ "$world_writable" != "1" ]; then
+                echo "workspace-root-init: FATAL: $target is mode $mode, owned by uid $owner -- uid $uid cannot create the top-level names it owns there, so every Sandbox.create() would fail with EACCES" >&2
+                echo "workspace-root-init: fix it once (on the node, or on the storage server): chmod 1777 $target  (or chown $uid:$uid $target)" >&2
+                exit 1
+              fi
+              echo "workspace-root-init: $target is writable by uid $uid (owner=$owner mode=$mode)"
           env:
             - name: WORKER_UID
               value: "65534"
