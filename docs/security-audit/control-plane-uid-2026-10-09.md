@@ -164,10 +164,10 @@ prune 实际上**只剩一次只读走查**（要回收的 staging 也都在它�
     "gid": 65534
   },
   {
-    "path": "workspaces/_migrate",
-    "mode": "missing",
-    "uid": -1,
-    "gid": -1
+    "path": "_migrate",
+    "mode": "0o1777",
+    "uid": 65534,
+    "gid": 65534
   }
 ]
 ```
@@ -175,19 +175,19 @@ prune 实际上**只剩一次只读走查**（要回收的 staging 也都在它�
 | 路径 | 真实 mode | uid:gid |
 |---|---|---|
 | `_builds` / `_images` / `_secrets` / `_snapshots` / `_templates` / `_volumes` | `0755` | `65534:65534` |
-| `state` | `1777` | `65534:65534` |
-| `workspaces/_migrate` | **missing** | — |
+| `state` / `_migrate` | `1777` | `65534:65534` |
 
 * 六条 `0755 65534:65534` ⇒ 迁到新 uid 之后 worker / agent 对它们仍"世界可读 + 可遍历"
   （`0644`/`0755`），§4.1 的"只读就够了"成立。
-* `state` 是 **`1777`**（sticky + world-rwx）而不是 `0755`。C3 的 storage-init
-  （`deploy/k8s/c3-agent.yaml` 的 `workspace-root-init`）对 `$state` 的放行判据就是"属主 65534 **或**
-  world-writable"；属主换成 65533 之后，这条 world-writable 位（或 init 自己再 `chmod 1777`）
-  是 worker / 槽位 uid 继续在 `state/**` 下建名字所依赖的 —— 迁移只改属主，**不要顺手收模式**。
-* `workspaces/_migrate` 报 `missing`：这条钉的是 §13.8（2026-09-28）的清单，**N58（§7.29）已把
-  `_migrate` 上浮到导出根**，舰队清单挂的是 `<root>/_migrate` —— 逐条实测 `0o1777 65534:65534`
-  （`workspaces/` 下没有 `_migrate`；`workspaces/` 自己 `0o1777 0:65534`）。所以"8 条"里这一条
-  按老路径读是空的，真实挂载点的读数就是这句括注。
+* `state` 与 `_migrate` 都是 **`1777`**（sticky + world-rwx）而不是 `0755`。C3 的 storage-init
+  （`deploy/k8s/c3-agent.yaml` 的 `workspace-root-init`）对这两个目标（`$state` / `$shared/_migrate`）
+  的放行判据就是"属主 65534 **或** world-writable"；属主换成 65533 之后，这条 world-writable 位
+  （或 init 自己再 `chmod 1777`）是 worker / 槽位 uid 继续在其下建名字所依赖的 —— 迁移只改属主，
+  **不要顺手收模式**。
+* 第 8 条读的是 `_migrate`：清单（`deploy/k8s/control-plane.yaml` 的同名 `subPath`）才是"pod 挂了
+  什么"的权威；本节初稿的 8 条清单抄的是 §13.8（2026-09-28）的快照，写的还是上浮前的
+  `workspaces/_migrate`，而 **N58（§7.29）已把 `_migrate` 上浮到导出根** —— 那处老拼写实测
+  `missing`（`workspaces/` 自己 `0o1777 0:65534`），按清单改读 `_migrate` 之后就是上表里的读数。
 
 ### 6.2 显式模式的写点与它们的读者（从代码对齐）
 

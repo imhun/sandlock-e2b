@@ -24,6 +24,9 @@ from pathlib import Path
 
 #: The eight subpaths the control plane's pod mounts RW (`control-plane.yaml`, §13.8). Order is
 #: fixed: the pin in `tests/unit/test_probe_platform_paths_shape.py` compares it exactly.
+#: The manifest is the source of truth for the list, and N58 moved the migration staging up:
+#: `deploy/k8s/control-plane.yaml` mounts `_migrate` (subPath `_migrate`) at the export root, so
+#: the list reads `_migrate` -- not the pre-N58 `workspaces/_migrate` spelling §13.8 recorded.
 PLATFORM_PATHS: tuple[str, ...] = (
     "_builds",
     "_images",
@@ -32,7 +35,7 @@ PLATFORM_PATHS: tuple[str, ...] = (
     "_templates",
     "_volumes",
     "state",
-    "workspaces/_migrate",
+    "_migrate",
 )
 
 

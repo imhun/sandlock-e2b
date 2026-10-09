@@ -27,7 +27,7 @@ EXPECTED = [
     "_templates",
     "_volumes",
     "state",
-    "workspaces/_migrate",
+    "_migrate",
 ]
 
 
