@@ -545,3 +545,9 @@ tmp/venv/bin/python deploy/scripts/acceptance/cp_uid_lane_diff.py --phase shared
 （gitignored；生成后用 `docker compose config` 校验一次）。完整原始日志（本轮）：
 `tmp/task5-cpuid/run-lane.log`、`tmp/task5-cpuid/run-shared.log`、`up-prod.log`、
 `down-*.log`（都在 gitignored 的 `tmp/` 下）。
+
+提交之后脚本的"车道没起"那条错误路径又被收紧了一次（原先是把它读成"没起"、现在按
+`HTTP < 500 = 有东西在服务`判定，并给出一句人话），改完按 `--phase lane`（车道已拆）与
+`--phase lane --up --only shape` 两条路各复跑一次：前者给出
+`the control plane on http://127.0.0.1:3110 answered HTTP 502; bring the lane up first (--up)…`，
+后者 `EXIT=0`（形态判据原样通过）。§3/§4 的判据读数由同一份脚本、同一个车道配置产出。

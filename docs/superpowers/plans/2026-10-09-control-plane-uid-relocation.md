@@ -205,6 +205,11 @@ def test_shape_reports_the_eight_platform_paths(tmp_path):
 `local/e2b/e2b-sandlock-control-plane-gateway:cpuid`、`cpuid-control-plane:latest`），
 与这台机器上原有的那批 lane 镜像同类。
 
+**提交**：`bc246be feat(acceptance): the uid move gets one command's worth of local-lane
+readings (Task 5 Steps 1-3)`（判据入口 + 读数 + 本节）。随后一次"车道没起时给人话"的小修
+（18 行，只动错误路径）落在同一条分支上；提交后按"车道已拆"与 `--up --only shape`
+两条路各复跑一次，判据读数不变（见 `docs/reports/2026-10-09-cp-uid-lane-diff.md` §10 末）。
+
 **留给 Step 4（gated）的问题**：Q1 车队上模板 tar + buildkit 侧车 + `CapEff 0`；
 Q2 车队的单 PVC 下同一支卷挂载探针；Q3 本车道 `E2B_TREES_SHARED` 的具名判据；
 Q4 `_snapshots`/`_migrate` 的跨 uid 关系（本车道两卷量不到）；
