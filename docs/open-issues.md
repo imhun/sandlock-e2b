@@ -19,8 +19,8 @@
 | **不做（带触发）** | 已决定不做，触发条件满足时必须回到这条 |
 | **有意保留** | 明确决定维持现状，不是漏项（退役要另立条目） |
 
-**一句话读法**：下面共 19 行，其中 18 行不是"现在就该动手"的 —— 待拍的 2 条、带触发条件的 7 条、
-换环境时复核的 2 条、有意保留的 5 条、可选卫生 2 条；唯一建议立刻做的是 2026-10-09 新登记的
+**一句话读法**：下面共 21 行，其中 20 行不是"现在就该动手"的 —— 待拍的 3 条、带触发条件的 7 条、
+换环境时复核的 2 条、有意保留的 6 条、可选卫生 2 条；唯一建议立刻做的是 2026-10-09 新登记的
 **N93**（第 19 行）。
 
 ---
@@ -37,6 +37,7 @@
 |---|---|---|---|
 | E2B_PAUSED_TTL_S | paused 沙箱的过期策略 | 已实现（`4396915`），默认 **0 = 不启用**；打开后周期任务只删"超期且 paused"的沙箱 | 拍板是否启用、阈值多少。出处 `docs/checkpoint-restore-e2b-half.md` §6(l) |
 | 空闲判定 ② | 沙箱互访 / 纯 egress 型长任务判不出空闲（① CPU 采样已上线并集群验收全绿） | ② **未做** | 等真有人用这类负载再做（每沙箱网络计数）。出处 `docs/resource-contention.md` §6 |
+| 控制面移出 uid 65534 | **已评估（2026-10-09）⇒ 可行**：控制面与 worker / agent 面 A 同 uid ⇒ 被攻破的 agent 可 ptrace 读控制面内存（实测）。评估订正了三条过期结论（`.uid_pool.lock` / `0700 记录目录` 今天都不约束控制面；舰队里"解包缓存"在节点本地，控制面不碰） | 现状：控制面 `runAsUser: 65534`；`hostPID` 拿不掉（承重）。**全库只剩一个共写点：`_images/_oci/`（控制面创建 vs worker 修剪）** | 要不要做：选专用 uid +（共享组 + setgid，或把 `_oci` 的修剪收回控制面）+ `migrate-state-owner.sh` 迁属主 + 两份清单 + 车道差分（create/logs/pause/snapshot/模板构建/卷/delete + 两条 smoke）。方案与代价见 `docs/security-audit/control-plane-uid-2026-10-09.md`；为什么值得做见 `docs/security-audit/c3-agent-hostpid-2026-10-09.md` §5 |
 
 ## 三、带触发条件（不触发就不做）
 
@@ -66,6 +67,7 @@
 | N14-S5 ③ | `/proc` 合成、策略挂载、COW、磁盘活账本 | 真根下仍需要 | 真 procfs 在本平台三种形态实测全 EPERM，活账本从拦截点采样（9 处 `mark_dirty`）⇒ 不随"退役模拟"一起退 |
 | fork `Open` 桶 | `path_surface.rs` 里 7 条"明确待决"的带路径 syscall：`fchmodat2` + `getxattrat`/`setxattrat`/`listxattrat`/`removexattrat` + `file_getattr`/`file_setattr` | 设计内待决，被 `open_items_are_enumerated_and_reasoned` 逐条 pin | 消一条要同步改 pin；`fchmodat2` 是 glibc 已在用的（账本判"要中介不要拒绝"），`file_*` 两条要等内核 6.13+ 签名核实 |
 | N84 残留 | 创建请求里的 `diskSizeMB` 仍被**静默忽略**（`cpuCount`/`memoryMB` 已真的解析并对非法值 400） | 未做 | 对外契约不一致：要么解析它，要么按非法字段回 400（今天既不生效也不报错） |
+| R1 `hostPID` | agent 的 `hostPID: true`（pod 级，面 A/B 共用） | **已评估（2026-10-09）：不能拿掉** —— 它是面 A 的 pid 反查与面 B 两处反查的承重件；可达面的增量实测为"同 uid ⇒ 等效 ptrace"，收窄杠杆在控制面的 uid（见上一节新登记那条） | 结论与逐条否决的替代路径见 `docs/security-audit/c3-agent-hostpid-2026-10-09.md`；探针 `deploy/scripts/acceptance/probe_c3_agent_hostpid_reach.sh` |
 
 ## 六、可选 / 卫生
 
@@ -81,7 +83,8 @@
 - **移除**：原索引一/二/三/四/五节里所有**已收口**的行（N1–N92 中的完成项、FUP-*、E-*/S-*、
   "已关（防翻旧账）"两节，以及 §五 的"N41 残余 / N27 identity 残差"两条 —— 后者在 S5 T1 把
   `E2B_PURE_ROOTFS=off` 变成启动期具名拒绝之后已不可达）。
-- **保留并压缩**：上面 19 行（原文是超长单元格，这里改成"现状 + 触发/下一步 + 出处"的短行）。
+- **保留并压缩**：清理时保留 19 行（原文是超长单元格，这里改成"现状 + 触发/下一步 + 出处"的短行）；
+  当天稍后又追加 2 行（`hostPID` 评估的结论、以及随之新登记的控制面 uid 待决策）⇒ 现在 21 行。
 - **新增**：**N93**（编号在 markdown 里此前未占用）。
 - **全文快照**：`docs/reports/open-issues-archive-2026-10-09.md`；`docs/**`、`tests/**` 里按编号
   引用被移除行的注释仍可在快照里检索到。
