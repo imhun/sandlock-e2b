@@ -501,6 +501,23 @@ HTTP，`SYS_ADMIN` 只留在 agent 上。
 （`pidfd_getfd`、`unshare`；做法是把这两个名字从各自的 capability 门控组移到无条件白名单，
 其余条目一律不动）。理由、证据与重新生成方式见 `deploy/seccomp/README.md`。
 
+> **2026-10-06 订正（N80，`4e3a7db` "unshare leaves the profile"）**：profile 现在是
+> **默认档 + `pidfd_getfd` 一条**。槽位握手改成 `spawn_child` 自己
+> `clone3(CLONE_NEWUSER)` 之后 `unshare` 就没有调用者了 —— 那一条是**被专门删掉的**，
+> 不是漏项；worker 自检探针也同步从 `unshare` 改成 `clone3`
+> （`envd_service/config.py::_userns_probe`，注释里写明"the shipped one deliberately
+> refuses it"）。fleet 的三种开关（`E2B_PID_NS` + net 对）全开，命名空间全部来自那一次
+> `clone3`，所以线上不需要它 —— 上面这张表里"`unshare` 是命名空间类路径必需"只对
+> **改开关之前**的形状成立。
+>
+> **2026-10-11 补**：本地车道曾把这一条按"缺项"加回去（为了让"net_isolation 不带
+> pid_ns"的车道跑绿），**已回退**（两个文件与 HEAD 逐字节一致）—— 正确的形状是让车道与
+> 夹具跑**生产形态**（`E2B_PID_NS=1` + `E2B_ENABLE_NET_ISOLATION=1` +
+> `E2B_FD_INJECT_CONNECT=1`）：`tests/contract/test_mcp_netns.py` 的 harness 现在自己钉
+> `pid_ns=True`，窄 profile 下 3/3 通过。哪个形状还需要 `unshare`，见
+> `docs/deploy-clusters.md` §7.55 的形状矩阵（`net_isolation` 单开在这个 profile 下
+> `sandlock_create failed`）。
+
 **为什么是这两条**（2026-09-15 实测，x86_64 容器 `CapEff=0xa80425fb`，无
 `SYS_ADMIN`／`SYS_PTRACE`；同容器只换 seccomp 档，按 errno 判定）：
 
@@ -1335,6 +1352,21 @@ pure 形态从此依赖真根（也就是依赖上面的 seccomp 档）；`E2B_P
   ⇒ 不带参数的 lane 是清单的**超集**；**无 `SYS_ADMIN` 的形态由 A7 的参数固化**：
   `PROD_DROP_CAPS=SYS_ADMIN UNPRIVILEGED_PHASE=0 ./deploy/scripts/test-prod-shaped.sh`
   （实测 `1075 passed, 3 skipped, 0 failed`，`tmp/a7-nosa.log`）。
+  **2026-10-11 起这个 lane 只跑正确性**：`tests/perf`（并发/延迟套件，要 30-50 个同时
+  沙箱，其主体是"准入控制之外的突发"）拆到 `deploy/scripts/test-perf-shaped.sh`（同一容器
+  形态，`pytest tests/perf --perf`）。同一个改动把 lane 的容器、两个 registry 与 buildkitd
+  改成**创建一次、后续复用**（`deploy/scripts/lib/lane-container.sh`，`LANE_RECREATE=1`
+  强制重建），把镜像 rootfs 的解析结果缓存到 `E2B_TEST_ROOTFS_DIR`（每镜像一次，而非每次
+  调用一次），并加了 `LANE_TARGETS=<pytest 目标>`（迭代用；容器与服务照旧复用）。
+  背景与根因见 `docs/open-issues.md` 的收口记录（2026-10-11）：**容器/进程里第一次 chroot
+  建箱**会烧掉若干个 15 s 的 verb 超时（实测 ~31 s，最差 184 s，偶发永久挂死），落在该
+  *pytest 进程*第一个要沙箱的用例上——security 每个文件的首个夹具都建一个沙箱，30 s 就绪
+  时限撞上它就让**整个文件**报错（一次全量里 11 个文件如此）。根因是 `spawn_child` 用
+  `ctypes.CDLL` 直调 `clone3`（**调用期间释放 GIL**）：若那一刻别的线程持有 GIL，子进程
+  会永远卡在 ctypes 的 `PyEval_RestoreThread`，一行子进程代码都走不到。修法（已入库）：
+  `ctypes.PyDLL` 全程持有 GIL + 子进程 exec 前不做会分配/取锁的活（fd 清单在父进程预算）。
+  修后连续 4 个全新容器首次 chroot 启动 = 0.070/0.095/0.075/0.078 s；`tests/security`
+  单目录 8:39 → 2:10。
   注意 `PROD_DROP_CAPS` 是把 cap 从 `--cap-add` 列表里**摘掉**，不只是追加 `--cap-drop`：
   本机引擎（29.4.0）`--cap-add` 压过 `--cap-drop`，与参数顺序无关
   （`--cap-drop ALL --cap-add SYS_ADMIN --cap-drop SYS_ADMIN` 的 `CapEff` 仍含 SYS_ADMIN 位；
@@ -1425,7 +1457,14 @@ TOOMANYREQUESTS`），而各镜像站的抖动互相独立 ⇒ 默认形态是**
 （同一做法已登记在 `docs/task-backlog.md` #20 的规避记录里，此处固化为默认跑法）：
 
 ```bash
-docker run -d --rm -p 127.0.0.1:5080:5000 registry:2
+# 具名 + 重启策略 + **具名卷**，不要用 `--rm`：`--rm` 那种起法只要容器被停一次
+# （daemon/VM 重启、手滑 `docker stop`）就**连 registry 一起消失**，而下一个全量车道
+# 会以 ~30 条毫不相干的 `428 warm_required` 表现出来（2026-10-11 实测一次 30 failed /
+# 2 errors，横跨 20 多个文件，看起来像代码回归）。具名卷让镜像内容留着，重建只是重挂
+# 同一个卷；车道开跑前也会探一次 mirror 的 `/v2/`，不健康就带具名信息退出。
+docker volume create gwlan_registry_data >/dev/null 2>&1 || true
+docker run -d --name gwlan-registry --restart unless-stopped \
+    -p 127.0.0.1:5080:5000 -v gwlan_registry_data:/var/lib/registry registry:2
 # 预置（amd64）全集：缺任何一个 tag 都会因「404 不重试」硬失败，不会回落公共源
 for t in 3.11-slim 3.12-slim 3.14-slim; do
   docker pull --platform linux/amd64 python:$t

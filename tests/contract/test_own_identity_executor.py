@@ -42,6 +42,7 @@ from envd_service.own_identity import (
     reset_slot_pools,
     slot_pool_for,
 )
+from tests.lane_identity import lane_identity_reporter
 from tests.security.conftest import sandlock_ready
 
 UID = 21200
@@ -109,6 +110,15 @@ def _executor(workspace: Path, sandbox_id: str) -> SandlockExecutor:
     The chroot shape's identity evidence is covered by
     ``test_uid_permissions``; forcing own identity here keeps the slot behaviour
     under test independent of whether the runner pulled a base image.
+
+    "Pure" means **a synthesized root**, not "no root": N14 S5 retired the
+    emulated root (the real root is the only shape left) and an executor with
+    neither an image rootfs nor a synthesized one has nothing to pivot into --
+    the executor says so once and the instance then fails to launch
+    (``read notif fd from child: pipe closed before 4 bytes read``; measured
+    2026-10-11, this file's whole set, with ``seccomp=unconfined`` too, i.e.
+    unrelated to the syscall filter). ``pure_rootfs_dir`` is the knob the
+    documented gate-B lane uses for the same shape.
     """
     # The workspace arrives on the runner's ownership-capable storage (the
     # ``workspace`` fixture), and it -- like every ancestor of a slot's paths
@@ -121,8 +131,19 @@ def _executor(workspace: Path, sandbox_id: str) -> SandlockExecutor:
         workspace_dir=str(workspace),
         base_image=None,
         image_rootfs=None,
+        # N16's synthesized skeleton: system directories bound from the host, so
+        # the sandbox has a root to be confined to without pulling an image.
+        pure_rootfs_dir=workspace.parent / "pure-rootfs",
         host_uid=UID,
         per_sandbox_uid=True,
+        # The deployed worker's own value, for the same reason as
+        # `tests/security/conftest.py`: the shipped seccomp profile refuses
+        # `unshare` on purpose (N80), and this sandbox's synthesized root needs
+        # a mount namespace, which needs a user namespace -- one that only the
+        # fork's single `clone3` call may create. Left off (the executor's
+        # default), the child dies before its notif fd and the whole file
+        # errors (measured 2026-10-11).
+        pid_ns=True,
         memory_mb=512,
         cpu_percent=100,
         disk_mb=1024,
@@ -136,6 +157,16 @@ def _executor(workspace: Path, sandbox_id: str) -> SandlockExecutor:
             uid_start=UID,
             uid_size=2,
             tmp_root=scratch,
+            # C3 is the only slot-identity shape left (N52): the child unshares
+            # and a *reporter* writes its identity. This lane has no node agent,
+            # so the root process performing the write stands in for it -- the
+            # shared ``tests/lane_identity.py`` helper. Without it the executor
+            # refuses by name ("own identity was requested but … needs the
+            # control-plane reporter"), which is what this file hit once
+            # `agent-grant` became the config default (measured 2026-10-11:
+            # 34 failures, every one of them that refusal).
+            identity_grant="agent-grant",
+            identity_reporter=lane_identity_reporter(UID, 2),
         ),
     )
 
@@ -742,11 +773,17 @@ import asyncio, json, sys
 from pathlib import Path
 sys.path.insert(0, "/workspace")
 from envd_service.own_identity import W1SlotPool
+from tests.lane_identity import lane_identity_reporter
 
 async def main():
     policy = json.loads(Path(sys.argv[1]).read_text())
     pool = W1SlotPool(uid_start=int(sys.argv[2]), size=1,
-                      tmp_root=Path(sys.argv[3]) / "slots")
+                      tmp_root=Path(sys.argv[3]) / "slots",
+                      # No node agent in this lane: the root process performs the
+                      # agent's write itself, or the child polls forever and the
+                      # pool dies (N52 leaves ``agent-grant`` as the only grant).
+                      identity_grant="agent-grant",
+                      identity_reporter=lane_identity_reporter(int(sys.argv[2]), 1))
     handle = await pool.acquire("sbx_orphan_probe", policy)
     print(handle.process.pid, flush=True)
     await asyncio.sleep(600)

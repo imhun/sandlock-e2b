@@ -29,6 +29,8 @@ import uuid
 import httpx
 import pytest
 
+from envd_service.config import Settings as EnvdSettings
+
 from tests.contract.test_uid_permissions import (
     _control_settings,
     _envd_settings,
@@ -170,7 +172,6 @@ def test_runtime_context_registers_both_volume_aliases(monkeypatch, tmp_path):
     """The `Produces` contract: every volume view is registered under BOTH
     workspace aliases, so a relative open resolves against whichever alias
     the sandbox's cwd names without relying on the mount-alias walk."""
-    from envd_service.config import Settings as EnvdSettings
     from envd_service.runtime import context as context_mod
     from envd_service.runtime.context import SandboxRuntimeContext
     from envd_service.runtime.registry import RuntimeSandbox

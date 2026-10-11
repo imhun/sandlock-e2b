@@ -44,7 +44,12 @@ def test_max_processes_limits_forks():
         "    for _ in range(200):\n"
         "        p=os.fork()\n"
         "        if p==0:\n"
-        "            import time; time.sleep(30)\n"
+        # The holding children must outlive the burst, not the test: the whole
+        # fork loop finishes in well under a second, so 6 s is enough for the
+        # ceiling to see them alive. It used to be 30, and the sandbox's
+        # teardown then waited those 30 s out on *every* lane run (measured
+        # 2026-10-11: this case was a flat 30.09 s in `--durations`).
+        "            import time; time.sleep(6)\n"
         "            os._exit(0)\n"
         "        pids.append(p)\n"
         "except OSError:\n"

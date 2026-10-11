@@ -268,7 +268,7 @@ def _drive_the_child_half(monkeypatch: pytest.MonkeyPatch, *, pass_fds=()):
         """Unwinds the child half at its own ``os._exit``."""
 
     monkeypatch.setattr(si, "_clone3_new_user_namespace", lambda: 0)
-    monkeypatch.setattr(si, "_close_fds_except", lambda keep: None)
+    monkeypatch.setattr(si, "_close_fds", lambda fds: None)
     monkeypatch.setattr(si.os, "dup2", lambda fd, target: None)
 
     polls: list[float] = []
@@ -354,7 +354,7 @@ def test_the_child_half_clears_close_on_exec_for_the_slots_descriptors(
     descriptors; the clone3 starter replaced ``Popen`` but not that step.
     Python builds the slot's control and events channels with
     ``socket.socketpair()``, which is ``O_CLOEXEC``, so the descriptors
-    ``_close_fds_except`` deliberately kept were still closed by ``execvpe`` --
+    ``_fds_to_close`` deliberately kept were still closed by ``execvpe`` --
     ``sandlock-supervise`` then died with "control fd 21 is not open: Bad file
     descriptor", and the create failed with "own-identity slot ... exited before
     answering on control fd".

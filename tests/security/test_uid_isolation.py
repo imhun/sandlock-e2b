@@ -21,9 +21,14 @@ The pure shape has the synthesized skeleton for a root (N16, and the *only* pure
 root since N14 S5 retired the identity one). The case below is about isolation,
 and the *spelling* of one refusal follows the tree the shape hands the sandbox:
 a sibling sandbox's workspace is a host path that sits under the skeleton's
-empty ``/var``, so ``stat`` of it never reaches the kernel DAC check and answers
-ENOENT. That spelling is pinned below (and contracted in
-``tests/security/test_pure_root_errno_contract.py``).
+empty ``/var``, so neither ``stat`` nor ``open``/``rm`` of it reaches the kernel
+DAC check (or the grant check, for the mediated open): all of them answer
+ENOENT, because the name is in no tree this sandbox has. Those spellings are
+pinned below, and the rule behind them is contracted in
+``tests/security/test_pure_root_errno_contract.py``. What the case proves about
+DAC is the *in-tree* spelling: A reaches its own file through its own cwd, and
+the ``0770 A:worker-gid`` mode plus ``setgroups([])`` is what would stop B if
+that path were visible to it.
 """
 
 from __future__ import annotations
@@ -125,13 +130,19 @@ def test_distinct_host_uids_isolate_same_path_files(workspace):
         f"cannot statx '{ws_a / 'workspace'}': No such file or directory",
     )
 
-    # Open path: sandlock's grant check (B is never granted A's workspace)
-    # blocks the read of A's same-path file.
+    # Open path: the same *host* spelling as the `stat`/`chdir` arms above, and
+    # the same answer -- one root per sandbox means the path is not in B's tree
+    # at all (ENOENT), so sandlock's grant check is not the thing that decides
+    # it. The grant-check arm cannot be spelled from here: B's root contains B's
+    # workspace and never A's (the sibling comment below says the same about A's
+    # own file). Pinned byte-exactly, like the two arms above.
     cat_b = _run(
         str(ws_b), UID_B, ["/bin/cat", str(secret_a)]
     )
     assert cat_b.exit_code != 0
-    assert cat_b.stderr in _diagnostic("cat", f"{secret_a}: Permission denied")
+    assert cat_b.stderr in _diagnostic(
+        "cat", f"{secret_a}: No such file or directory"
+    )
 
     # A's control read succeeds -- through its own cwd, the one spelling of the
     # path the shape keeps inside the sandbox. (The *host* path of A's own file
@@ -141,7 +152,13 @@ def test_distinct_host_uids_isolate_same_path_files(workspace):
     assert cat_a.exit_code == 0
     assert cat_a.stdout == b"A-secret"
 
-    # Sandbox B writing/deleting inside A's tree is refused too.
+    # Sandbox B writing/deleting inside A's tree is refused too -- and, from
+    # this spelling, for the same reason as the read above: B's root does not
+    # contain A's path, so the lookup answers ENOENT before any permission bit
+    # is consulted. (The DAC half of this file's claim is the in-tree spelling:
+    # the `0770 A:worker-gid` mode plus `setgroups([])` is what the chdir/stat
+    # arms above describe, and what the *kernel* would answer if the path were
+    # visible.)
     write_b = _run(
         str(ws_b),
         UID_B,
@@ -150,12 +167,12 @@ def test_distinct_host_uids_isolate_same_path_files(workspace):
     assert write_b.exit_code != 0
     assert write_b.stderr == (
         f"/bin/sh: 1: cannot create {ws_a / 'workspace' / 'b-wrote.txt'}: "
-        "Permission denied\n"
+        "Directory nonexistent\n"
     ).encode()
     rm_b = _run(str(ws_b), UID_B, ["/bin/rm", str(secret_a)])
     assert rm_b.exit_code != 0
     assert rm_b.stderr in _diagnostic(
-        "rm", f"cannot remove '{secret_a}': Permission denied"
+        "rm", f"cannot remove '{secret_a}': No such file or directory"
     )
     assert secret_a.read_text(encoding="utf-8") == "A-secret"
 

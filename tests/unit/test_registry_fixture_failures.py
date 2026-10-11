@@ -54,6 +54,19 @@ def test_a_failing_registry_setup_is_a_failure_not_a_skip(
     fixture, expected: str, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     _stub_docker(tmp_path, monkeypatch)
+    # These two exercise the *fixture starts the container* path. A lane that
+    # names a long-lived registry of its own (``E2B_TEST_REGISTRY_URL`` /
+    # ``E2B_TEST_REGISTRY_AUTH_URL``, see deploy/scripts/lib/lane-container.sh)
+    # takes the reuse branch instead, which is a different (also named) failure
+    # -- so the ambient value is cleared here rather than silently deciding
+    # which path this test measures.
+    for name in (
+        "E2B_TEST_REGISTRY_URL",
+        "E2B_TEST_REGISTRY_AUTH_URL",
+        "E2B_TEST_REGISTRY_AUTH_USER",
+        "E2B_TEST_REGISTRY_AUTH_PASSWORD",
+    ):
+        monkeypatch.delenv(name, raising=False)
     with pytest.raises(pytest.fail.Exception) as excinfo:
         list(fixture.__wrapped__())
     assert str(excinfo.value) == expected

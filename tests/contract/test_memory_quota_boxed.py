@@ -201,9 +201,12 @@ def test_boxed_memory_quota_denies_sibling_overcommit(
         assert detail.json()["memoryMB"] == DEFAULT_MEMORY_MB
 
         # Holder: 70% of the ceiling as a background command, alive until its
-        # sleep ends.
+        # sleep ends. The hold only has to outlive the two sibling commands
+        # (one denial plus one 2 s control) -- measured 2026-10-11, the whole
+        # sequence after the marker is ~1.2 s, and the 30 s it used to hold
+        # bought nothing but 30 s of lane wall clock.
         holder = sandbox.commands.run(
-            py_cmd(alloc_script(HOLDER_MB, hold=30.0)),
+            py_cmd(alloc_script(HOLDER_MB, hold=12.0)),
             background=True,
             timeout=120,
         )

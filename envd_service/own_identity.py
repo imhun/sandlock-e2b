@@ -1169,10 +1169,18 @@ class W1SlotPool:
         deadline = time.monotonic() + self._socket_timeout_s
         last_error: str | None = None
         while time.monotonic() < deadline:
-            if process.poll() is not None:
+            exited = process.poll()
+            if exited is not None:
+                # The child's status *and* its stderr: the pre-exec exits are
+                # named (`identity_grant`'s 3/4/9), and the child now writes its
+                # own reason to stderr before dying (it has no logging of its
+                # own), so "the slot died" comes with a cause instead of an
+                # empty tail -- measured 2026-10-11, when a 4-second failure
+                # reported `<empty slot stderr>`.
                 raise SlotDeadError(
                     f"own-identity slot {handle.name} (uid {handle.uid}) exited "
-                    f"before answering on {where}: {_slot_stderr(handle)}"
+                    f"with {exited}{_child_exit_meaning(exited)} before answering "
+                    f"on {where}: {_slot_stderr(handle)}"
                 )
             try:
                 stats = self.channel_for(handle).request("stats")
@@ -1305,6 +1313,21 @@ class W1SlotPool:
 
     async def release(self, sandbox_id: str) -> None:
         await asyncio.to_thread(self.release_sync, sandbox_id)
+
+
+#: The slot child's pre-exec exit statuses, from
+#: ``envd_service/identity_grant.spawn_child``: it is the only thing the worker
+#: can see when a slot dies before it ever answers, so the pool says what each
+#: one means instead of printing a bare number.
+_CHILD_EXIT_MEANINGS = {
+    3: " (its identity never landed: uid_map/setgroups were never written)",
+    4: " (the child raised before exec; see its stderr below)",
+    9: " (execvpe returned, which it should never do)",
+}
+
+
+def _child_exit_meaning(code: int) -> str:
+    return _CHILD_EXIT_MEANINGS.get(code, "")
 
 
 def _slot_stderr(handle: SlotHandle) -> str:
@@ -2143,6 +2166,10 @@ def slot_pool_for(
         str(config.tmp_root),
         config.transport,
         float(config.verb_timeout_s),
+        # The readiness deadline is part of the shape too: a fleet that waits
+        # 30 s for a launch and one that waits 180 s must not share a ledger
+        # (the ledger is what decides "this uid already has a live slot").
+        float(config.socket_timeout_s),
         # Two fleets with different identity modes are different shapes: one
         # starts privileged children, the other unprivileged ones that wait for
         # a grant. They must never share a ledger.
@@ -2163,6 +2190,7 @@ def slot_pool_for(
             supervise_bin=supervise_bin,
             transport=config.transport,
             verb_timeout_s=config.verb_timeout_s,
+            socket_timeout_s=config.socket_timeout_s,
             identity_grant=config.identity_grant,
             identity_reporter=config.identity_reporter,
             sandbox_cgroups=config.sandbox_cgroups,
@@ -2194,6 +2222,14 @@ class OwnIdentityConfig:
     transport: str = "fd"
     #: Per-verb response deadline on the slot channel (seconds).
     verb_timeout_s: float = 15.0
+    #: How long to wait for a freshly spawned slot's first answer, i.e. the
+    #: whole "spawn -> launched" window (seconds). Its own number because the
+    #: per-verb deadline above bounds one request on an *established* channel:
+    #: the first launch in a container opens with a closed channel and only
+    #: reports ~30.5 s in (measured 2026-10-11), so a lane paying that one-time
+    #: cost raises this and a deployment keeps its own bound. See
+    #: ``Settings.slot_ready_timeout_s``.
+    socket_timeout_s: float = 30.0
     #: C3 Task 3: how a slot gets its identity -- and the only value left is
     #: ``agent-grant``: the child unshares, the worker reports its pid, and the
     #: per-node agent writes the identity. ``spawn`` (the worker, or its
@@ -2289,8 +2325,19 @@ class OwnIdentityConfig:
             verb_timeout_s=float(
                 getattr(settings, "slot_verb_timeout_s", 15.0)
             ),
+            socket_timeout_s=float(
+                getattr(settings, "slot_ready_timeout_s", 30.0)
+            ),
             identity_grant=identity_grant,
-            identity_reporter=build_identity_reporter(settings),
+            # An embedder that already knows how to grant (the in-process lanes:
+            # ``tests/lane_identity.py``) attaches the callable to its settings;
+            # otherwise the worker derives one from its environment -- the
+            # control plane's URL and this node's id, which is what the deployed
+            # shape has and an in-process lane does not.
+            identity_reporter=(
+                getattr(settings, "identity_reporter", None)
+                or build_identity_reporter(settings)
+            ),
             # N83 phase 1: ``off`` (the default) resolves to ``None`` without
             # constructing anything; an unknown switch value is refused here, by
             # name, before a fleet is built on top of it.

@@ -11,4 +11,4 @@
   它保留当时全部行文（不删条目、不重排）。
 
 保留本页只是为了让既有指针（`README.md` 的文档索引、`deploy/k8s/worker.yaml` 的注释）仍然落地 ——
-与 `docs/isolation-boundaries.md` 保留"旧称 route B"那句是同一条做法。
+与 `docs/isolation-boundaries.md` 保留"旧称"（按本质改名前的叫法）那句是同一条做法。

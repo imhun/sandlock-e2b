@@ -33,6 +33,7 @@ from gateway_common.keepalive import uvicorn_keep_alive_kwargs
 from control_plane.node_address import NodeEndpoint, StaticAddressResolver
 from tests._c3_resolver import AnyNodeLoopbackResolver
 from tests._disk_projids import DISK_READ_BACKENDS
+from tests.lane_identity import lane_identity_reporter, with_lane_identity_reporter
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Ownership-sensitive tests (E3.2 per-sandbox uids) need a filesystem where
@@ -450,14 +451,23 @@ def _start_buildkitd() -> tuple[str, str, Path]:
     """
     if shutil.which("docker") is None:
         pytest.skip("docker is required for template build tests")
-    port = _free_container_port()
+    # A pin lets a lane create this daemon **once** and hand the same address to
+    # every pytest process it starts afterwards (``E2B_TEST_BUILDKIT_ADDR``,
+    # checked at the top of the ``buildkitd`` fixture): the container, its
+    # volume and its port then outlive the process that created them.
+    pinned_port = os.environ.get("E2B_TEST_BUILDKIT_PORT") or ""
+    port = int(pinned_port) if pinned_port else _free_container_port()
     config_text = _buildkit_config_text(port)
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
     cfg_dir = Path(tempfile.mkdtemp(prefix="buildkit-cfg-", dir=TMP_ROOT))
     cfg = cfg_dir / "buildkitd.toml"
     cfg.write_text(config_text, encoding="utf-8")
-    name = f"buildkit-test-{uuid.uuid4().hex[:8]}"
-    volume = f"buildkit-test-vol-{uuid.uuid4().hex[:8]}"
+    name = (os.environ.get("E2B_TEST_BUILDKIT_NAME") or "").strip() or (
+        f"buildkit-test-{uuid.uuid4().hex[:8]}"
+    )
+    volume = (os.environ.get("E2B_TEST_BUILDKIT_VOLUME") or "").strip() or (
+        f"buildkit-test-vol-{uuid.uuid4().hex[:8]}"
+    )
     container = ""
     try:
         try:
@@ -526,6 +536,26 @@ def _start_buildkitd() -> tuple[str, str, Path]:
 @pytest.fixture(scope="session")
 def buildkitd():
     """Rootless buildkit daemon (TCP) for local template builds."""
+    named = (os.environ.get("E2B_TEST_BUILDKIT_ADDR") or "").strip()
+    if named:
+        # A lane-owned, long-lived daemon (see
+        # ``deploy/scripts/lib/lane-container.sh``): starting buildkit per
+        # pytest process costs a container create plus a readiness wait (up to
+        # 90 s when something is wrong), and the lane runs several processes per
+        # run (two phases plus every iteration). A *named* address that is not
+        # listening is a fixture failure, never a skip -- same rule as a daemon
+        # that will not come up.
+        port = int(named.rsplit(":", 1)[1])
+        if not _port_accepting(port):
+            pytest.fail(
+                f"E2B_TEST_BUILDKIT_ADDR={named} is not listening: the lane "
+                "owns that daemon (deploy/scripts/lib/lane-container.sh), so a "
+                "missing one is an environment fault, not a reason to drop the "
+                "template-build coverage",
+                pytrace=False,
+            )
+        yield named
+        return
     address, container, cfg_dir = _start_buildkitd()
     try:
         yield address
@@ -588,7 +618,9 @@ def make_apps(workspace):
             **(control_kwargs or {}),
         )
         envd = create_envd_app(
-            settings=envd_settings or EnvdSettings(executor="local"),
+            settings=with_lane_identity_reporter(
+                envd_settings or EnvdSettings(executor="local")
+            ),
             runtime_registry=runtime_registry,
             workspace_base=workspace,
         )
@@ -693,10 +725,27 @@ def live_servers(buildkitd):
             envd_port=envd_port,
             template_images={"py311": "python:3.11-slim"},
             max_sandboxes=500,
-            max_total_memory_mb=0,
-            max_total_cpu_percent=0,
+            # The fleet budget is *declared* here, not inherited from the box
+            # (`0` means "derive from the registered nodes", i.e.
+            # `IN_PROCESS_NODE_DEFAULT_TOTALS`: 8192 MiB / 400 CPU points /
+            # 2048 processes -- four concurrent sandboxes at the per-sandbox
+            # defaults, measured 2026-10-11 by counting creates until the
+            # refusal: "create #5 FAILED: SandboxException: 503: No resources
+            # available").
+            #
+            # That is admission control working, and admission control is *not*
+            # what these suites measure: they are the SDK contracts and the
+            # latency/concurrency profile, whose bursts are 30-50 sandboxes
+            # (`tests/perf/test_latency.py`), well past any slice a laptop can
+            # honestly declare. The gates themselves have their own subject
+            # fixtures (`test_resource_create_limits.py`, `test_scaling.py`,
+            # `test_control_plane.py::test_resource_exhausted_503`), all of
+            # which build their own settings and keep the production numbers.
+            # Same reasoning, and the same shape, as the rate limits below.
+            max_total_memory_mb=65536,
+            max_total_cpu_percent=20000,
             max_total_disk_mb=0,
-            max_total_processes=0,
+            max_total_processes=32768,
             # The suite creates far more sandboxes per minute than a
             # production budget allows (120/min by default), which shows up
             # as 429 in SDK fixtures; the limiter itself has its own tests.
@@ -851,25 +900,39 @@ def _start_multinode(
         worker_dir.mkdir(parents=True, exist_ok=True)
         worker_dirs.append(worker_dir)
         worker_base = shared_workspace_dir if shared_workspace else worker_dir
+        worker_settings = EnvdSettings(
+            executor="auto",
+            envd_port=worker_port,
+            workspace_base=worker_base,
+            # The E2B network API is per-sandbox: the platform-level
+            # switch must be on so sandbox-level allow/deny policies
+            # are enforced (default off denies all egress).
+            enable_network=True,
+            shared_volume_root=str(shared_volumes),
+            # The worker needs the registry host too: the pull
+            # credentials are scoped to it (public images stay
+            # anonymous).
+            image_registry=image_registry,
+            image_registry_username=image_registry_username,
+            image_registry_password=image_registry_password,
+            **envd_extra,
+        )
+        # This harness runs the workers *in process*, so it has no node agent to
+        # write a slot child's ``uid_map`` -- and since N52 ``agent-grant`` is the
+        # only grant shape left, a chroot create without one is refused by name
+        # (the in-process mediator is refused by the fork rather than writing
+        # files as the worker, T5). The root process performing the same write
+        # stands in for the agent: ``tests/lane_identity.py``, the same helper the
+        # security lane uses. The range is the worker's *own* pool, so every uid
+        # it can lease is mapped (measured 2026-10-11: without this, every
+        # chroot-shape contract test in this harness died with ``in-process path
+        # mediation refused … (SL-1)``).
+        worker_settings.identity_reporter = lane_identity_reporter(
+            worker_settings.uid_pool_start, worker_settings.uid_pool_size
+        )
         worker_apps.append(
             create_envd_app(
-                settings=EnvdSettings(
-                    executor="auto",
-                    envd_port=worker_port,
-                    workspace_base=worker_base,
-                    # The E2B network API is per-sandbox: the platform-level
-                    # switch must be on so sandbox-level allow/deny policies
-                    # are enforced (default off denies all egress).
-                    enable_network=True,
-                    shared_volume_root=str(shared_volumes),
-                    # The worker needs the registry host too: the pull
-                    # credentials are scoped to it (public images stay
-                    # anonymous).
-                    image_registry=image_registry,
-                    image_registry_username=image_registry_username,
-                    image_registry_password=image_registry_password,
-                    **envd_extra,
-                ),
+                settings=worker_settings,
                 runtime_registry=RuntimeRegistry(worker_base),
                 workspace_base=worker_base,
                 control_plane_url=f"http://127.0.0.1:{control_port}",
@@ -1001,6 +1064,34 @@ def _registry_failure(container: str, detail: str) -> str:
     return f"registry {detail}\n--- registry log tail ---\n{tail}"
 
 
+def _require_named_registry(
+    url: str, variable: str, *, statuses: tuple[int, ...] = (200,)
+) -> None:
+    """A lane-owned registry the caller named: it has to answer, or we fail.
+
+    The whole point of a named registry is that the lane created it **once**
+    (``deploy/scripts/lib/lane-container.sh``) and every later pytest process
+    reuses it instead of paying a container start plus a readiness poll. A name
+    that does not answer means the lane's own service is gone -- an environment
+    fault, and one this fixture must not turn into "no coverage": the push
+    contracts are that registry's subject.
+    """
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            if httpx.get(f"http://{url}/v2/", timeout=2).status_code in statuses:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.5)
+    pytest.fail(
+        f"{variable}={url} does not answer /v2/ with {statuses}: the lane owns "
+        "that registry (deploy/scripts/lib/lane-container.sh), so a missing one "
+        "is an environment fault, not a reason to drop the push coverage",
+        pytrace=False,
+    )
+
+
 @pytest.fixture(scope="session")
 def image_registry_url():
     """A disposable Docker registry (``registry:2``) on a docker-assigned port.
@@ -1015,6 +1106,15 @@ def image_registry_url():
     """
     if shutil.which("docker") is None:
         pytest.skip("docker is required for the image registry tests")
+    named = (os.environ.get("E2B_TEST_REGISTRY_URL") or "").strip()
+    if named:
+        # A lane-owned registry (``deploy/scripts/lib/lane-container.sh``): the
+        # fixture starts one per pytest process otherwise, and every process
+        # then pays a container start plus a readiness poll. A named registry
+        # that does not answer is a fixture failure, not a skip.
+        _require_named_registry(named, "E2B_TEST_REGISTRY_URL")
+        yield named
+        return
     start = subprocess.run(
         [
             "docker",
@@ -1073,6 +1173,22 @@ def authenticated_registry():
     """
     if shutil.which("docker") is None:
         pytest.skip("docker is required for the authenticated registry tests")
+    named = (os.environ.get("E2B_TEST_REGISTRY_AUTH_URL") or "").strip()
+    if named:
+        username = (os.environ.get("E2B_TEST_REGISTRY_AUTH_USER") or "testuser").strip()
+        password = (
+            os.environ.get("E2B_TEST_REGISTRY_AUTH_PASSWORD") or "testpass"
+        ).strip()
+        # Same rule as the anonymous one: a lane-owned registry is reused, and
+        # a named one that does not answer *fails* (its whole subject is the
+        # authenticated push path).
+        _require_named_registry(
+            named,
+            "E2B_TEST_REGISTRY_AUTH_URL",
+            statuses=(200, 401),
+        )
+        yield {"url": named, "username": username, "password": password}
+        return
     username, password = "testuser", "testpass"
     ht = subprocess.run(
         [

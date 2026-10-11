@@ -311,7 +311,11 @@ spec:
             - name: E2B_IMAGE_OCI_DIR
               value: /var/lib/e2b-sandboxes/_images
             - name: E2B_IMAGE_CACHE_MAX_BYTES
-              value: "4294967296"
+              # 2026-10-10：4 GiB 装不下"基础镜像 + 各模板 + 历史本地构建条目" ——
+              # 实测挤到 4051/4096 MB 之后驱逐掉了基础镜像的 rootfs（只剩 `.lock`），
+              # 默认模板随即回 428 warm_required。16 GiB 是本节点 nvme 能轻松承受的量
+              # （该盘 100 G，用 36 G）。与 control-plane.yaml 保持同值。
+              value: "17179869184"
             - name: E2B_IMAGE_CACHE_EVICT_MIN_AGE_S
               value: "300"
             # Task 3: one tree copy's byte cap, shared by every component that
@@ -373,7 +377,8 @@ spec:
             # C3 (Task 3): own identity's slot identity now comes from the per-node
             # agent, not from a file-capability binary in this image.
             #
-            # The worker forks the slot, lets it `unshare` a user namespace and
+            # The worker forks the slot with its own `clone3(CLONE_NEWUSER)` (N80;
+            # the profile carries no `unshare`), which
             # reports `{sandbox_id, pid}` to the **control plane** (never to the
             # agent: `worker <-> agent` does not exist, hard rule 5); the CP
             # checks the report against its own records and instructs the agent
@@ -407,8 +412,10 @@ spec:
             #     single-switch shape is a sandbox with no network at all).
             # Neither adds a kernel prerequisite this pod did not already have:
             # per-sandbox host uids (E2B_PER_SANDBOX_UID, on by default) already
-            # create a user namespace per sandbox, which is the same
-            # `unshare(CLONE_NEWUSER)` these two build on.
+            # create a user namespace per sandbox, and the fork builds all of
+            # these namespaces with a single `clone3` call (N80 removed
+            # `unshare` from the profile; that one call is also what carries
+            # the netns, which is why the switches are required together).
             - name: E2B_PID_NS
               value: "true"
             - name: E2B_ENABLE_NET_ISOLATION
@@ -522,7 +529,11 @@ spec:
               # mirror; Docker Hub is unreachable from the deployment hosts).
               value: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
             - name: E2B_TEMPLATE_IMAGES
-              value: '{"py311": "registry.cn-shanghai.aliyuncs.com/byteplan/python:3.11-slim"}'
+              # Keep in step with control-plane.yaml (same map, same reasons --
+              # 见那份上面对 arm64 / OCI index 的注释). The worker's copy is the
+              # **startup warm list** (`envd_service/app.py`), so每加一个键就是
+              # 每节点一次全量拉取+解包；建箱本身走控制面按需预热，不依赖这里。
+              value: '{"py311": "registry.cn-shanghai.aliyuncs.com/byteplan/python:3.11-slim", "byteplan-python-template": "registry.cn-shanghai.aliyuncs.com/byteplan/sandbox-base:latest"}'
             - name: E2B_NODE_MEMORY_MB
               value: "2048"
             - name: E2B_NODE_CPU_PERCENT
@@ -794,9 +805,9 @@ spec:
             # the DaemonSet to be ready; a node without the file cannot start
             # this pod at all. Copying the file by hand still works for a
             # one-off node, but the DaemonSet is the reproducible path.
-            # The profile is the runtime default plus `pidfd_getfd` and a
-            # **narrowed** `unshare` (the argument mask keeps the namespace
-            # types this deployment builds and refuses the rest) -- see
+            # The profile is the runtime default plus `pidfd_getfd` and nothing else
+            # since N80 (the masked `unshare` rule left it with the clone3 slot
+            # handshake) -- see
             # deploy/seccomp/README.md. `Localhost` (not `Unconfined`) also keeps
             # this pod on the allowed side of the Pod Security "baseline" rule.
             seccompProfile:

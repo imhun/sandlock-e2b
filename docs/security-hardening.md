@@ -9,7 +9,7 @@
 | 内网横向访问 | 全放行网络沙箱可直连 redis（无密码可读写）/buildkit（无认证）/control-plane/worker；默认白名单沙箱全部拒绝 | 已修复（P0） |
 | 磁盘无配额 | 1.5G 写入无运行时限制 | 已缓解（P1，见下） |
 | 跨沙箱 kill | 同 worker 目标可见但 `os.kill` 返回 EPERM（sandlock 拦截） | 已确认防护有效 |
-| PTY 跨沙箱 | `/dev/pts` 无从端节点，扫描不可达 | 已确认防护有效 |
+| PTY 跨沙箱 | `/dev/pts` 是 **worker 的 devpts 原样绑入**（从端节点**按名字可见**：全量车道里能看到别的会话留下的 `0`/`1`），但节点是 `0620 root:tty`、沙箱是异己 uid ⇒ `open` 答 EACCES；`/dev/tty` 答 ENXIO(6) | 已确认防护有效（**判据在 2026-10-11 由"无从端节点"改成 DAC 不可达**，因为那个读数只在安静的 worker 上成立；现在钉在 `tests/security/test_ioctl_inventory.py::test_foreign_ptys_are_unreachable`） |
 | 通知洪泛 | 400 次 on-behalf connect 对 API 延迟无明显影响 | 增加限流（P1） |
 | UDP 出站 | 全放行沙箱 UDP 出站不受限 | 随 P0 私网拒绝覆盖 |
 

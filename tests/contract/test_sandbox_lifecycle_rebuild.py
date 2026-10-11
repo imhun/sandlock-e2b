@@ -27,6 +27,7 @@ from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.executors.base import ExecConfig
 from envd_service.runtime.registry import RuntimeRegistry
+from tests.lane_identity import with_lane_identity_reporter
 from tests.security.conftest import sandlock_ready
 
 
@@ -117,15 +118,17 @@ async def test_nonexistent_binary_exits_127_with_no_output(workspace) -> None:
     # tests/contract/test_own_identity_executor.py::test_missing_binary_exits_127_through_the_slot
     from tests.security.conftest import SANDBOX_UID, sandbox_tmpdir
 
-    settings = EnvdSettings(
-        executor="sandlock",
-        per_sandbox_uid=True,
-        own_identity="on",
-        slot_tmp_root=sandbox_tmpdir(suffix="-route-b"),
-        # The slot segment has to contain the uid the record carries (the
-        # pool refuses a uid outside it, by name).
-        uid_pool_start=SANDBOX_UID,
-        uid_pool_size=2,
+    settings = with_lane_identity_reporter(
+        EnvdSettings(
+            executor="sandlock",
+            per_sandbox_uid=True,
+            own_identity="on",
+            slot_tmp_root=sandbox_tmpdir(suffix="-route-b"),
+            # The slot segment has to contain the uid the record carries (the
+            # pool refuses a uid outside it, by name).
+            uid_pool_start=SANDBOX_UID,
+            uid_pool_size=2,
+        )
     )
     app = create_envd_app(
         settings=settings,

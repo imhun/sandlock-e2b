@@ -113,6 +113,39 @@ XFS_DESELECTS="--ignore=tests/contract/test_volume_quota.py
 # pass here while the sandbox-side network enforcement stays under test.
 EXTRA_CAPS="--cap-add NET_ADMIN"
 
+# The unprivileged-port window. A worker runs *inside a container/pod netns*,
+# and every runtime opens that window there: measured 2026-10-11 on this host,
+# `docker run alpine sysctl net.ipv4.ip_unprivileged_port_start` answers 0 with
+# no `sysctls:` declared. It matters because the shared-netns shape binds the
+# per-sandbox wildcard DNS gateway on 127.0.1.x:53 *as the sandbox's own uid*
+# (the own-identity slot's supervisor), which is `bind DNS gateway: Permission
+# denied (os error 13)` -- N36 -- once the window is shut. This lane runs
+# `--network host` so the
+# in-process sandboxes share the runner's netns; that netns is the VM's, which
+# starts at 1024. Reproduce the deployed window in it (idempotent, one
+# privileged one-shot before the lane's own unprivileged runs start).
+ensure_unprivileged_port_window() {
+    if [ "${LANE_SKIP_PORT_WINDOW:-0}" = "1" ]; then
+        echo "!! LANE_SKIP_PORT_WINDOW=1: leaving net.ipv4.ip_unprivileged_port_start" >&2
+        echo "!! as is; the shared-netns wildcard DNS-gateway cases will fail with EPERM." >&2
+        return 0
+    fi
+    # `--entrypoint sh` on both runs: the runner image's entrypoint prints its
+    # own diagnostics (XFS/loop messages) on *stdout*, so a bare
+    # ``docker run "$IMAGE" cat ...`` would capture those into the value and
+    # compare an always-unequal string (measured 2026-10-11).
+    current="$(docker run --rm --network host --entrypoint sh "$IMAGE" \
+        -c 'cat /proc/sys/net/ipv4/ip_unprivileged_port_start' 2>/dev/null || true)"
+    if [ "$current" = "0" ]; then
+        return 0
+    fi
+    echo "==> opening the unprivileged-port window in this lane's netns:" >&2
+    echo "    net.ipv4.ip_unprivileged_port_start: ${current:-unknown} -> 0" >&2
+    docker run --rm --privileged --network host --entrypoint sh "$IMAGE" \
+        -c 'echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start'
+}
+ensure_unprivileged_port_window
+
 # The image bakes in the multi-source default for E2B_REGISTRY_MIRRORS, but a
 # run may want a *different* source -- typically the local registry:2 on
 # 127.0.0.1:5080 with the images preloaded, which takes the public mirror chain
@@ -139,6 +172,47 @@ else
     echo "!! those allowlists -- expect ~200 failures unless the local registry" >&2
     echo "!! on 127.0.0.1:5080 is preloaded and passed here (§2.6.1)." >&2
 fi
+
+# A *dead* mirror is worse than an unset one: the failure it produces looks like
+# a code regression (every create whose fixture needs the base image answers 428
+# warm_required) and it is spread across unrelated files. Measured 2026-10-11:
+# the container behind 127.0.0.1:5080 had been removed, and one full run came
+# back `30 failed / 2 errors` -- `warm_required` in 15 tracebacks, "registry
+# endpoint http://127.0.0.1:5080/v2 unusable" in 32 -- with nothing in common
+# between the files. The check below names it before pytest starts, because the
+# fix is operational (docs/production-deployment-requirements.md §2.6.1).
+# LANE_SKIP_MIRROR_CHECK=1 is the escape hatch for a deliberate cold/no-source
+# run.
+check_registry_mirrors() {
+    [ "${LANE_SKIP_MIRROR_CHECK:-0}" = "1" ] && return 0
+    [ -n "${E2B_REGISTRY_MIRRORS:-}" ] || return 0
+    # `\n` on purpose: without the trailing newline `read` reports end-of-file
+    # for a single-element (comma-free) value and the loop body never runs --
+    # i.e. the check would silently pass for exactly the common case.
+    printf '%s\n' "$E2B_REGISTRY_MIRRORS" | tr ',' '\n' | while read -r pair || [ -n "$pair" ]; do
+        [ -n "$pair" ] || continue
+        mirror="${pair#*=}"
+        case "$mirror" in
+            127.0.0.1:*|localhost:*) ;;
+            *) continue ;;
+        esac
+        code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://$mirror/v2/" || true)"
+        # 401 is a live registry that wants credentials; anything else (000
+        # for a refused connection, 404, a proxy error) means "not usable".
+        case "$code" in
+            200|401) ;;
+            *)
+                echo "!! the registry mirror $mirror answers '${code:-no answer}': every create" >&2
+                echo "!! that needs the base image will 428 warm_required across unrelated tests." >&2
+                echo "!! Start it (and preload the full tag set) per" >&2
+                echo "!! docs/production-deployment-requirements.md §2.6.1, or set" >&2
+                echo "!! LANE_SKIP_MIRROR_CHECK=1 to run a deliberately cold lane." >&2
+                return 1
+                ;;
+        esac
+    done
+}
+check_registry_mirrors || exit 2
 
 # The per-sandbox memory ceiling is a *deployment* value: the shipped stack
 # runs 512MB (deploy/stack/.env, docs §2.4.8) while the code default is
@@ -198,23 +272,75 @@ if [ -n "${E2B_IMAGE_CACHE_DIR:-}" ]; then
     CACHE_ENV="-e E2B_IMAGE_CACHE_DIR=${E2B_IMAGE_CACHE_DIR}"
 fi
 
+# --- the run itself, in reusable containers ---------------------------------
+#
+# The suite runs *correctness only* here: `tests/perf` is the concurrency/
+# latency suite, whose subject is a burst of 30-50 simultaneous sandboxes --
+# a shape an admission-controlled lane cannot honestly declare (and one that
+# made the lane's own `live_servers` pool the thing under test). It has its own
+# entry point, `deploy/scripts/test-perf-shaped.sh`, so a correctness run is
+# not gated on it and a perf run is not diluted by 3000 other tests.
+#
+# `--durations=25` and `PYTHONUNBUFFERED=1` (set when the containers are
+# created) are there because this lane's wall clock is dominated by a handful
+# of very slow cases, and by output buffering that makes a running suite look
+# stuck when it is redirected to a file.
+LANE_SECCOMP_PROFILE="$SECCOMP_PROFILE"
+LANE_HOST_PROJECT="$(pwd)"
+. "$(dirname "$0")/lib/lane-container.sh"
+# The setup steps (warm-up, services) see the same shape env the suite will.
+LANE_EXTRA_EXEC_ENV="$MIRRORS_ENV $MEMORY_ENV $PIDNS_ENV $NETNS_ENV $CACHE_ENV"
+
+LANE_CONTAINER="${LANE_CONTAINER:-e2b-prod-shaped-lane}"
+LANE_RUN_ID="${LANE_RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
+#: What the suite run collects. `tests` (the whole suite, correctness only) is
+#: the lane's meaning; `LANE_TARGETS=tests/security/test_x.py` is the iteration
+#: lever -- the containers, the services and the warm-up are the same, so a
+#: targeted run measures the same shape (and the same lane can be re-entered
+#: cheaply, because nothing is created twice).
+LANE_TARGETS="${LANE_TARGETS:-tests}"
+
+lane_cleanup() {
+    lane_container_reset_scratch "$LANE_CONTAINER-root" "$LANE_RUN_ID"
+    if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
+        lane_container_reset_scratch \
+            "$LANE_CONTAINER-nobody" "$LANE_RUN_ID-nobody"
+    fi
+}
+trap lane_cleanup EXIT
+
+lane_container_up "$LANE_CONTAINER-root" "$IMAGE" "$CAPS $EXTRA_CAPS" \
+    "phase 1 (root worker)"
+# Once per *container*, not per test: see lib/lane-container.sh and
+# deploy/scripts/lane-warmup.py.
+lane_container_warmup "$LANE_CONTAINER-root"
+# Once per *lane*, not per pytest process: the two registries and buildkitd
+# the fixtures read from the env (tests/conftest.py).
+lane_services_up "$LANE_CONTAINER-root"
+SERVICES_ENV="$(lane_services_env)"
+
+# No readiness-deadline override: the pool keeps its deployment default (30 s).
+# The reason the lane used to need 180 s here was a real bug -- a hand-rolled
+# ``clone3`` released the GIL around the syscall, so a child whose parent's other
+# thread held the GIL at that instant parked forever in ctypes'
+# ``PyEval_RestoreThread`` before it ever exec'd (fixed 2026-10-11 in
+# ``envd_service/identity_grant.py``: ``PyDLL`` + an allocation-free child path;
+# first chroot launch went from 31/92/184 s -- or a hang -- to 0.07-0.095 s in
+# four fresh containers). Raising the deadline would only have hidden it.
 # shellcheck disable=SC2086
-docker run --rm --init --network host \
-    $CAPS $EXTRA_CAPS --security-opt seccomp="$SECCOMP_PROFILE" \
-    --security-opt apparmor=unconfined \
-    -e E2B_HOST_PROJECT="$(pwd)" \
-    -e E2B_TEST_STRICT_SKIPS=1 \
+docker exec \
+    -e E2B_TEST_TMP_ROOT="$(lane_container_scratch "$LANE_RUN_ID")" \
     -e E2B_BASE_IMAGE="${E2B_BASE_IMAGE:-python-mcp:3.14}" \
     -e E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=2 \
+    $SERVICES_ENV \
     $MIRRORS_ENV \
     $MEMORY_ENV \
     $PIDNS_ENV \
     $NETNS_ENV \
     $CACHE_ENV \
-    -v "$HOME/.orbstack/run/docker.sock:/var/run/docker.sock" \
-    -v "$(pwd):/workspace" -w /workspace \
-    "$IMAGE" \
-    pytest tests --perf -q -p no:cacheprovider $XFS_DESELECTS "$@"
+    "$LANE_CONTAINER-root" \
+    pytest $LANE_TARGETS -q -p no:cacheprovider --durations=25 \
+        --ignore=tests/perf $XFS_DESELECTS "$@"
 
 if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
     echo "==> phase 2: unprivileged worker (uid 65534, no privileged file-step path)"
@@ -235,26 +361,35 @@ if [ "${UNPRIVILEGED_PHASE:-1}" = "1" ]; then
     # `tests/contract/test_nonroot_own_identity.py` is deliberately not in the list
     # any more: a non-root worker has no own-identity capability without the agent,
     # which is what that contract used to pin when the brokers supplied it.
+    # Its own reusable container, created with `--cap-drop ALL` and no `--add`:
+    # the whole point of this phase is that *nothing* is granted, so it cannot
+    # share phase 1's container (caps are fixed when a container is created).
+    lane_container_up "$LANE_CONTAINER-nobody" "$IMAGE" "--cap-drop ALL" \
+        "phase 2 (uid 65534 worker)"
+    # The shared rootfs cache belongs to phase 1's *root* process, so this
+    # container's copy of the path is root-owned (or missing) and uid 65534
+    # cannot traverse it: prepared root-side here, in the lib, because the
+    # suite's `docker exec` shape is pinned by
+    # tests/unit/test_prod_shaped_lane_netns_passthrough.py (two execs of the
+    # *suite*, not three).
+    lane_container_prepare_rootfs "$LANE_CONTAINER-nobody"
     # shellcheck disable=SC2086
-    docker run --rm --init --network host --user 65534:65534 \
-        --cap-drop ALL \
-        --security-opt seccomp="$SECCOMP_PROFILE" \
-        --security-opt apparmor=unconfined \
+    docker exec -u 65534:65534 \
         -e HOME=/tmp -e TMPDIR=/tmp \
-        -e E2B_HOST_PROJECT="$(pwd)" \
-        -e E2B_TEST_STRICT_SKIPS=1 \
+        -e E2B_TEST_TMP_ROOT="$(lane_container_scratch "$LANE_RUN_ID-nobody")" \
         -e E2B_BASE_IMAGE="${PHASE2_BASE_IMAGE:-python:3.11-slim}" \
+        $SERVICES_ENV \
         $MIRRORS_ENV \
         $MEMORY_ENV \
         $PIDNS_ENV \
         $NETNS_ENV \
         $CACHE_ENV \
-        -v "$(pwd):/workspace" -w /workspace \
-        "$IMAGE" \
+        "$LANE_CONTAINER-nobody" \
         pytest tests/security/test_template_isolation.py \
             tests/security/test_sandlock_isolation.py \
             tests/unit/test_sandlock_executor_own_identity.py \
-            tests/unit/test_policy_mapping.py -q -p no:cacheprovider "$@"
+            tests/unit/test_policy_mapping.py -q -p no:cacheprovider \
+            --durations=25 "$@"
         # ^ E2B_BASE_IMAGE is deliberately not inherited: `python-mcp:3.14` is a
         # locally built image that the registry mirrors refuse (403 not in the
         # allowlist), and phase 1 only resolves it because its rootfs is already

@@ -109,7 +109,17 @@ pytestmark = pytest.mark.skipif(
 
 
 def _host_repo_path() -> str:
-    """Where this repository lives *on the Docker host* (see the Task 3 lane)."""
+    """Where this repository lives *on the Docker host* (see the Task 3 lane).
+
+    ``E2B_HOST_PROJECT`` first, for the reason spelled out in
+    ``test_c3_slot_identity_grant.py``: on an engine whose containers all report
+    the same hostname (OrbStack: ``orbstack``, cgroup ``0::/``) the inspect below
+    cannot name this container, and the fallback mounts a path the host sees as
+    an empty directory.
+    """
+    declared = os.environ.get("E2B_HOST_PROJECT")
+    if declared:
+        return declared
     inspected = _run(
         "docker",
         "inspect",

@@ -114,6 +114,7 @@
 | `probe_push_and_tighten.py` | Cluster evidence for N25's push reporting and the live tightening. | —（头部无 Usage 行；见脚本 `--help`） |
 | `probe_restore_state.py` | Why does a *restored* sandbox not tick? (2026-09-25, cluster probe) | `Run with KUBECONFIG + E2B_API_URL + E2B_API_KEY set; it prints the sandbox id` |
 | `probe_state_base_visibility.py` | N27 Task 7 acceptance probe: is the platform's state base visible from a sandbox? | 头部 Modes：`cluster`（默认，走 API）/ `lane`（lane 容器内）/ `in-sandbox`（checker 本体）；退出码 0/1/2 |
+| `probe_write_path_errno.py` | N95: does the sandbox answer ENOENT for a write path whose parent is missing? | `E2B_API_URL=http://127.0.0.1:3110 E2B_API_KEY=local-key python3 -u deploy/scripts/acceptance/probe_write_path_errno.py [--json]`（头部） |
 | `probe_write_paths.py` | Which ways of making a file bigger does RLIMIT_FSIZE actually stop? | —（头部无 Usage 行；见脚本 `--help`） |
 | `rb_token_probe.py` | What actually leaks when the channel token travels in supervise's argv. | —（头部无 Usage 行；见脚本 `--help`） |
 | `red-routeb-stderr-drain.py` | RED/GREEN check for the slot-stderr drain (N35 side quest). | `sh tmp/k0s/n35-lane.sh python3 -u tmp/k0s/red-routeb-stderr-drain.py`（旧拼写） |

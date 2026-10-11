@@ -65,7 +65,20 @@ def _host_repo_path() -> str:
     inside a container (the lane's normal place), where the repository is mounted
     somewhere else. The mount table of the container we are in is the honest
     source, and a run directly on the host falls back to our own path.
+
+    ``E2B_HOST_PROJECT`` is consulted first: the lanes export the host-side tree
+    path there (``deploy/scripts/test-prod-shaped.sh``), and the inspect below is
+    only usable when the container's hostname *is* its container id. On OrbStack
+    it is not -- every container reports ``hostname=orbstack`` and
+    ``/proc/self/cgroup`` is ``0::/`` -- so the inspect answered "No such object"
+    and the fallback below mounted the *in-container* path, which the host sees
+    as an empty directory: the driver container then died on
+    ``can't open file '/w/tests/contract/c3_slot_child_driver.py'`` (measured
+    2026-10-10, both this file and ``test_c3_worker_kernel_identity.py``).
     """
+    declared = os.environ.get("E2B_HOST_PROJECT")
+    if declared:
+        return declared
     inspected = _run(
         "docker",
         "inspect",
@@ -267,8 +280,9 @@ class _Topology:
         """Start a worker container running the production child path.
 
         Returns the container name and the moment it was started, so a lane can
-        bound *when* the worker reported (``--mode delayed`` is only reported
-        once the child's handshake byte has arrived).
+        bound *when* the worker reported. ``mode="plain"`` (a child that never
+        unshares) is the counter-arm's target; see the driver for why the old
+        ordering modes are gone.
         """
         LANE_TMP.mkdir(parents=True, exist_ok=True)
         LANE_TMP.chmod(0o777)
@@ -453,14 +467,13 @@ def test_the_production_child_path_grants_then_execs(
 ) -> None:
     """D11.2: the *worker's* child module, not a stand-in, end to end.
 
-    ``_spawn_slot_child`` builds ``child_argv`` for
-    ``python -m envd_service.identity_grant``, hands it the handshake descriptor
-    and returns only after the child's ``unshare``. From there the real grant
-    runs (face A's ``as_uid`` against the real ``/proc``) and the child -- which
-    has been polling ``setresuid`` -- execs the program it was told to run. That
-    covers argv parsing, the handshake, the poll loop and the descriptor
-    surviving the interpreter start, and it is repeated because a race is not
-    disproved by one pass.
+        ``_spawn_slot_child`` is the worker's real starter: ``clone3`` the child
+        into its own user namespace (N80 -- no child module, no handshake byte),
+        hand it the documents, and return the pid the control plane is told. From
+        there the real grant runs (face A's ``as_uid`` against the real ``/proc``)
+        and the child -- polling ``setresuid`` -- execs the program it was told to
+        run. That covers the starter, the poll loop and the exec under a granted
+        identity, and it is repeated because a race is not disproved by one pass.
     """
     name = f"production-{iteration}"
     container, _started = agent_only.start_child_driver(name, mode="production")
@@ -485,32 +498,16 @@ def test_the_production_child_path_grants_then_execs(
     assert stat.stdout.strip() == str(GRANT_UID)
 
 
-def test_the_report_waits_for_a_slow_childs_unshare(agent_only: _Topology) -> None:
-    """D11, in the lane: the worker is *late* by exactly the child's delay.
-
-    The child here is the production module behind a wrapper that sleeps one
-    second before exec'ing it, and the descriptor rides through both execs. The
-    worker's report is printed only after the handshake byte, so it cannot appear
-    before the child has unshared -- while a worker that reported on the spawn
-    alone would print immediately (and then grant a namespace that does not
-    exist yet).
-    """
-    delay = 1.0
-    container, _started = agent_only.start_child_driver(
-        "slow", mode="delayed", delay=delay
-    )
-    container_pid, mode, elapsed = _wait_for_ready(container)
-    assert mode == "delayed"
-    assert elapsed >= delay
-
-    identity = agent_only.pid_namespace_of(container)
-    resolved = agent_only.lookup(container_pid, identity, "slow")
-    host_pid = _resolved_pid(resolved)
-    granted = agent_only.grant(host_pid)
-    assert granted.returncode == 0, granted.stderr
-    assert _wait_for(
-        container, r"^(C3-SLOT-EXEC-OK uid=\d+ pidns=pid:\[\d+\])$"
-    ) == f"C3-SLOT-EXEC-OK uid={GRANT_UID} pidns={identity}"
+#: (N80, 2026-10-06) There used to be a second arm here,
+#: ``test_the_report_waits_for_a_slow_childs_unshare``: the child was the
+#: production module behind a sleeping wrapper, and the report was printed only
+#: after the handshake byte, so ``elapsed >= delay`` proved the ordering. The
+#: byte is gone -- ``clone3(CLONE_NEWUSER)`` creates the child *inside* its
+#: namespace, so "the namespace exists" is true before the starter returns and
+#: there is no window left for a report to be early in. The arm is deleted
+#: rather than kept as a tautology; ``test_the_production_child_path_…`` above
+#: still covers the starter, and face A's refusal below still covers the
+#: wrong-namespace case from the other side.
 
 
 def test_a_grant_that_precedes_the_unshare_is_refused_by_name(
@@ -518,17 +515,19 @@ def test_a_grant_that_precedes_the_unshare_is_refused_by_name(
 ) -> None:
     """The counter-arm: the old ordering is a *refusal*, not a slow success.
 
-    ``--mode no-wait`` is the pre-D11 worker: it reports the pid straight off
-    ``Popen``, with the child still a second away from its ``unshare``. Face A
-    then reads the initial namespace's full-range map and refuses by name --
-    which is exactly the intermittent create failure the handshake removes, and
-    the reason the ordering is a contract and not a tuning detail.
+    ``--mode plain`` forks a child that never unshares -- the shape a
+    pre-D11 worker used to hand face A (it reported the pid straight off
+    ``Popen``). Face A reads the initial namespace's full-range map and refuses
+    by name, which is exactly the intermittent create failure the ordering
+    removes -- and the reason it is a contract and not a tuning detail. The pid
+    comes from a plain fork rather than the production starter because N80's
+    ``clone3`` can no longer produce an un-unshared pid.
     """
     container, _started = agent_only.start_child_driver(
-        "nowait", mode="no-wait", delay=1.0
+        "nowait", mode="plain"
     )
     container_pid, mode, _elapsed = _wait_for_ready(container)
-    assert mode == "no-wait"
+    assert mode == "plain"
     identity = agent_only.pid_namespace_of(container)
     resolved = agent_only.lookup(container_pid, identity, "nowait")
     host_pid = _resolved_pid(resolved)

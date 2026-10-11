@@ -12,18 +12,19 @@ module is stdlib-only, so no worker image is needed):
 Modes (the test picks one):
 
 * ``production`` -- :func:`envd_service.own_identity._spawn_slot_child`, i.e. the
-  worker's real starter: it builds ``child_argv`` for
-  ``python -m envd_service.identity_grant``, passes the handshake descriptor and
-  **returns only after the child's ``unshare`` byte**. This is the arm that
-  covers the child module end to end (argv parsing, handshake, poll loop, and
-  the descriptor surviving the interpreter start).
-* ``delayed`` -- the same child module behind a wrapper that sleeps first, with
-  the handshake driven by the *production* ``await_unshared``. It makes the
-  ordering measurable: a worker that reported on the spawn alone would be
-  granting a namespace that does not exist yet.
-* ``no-wait`` -- the *old* ordering, kept as the lane's counter-arm: it reports
-  the pid immediately after ``Popen`` and is what the delayed arm would look
-  like without the handshake (the grant is then refused, by name, by face A).
+  worker's real starter: ``clone3(CLONE_NEWUSER)`` a child, hand it its the
+  documents, and return the pid -- the child polls ``setresuid`` and then execs
+  the program it was told to run. This is the arm that covers the starter end to
+  end, including the ``stderr=PIPE`` contract the pool reads refusals from.
+* ``plain`` -- a child that never unshares (a plain ``sleep``), for the
+  counter-arm that pins face A's refusal against a pid still in the initial
+  namespace. The production starter cannot produce one any more (see N80 below).
+
+The pre-D11 ordering arms were ``delayed``/``no-wait``: they existed to order
+the worker's report against the child's ``unshare`` byte. N80 (2026-10-06)
+deleted that byte -- the child is created *inside* its namespace by ``clone3``,
+so "the namespace exists" is true the moment the starter returns -- and the
+driver refuses those modes by name rather than pretending to still test them.
 
 It prints ``C3-DRIVER-READY container_pid=<pid> mode=<mode>`` once the pid the
 control plane would be told about is known, and then stays up so the child's own
@@ -34,13 +35,12 @@ from __future__ import annotations
 
 import argparse
 import os
-import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-from envd_service import identity_grant as si
 from envd_service.own_identity import _spawn_slot_child
 
 #: A slot's line for the "it really got there" fact: the program the child
@@ -63,7 +63,20 @@ def _slot_exec(tmp_dir: Path) -> str:
 
 
 def _start_production(uid: int, slot_exec: str) -> subprocess.Popen:
-    """The worker's real starter, unmodified."""
+    """The worker's real starter, unmodified.
+
+    ``stderr=PIPE`` is the starter's own contract since N80 (the child's refusal
+    is read from that pipe by the pool, and the starter refuses anything else by
+    name); the old call passed ``None, None`` and would now die with
+    ``NotImplementedError`` -- which the lane read as "the driver never reported
+    ready" (measured 2026-10-10).
+
+    ``stdout`` stays **inherited** (``None``): the program the child execs prints
+    the ``C3-SLOT-EXEC-*`` line the lane reads out of this container's log, so
+    sending it to ``DEVNULL`` (the pool's production choice) would make the arm
+    unobservable -- measured: the driver reported ready, the grant landed, and
+    the line the test waits for never appeared.
+    """
     return _spawn_slot_child(
         Path(slot_exec),
         uid,
@@ -73,49 +86,47 @@ def _start_production(uid: int, slot_exec: str) -> subprocess.Popen:
         "unused-channel-token",
         uid,
         None,
-        None,
+        subprocess.PIPE,
     )
 
 
-def _start_timed(uid: int, slot_exec: str, *, delay: float, wait: bool):
-    """The same child module, with the timing of its ``unshare`` controlled.
+def _relay_stderr(process) -> None:
+    """Forward the child's stderr to ours, so a refusal lands in the log.
 
-    ``delay`` is applied by a wrapper that sleeps *before* exec'ing the child
-    module, so the handshake still comes from the production child; the
-    handshake descriptor is inherited across both execs (that is what
-    ``pass_fds`` is for). ``wait=False`` reproduces the pre-D11 ordering: report
-    on the spawn, without waiting for the byte.
+    ``spawn_child`` only knows ``stderr=PIPE`` and nothing in this driver would
+    read it: a hidden refusal (or, past the 64 KiB pipe buffer, a blocked child)
+    is exactly the shape the lane would report as "no C3-SLOT-EXEC-OK line".
     """
-    read_fd, write_fd = os.pipe()
-    supervise = [slot_exec, "--policy", "/tmp/delayed", "--uid", str(uid)]
-    argv = si.child_argv(uid=uid, supervise_argv=supervise, unshared_fd=write_fd)
-    if delay > 0:
-        argv = [
-            "/bin/sh",
-            "-c",
-            f"sleep {delay}; exec " + " ".join(shlex.quote(part) for part in argv),
-        ]
-    process = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        pass_fds=(write_fd,),
-    )
-    os.close(write_fd)
-    if wait:
+
+    def _pump() -> None:
         try:
-            si.await_unshared(read_fd, pid=process.pid)
-        finally:
-            os.close(read_fd)
-    else:
-        os.close(read_fd)
-    return process
+            for chunk in iter(lambda: process.stderr.readline(), b""):
+                sys.stderr.write(chunk.decode("utf-8", "replace"))
+                sys.stderr.flush()
+        except Exception:  # noqa: BLE001 - best effort, the lane reads stdout
+            pass
+
+    threading.Thread(target=_pump, daemon=True).start()
+
+
+def _start_plain_child() -> subprocess.Popen:
+    """A child that never unshares: the target of the counter-arm.
+
+    Face A's refusal ("uid_map … is the initial namespace's full range") is
+    about a pid that is *still* in the initial namespace, and the production
+    starter can no longer produce one: N80's ``clone3`` creates the child
+    directly inside its own user namespace, so every pid it returns has already
+    unshared. A plain fork still has the old shape, and that is all the
+    counter-arm needs -- it is testing face A, not the starter.
+    """
+    return subprocess.Popen(["/bin/sh", "-c", "sleep 600"], stdin=subprocess.DEVNULL)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--uid", type=int, required=True)
     parser.add_argument(
-        "--mode", choices=("production", "delayed", "no-wait"), default="production"
+        "--mode", choices=("production", "plain"), default="production"
     )
     parser.add_argument("--delay", type=float, default=0.0)
     parser.add_argument("--tmp-dir", default="/tmp")
@@ -123,12 +134,20 @@ def main(argv: list[str] | None = None) -> int:
     slot_exec = _slot_exec(Path(args.tmp_dir))
     if args.mode == "production":
         process = _start_production(args.uid, slot_exec)
+        _relay_stderr(process)
+    elif args.mode == "plain":
+        process = _start_plain_child()
     else:
-        process = _start_timed(
-            args.uid,
-            slot_exec,
-            delay=args.delay,
-            wait=args.mode == "delayed",
+        # ``--mode delayed`` / ``--mode no-wait`` were the pre-D11 ordering arms.
+        # N80 removed the thing they ordered against: the child is created by
+        # ``clone3(CLONE_NEWUSER)`` and never execs a module of its own, so there
+        # is no handshake byte to be early or late for ("clone3 returning *is*
+        # 'the namespace exists'"). Refused by name so a re-added arm cannot
+        # silently test nothing.
+        raise SystemExit(
+            f"--mode {args.mode} was removed by N80: the handshake byte it "
+            "ordered against no longer exists (clone3 creates the namespace "
+            "before the starter returns)"
         )
     print(
         f"C3-DRIVER-READY container_pid={process.pid} mode={args.mode}",

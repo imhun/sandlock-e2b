@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from envd_service.own_identity import W1SlotPool, default_supervise_bin
+from tests.lane_identity import lane_identity_reporter
 from tests.security.conftest import sandlock_ready
 
 
@@ -159,6 +160,13 @@ async def test_w1_slot_pool_two_uids_share_sticky_dir_through_python_client():
         uid_start=UID_X,
         size=2,
         tmp_root=base / "slots",
+        # The pool starts a real supervise generation at another uid, and since
+        # N52 ``agent-grant`` is the only grant shape left: without an identity
+        # reporter the child polls for a map nobody writes and the pool dies
+        # (measured 2026-10-11). This lane has no node agent, so the root process
+        # performing the write stands in for it -- ``tests/lane_identity.py``.
+        identity_grant="agent-grant",
+        identity_reporter=lane_identity_reporter(UID_X, 2),
     )
     try:
         sx = await pool.acquire(
@@ -211,7 +219,13 @@ async def test_w1_slot_pool_two_uids_share_sticky_dir_through_python_client():
 async def test_w1_pool_refuses_live_uid_reuse_and_exhausts_cleanly():
     base = Path(tempfile.mkdtemp(prefix="rb-pool2-"))
     _chmod(base, 0o777)
-    pool = W1SlotPool(uid_start=UID_X, size=1, tmp_root=base / "slots")
+    pool = W1SlotPool(
+        uid_start=UID_X,
+        size=1,
+        tmp_root=base / "slots",
+        identity_grant="agent-grant",
+        identity_reporter=lane_identity_reporter(UID_X, 1),
+    )
     try:
         policy = {
             "fs_readable": ["/usr", "/usr/local", "/lib", "/bin", "/etc", "/proc", "/dev"],

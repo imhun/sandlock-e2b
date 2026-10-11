@@ -712,9 +712,9 @@ services:
     # because a pod-level window let every process in the pod bind low ports,
     # a hole with nothing to do with sandboxes.
     security_opt:
-      # Docker's default syscall filter plus the two syscalls the sandbox-create
-      # path needs (`pidfd_getfd` for the seccomp-notification fd, `unshare` for
-      # the user namespace). `seccomp=unconfined` used to stand here; the
+      # Docker's default syscall filter plus the one syscall the sandbox-create
+      # path needs (`pidfd_getfd`; per-sandbox namespaces come from the fork's
+      # `clone3` since N80, which carries no `unshare`). `seccomp=unconfined` used to stand here; the
       # profile is strictly narrower and is what the deployment is verified
       # against -- see deploy/seccomp/README.md. Override the path with
       # E2B_SECCOMP_PROFILE when the profile does not sit next to this file.

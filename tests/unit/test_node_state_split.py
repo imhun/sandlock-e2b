@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 
@@ -167,10 +168,21 @@ def test_the_uid_pools_own_files_live_on_the_shared_base(tmp_path: Path) -> None
 
 
 def _worker(tmp_path: Path) -> tuple[object, EnvdSettings, RuntimeRegistry]:
-    """A worker whose three bases are three different directories."""
+    """A worker whose three bases are three different directories.
+
+    The two *named* bases are created here because the deployment creates them
+    before the worker starts (the init container owns the node-local base --
+    ``deploy/k8s/worker.yaml``'s ``storage-init`` -- and the shared one lives on
+    the export). A worker pointed at a base that is not there is not the shape
+    under test here, and it fails deep inside the uid pool
+    (``FileNotFoundError: …/.uid_pool.lock`` → a 500 from the create, which is
+    how this fixture failed until 2026-10-11: all four cases in this file).
+    """
     workspace_base = tmp_path / "workspaces"
     state_base = tmp_path / "export" / "state"
     node_state_base = tmp_path / "node" / "state"
+    state_base.mkdir(parents=True, exist_ok=True)
+    node_state_base.mkdir(parents=True, exist_ok=True)
     settings = EnvdSettings(
         executor="local",
         workspace_base=workspace_base,
@@ -482,6 +494,17 @@ async def test_a_failed_node_local_cleanup_is_named_not_swallowed(
     (node_dir / "disk-stats").write_text("1024 0\n", encoding="utf-8")
     parent = node_dir.parent
     parent.chmod(0o500)
+    if os.geteuid() == 0:  # pragma: no cover - root ignores the mode
+        # The injection is a permission bit, and root is not stopped by one:
+        # the ``rmdir`` succeeds and there is no failure to report. The
+        # *mechanism* this test exists for (a checked removal, not an
+        # ``ignore_errors``-style silent no-op) is pinned in both lanes by
+        # ``test_the_node_local_removal_is_checked_even_when_it_succeeds``.
+        parent.chmod(0o755)
+        pytest.skip(
+            "the injected failure is a read-only parent (EACCES); root ignores "
+            "it, so this case needs a non-root lane"
+        )
     try:
         assert (await _park(app)).status_code == 200
     finally:
@@ -493,3 +516,42 @@ async def test_a_failed_node_local_cleanup_is_named_not_swallowed(
         for message in messages
         if "could not remove its node-local" in message
     ] != []
+
+
+@pytest.mark.asyncio
+async def test_the_node_local_removal_is_checked_even_when_it_succeeds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The removal is a *checked* one, in the lane where nothing fails.
+
+    The review nit behind the case above is that the old code wrapped the
+    removal in ``ignore_errors=True``: a failure could not be reported at all.
+    That is only observable as a *call shape*, so it is pinned as one -- the
+    call site must hand ``rmtree`` an ``onerror`` callback -- which holds for
+    every uid, root lanes included.
+    """
+    app, settings, _registry = _worker(tmp_path)
+    (Path(settings.workspace_base) / SANDBOX / "workspace").mkdir(parents=True)
+    node_dir = _node_dir(settings)
+    node_dir.mkdir(parents=True)
+    (node_dir / "disk-stats").write_text("1024 0\n", encoding="utf-8")
+
+    calls: list[dict] = []
+    real_rmtree = agent_module.shutil.rmtree
+
+    def recording_rmtree(path, *args, **kwargs):
+        calls.append({"path": Path(path), **kwargs})
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(agent_module.shutil, "rmtree", recording_rmtree)
+
+    assert (await _park(app)).status_code == 200
+
+    removed = [call for call in calls if call["path"] == node_dir]
+    assert len(removed) == 1, calls
+    assert callable(removed[0].get("onerror")), (
+        "the node-local removal must report its failures: pass onerror rather "
+        "than ignore_errors=True"
+    )
+    assert removed[0].get("ignore_errors") is not True
+    assert node_dir.exists() is False

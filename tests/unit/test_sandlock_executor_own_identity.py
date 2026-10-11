@@ -13,6 +13,7 @@ against a real slot is ``tests/contract/test_own_identity_executor.py``.
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,24 @@ from gateway_common.network import NetworkUpdateConflictError
 WORKSPACE = "/var/lib/e2b-sandboxes/sbx_own_identity/workspace"
 ROOTFS = Path("tmp/unit-route-b-rootfs")
 HOST_UID = 20007
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rootfs():
+    """Start every case from a clean ``tmp/unit-route-b-rootfs``.
+
+    ``ROOTFS`` lives under the repo's ``tmp/``, which survives between runs --
+    and a run *on macOS* once left ``dev/pts`` there as a regular **file** (the
+    host has no ``/dev/pts`` directory, so the mount materializer ``touch``ed
+    one in its place). ``_mkdir_traversable`` refuses a non-directory occupant
+    by design -- "a file in the way has to fail here, loudly" -- so the next
+    run died with ``FileExistsError: …/dev/pts`` before its first assertion
+    (measured 2026-10-11: 19 failures in this file, on a tree nothing had
+    changed). The tests build the tree they need themselves, so removing it
+    first is what makes this file re-runnable.
+    """
+    shutil.rmtree(ROOTFS, ignore_errors=True)
+    yield
 
 
 class FakeSlotProcess:

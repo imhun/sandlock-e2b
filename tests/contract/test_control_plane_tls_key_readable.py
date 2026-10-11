@@ -74,18 +74,29 @@ def staged_pair(tmp_path: Path):
     _run(str(GEN), str(out), "control-plane")
     volume = f"e2b-tls-contract-{uuid.uuid4().hex[:12]}"
     _run("docker", "volume", "create", volume)
+    # The pair travels in with `docker cp`, not a bind mount: this test runs
+    # *inside* a container (the lane), so `tmp_path` is a path the daemon
+    # cannot see -- a bind of it silently becomes an empty directory and the
+    # stager then dies on `cp /src/tls.crt` (measured 2026-10-11: both tests in
+    # this file errored with exactly that argv). `docker cp` carries the bytes
+    # through the daemon API, which is the same remedy `tests/conftest.py`
+    # documents for buildkitd's config.
+    container = f"e2b-tls-stage-{uuid.uuid4().hex[:12]}"
     try:
         _run(
-            "docker", "run", "--rm",
+            "docker", "create", "--name", container,
             "-v", f"{volume}:/tls",
-            "-v", f"{out}:/src:ro",
             "--entrypoint", "sh", STAGER, "-c",
             # root:root, the shape a native Linux bind mount / Secret has.
-            "cp /src/tls.crt /src/tls.key /tls/ && chown root:root /tls/tls.crt "
+            "chown root:root /tls/tls.crt "
             "/tls/tls.key && chmod 644 /tls/tls.crt && chmod 600 /tls/tls.key",
         )
+        _run("docker", "cp", str(out / "tls.crt"), f"{container}:/tls/tls.crt")
+        _run("docker", "cp", str(out / "tls.key"), f"{container}:/tls/tls.key")
+        _run("docker", "start", "-a", container)
         yield volume, out
     finally:
+        _run("docker", "rm", "-f", container, check=False)
         _run("docker", "volume", "rm", "-f", volume, check=False)
 
 

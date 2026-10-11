@@ -33,6 +33,7 @@ from envd_service.app import create_app as create_envd_app
 from envd_service.config import Settings as EnvdSettings
 from envd_service.runtime.registry import RuntimeRegistry
 from tests.conftest import TMP_ROOT, _ServerThread, _bind_low_port, _fresh_dir
+from tests.lane_identity import with_lane_identity_reporter
 from tests.security.conftest import sandlock_ready
 
 pytestmark = pytest.mark.skipif(
@@ -83,9 +84,11 @@ def sandlock_combined_harness() -> dict[str, str]:
         workspace_base=workspace,
     )
     envd_app = create_envd_app(
-        settings=EnvdSettings(
-            executor="sandlock",
-            envd_port=envd_port,
+        settings=with_lane_identity_reporter(
+            EnvdSettings(
+                executor="sandlock",
+                envd_port=envd_port,
+            )
         ),
         runtime_registry=runtime_registry,
         workspace_base=workspace,

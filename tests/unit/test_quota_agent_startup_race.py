@@ -35,6 +35,24 @@ FACTS = {
     "xfs_quota": True,
 }
 
+#: The only loggers the startup window and its callers write through. The
+#: assertion below is an exact-equality one, so it must not depend on what the
+#: *rest* of the process happens to log while it runs: a full-suite run keeps
+#: the multinode harness's servers alive in this interpreter, and their
+#: background work (worker heartbeats resolving the container id, the control
+#: plane's TTL sweep) logs INFO through other ``envd_service``/``control_plane``
+#: loggers. Measured 2026-10-11 in ``deploy/scripts/test-prod-shaped.sh``: 21
+#: such records landed in this capture and failed the case, while the same file
+#: run alone captures none.
+_SUBJECT_LOGGERS = frozenset(
+    {
+        "envd_service.app",
+        "envd_service.quota_agent",
+        "envd_service.quota_maintenance",
+        "envd_service.xfs_quota",
+    }
+)
+
 
 def _sleeps(monkeypatch) -> list[float]:
     """Replace the retry's sleep with a recorder (the window is policy)."""
@@ -56,7 +74,7 @@ def _agent_records(caplog) -> list[tuple[int, str]]:
     return [
         (record.levelno, record.getMessage())
         for record in caplog.records
-        if record.name.startswith("envd_service")
+        if record.name in _SUBJECT_LOGGERS
     ]
 
 
@@ -97,6 +115,11 @@ def test_a_late_agent_is_absorbed_by_the_monitors_first_scan(
         return dict(FACTS)
 
     monkeypatch.setattr(xfs_quota, "agent_query", late_agent)
+    # The window's *spacing* is pinned by
+    # ``test_the_window_spaces_its_attempts_by_the_configured_delay``; here the
+    # two real 2.5 s delays would only be spent waiting for an agent the fake
+    # already answers on the third attempt.
+    _sleeps(monkeypatch)
     _healthy_disk(monkeypatch)
     table_calls: list[tuple[str, bool]] = []
     monkeypatch.setattr(

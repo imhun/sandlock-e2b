@@ -16,6 +16,7 @@ still works, with its own client, and hangs up when it is done).
 from __future__ import annotations
 
 import asyncio
+import inspect
 from types import SimpleNamespace
 
 import httpx
@@ -62,6 +63,13 @@ def _dialed_with(monkeypatch, handler) -> list:
     A counting factory rather than a stub: the class it returns is the real
     ``httpx.AsyncClient`` (so ``is_closed`` means what it says), and the
     transport is replaced only so the test never leaves the process.
+
+    The count is attributed by *call stack* on purpose: patching
+    ``httpx.AsyncClient`` is process-wide, and a full-suite run keeps the
+    multinode harness's servers alive in this interpreter, so a background
+    heartbeat that happens to build a client inside the window used to make
+    ``assert len(made) == 1`` read 2 (measured 2026-10-11, one full run:
+    ``assert 2 == 1``). Only frames under the code under test are counted.
     """
     made: list = []
     real_client = httpx.AsyncClient
@@ -69,7 +77,11 @@ def _dialed_with(monkeypatch, handler) -> list:
     def _factory(*args, **kwargs):
         kwargs["transport"] = httpx.MockTransport(handler)
         client = real_client(*args, **kwargs)
-        made.append(client)
+        if any(
+            frame.function == "_provision_remote"
+            for frame in inspect.stack()
+        ):
+            made.append(client)
         return client
 
     monkeypatch.setattr(httpx, "AsyncClient", _factory)

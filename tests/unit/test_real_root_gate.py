@@ -104,7 +104,13 @@ def test_a_sandbox_without_a_root_neither_probes_nor_arms_the_root(monkeypatch):
             cmd=["/bin/sh"], env={}, cwd=str(WORKSPACE), stdin_enabled=False
         )
     )
-    assert "real_root" not in vars(one_shot)
+    # The gate is *not armed*, which is what the fork reads: it admits the
+    # mount family (`pivot_root`/`mount`/`umount2`) only under ``real_root``.
+    # The field itself is always on the document -- the wheel's ``Sandbox`` is a
+    # dataclass with ``real_root: bool = False``
+    # (``fields: [… 'real_root' …]``, measured 2026-10-11), so "not in
+    # ``vars()``" stopped being expressible; the *value* is the shape.
+    assert one_shot.real_root is False
     assert calls == []
 
 

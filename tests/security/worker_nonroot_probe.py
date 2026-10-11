@@ -34,6 +34,17 @@ def _executor(workspace: str, **kwargs) -> SandlockExecutor:
         workspace_dir=workspace,
         base_image=kwargs.get("base_image"),
         image_rootfs=kwargs.get("image_rootfs"),
+        # N16's synthesized skeleton, i.e. the root the worker builds for a pure
+        # sandbox (`envd_service/executors/factory.py`, `E2B_PURE_ROOTFS=synth`,
+        # the default and the only value left). A pure sandbox with no root of
+        # its own has nothing for the real root to pivot into: the executor says
+        # so once and the launch then fails outright -- measured 2026-10-11 as
+        # this probe's `FAIL plain sandbox: exit=-1 stdout=b'' stderr=b''` after
+        # "sandbox <unnamed> has no image rootfs and no synthesized root (pure
+        # shape)". Per workspace, so the three probes cannot share one skeleton.
+        pure_rootfs_dir=(
+            Path(workspace).parent / f"{Path(workspace).name}-pure-rootfs"
+        ),
         # N14 S5: the real root needs a user namespace of the sandbox's own
         # (an unprivileged process cannot `unshare(CLONE_NEWNS)` without one),
         # and the shape that provides it without a privileged mediator is the

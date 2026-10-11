@@ -509,7 +509,10 @@ spec:
             - name: E2B_IMAGE_OCI_DIR
               value: /var/lib/e2b-sandboxes/_images
             - name: E2B_IMAGE_CACHE_MAX_BYTES
-              value: "4294967296"
+              # Kept in step with worker.yaml (16 GiB, 2026-10-10)：这一份约束的是
+              # **共享卷上的 OCI tar store**，worker 那份约束节点本地解包缓存；
+              # 两份一直同值，分开写会让人以为可以只改一边。
+              value: "17179869184"
             - name: E2B_IMAGE_CACHE_EVICT_MIN_AGE_S
               value: "300"
             # The resolver hands every directory and file it creates to **this**
@@ -550,7 +553,14 @@ spec:
               # deployment hosts. Digest verified against ACR 2026-09-17.
               value: registry.cn-shanghai.aliyuncs.com/byteplan/python-mcp:3.14@sha256:3675662d0f545e255c707ca67ee1b6fae556b6db9306f6c5fbfb83b51920c8f6
             - name: E2B_TEMPLATE_IMAGES
-              value: '{"py311": "registry.cn-shanghai.aliyuncs.com/byteplan/python:3.11-slim"}'
+              # `byteplan-python-template` 由外部构建（不经过本仓库）：镜像必须带
+              # **linux/arm64**，集群两节点全是 arm64，而 worker 的 manifest 解析
+              # 对单架构 manifest 不做平台校验（`envd_service/runtime/oci_registry.py`
+              # 的 `fetch_platform_manifest`）—— 挂一个 amd64-only 的 ref 会建出一个
+              # "建得出来、箱内命令 exec format error" 的箱子。这是**可变 tag**：
+              # 镜像侧补上 arm64 之后同一个 tag 就会解析到 arm64 manifest（缓存按
+              # 每平台 manifest digest 做 key，旧的 amd64 条目不会挡路）。
+              value: '{"py311": "registry.cn-shanghai.aliyuncs.com/byteplan/python:3.11-slim", "byteplan-python-template": "registry.cn-shanghai.aliyuncs.com/byteplan/sandbox-base:latest"}'
             - name: E2B_MAX_SANDBOXES
               value: "1000"
             # N83 phase 2 / Task 1 + ruling R17 (2026-10-07): the largest

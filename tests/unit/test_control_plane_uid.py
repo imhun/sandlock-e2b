@@ -253,6 +253,14 @@ def test_the_worker_keeps_the_node_local_cache_and_the_shared_oci_dir() -> None:
     `E2B_IMAGE_CACHE_MAX_BYTES` is the node-local cache's own bound and stays
     set (this manifest set ships no quota-agent, so it is the only bound the
     cache has); the *knobs two lines above* are the ones that stay unset.
+
+    The bound itself is 16 GiB: the operator raised it from 4 GiB on
+    2026-10-11 ("镜像缓存可以加大到16G"), because the node-local cache is what
+    keeps a swept image from having to be pulled again on that node -- and a
+    multi-arch image is most of that. The number is asserted *here* rather than
+    read from the manifest on purpose: it is an operator decision on the
+    record, and a manifest edit that forgets it should fail a test, not move a
+    silence.
     """
     worker_env = _env(
         _containers(_only(_load_all(WORKER_MANIFEST), "StatefulSet", "e2b-worker"))[
@@ -261,7 +269,7 @@ def test_the_worker_keeps_the_node_local_cache_and_the_shared_oci_dir() -> None:
     )
     assert worker_env["E2B_IMAGE_CACHE_DIR"]["value"] == NODE_LOCAL_CACHE
     assert worker_env["E2B_IMAGE_OCI_DIR"]["value"] == f"{SHARED_ROOT}/_images"
-    assert worker_env["E2B_IMAGE_CACHE_MAX_BYTES"]["value"] == "4294967296"
+    assert worker_env["E2B_IMAGE_CACHE_MAX_BYTES"]["value"] == "17179869184"
 
 
 def test_both_manifests_spell_the_task_2_precondition() -> None:

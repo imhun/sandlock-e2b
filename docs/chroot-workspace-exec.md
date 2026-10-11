@@ -530,6 +530,26 @@ workspace/卷/六个 `/dev` → `pivot_root` → 然后照旧装 Landlock + secc
    —— 两形状都是 `EACCES`，也就是说拒绝来自 **Landlock 的 `fs_denied` 规则**（与目标在树里存不存在
    无关），不是"树里恰好是空的"这种巧合；真正"空"的只有 `/proc`，因为它是中介合成的视图
    （列出成功、内容为空，没有宿主 pid/宿主树）。结论不变、而且更强：真根没有让任何一条被拒路径变松。
+
+   **N95 之后重测（2026-10-11，模拟形状已退役，只剩真根形状）**：上一段那条"拒绝来自规则、
+   与树里存不存在无关"**不再对**，两条读数的拼写都动了（`tests/security/test_real_root_denials.py`
+   已按新读数重钉）：
+
+   | 探针 | (rc, stdout, stderr) —— N95 后 |
+   |---|---|
+   | `ls /sys` | `(2, b"", "ls: cannot open directory '/sys': Permission denied\n")` |
+   | `ls /sys/kernel` | `(2, b"", "ls: cannot access '/sys/kernel': No such file or directory\n")` |
+
+   原因就是 N95 自己那条原则——**"errno 是内核的，不是判决"**（`chroot/resolve.rs`）：解析层不再
+   把"查不到"折成 `EACCES`，所以
+   * `/sys` 在镜像 rootfs 里**是**一个目录 → 查找成功、拒绝落在 `open` 上，于是 `ls` 报
+     "cannot open directory"（仍是 `fs_denied` 的 `EACCES`）；
+   * `/sys/kernel` 在镜像树里**不存在**（rootfs 的 `/sys` 是空的）→ 答内核的 `ENOENT`，而
+     旧的模拟中介在查找之前就把整条前缀判成 `EACCES`。
+
+   结论方向不变、但表述要收窄：**没有一条被拒路径变松**（`kcore` 仍 `EACCES`、`/sys` 列目录仍
+   `EACCES`、镜像 rootfs 仍只读），但"与目标在树里存不存在无关"这句只对**规则本身**成立，对**拼写**
+   不成立——拼写由内核的真实查找决定。
 9. **checkpoint/restore：已从"没人用"升级为"实测不兼容并被显式拒绝"（2026-09-23）**。
    **① envd 确实没用**：`envd_service/` 全树没有任何 fork C/R 符号（`checkpoint` /
    `restore_interactive` / `restore_skipped`），现由 `tests/unit/test_checkpoint_restore_unused.py`

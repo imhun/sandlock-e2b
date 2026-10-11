@@ -622,7 +622,13 @@ async def test_a_slot_that_dies_on_the_way_up_is_a_dead_error(tmp_path):
     treats it like a dead in-process instance, and the uid goes back."""
     dead = FakeProcess(returncode=1)
     pool, spawned, log, channels = _pool(tmp_path, spawner=lambda **kw: dead)
-    with pytest.raises(SlotDeadError, match=r"exited before answering on"):
+    # The status is part of the message since 2026-10-11: a slot that dies
+    # before it ever answers is the worker's only evidence, and the pre-exec
+    # exits are named (see ``identity_grant.spawn_child``), so "exited with 1
+    # before answering on ..." is what an operator reads.
+    with pytest.raises(
+        SlotDeadError, match=r"exited with 1 before answering on"
+    ):
         await pool.acquire("sbx_dead", {}, uid=20000)
     assert pool.live_slots == []
     # The uid went back: the next lease (a W1 restart) can use it again.

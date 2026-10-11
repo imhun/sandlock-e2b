@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import subprocess
 import tempfile
 import threading
@@ -92,7 +93,6 @@ def _own_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExecutor
     in production, performed in-process by this lane's reporter when it runs as
     root.
     """
-    from envd_service.config import Settings as EnvdSettings
     from envd_service.own_identity import OwnIdentityConfig
     from envd_service.uid_pool import apply_sandbox_ownership
     from tests.security.conftest import _lane_identity_reporter
@@ -100,21 +100,26 @@ def _own_identity_executor(workspace: Path, pooled_uid: int) -> SandlockExecutor
     base = Path(workspace).parent
     scratch = base / "route-b"
     scratch.mkdir(parents=True, exist_ok=True)
-    EnvdSettings(  # the shape the worker resolves at startup, named here too
-        per_sandbox_uid=True,
-        workspace_base=base,
-        own_identity="on",
-        uid_pool_start=pooled_uid,
-        uid_pool_size=1,
-        slot_tmp_root=scratch,
-    )
     apply_sandbox_ownership(workspace, pooled_uid)
     return SandlockExecutor(
         workspace_dir=str(workspace),
         base_image=None,
         image_rootfs=None,
+        # N16's synthesized skeleton. "Pure" means *a root of its own*, not "no
+        # root": the executor with neither an image rootfs nor a synthesized one
+        # has nothing to pivot into and its instance dies at launch ("sandbox …
+        # has no image rootfs and no synthesized root (pure shape)" then
+        # ``read notif fd from child: pipe closed before 4 bytes read``;
+        # measured 2026-10-11 -- the same wall
+        # ``tests/contract/test_own_identity_executor.py`` hit).
+        pure_rootfs_dir=base / "pure-rootfs",
         host_uid=pooled_uid,
         per_sandbox_uid=True,
+        # Same reason as `tests/security/conftest.py`: the shipped seccomp
+        # profile has no `unshare` (N80), so a sandbox that is not already in a
+        # user namespace cannot make one for its real root. The deployment runs
+        # `E2B_PID_NS=true`, and this fixture has to build that shape.
+        pid_ns=True,
         memory_mb=512,
         cpu_percent=100,
         disk_mb=1024,
@@ -356,7 +361,6 @@ async def test_sandbox_child_runs_unprivileged():
         assert exit_code != 0, "uid 0 child must not write host system paths"
     finally:
         executor.close()
-        priv_helpers.configure_priv_helpers(EnvdSettings(priv_helpers="off"))
 
 
 @pytest.mark.usefixtures("require_sandlock")
@@ -395,17 +399,36 @@ async def test_https_mitm_ca_spliced_in_image_rootfs(multinode_two_workers):
 
 
 @pytest.mark.usefixtures("require_sandlock")
-async def test_sdk_iam_token_injected_as_jwt(multinode_two_workers):
+async def test_sdk_iam_token_injected_as_jwt(multinode_two_workers, loopback_alias):
     """SDK workload identity: ``iam=...`` plus a transform callable that
     references ``ctx.iam.tokens`` results in a minted JWT-SVID on the wire
-    (``Authorization: Bearer <jwt>`` with the requested audience)."""
+    (``Authorization: Bearer <jwt>`` with the requested audience).
+
+    The origin sits on the guard-allowed benchmark address on ``lo``
+    (``loopback_alias``), **not** on ``127.0.0.1``: this is an SDK create, so it
+    goes through the platform's own egress path (control plane -> worker), where
+    ``DEFAULT_NETWORK_DENY_CIDRS`` denies ``127.0.0.0/8`` (with ``0.0.0.0/8`` and
+    ``::1/128``) so a sandbox cannot reach worker-local services (SEC-001), and
+    the denial is not overridable by ``allowOut``. Measured 2026-10-11 in this
+    harness: a request to a loopback origin answers ``[Errno 111] Connection
+    refused`` whatever the allow list says, while the same origin on
+    ``198.18.0.99`` answers 200 and carries the JWT. The executor-level siblings
+    above may use ``127.0.0.1`` because they build the executor themselves and
+    pass no CIDR deny list -- that is the difference, not the network plumbing.
+    """
     import base64
     import json
 
     from e2b import Sandbox
 
     harness = multinode_two_workers
-    origin, thread, loop, state = _start_bg_origin("127.0.0.1", 80)
+    #: ``loopback_alias`` is taken for its side effect here -- it puts the
+    #: guard-allowed ``/32`` on ``lo`` and maps its hostname to it -- while the
+    #: allow rule and the request URL both spell the address itself. The assert
+    #: checks that mapping rather than trusting the fixture's name.
+    host = "198.18.0.99"
+    assert socket.gethostbyname(loopback_alias) == host
+    origin, thread, loop, state = _start_bg_origin(host, 80)
     try:
         sandbox = Sandbox.create(
             iam={
@@ -417,9 +440,9 @@ async def test_sdk_iam_token_injected_as_jwt(multinode_two_workers):
                 }
             },
             network={
-                "allow_out": ["127.0.0.1:80"],
+                "allow_out": [f"{host}:80"],
                 "rules": {
-                    "127.0.0.1": [
+                    host: [
                         {
                             "transform": lambda ctx: {
                                 "headers": {
@@ -439,7 +462,7 @@ async def test_sdk_iam_token_injected_as_jwt(multinode_two_workers):
         try:
             result = sandbox.commands.run(
                 "python3 -c \"import urllib.request; "
-                "print(urllib.request.urlopen('http://127.0.0.1/', timeout=10).status)\""
+                f"print(urllib.request.urlopen('http://{host}/', timeout=10).status)\""
             )
             assert result.exit_code == 0, result.error
             assert origin.requests, "origin must receive the iam-authenticated request"

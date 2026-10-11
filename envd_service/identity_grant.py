@@ -31,10 +31,12 @@ everywhere so unit tests can drive :func:`spawn_child`'s parent half.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import signal
 import subprocess
 import time
+import traceback
 from typing import Sequence
 
 from envd_service import env_alias
@@ -58,8 +60,6 @@ def _clone3_new_user_namespace() -> int:
     those capabilities are what ``setresuid(X)`` needs. Measured both ways in
     ``deploy/scripts/acceptance/probe_slot_clone3_shape.py``.
     """
-    import ctypes
-
     class _CloneArgs(ctypes.Structure):
         _fields_ = [
             (name, ctypes.c_uint64)
@@ -81,7 +81,35 @@ def _clone3_new_user_namespace() -> int:
     args = _CloneArgs()
     args.flags = CLONE_NEWUSER
     args.exit_signal = signal.SIGCHLD
-    libc = ctypes.CDLL(None, use_errno=True)
+    # ``PyDLL``, not ``CDLL``: a plain ``CDLL`` call **releases the GIL** around
+    # the syscall, and this call is a *fork*. If another thread holds the GIL at
+    # the instant the clone lands, the child inherits that state and can never
+    # take it back: it parks in ``pthread_cond_timedwait`` inside ctypes'
+    # ``PyEval_RestoreThread`` before a single line of the child branch runs.
+    #
+    # Measured 2026-10-11 on this box, and it is the whole "the first sandbox in
+    # a process takes 30/90/180 s (or hangs forever)" story: the child's own
+    # faulthandler dump showed `identity_grant.py:86 in _clone3_new_user_namespace`
+    # -> `_ctypes` -> `PyEval_RestoreThread` -> `pthread_cond_timedwait`, while
+    # the parent's `SlotProcess.poll()` correctly said "alive" and the pool's
+    # `stats` never got an answer. The other thread holding the GIL is whoever
+    # happens to be running -- the image-cache pruner, an import, the event loop
+    # -- which is why it hits *some* launches and not others, and why it is worst
+    # right after startup (most threads busy).
+    #
+    # Holding the GIL across the clone makes the child start with the GIL owned
+    # by its own (only) thread, which is the state ``os.fork()`` guarantees. The
+    # runtime's *other* locks cannot be re-initialized here (``PyOS_AfterFork_Child``
+    # aborts when the fork did not go through CPython), so the child keeps its
+    # pre-exec work free of allocation and locks until it execs -- see
+    # ``_fds_to_close`` and the child branch below.
+    libc = ctypes.PyDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    libc.syscall.argtypes = [
+        ctypes.c_long,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
     ctypes.set_errno(0)
     pid = libc.syscall(CLONE3_SYSCALL, ctypes.byref(args), ctypes.sizeof(args))
     if pid < 0:
@@ -90,24 +118,52 @@ def _clone3_new_user_namespace() -> int:
     return pid
 
 
-def _close_fds_except(keep: set[int]) -> None:
-    """Close every descriptor above stderr that is not in ``keep``.
+def _child_says(message: str) -> None:
+    """Write one line to the slot's stderr (fd 2, the pool's drained pipe).
+
+    The child runs before ``exec`` with no logging of its own, and its exit
+    status is all the worker sees otherwise -- the pool turns "the child died"
+    into a named error that quotes this text (``_slot_stderr``), so a failure
+    here is diagnosable from the worker log alone.
+    """
+    try:
+        os.write(2, (message.rstrip() + "\n").encode("utf-8", "replace"))
+    except OSError:  # pragma: no cover - stderr is a pipe we own
+        pass
+
+
+def _fds_to_close(keep: set[int]) -> list[int]:
+    """The descriptors above stderr a child must not inherit.
 
     ``subprocess.Popen(close_fds=True)`` used to do this. A clone3 child
     inherits the worker's whole fd table -- asyncio wakeup pipes, the control
     plane's sockets, every other slot -- so skipping this hands the supervisor
     a table full of descriptors it must never hold.
+
+    The list is computed **in the parent**, before the clone: enumerating
+    ``/proc/self/fd`` allocates (a list of path names, one ``int`` per entry),
+    and the child is a hand-rolled fork in a multi-threaded process -- it must
+    not take a lock another thread held at clone time. See
+    ``_clone3_new_user_namespace``'s note on the GIL.
     """
     try:
         names = os.listdir("/proc/self/fd")
     except OSError:  # pragma: no cover - no /proc
-        return
+        return []
+    close: list[int] = []
     for name in names:
         if not name.isdigit():
             continue
         fd = int(name)
         if fd <= 2 or fd in keep:
             continue
+        close.append(fd)
+    return close
+
+
+def _close_fds(fds: Sequence[int]) -> None:
+    """Close ``fds`` (the list the parent computed, see :func:`_fds_to_close`)."""
+    for fd in fds:
         try:
             os.close(fd)
         except OSError:  # pragma: no cover - already closed
@@ -120,7 +176,7 @@ def _keep_inheritable(fds: Sequence[int]) -> None:
     ``subprocess.Popen(pass_fds=...)`` did this for the old starter, and the
     clone3 one replaced ``Popen`` without it. Python builds the slot's control
     and events channels with ``socket.socketpair()``, which is ``O_CLOEXEC``:
-    a descriptor ``_close_fds_except`` deliberately kept would still be closed
+    a descriptor ``_fds_to_close`` deliberately kept would still be closed
     by the child's ``execve``, and ``sandlock-supervise`` would find
     ``--control-fd`` gone ("control fd N is not open: Bad file descriptor").
     clone3 copies the descriptor table but changes no flags, so the starter
@@ -302,6 +358,8 @@ def spawn_child(
         raise NotImplementedError("the slot starter only knows stderr=PIPE")
 
     stderr_reader, stderr_writer = os.pipe()
+    # Computed here, not in the child: see _fds_to_close.
+    close_fds = _fds_to_close({0, 1, 2, *pass_fds})
     try:
         pid = _clone3_new_user_namespace()
     except BaseException:
@@ -312,6 +370,18 @@ def spawn_child(
     if pid == 0:
         # === the child: inside the new namespace, capabilities intact ===
         try:
+            # The child is a *hand-rolled* fork inside a multi-threaded
+            # process: CPython's runtime knows nothing about it (see the GIL
+            # note in ``_clone3_new_user_namespace``), so it must not allocate,
+            # import or take any lock another thread might have held at clone
+            # time. Everything below is either a plain syscall or a loop over
+            # values the parent already computed.
+            #
+            # (``PyOS_AfterFork_Child`` would be the runtime's own remedy, but
+            # it *aborts* when the fork was not taken through CPython -- SIGABRT
+            # in a thread-spawned child, measured here -- so the path instead
+            # holds the GIL across the clone, above, and keeps the child's work
+            # allocation- and lock-free until exec.)
             if stdout is subprocess.DEVNULL:
                 devnull = os.open(os.devnull, os.O_WRONLY)
                 os.dup2(devnull, 1)
@@ -319,7 +389,11 @@ def spawn_child(
             os.dup2(stderr_writer, 2)
             os.close(stderr_reader)
             os.close(stderr_writer)
-            _close_fds_except({0, 1, 2, *pass_fds})
+            # A plain loop over ints, through a helper so a test can drive
+            # this half without closing the *runner's* descriptors (see
+            # tests/unit/test_identity_grant.py): the child does no allocation
+            # and takes no lock between here and exec (see _fds_to_close).
+            _close_fds(close_fds)
             _keep_inheritable(pass_fds)
             limit = (
                 identity_wait_timeout_s()
@@ -327,9 +401,18 @@ def spawn_child(
                 else float(timeout_s)
             )
             if not _await_identity(uid, deadline_s=limit):
+                _child_says(
+                    f"identity for uid {uid} never landed within {limit:.0f}s"
+                )
                 os._exit(3)
             os.execvpe(argv[0], argv, env if env is not None else os.environ)
         except BaseException:
+            # Nothing of this is visible from the worker otherwise: the child's
+            # exit says only "the slot is gone" (measured 2026-10-11, an empty
+            # ``<empty slot stderr>`` on a launch that failed in 4 s). The
+            # reason goes to the slot's stderr, which the pool keeps and prints
+            # when the child dies.
+            _child_says(traceback.format_exc())
             os._exit(4)
         os._exit(9)  # pragma: no cover - execvpe does not return
 

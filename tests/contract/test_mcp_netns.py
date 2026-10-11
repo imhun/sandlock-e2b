@@ -2,8 +2,10 @@
 `net_isolation` (per-sandbox netns + fd-injected connect + inbound mapping).
 
 The harness runs the control plane + one real envd worker (sandlock
-executor) + the envd gateway with ``enable_net_isolation`` and
-``fd_inject_connect`` enabled on the worker. Verifies:
+executor) + the envd gateway with ``enable_net_isolation``,
+``fd_inject_connect`` and ``pid_ns`` enabled on the worker -- the shipped
+worker shape (see ``_netns_servers`` for why the pid ns is part of it).
+Verifies:
 
 * SDK -> gateway -> /mcp proxy -> host mapped port (50005+) -> sandbox's
   own accept() -> in-sandbox mcp-gateway -> stdio MCP server;
@@ -68,6 +70,18 @@ def _netns_servers(buildkit_addr):
         envd_settings_extra={
             "enable_net_isolation": True,
             "fd_inject_connect": True,
+            # The third switch of the same shipped shape: the deployed workers
+            # run net_isolation **with** pid_ns (k8s `E2B_PID_NS=true`,
+            # compose `${E2B_PID_NS:-true}`), and with this seccomp profile that
+            # pairing is what creates every per-sandbox namespace -- the profile
+            # carries no `unshare` at all, so the namespaces can only come from
+            # the one `clone3` that also creates the pid ns. Running this worker
+            # in the code default (pid_ns off) makes every create fail with
+            # `sandlock_create failed` (measured 2026-10-08 on the fleet, shape
+            # matrix in docs/deploy-clusters.md §7.55, and again 2026-10-11 in
+            # the lane: 3 failed). Pinned here rather than left to the caller's
+            # env so the file always exercises the supported pairing.
+            "pid_ns": True,
         },
     )
     return harness

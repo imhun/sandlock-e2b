@@ -19,6 +19,11 @@ async def test_total_memory_503_no_runtime(make_apps, workspace):
             # node (executor=auto would warm-peek E2B_BASE_IMAGE and 428 on
             # a cold image cache).
             executor="local",
+            # The 503 has to be the *immediate* admission answer. Without this
+            # the request first waits out the create queue's 30 s default
+            # (control_plane/config.py) and only then answers -- same status,
+            # 30 s of lane wall clock per case.
+            create_queue_timeout_s=0,
             default_memory_mb=512,
             max_total_memory_mb=512,
             max_total_cpu_percent=0,
@@ -62,6 +67,7 @@ async def test_total_cpu_503(make_apps):
         control_settings=Settings(
             api_keys=("local-key",),
             executor="local",
+            create_queue_timeout_s=0,
             default_cpu_percent=100,
             max_total_cpu_percent=100,
             max_total_memory_mb=0,
@@ -89,6 +95,7 @@ async def test_ttl_release_restores_creation(make_apps):
         control_settings=Settings(
             api_keys=("local-key",),
             executor="local",
+            create_queue_timeout_s=0,
             default_memory_mb=512,
             max_total_memory_mb=512,
             max_total_cpu_percent=0,

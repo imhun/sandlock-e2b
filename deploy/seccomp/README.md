@@ -16,9 +16,12 @@ container, and the worker is the process that runs untrusted workloads.
   node. Apply the installer and wait for it to be ready *before* rolling the
   worker StatefulSet.
 
-The profile is **the Docker default profile plus `pidfd_getfd`, plus a masked
-`unshare`** — nothing else is relaxed, and the `unshare` entry is not a blanket
-allow (see "The `unshare` mask" below). Everything the sandbox itself needs
+The profile is **the Docker default profile plus `pidfd_getfd`** — nothing else
+is relaxed. Until 2026-10-06 it also carried a masked `unshare`; N80 (`4e3a7db`)
+deleted that rule when the slot handshake moved to `clone3`, and every
+per-sandbox namespace now comes from that one call. "The `unshare` mask" below
+is kept as the record of the deleted entry and of the shapes that would need it
+back. Everything the sandbox itself needs
 (`seccomp` with `NEW_LISTENER`, `setgroups`, `pidfd_open`, `landlock_*`,
 `fork`/`clone`, `ioctl`, …) is already in the default allowlist.
 
@@ -31,8 +34,8 @@ the profile is not in effect — both failures below are otherwise silent:
 * `Seccomp: 0` in `/proc/self/status` (no filter at all: profile dropped,
   `seccomp=unconfined`, or a runtime that ignored an unknown profile) →
   `SECCOMP_FILTER_MISSING`.
-* a filter is loaded but `unshare(CLONE_NEWUSER)` is still gated (an active
-  probe in a child process) → `SECCOMP_PROFILE_NOT_APPLIED`. That is the runtime
+* a filter is loaded but `clone3(CLONE_NEWUSER)` is refused (an active probe in
+  a child process) → `SECCOMP_PROFILE_NOT_APPLIED`. That is the runtime
   default profile, and it is how a k8s node with a *missing* Localhost profile
   presents itself: the kubelet silently skips the missing file and the pod comes
   up anyway (kubernetes#124944, 1.28/1.29), so every sandbox create would fail
@@ -90,9 +93,12 @@ every entry point of that family (`mount`, `umount2`, `pivot_root`, `open_tree`,
 
 ### Which rows are deltas, and which are just the default
 
-Only **`pidfd_getfd` and `unshare` are changes**: the default profile gates them
-(behind `CAP_SYS_PTRACE` / `CAP_SYS_ADMIN`) and neither worker shape carries
-those capabilities. The other three are here because this file was generated
+Only **`pidfd_getfd` is a change** since N80 (2026-10-06): the default profile
+gates it behind `CAP_SYS_PTRACE`, which neither worker shape carries. `unshare`
+was the second one until that change moved the slot handshake onto `clone3` and
+deleted the rule — a deployment that turns `E2B_PID_NS` off (or runs net
+isolation without it) would need it back; the measured shape matrix is §7.55 of
+docs/deploy-clusters.md. The other three are here because this file was generated
 from an older revision of the default profile that still gated them; current
 daemons allow all three unconditionally, and the supervisor does use them, so
 leaving them gated would make this profile *stricter than the default* and break
@@ -137,7 +143,18 @@ deviation to argue for on its own merits, not something this file does silently.
 `ptrace` and `process_vm_readv` cannot be re-gated without breaking fork
 tracking and the notification path.
 
-### The `unshare` mask (2026-09-30)
+### The `unshare` mask (2026-09-30; **the entry is gone since 2026-10-06, N80**)
+
+**Nothing below is in the profile any more.** N80 moved the slot handshake onto
+one `clone3(CLONE_NEWUSER|NEWPID|NEWNET|NEWNS)` call, so no shipped shape issues
+`unshare()` and the rule was deleted with its last caller (commit `4e3a7db`,
+"unshare leaves the profile"). The section is kept for one reason: it is the
+argument for what a deployment would need **if** it ever ran a shape that
+creates namespaces *after* the fork. That is not hypothetical — measured
+2026-10-08 on the fleet, `net_isolation` **without** `pid_ns` cannot create a
+sandbox at all under this profile (`sandlock_create failed`; shape matrix in
+§7.55 of `docs/deploy-clusters.md`). With the shipped switches on, nothing needs
+it back.
 
 `unshare` used to be an unconditional allow. It is now one entry whose argument
 mask excludes the namespace types this deployment never builds:

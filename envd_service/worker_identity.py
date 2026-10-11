@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import logging
+import re
 import socket
 from pathlib import Path
 from typing import Any, Callable
@@ -31,6 +32,18 @@ from gateway_common.worker_identity import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The container id Docker names in the root mount's ``upperdir``:
+#: ``overlay / overlay rw,...,upperdir=/var/lib/docker/overlay2/<id>/diff``.
+#: Read from ``/proc/self/mountinfo`` -- the **kernel's** view, like the
+#: hostname it stands in for, and not a file a deployment could have written.
+_MOUNTINFO_OVERLAY_ID = re.compile(r"overlay2/([0-9a-f]{12,64})(?:/|,|\s|$)")
+
+#: The ``upperdir=``/``workdir=`` spelling of the same thing. Kept separate so a
+#: *layer* id elsewhere in the line (``overlay2/l/…``, base32, so it never
+#: matches the hex class) cannot be mistaken for the container's.
+_MOUNTINFO_DIR_ID = re.compile(r"(?:upper|work)dir=[^,\s]*/([0-9a-f]{12,64})(?:/|,|\s|$)")
+
 
 #: Where the worker reads its own identity from (Linux ``procfs``).
 DEFAULT_PROC_ROOT = Path("/proc")
@@ -129,21 +142,69 @@ def worker_container_id() -> str | None:
     **by name** -- never a looser match. That is the documented cost of the
     anchor, and it is why a compose stack must not override the worker's
     hostname (``docs/c3-privilege-relocation.md`` §11.2.1).
+
+    A hostname that is **not** a container id falls back to the mount table
+    (:func:`_container_id_from_mountinfo`) before giving up: an engine that
+    ignores Docker's hostname default (OrbStack: every container reports
+    ``hostname=orbstack``) would otherwise leave every worker on the host with
+    no anchor at all, which is not the operator's mistake the warning names.
+    Both routes name the *same* kernel-visible id -- the agent's cgroup substring
+    check is unchanged, and a value the worker's cgroup does not contain is still
+    refused downstream.
     """
     try:
         value = socket.gethostname().strip()
     except OSError:  # pragma: no cover - uname(2) does not fail in practice
-        return None
-    if not validate_container_id(value):
-        logger.warning(
-            "this worker's hostname (%r) is not a container id, so it has no "
-            "container identity to report: the control plane will refuse every "
-            "C3 file operation on this node by name -- do not set `hostname:` "
-            "on a C3 worker (the runtime's default is the container id)",
+        value = ""
+    if validate_container_id(value):
+        return value
+    from_mounts = _container_id_from_mountinfo()
+    if from_mounts is not None:
+        logger.info(
+            "this worker's hostname (%r) is not a container id; using the id "
+            "the mount table names instead (%r)",
             value,
+            from_mounts,
         )
+        return from_mounts
+    logger.warning(
+        "this worker's hostname (%r) is not a container id, so it has no "
+        "container identity to report: the control plane will refuse every "
+        "C3 file operation on this node by name -- do not set `hostname:` "
+        "on a C3 worker (the runtime's default is the container id)",
+        value,
+    )
+    return None
+
+
+def _container_id_from_mountinfo(
+    proc_root: Path | str = DEFAULT_PROC_ROOT,
+) -> str | None:
+    """The container id the *kernel* names in this process's mount table.
+
+    The root mount of a container is the engine's overlay -- Docker spells the
+    container's own (upper) layer ``upperdir=/var/lib/docker/overlay2/<id>/diff``
+    -- so the id the agent looks for in the worker's host-side cgroup path is
+    right there in ``/proc/self/mountinfo``. Same value by a second route, from
+    the kernel rather than from a file a deployment could have written.
+
+    Candidates are shape-checked (lowercase hex, 12..64) exactly like the
+    hostname route; the layer *link* ids elsewhere in the line are base32 and
+    never match, and anything that slips through is still refused by the agent's
+    cgroup check rather than accepted more loosely.
+    """
+    try:
+        content = (Path(proc_root) / "self" / "mountinfo").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:  # pragma: no cover - Linux containers always have it
         return None
-    return value
+    for line in content.splitlines():
+        for pattern in (_MOUNTINFO_DIR_ID, _MOUNTINFO_OVERLAY_ID):
+            for match in pattern.finditer(line):
+                if validate_container_id(match.group(1)):
+                    return match.group(1)
+    return None
 
 
 def build_identity_reporter(

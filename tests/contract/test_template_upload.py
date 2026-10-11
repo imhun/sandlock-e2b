@@ -190,7 +190,18 @@ async def test_concurrent_upload_same_file_hash_keeps_winner_archive(
     real_replace = os.replace
 
     def delayed_replace(src, dst):
-        barrier.wait(timeout=5)
+        try:
+            barrier.wait(timeout=10)
+        except threading.BrokenBarrierError:
+            # The rendezvous is best-effort: a PUT can lose the claim *before*
+            # it stages anything, in which case it never reaches this rename and
+            # the other side would otherwise die on the broken barrier instead of
+            # reporting the race it was set up to measure (measured 2026-10-11,
+            # this test alone: `assert not [BrokenBarrierError()]`). The
+            # assertions below are about the outcome -- exactly one 204, one 409,
+            # and the winner's archive surviving with its bytes -- which hold
+            # whether or not both sides staged.
+            pass
         real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", delayed_replace)
@@ -215,7 +226,13 @@ async def test_concurrent_upload_same_file_hash_keeps_winner_archive(
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=10)
+        # Longer than the barrier's own 10 s rendezvous on purpose: the losing
+        # PUT can only append its 409 *after* the barrier breaks, so a join
+        # deadline equal to the barrier turns a loaded machine into
+        # ``assert [204] == [204, 409]`` (measured 2026-10-11 in
+        # ``deploy/scripts/test-prod-shaped.sh`` while another process held the
+        # box). This is a wait for a thread that is already on its way out.
+        thread.join(timeout=30)
 
     assert not errors
     assert sorted(statuses) == [204, 409]

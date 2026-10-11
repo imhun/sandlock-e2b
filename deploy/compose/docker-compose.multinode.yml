@@ -589,9 +589,9 @@ services:
     # deploy/stack/docker-compose.prod.yml and deploy/compose/docker-compose.prod.yml).
     security_opt:
       # The stack's line, verbatim (deploy/stack/docker-compose.prod.yml:328):
-      # Docker's default filter plus the two syscalls the sandbox-create path
-      # needs (`pidfd_getfd` for the seccomp-notification fd, `unshare` for the
-      # user namespace). `seccomp=unconfined` used to stand here -- this file
+      # Docker's default filter plus the one syscall the sandbox-create path
+      # needs (`pidfd_getfd`; per-sandbox namespaces come from the fork's
+      # `clone3` since N80, which carries no `unshare`). `seccomp=unconfined` used to stand here -- this file
       # was the last place in the tree still on it -- and the worker refuses to
       # serve unfiltered by default (`envd_service/config.py::check_seccomp_filter`:
       # `Seccomp: 0` is SECCOMP_FILTER_MISSING, fatal unless
@@ -697,9 +697,9 @@ services:
     # deploy/stack/docker-compose.prod.yml and deploy/compose/docker-compose.prod.yml).
     security_opt:
       # The stack's line, verbatim (deploy/stack/docker-compose.prod.yml:328):
-      # Docker's default filter plus the two syscalls the sandbox-create path
-      # needs (`pidfd_getfd` for the seccomp-notification fd, `unshare` for the
-      # user namespace). `seccomp=unconfined` used to stand here -- this file
+      # Docker's default filter plus the one syscall the sandbox-create path
+      # needs (`pidfd_getfd`; per-sandbox namespaces come from the fork's
+      # `clone3` since N80, which carries no `unshare`). `seccomp=unconfined` used to stand here -- this file
       # was the last place in the tree still on it -- and the worker refuses to
       # serve unfiltered by default (`envd_service/config.py::check_seccomp_filter`:
       # `Seccomp: 0` is SECCOMP_FILTER_MISSING, fatal unless
@@ -805,9 +805,9 @@ services:
     # deploy/stack/docker-compose.prod.yml and deploy/compose/docker-compose.prod.yml).
     security_opt:
       # The stack's line, verbatim (deploy/stack/docker-compose.prod.yml:328):
-      # Docker's default filter plus the two syscalls the sandbox-create path
-      # needs (`pidfd_getfd` for the seccomp-notification fd, `unshare` for the
-      # user namespace). `seccomp=unconfined` used to stand here -- this file
+      # Docker's default filter plus the one syscall the sandbox-create path
+      # needs (`pidfd_getfd`; per-sandbox namespaces come from the fork's
+      # `clone3` since N80, which carries no `unshare`). `seccomp=unconfined` used to stand here -- this file
       # was the last place in the tree still on it -- and the worker refuses to
       # serve unfiltered by default (`envd_service/config.py::check_seccomp_filter`:
       # `Seccomp: 0` is SECCOMP_FILTER_MISSING, fatal unless

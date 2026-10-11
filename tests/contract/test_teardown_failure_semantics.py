@@ -728,6 +728,21 @@ def _record_releases(monkeypatch) -> list[tuple[str, int]]:
     return released
 
 
+def _slice_root(volume_root: Path) -> Path:
+    """Where a volume's slice actually lives under the shared *export* root.
+
+    N73: ``E2B_SHARED_VOLUME_ROOT`` is the export root and the control plane's
+    store is its ``_volumes`` child, so a slice belongs at
+    ``<export>/_volumes/<vol_id>/<sandbox_id>``. These fixtures laid their
+    slices one level higher (``<export>/<vol_id>/…``, the legacy flat layout),
+    which no longer loads the control plane at all: it refuses to start with
+    ``LegacyVolumeLayoutError`` -- every assert in the file then died in the
+    fixture (measured 2026-10-11: 5 failures, all of them that guard, and the
+    layout is what N73 moved).
+    """
+    return volume_root / "_volumes"
+
+
 @pytest.mark.asyncio
 async def test_the_combined_node_never_reaches_another_tenants_slice(
     workspace, monkeypatch, caplog, disk_read_backend
@@ -742,7 +757,7 @@ async def test_the_combined_node_never_reaches_another_tenants_slice(
     one target that is verified by construction.
     """
     volume_root = workspace / "_volumes"
-    victim_slice = volume_root / "vol_1" / "sbx_victim"
+    victim_slice = _slice_root(volume_root) / "vol_1" / "sbx_victim"
     victim_slice.mkdir(parents=True)
     (victim_slice / "victim.bin").write_bytes(b"another tenant's volume")
     outside_slice = workspace / "elsewhere" / "sbx_local_liar"
@@ -806,7 +821,7 @@ async def test_the_combined_node_still_cleans_its_own_slice(
     removed exactly as before the rework.
     """
     volume_root = workspace / "_volumes"
-    slice_dir = volume_root / "vol_1" / "sbx_local_own"
+    slice_dir = _slice_root(volume_root) / "vol_1" / "sbx_local_own"
     slice_dir.mkdir(parents=True)
     (slice_dir / "data.bin").write_bytes(b"this sandbox's own volume")
     tree = _write_tree(
@@ -1245,10 +1260,10 @@ async def test_a_slice_that_is_a_link_to_another_tenants_slice_is_refused(
     link, so the entry is refused.
     """
     volume_root = workspace / "_volumes"
-    victim_slice = volume_root / "vol_1" / "sbx_victim"
+    victim_slice = _slice_root(volume_root) / "vol_1" / "sbx_victim"
     victim_slice.mkdir(parents=True)
     (victim_slice / "victim.bin").write_bytes(b"another tenant's volume")
-    link = volume_root / "vol_1" / "sbx_linked"
+    link = _slice_root(volume_root) / "vol_1" / "sbx_linked"
     link.symlink_to(victim_slice)
     tree = _write_tree(
         workspace,
@@ -1452,10 +1467,10 @@ async def test_parking_a_refused_tree_releases_the_slices_it_claims(
     """
     volume_root = workspace / "_volumes"
     victim_tree = _write_tree(workspace, "sbx_victim", project_id=VICTIM_PROJID)
-    own_slice = volume_root / "vol_1" / "sbx_liar"
+    own_slice = _slice_root(volume_root) / "vol_1" / "sbx_liar"
     own_slice.mkdir(parents=True)
     (own_slice / "data.bin").write_bytes(b"this sandbox's own slice")
-    victim_slice = volume_root / "vol_1" / "sbx_victim"
+    victim_slice = _slice_root(volume_root) / "vol_1" / "sbx_victim"
     victim_slice.mkdir(parents=True)
     (victim_slice / "victim.bin").write_bytes(b"another tenant's volume")
     outside_slice = workspace / "elsewhere" / "sbx_liar"

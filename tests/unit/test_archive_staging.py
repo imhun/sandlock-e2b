@@ -452,7 +452,13 @@ async def test_the_workers_restore_leaves_no_tree(
     ) as client:
         resp = await client.post(
             "/agent/sandboxes",
-            json={"sandboxID": SANDBOX, "snapshotID": SNAPSHOT, "hostUID": 1000},
+            # A uid inside this worker's pool (`E2B_UID_POOL_START`..+size, the
+            # 10000..11000 default): the point of this case is the *archive*
+            # refusal (400) leaving no tree, and a uid the pool does not own is
+            # refused earlier and by a different gate -- the create answers 500
+            # ("uid 1000 is outside this worker's pool"), which is how this case
+            # failed until 2026-10-11.
+            json={"sandboxID": SANDBOX, "snapshotID": SNAPSHOT, "hostUID": 10000},
             headers={"X-Internal-Key": KEY},
         )
 

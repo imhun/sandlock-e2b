@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from gateway_common.paths import sandbox_record_path
+from gateway_common.paths import sandbox_creating_marker, sandbox_record_path
 
 import envd_service.agent as agent
 import envd_service.xfs_quota as xfs_quota
@@ -20,6 +21,29 @@ from envd_service.xfs_quota import ProjectQuotaError
 from tests._disk_projids import install_disk_projids as _install_disk_projids
 from tests._disk_projids import read_calls
 from tests.conftest import uid_startup_disclosure
+
+
+async def _record_on_disk(workspace: Path, sandbox_id: str) -> dict:
+    """The record as *other* processes see it, after the create's write landed.
+
+    Design §4.5: the agent answers the create before the record is durable (the
+    sandbox already exists for everyone in this process; the copy on disk is for
+    other processes), and ``.creating`` is what keeps the two consistent in
+    between -- the marker comes off only once the write finished. Reading the
+    file straight off the response therefore races the scheduled write, which is
+    measured here as ``FileNotFoundError`` (2026-10-11). Waiting on the marker's
+    documented invariant is what makes the *persisted* assertions below mean
+    what they say.
+    """
+    marker = sandbox_creating_marker(workspace, sandbox_id)
+    for _ in range(400):
+        if not marker.exists():
+            break
+        await asyncio.sleep(0.05)
+    assert not marker.exists(), f"the create marker {marker} was never cleared"
+    return json.loads(
+        sandbox_record_path(workspace, sandbox_id).read_text(encoding="utf-8")
+    )
 
 
 def _warnings(caplog) -> list[str]:
@@ -118,8 +142,7 @@ async def test_create_provisions_quota_and_persists_project_id(workspace, monkey
     record = app.state.runtime_registry.get("sbx_quota1")
     assert record is not None
     assert record.project_id == 42
-    record_path = sandbox_record_path(workspace, "sbx_quota1")
-    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    payload = await _record_on_disk(workspace, "sbx_quota1")
     assert payload["project_id"] == 42
     assert (workspace / "sbx_quota1" / "workspace").is_dir()
 
@@ -249,11 +272,7 @@ async def test_create_reprovision_failure_persists_none_after_cleanup(
     record = app.state.runtime_registry.get("sbx_reprov_fail")
     assert record is not None
     assert record.project_id is None
-    payload = json.loads(
-        sandbox_record_path(workspace, "sbx_reprov_fail").read_text(
-            encoding="utf-8"
-        )
-    )
+    payload = await _record_on_disk(workspace, "sbx_reprov_fail")
     assert payload["project_id"] is None
     assert calls == [
         [

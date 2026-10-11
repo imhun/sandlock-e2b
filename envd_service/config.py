@@ -485,6 +485,19 @@ class Settings:
             "E2B_OWN_IDENTITY", legacy="E2B_ROUTE_B", default="auto"
         ).lower()
     )
+    #: How the slot child's identity is granted, for an embedder that already
+    #: holds it: ``identity_reporter`` is the callable the pool would otherwise
+    #: build from ``E2B_CONTROL_PLANE_URL`` / ``E2B_NODE_ID`` (see
+    #: ``envd_service.worker_identity.build_identity_reporter``). Left ``None``
+    #: in every deployment -- the worker only knows the control plane's URL from
+    #: its environment, and the agent's write is the production path. The
+    #: in-process lanes set it because they have no agent and no control-plane
+    #: round trip to make: ``tests/lane_identity.py`` performs the same write as
+    #: the root process (measured 2026-10-11: without it, ``agent-grant`` -- the
+    #: only grant shape left since N52 -- refuses every chroot create in the
+    #: multi-node harness by name, since the in-process mediator is refused by
+    #: the fork instead of writing files as the worker).
+    identity_reporter: object | None = None
     # Maximum live slots. W1 recycle semantics: one uid = one supervise
     # process = one sandbox generation, and reuse means restarting in place,
     # so the uid-reuse window is the number of concurrently live slots
@@ -520,6 +533,28 @@ class Settings:
                 "E2B_SLOT_VERB_TIMEOUT_S",
                 legacy="E2B_ROUTE_B_VERB_TIMEOUT_S",
                 default="15.0",
+            )
+        )
+    )
+    #: How long the worker waits for a freshly spawned slot to report a
+    #: launched instance, in seconds. Distinct from the per-verb deadline above,
+    #: which bounds one request on an *established* channel: this one bounds the
+    #: whole "spawn -> first answer" window.
+    #:
+    #: It is a knob for one measured reason (2026-10-11): the **first**
+    #: chroot/real-root sandbox launch inside a container is not 0.07 s like
+    #: every later one -- it opens with a closed control channel and only
+    #: answers ~30.5 s in, which the 30 s default turned into a coin flip. On a
+    #: test lane that coin flip decided whether a whole *file* ran (each
+    #: security file's first fixture builds a sandbox: 11 files errored that way
+    #: in one full run). A lane that knows it is paying that one-time cost can
+    #: raise this; a deployment keeps the bound that suits its own hardware.
+    slot_ready_timeout_s: float = field(
+        default_factory=lambda: float(
+            env_alias.read(
+                "E2B_SLOT_READY_TIMEOUT_S",
+                legacy="E2B_ROUTE_B_READY_TIMEOUT_S",
+                default="30.0",
             )
         )
     )

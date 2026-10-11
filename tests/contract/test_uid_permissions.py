@@ -20,6 +20,7 @@ in both shapes.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -33,7 +34,7 @@ import pytest
 from control_plane.config import Settings as ControlSettings
 from envd_service.config import Settings as EnvdSettings
 from envd_service.connect.codec import decode_envelopes, encode_message
-from gateway_common.paths import sandbox_record_path
+from gateway_common.paths import sandbox_creating_marker, sandbox_record_path
 from tests.security.conftest import sandlock_ready
 
 POOL_START = 20000
@@ -281,9 +282,30 @@ async def test_agent_uid_lifecycle_and_orphan_reconcile(make_apps, workspace):
         assert ws.stat().st_uid == POOL_START
         assert ws.stat().st_gid == os.getegid()
         assert stat.S_IMODE(ws.stat().st_mode) == 0o770
-        persisted = json.loads(
-            sandbox_record_path(workspace, sbx_id).read_text(encoding="utf-8")
+        # Design §4.5: the create answers *before* the record is durable
+        # (``register(persist=False)`` already made the sandbox exist for
+        # everyone in this process; the disk copy is for other processes), and
+        # the ``.creating`` marker is what keeps the two consistent in between.
+        # So the record is a subsequent fact, not a synchronous one: reading it
+        # straight off the response races the scheduled write, which is measured
+        # here as ``FileNotFoundError`` (2026-10-11). Wait on the invariant the
+        # marker documents instead -- *marker gone ⇒ the record is durable* --
+        # and then read the record, which pins the order rather than trusting it.
+        record_path = sandbox_record_path(workspace, sbx_id)
+        marker = sandbox_creating_marker(workspace, sbx_id)
+        for _ in range(400):
+            if not marker.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert not marker.exists(), (
+            f"the create marker {marker} was never cleared, so the record write "
+            "never finished"
         )
+        assert record_path.is_file(), (
+            f"{record_path} is missing after {marker} was cleared: the record "
+            "must be durable before the marker comes off (§4.5)"
+        )
+        persisted = json.loads(record_path.read_text(encoding="utf-8"))
         assert persisted["host_uid"] == POOL_START
 
         deleted = await client.delete(

@@ -17,17 +17,25 @@ code comment:
    them would break `openpty`, `tmux`, `vim`, `ssh` and the platform's own PTY
    endpoint. What they could attack is *not* reachable, and that is the part
    worth asserting:
-     - `/dev/pts` must be a per-sandbox devpts instance, so no other sandbox's
-       ptys are visible;
+     - a *foreign* `/dev/pts` node -- another session's pty, or the worker's
+       own -- must not be openable from inside the sandbox;
      - `/dev/tty` must not be openable, so there is no controlling terminal to
        retarget.
 
-   These are the load-bearing preconditions. If a deployment ever mounts the
-   host devpts instead of a private instance, `test_devpts_is_a_private_instance`
-   and `test_controlling_terminal_is_unreachable` go red and the deny list needs
-   the write family back. That is the point of the file: the gap is closed by a
-   test on the preconditions rather than by a blocklist that would break the
-   product.
+   These are the load-bearing preconditions. The first one is asserted against
+   the *measured* shape (2026-10-11): `/dev/pts` inside the sandbox **is** the
+   worker's devpts instance bound in (`envd_service/executors/sandlock.py`
+   `_minimal_dev_mounts` -> the fork's `minimal_dev`), so the slave nodes of
+   every pty on the worker are visible *by name* -- a full-suite lane run
+   leaves `0`/`1` behind from `tests/contract/test_pty_sandlock.py` and
+   `tests/sdk/python/test_pty.py`. The protection is therefore DAC, not
+   absence: the nodes carry the devpts `0620 root:tty` mode (owned by whoever
+   opened the master, i.e. the worker), and the sandbox is a foreign uid, so
+   opening one answers EACCES. A deployment that bound the *host's* devpts
+   with looser ownership, or that ran the worker as the sandbox's own uid
+   (the E5.1 shape `tests/security/test_worker_nonroot.py` exercises), turns
+   `test_foreign_ptys_are_unreachable` red -- which is the shape this test is
+   for. `test_controlling_terminal_is_unreachable` is unchanged.
 
    Also pinned here, because both were load-bearing during the audit that
    produced the list: `TIOCSTI`/`TIOCLINUX` stay refused on the one node where
@@ -121,6 +129,23 @@ try:
     out["pts_before_any_pty"] = sorted(os.listdir("/dev/pts"))
 except OSError as exc:
     out["pts_before_any_pty"] = "errno%%d" %% exc.errno
+# Every node here other than ptmx belongs to somebody else on this worker (its
+# own pty, or another sandbox's session): /dev/pts is the worker's devpts bound
+# into the sandbox, so those names are visible either way. What has to hold is
+# that this uid cannot open one -- that is the whole isolation, and it is what
+# the caller asserts.
+out["pts_foreign"] = {}
+if isinstance(out["pts_before_any_pty"], list):
+    for name in out["pts_before_any_pty"]:
+        if name == "ptmx":
+            continue
+        try:
+            os.close(os.open("/dev/pts/" + name, os.O_RDWR | os.O_NOCTTY))
+            out["pts_foreign"][name] = "opened"
+        except OSError as exc:
+            out["pts_foreign"][name] = E.errorcode.get(
+                exc.errno, "errno%%d" %% exc.errno
+            ).lower()
 try:
     os.close(os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY))
     out["ctty_open"] = True
@@ -173,20 +198,46 @@ async def test_landlock_ioctl_dev_is_enforced(readings):
 
 
 @pytest.mark.usefixtures("require_sandlock")
-async def test_devpts_is_a_private_instance(readings):
-    """The precondition: no other sandbox's ptys are in scope."""
+async def test_foreign_ptys_are_unreachable(readings):
+    """The precondition: no other process's terminal is reachable from here.
+
+    `/dev/pts` is the worker's devpts bound in, so foreign slave nodes are
+    visible by name (see the module docstring for the measurement); what has
+    to hold is that this sandbox's uid cannot *open* one.
+    """
     before = readings["pts_before_any_pty"]
-    assert before == ["ptmx"], (
-        f"/dev/pts holds {before!r} before the sandbox has allocated a pty. A "
-        f"shared or host-mounted devpts would expose other tenants' terminals, "
-        f"which is precisely what makes the allowed terminal write family safe"
+    assert isinstance(before, list), (
+        f"/dev/pts could not be listed at all ({before!r}); that is not the "
+        f"same fact as 'it is empty', and an unlistable devpts is a shape of "
+        f"its own"
+    )
+    foreign = readings["pts_foreign"]
+    # EACCES is what a *present* foreign node answers (measured 2026-10-11 with
+    # a pty held open in the runner container: /dev/pts/0 owned by root, the
+    # sandbox uid refused). ENOENT is allowed because another session can close
+    # its master between the listing and this probe -- a node that is gone is
+    # not a node we can reach, so it cannot mask anything.
+    reachable = {
+        name: verdict
+        for name, verdict in foreign.items()
+        if verdict not in ("eacces", "enoent")
+    }
+    assert reachable == {}, (
+        f"another process's pty is reachable from inside this sandbox: "
+        f"{reachable!r} (every foreign node: {foreign!r}). The nodes are "
+        f"root:tty 0620 and this sandbox is a foreign uid, so open() must "
+        f"answer EACCES -- that DAC boundary is the only thing standing between "
+        f"the allowed terminal write family and another tenant's terminal"
     )
     after = readings["pts_after_one_pty"]
-    # Exactly one new entry, and it is this process's own pty number.
     own = readings["slave_path"].rsplit("/", 1)[-1]
-    assert set(after) - set(before) == {own}, (
-        f"/dev/pts gained {sorted(set(after) - set(before))!r} for one openpty()"
-    )
+    # The listing is a *shared* space (the worker's devpts), so it can change
+    # for reasons that have nothing to do with this sandbox -- a concurrent
+    # session's openpty shows up here too, and this used to be asserted as
+    # "exactly one new entry". What must hold is that our own openpty
+    # materialized *our* node and that the kernel handed us that node.
+    assert own not in before, (own, before)
+    assert own in after, (own, after)
 
 
 @pytest.mark.usefixtures("require_sandlock")

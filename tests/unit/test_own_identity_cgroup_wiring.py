@@ -346,18 +346,27 @@ def test_the_required_switch_builds_one_handle_for_the_whole_process(
     settings = _settings(sandbox_cgroup="required", cgroup_mount="/pod-cgroup")
     first = rb.sandbox_cgroups_for(settings)
     assert first is rb.sandbox_cgroups_for(settings)
-    assert built == [
-        {
-            "mount": Path("/pod-cgroup"),
-            "worker_uid": os.geteuid(),
-            "container_token": None,
-            # N83 phase 2 (R3/R17): the handle is built with the per-sandbox
-            # ceiling the control plane handed down, so ``attach`` can refuse a
-            # declared size above it *by name*. It is read next to the handle
-            # because both are one process-wide fact.
-            "policy_ceiling": POLICY_CEILING,
-        }
-    ]
+    assert len(built) == 1
+    assert built[0] == {
+        "mount": Path("/pod-cgroup"),
+        "worker_uid": os.geteuid(),
+        # The lane token, through the same reader the handle uses: on k8s the
+        # mount is already this pod's cgroup (``subPathExpr``) and there is
+        # nothing to narrow, so the container id is ``None``; on compose the
+        # mount is the whole VM tree and the token is the container id, which
+        # since the 2026-10-11 kernel-source change is resolved from the mount
+        # table's overlay ``upperdir`` when the hostname is not one (OrbStack
+        # reports ``hostname=orbstack``). Pinning the literal ``None`` here is
+        # what made the reader's new source look like a regression -- the
+        # subject of this test is *one handle per process*, not the token's
+        # value, so the token is asserted through its own reader.
+        "container_token": rb.cgroup_container_token(),
+        # N83 phase 2 (R3/R17): the handle is built with the per-sandbox
+        # ceiling the control plane handed down, so ``attach`` can refuse a
+        # declared size above it *by name*. It is read next to the handle
+        # because both are one process-wide fact.
+        "policy_ceiling": POLICY_CEILING,
+    }
 
 
 def test_the_compose_lane_hands_the_worker_its_container_id(monkeypatch) -> None:

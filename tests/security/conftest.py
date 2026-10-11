@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.lane_identity import lane_identity_reporter
+
 
 def sandlock_ready() -> bool:
     """True only on Linux with a working sandlock and Landlock ABI >= 6."""
@@ -175,49 +177,49 @@ def require_sandlock():
 _slot_serial = itertools.count()
 
 
+#: One extracted rootfs per image per *lane*, not per call. The resolver caches
+#: inside whatever directory it is handed (a ``.complete`` marker plus a digest
+#: sidecar, ``resolve_image_rootfs``), so a stable directory **is** the cache --
+#: and a fresh ``mkdtemp`` per call re-extracted the image every single time
+#: (measured 2026-10-11: 2.7-2.9 s per call with the local mirror, 13-14 s
+#: without one, and 15 call sites in this suite alone -- ~40 s of every lane
+#: run spent unpacking the same 60 MB tree).
+#:
+#: One tree for every caller is also the *product's* own invariant: the shared
+#: image rootfs is read-only from inside a sandbox, which is what
+#: ``test_real_root_denials`` asserts by looking for a file that must never
+#: appear in it. ``E2B_TEST_ROOTFS_DIR`` lets a lane place the cache outside
+#: the per-run scratch (a reused lane container would otherwise throw it away
+#: with ``E2B_TEST_TMP_ROOT``).
+_ROOTFS_CACHE: dict[str, Path] = {}
+
+
 def resolve_test_rootfs(image: str = "python:3.11-slim") -> Path:
-    """The image rootfs, extracted into a cache directory this test owns.
+    """The image rootfs, extracted once per image (see ``_ROOTFS_CACHE``).
 
     Pulled through the registry client (no Docker daemon needed), so the same
     helper serves the Docker-less production-shape lane.
     """
+    cached = _ROOTFS_CACHE.get(image)
+    if cached is not None and cached.is_dir():
+        return cached
+
     from envd_service.runtime.image_resolver import resolve_image_rootfs
 
-    return resolve_image_rootfs(image, str(sandbox_tmpdir(suffix="-cache")))
+    base = Path(os.environ.get("E2B_TEST_ROOTFS_DIR") or "")
+    if not str(base):
+        base = sandbox_tmpdir(suffix="-rootfs-cache")
+    base.mkdir(parents=True, exist_ok=True)
+    rootfs = resolve_image_rootfs(image, str(base))
+    _ROOTFS_CACHE[image] = rootfs
+    return rootfs
 
 
-def _lane_identity_reporter(uid_start: int, uid_size: int):
-    """The per-node agent's write, performed in-process by the lane.
-
-    C3 grants a slot its identity by having the agent write the child's
-    ``uid_map``/``gid_map``. The one-shot lane has no agent, but its phase 1
-    runs as root -- the same capability the agent has -- so it can perform the
-    identical write on the child the pool forked. A non-root lane answers
-    ``None``: own identity then declines with its named reason, exactly as a worker
-    whose agent is missing would (and `require_mediation_capable` turns that
-    into a skip rather than a false pass).
-
-    The mapping is a *range* (``uid_start .. uid_start+uid_size-1``) because the
-    reporter is handed ``(sandbox_id, pid)`` and not the uid the pool picked;
-    every uid the pool can hand out is mapped, and the sandbox's host identity
-    is the same number the pool reserved.
-    """
-    if os.geteuid() != 0:
-        return None
-
-    def report(sandbox_id: str, pid: int) -> dict:
-        mapping = f"{uid_start} {uid_start} {uid_size}\n"
-        Path(f"/proc/{pid}/uid_map").write_text(mapping, encoding="ascii")
-        try:
-            Path(f"/proc/{pid}/setgroups").write_text("deny\n", encoding="ascii")
-        except OSError:
-            # Already denied (the child or an earlier grant did it): the map
-            # below is what matters.
-            pass
-        Path(f"/proc/{pid}/gid_map").write_text(mapping, encoding="ascii")
-        return {"ok": True}
-
-    return report
+#: The per-node agent's write, performed in-process by the lane. Moved to
+#: ``tests/lane_identity.py`` when the multi-node harness needed the same thing
+#: (one implementation, three lanes); the old name stays because
+#: ``tests/contract/test_nonroot_own_identity.py`` imports it.
+_lane_identity_reporter = lane_identity_reporter
 
 
 def own_identity_sandbox(
@@ -275,6 +277,20 @@ def own_identity_sandbox(
         image_rootfs=rootfs,
         host_uid=host_uid,
         per_sandbox_uid=per_sandbox_uid,
+        # The deployed worker's own value (`E2B_PID_NS=true` in every shipped
+        # stack). The fixture has to match it, because with the *shipped*
+        # seccomp profile (`deploy/seccomp/sandlock-worker.json` -- no
+        # `unshare`, deliberately, N80) a sandbox that is not already inside a
+        # user namespace cannot create one: `context.rs` calls
+        # `unshare(CLONE_NEWUSER)` for the real root (which needs a mount ns)
+        # and the filter answers EPERM, so the child dies before its notif fd
+        # and every create in this file fails with `read notif fd from child:
+        # pipe closed before 4 bytes read` (measured 2026-10-11, with the
+        # profile's `SANLOCK_REALROOT_TRACE` naming the exact line:
+        # `FAILURE: sandlock child: unshare(CLONE_NEWUSER): Operation not
+        # permitted`). With `pid_ns` on, the one `clone3` call carries the
+        # user/PID/mount/net namespaces exactly as it does on the fleet.
+        pid_ns=True,
         pure_rootfs_dir=Path(pure_rootfs_dir),
         memory_mb=512,
         cpu_percent=100,
@@ -289,6 +305,16 @@ def own_identity_sandbox(
             uid_start=host_uid if host_uid is not None else SANDBOX_UID,
             uid_size=2,
             tmp_root=sandbox_tmpdir(suffix="-route-b"),
+            # ``E2B_SLOT_READY_TIMEOUT_S`` applies to hand-built executors too:
+            # the *first* chroot launch inside a container opens with a closed
+            # control channel and only answers ~30.5 s in (measured 2026-10-11),
+            # so the 30 s default is a coin flip that decides whether a whole
+            # file runs -- 11 security files lost their run to it. A lane that
+            # pays that cost once, up front, raises this for the warm-up; an
+            # ordinary run leaves it unset and keeps the deployment's bound.
+            socket_timeout_s=float(
+                os.environ.get("E2B_SLOT_READY_TIMEOUT_S") or 30.0
+            ),
             # C3 is the only slot-identity shape left (N52): every slot is
             # granted by writing the child's map, and in this lane the root
             # process performing the write stands in for the node's agent.
